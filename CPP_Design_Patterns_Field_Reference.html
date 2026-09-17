@@ -1,0 +1,1349 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>C++ Design Patterns — Field Reference</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/nord.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/cpp.min.js"></script>
+<style>
+:root{
+  --bg:#0e2036;
+  --bg-panel:#123049;
+  --bg-sidebar:#0a1a2c;
+  --line:#2f5578;
+  --line-soft:#1c3852;
+  --accent:#ffb454;
+  --accent-dim:#c98e42;
+  --text:#e7eef6;
+  --text-dim:#8fa9c2;
+  --text-faint:#5d7995;
+  --code-bg:#081422;
+  --cat-creational:#7ec8e3;
+  --cat-structural:#ffb454;
+  --cat-behavioral:#9fdf9f;
+}
+*{box-sizing:border-box;}
+html,body{margin:0;padding:0;background:var(--bg);color:var(--text);font-family:'IBM Plex Sans',sans-serif;}
+body{
+  background-image:
+    linear-gradient(var(--line-soft) 1px, transparent 1px),
+    linear-gradient(90deg, var(--line-soft) 1px, transparent 1px);
+  background-size: 28px 28px;
+  background-attachment: fixed;
+  min-height:100vh;
+}
+::selection{background:var(--accent);color:#0e2036;}
+a{color:inherit;}
+.app{display:flex;min-height:100vh;}
+
+/* Sidebar */
+.sidebar{
+  width:300px;flex-shrink:0;background:var(--bg-sidebar);
+  border-right:1px solid var(--line);
+  padding:0; position:sticky; top:0; height:100vh; overflow-y:auto;
+}
+.sidebar-header{
+  padding:24px 22px 18px 22px;border-bottom:1px solid var(--line);
+}
+.sidebar-header .kicker{
+  font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:0.08em;
+  color:var(--accent);margin:0 0 6px 0;
+}
+.sidebar-header h1{
+  font-size:19px;margin:0 0 4px 0;font-weight:600;line-height:1.3;
+}
+.sidebar-header p{
+  font-size:12.5px;color:var(--text-dim);margin:0;line-height:1.5;
+}
+.nav-group{padding:14px 0 6px 0;}
+.nav-group-label{
+  font-family:'IBM Plex Mono',monospace;font-size:10.5px;letter-spacing:0.1em;
+  padding:6px 22px;color:var(--text-faint);display:flex;align-items:center;gap:8px;
+}
+.nav-group-label .dot{width:7px;height:7px;border-radius:1px;display:inline-block;transform:rotate(45deg);}
+.nav-item{
+  display:flex;align-items:baseline;gap:10px;
+  padding:8px 22px 8px 30px;cursor:pointer;font-size:14px;color:var(--text-dim);
+  border-left:2px solid transparent;transition:background .12s, color .12s, border-color .12s;
+}
+.nav-item .num{font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--text-faint);width:18px;flex-shrink:0;}
+.nav-item:hover{background:rgba(255,255,255,0.03);color:var(--text);}
+.nav-item.active{
+  background:rgba(255,180,84,0.08);color:var(--accent);border-left-color:var(--accent);
+}
+.nav-item.active .num{color:var(--accent);}
+
+/* Main */
+.main{flex:1;min-width:0;display:flex;flex-direction:column;}
+.topbar{
+  padding:18px 40px;border-bottom:1px solid var(--line);
+  background:rgba(14,32,54,0.85);backdrop-filter:blur(6px);
+  position:sticky;top:0;z-index:5;
+  display:flex;align-items:center;justify-content:space-between;
+}
+.topbar .crumb{font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--text-faint);}
+.topbar .crumb .sep{margin:0 6px;color:var(--line);}
+.topbar .crumb .current{color:var(--accent);}
+.progress-pill{
+  font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--text-dim);
+  border:1px solid var(--line);padding:4px 10px;border-radius:3px;
+}
+
+.content{padding:48px 56px 100px 56px;max-width:900px;}
+.pattern-page{display:none;}
+.pattern-page.active{display:block;animation:fadein .25s ease;}
+@keyframes fadein{from{opacity:0;transform:translateY(6px);}to{opacity:1;transform:translateY(0);}}
+
+.cat-tag{
+  display:inline-flex;align-items:center;gap:7px;
+  font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:0.08em;
+  color:var(--text-dim);border:1px solid var(--line);padding:4px 10px 4px 8px;border-radius:3px;
+  margin-bottom:18px;
+}
+.cat-tag .dot{width:8px;height:8px;transform:rotate(45deg);display:inline-block;}
+
+.pattern-page h2{
+  font-size:34px;margin:0 0 6px 0;font-weight:700;letter-spacing:-0.01em;
+}
+.pattern-alias{
+  font-family:'IBM Plex Mono',monospace;color:var(--text-faint);font-size:13px;margin:0 0 26px 0;
+}
+.intent{
+  font-size:16.5px;line-height:1.7;color:var(--text);margin:0 0 32px 0;
+  padding:16px 20px;background:var(--bg-panel);border-left:3px solid var(--accent);border-radius:0 4px 4px 0;
+}
+.section-label{
+  font-family:'IBM Plex Mono',monospace;font-size:12px;letter-spacing:0.1em;
+  color:var(--accent-dim);margin:36px 0 14px 0;display:flex;align-items:center;gap:10px;
+}
+.section-label::after{content:'';flex:1;height:1px;background:var(--line);}
+
+pre{
+  background:var(--code-bg)!important;border:1px solid var(--line-soft);border-radius:6px;
+  padding:20px 22px!important;overflow-x:auto;margin:0;
+}
+code.hljs{background:transparent!important;font-family:'IBM Plex Mono',monospace!important;font-size:13px;line-height:1.65;}
+.code-wrap{position:relative;}
+.code-label{
+  position:absolute;top:-11px;left:16px;background:var(--accent);color:#0e2036;
+  font-family:'IBM Plex Mono',monospace;font-size:10.5px;font-weight:700;letter-spacing:0.05em;
+  padding:2px 8px;border-radius:3px;
+}
+
+.examples{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:12px;}
+.examples li{
+  display:flex;gap:14px;padding:14px 16px;background:var(--bg-panel);border:1px solid var(--line-soft);border-radius:6px;
+}
+.examples .ex-num{
+  font-family:'IBM Plex Mono',monospace;color:var(--accent);font-size:13px;font-weight:600;flex-shrink:0;
+}
+.examples .ex-title{font-weight:600;font-size:14.5px;margin:0 0 3px 0;}
+.examples .ex-body{font-size:13.5px;color:var(--text-dim);line-height:1.55;margin:0;}
+
+.tradeoffs{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:8px;}
+.tradeoff-box{padding:14px 16px;border-radius:6px;border:1px solid var(--line-soft);background:var(--bg-panel);}
+.tradeoff-box h4{margin:0 0 8px 0;font-size:12px;font-family:'IBM Plex Mono',monospace;letter-spacing:0.06em;}
+.tradeoff-box.use h4{color:#9fdf9f;}
+.tradeoff-box.avoid h4{color:#ff9d9d;}
+.tradeoff-box ul{margin:0;padding-left:16px;font-size:13px;color:var(--text-dim);line-height:1.6;}
+
+.footer-nav{display:flex;justify-content:space-between;margin-top:56px;padding-top:24px;border-top:1px solid var(--line-soft);}
+.footer-nav button{
+  background:var(--bg-panel);border:1px solid var(--line);color:var(--text);
+  font-family:'IBM Plex Mono',monospace;font-size:12.5px;padding:10px 16px;border-radius:5px;cursor:pointer;
+  display:flex;align-items:center;gap:8px;transition:border-color .15s, color .15s;
+}
+.footer-nav button:hover{border-color:var(--accent);color:var(--accent);}
+.footer-nav .dir{color:var(--text-faint);font-size:10px;display:block;}
+
+/* Home page */
+.home-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:14px;margin-top:28px;}
+.home-card{
+  background:var(--bg-panel);border:1px solid var(--line-soft);border-radius:6px;padding:16px 18px;cursor:pointer;
+  transition:border-color .15s, transform .15s;
+}
+.home-card:hover{border-color:var(--accent);transform:translateY(-2px);}
+.home-card .hc-num{font-family:'IBM Plex Mono',monospace;color:var(--text-faint);font-size:11px;}
+.home-card h3{margin:6px 0 6px 0;font-size:15.5px;}
+.home-card p{margin:0;font-size:12.5px;color:var(--text-dim);line-height:1.5;}
+
+@media(max-width:900px){
+  .sidebar{position:fixed;left:-300px;z-index:20;transition:left .2s;box-shadow:8px 0 24px rgba(0,0,0,0.4);}
+  .sidebar.open{left:0;}
+  .content{padding:32px 20px 80px 20px;}
+  .topbar{padding:14px 20px;}
+  .tradeoffs{grid-template-columns:1fr;}
+}
+.menu-btn{display:none;background:none;border:1px solid var(--line);color:var(--text);border-radius:5px;padding:6px 10px;cursor:pointer;font-family:'IBM Plex Mono',monospace;}
+@media(max-width:900px){.menu-btn{display:inline-block;}}
+</style>
+</head>
+<body>
+<div class="app">
+  <nav class="sidebar" id="sidebar">
+    <div class="sidebar-header">
+      <p class="kicker">GoF · C++17</p>
+      <h1>Design Patterns Field Reference</h1>
+      <p>23 patterns, C++ implementations, and where they actually show up in production systems.</p>
+    </div>
+    <div id="navGroups"></div>
+  </nav>
+
+  <div class="main">
+    <div class="topbar">
+      <div class="crumb" id="crumb">Design Patterns <span class="sep">/</span> <span class="current" id="crumbCurrent">Overview</span></div>
+      <button class="menu-btn" onclick="document.getElementById('sidebar').classList.toggle('open')">☰ Menu</button>
+    </div>
+    <div class="content" id="content"></div>
+  </div>
+</div>
+
+<script id="pattern-data">
+const PATTERNS = [
+
+// ============ CREATIONAL ============
+
+{
+id:'singleton', category:'creational', name:'Singleton',
+alias:'Ensures a class has only one instance, with a global access point.',
+intent:'Restricts instantiation of a class to a single object and provides a global point of access to it — used when exactly one coordinating object must exist (a logger, a hardware register bank, a connection pool).',
+code:`class Logger {
+public:
+    static Logger& instance() {
+        static Logger inst;      // Meyers Singleton: thread-safe since C++11
+        return inst;
+    }
+    void log(const std::string& msg) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        std::cout << "[LOG] " << msg << "\\n";
+    }
+    Logger(const Logger&) = delete;
+    Logger& operator=(const Logger&) = delete;
+private:
+    Logger() = default;
+    std::mutex mtx_;
+};
+
+// Usage
+Logger::instance().log("Service started");`,
+examples:[
+  {title:'Logging frameworks', body:'spdlog, glog, and most in-house logging libraries expose a single global logger instance so every module writes to the same sink without passing a logger reference through every function call.'},
+  {title:'Hardware register / driver managers', body:'In firmware, a single object often wraps a memory-mapped register bank or DMA controller — there really is only one physical device, so a Singleton models that constraint directly.'},
+  {title:'Configuration managers', body:'Application-wide config (parsed once from a file/env) is commonly exposed as a Singleton so any component can read settings without threading a config object through every constructor.'}
+],
+useWhen:['Exactly one instance must exist by the problem domain itself (a hardware resource, a log file handle)','You need lazy, thread-safe initialization without manual locking'],
+avoidWhen:['You are using it just to avoid passing a dependency around ("global variable in disguise") — pass a reference/pointer instead','Unit testing needs multiple independent instances — Singletons make mocking/injection harder']
+},
+
+{
+id:'factory-method', category:'creational', name:'Factory Method',
+alias:'Defers instantiation of an object to a subclass via a virtual creator method.',
+intent:'Defines an interface for creating an object, but lets subclasses decide which concrete class to instantiate — decouples client code from the concrete product types.',
+code:`class Document { public: virtual void open() = 0; virtual ~Document()=default; };
+class PDFDocument  : public Document { public: void open() override { std::cout<<"Opening PDF\\n"; } };
+class WordDocument : public Document { public: void open() override { std::cout<<"Opening Word doc\\n"; } };
+
+class Application {
+public:
+    virtual std::unique_ptr<Document> createDocument() = 0; // factory method
+    void newFile() {
+        auto doc = createDocument();
+        doc->open();
+    }
+    virtual ~Application()=default;
+};
+class PDFApplication  : public Application {
+public: std::unique_ptr<Document> createDocument() override { return std::make_unique<PDFDocument>(); }
+};
+class WordApplication : public Application {
+public: std::unique_ptr<Document> createDocument() override { return std::make_unique<WordDocument>(); }
+};
+
+// Usage
+std::unique_ptr<Application> app = std::make_unique<PDFApplication>();
+app->newFile();`,
+examples:[
+  {title:'GUI toolkits', body:'Qt\'s QStyle and cross-platform widget toolkits use factory methods so the same application code creates the correct native-looking button/menu implementation per OS.'},
+  {title:'Storage driver initialization', body:'A storage stack that must create either an NVMe, SATA, or eMMC driver object based on detected hardware typically routes through a factory method keyed on device type.'},
+  {title:'Parsers/codec libraries', body:'A media framework creating the correct Decoder subclass (H264Decoder, VP9Decoder) based on a file\'s codec tag is a textbook Factory Method use.'}
+],
+useWhen:['A class can\'t anticipate which concrete subclass of an object it needs to create','You want subclasses to customize the objects a base class algorithm creates'],
+avoidWhen:['There is only ever one product type — a plain constructor call is simpler','The full class hierarchy overhead isn\'t justified by real variation — consider a simple factory function instead']
+},
+
+{
+id:'abstract-factory', category:'creational', name:'Abstract Factory',
+alias:'Produces families of related objects without specifying their concrete classes.',
+intent:'Provides an interface for creating families of related or dependent objects (e.g., a UI theme\'s button + checkbox + scrollbar) without specifying their concrete classes, ensuring the produced objects are mutually consistent.',
+code:`class Button   { public: virtual void render()=0; virtual ~Button()=default; };
+class Checkbox { public: virtual void render()=0; virtual ~Checkbox()=default; };
+
+class DarkButton   : public Button   { public: void render() override { std::cout<<"[dark button]\\n"; } };
+class DarkCheckbox : public Checkbox { public: void render() override { std::cout<<"[dark checkbox]\\n"; } };
+class LightButton   : public Button   { public: void render() override { std::cout<<"[light button]\\n"; } };
+class LightCheckbox : public Checkbox { public: void render() override { std::cout<<"[light checkbox]\\n"; } };
+
+class UIFactory {
+public:
+    virtual std::unique_ptr<Button>   createButton()   = 0;
+    virtual std::unique_ptr<Checkbox> createCheckbox() = 0;
+    virtual ~UIFactory()=default;
+};
+class DarkThemeFactory : public UIFactory {
+public:
+    std::unique_ptr<Button>   createButton()   override { return std::make_unique<DarkButton>(); }
+    std::unique_ptr<Checkbox> createCheckbox() override { return std::make_unique<DarkCheckbox>(); }
+};
+class LightThemeFactory : public UIFactory {
+public:
+    std::unique_ptr<Button>   createButton()   override { return std::make_unique<LightButton>(); }
+    std::unique_ptr<Checkbox> createCheckbox() override { return std::make_unique<LightCheckbox>(); }
+};
+
+// Usage — swapping the factory swaps the entire consistent family
+void buildUI(UIFactory& factory) {
+    auto btn = factory.createButton();
+    auto cb  = factory.createCheckbox();
+    btn->render(); cb->render();
+}`,
+examples:[
+  {title:'Cross-platform GUI toolkits', body:'wxWidgets and similar frameworks use an Abstract Factory so an entire widget set (buttons, menus, dialogs) is created consistently for Windows, macOS, or Linux without mixing look-and-feel elements.'},
+  {title:'Database driver abstraction layers', body:'ORMs/database layers that must produce a matching {Connection, Command, Transaction} family for MySQL vs PostgreSQL vs SQLite use an Abstract Factory keyed on the configured backend.'},
+  {title:'Test doubles for hardware abstraction layers (HAL)', body:'In embedded/firmware testing, a MockHardwareFactory produces mock {Sensor, Actuator, Timer} objects as a consistent family, swapped in for the RealHardwareFactory during unit tests.'}
+],
+useWhen:['A system must be configured with one of several families of related products, and those products must be used together consistently'],
+avoidWhen:['You only ever create one kind of object (use plain Factory Method instead)','Adding a new product to the family requires touching every concrete factory — a real maintenance cost worth weighing']
+},
+
+{
+id:'builder', category:'creational', name:'Builder',
+alias:'Separates construction of a complex object from its representation.',
+intent:'Constructs a complex object step by step, allowing the same construction process to create different representations — avoids telescoping constructors with many optional parameters.',
+code:`class HttpRequest {
+public:
+    std::string url, method="GET", body;
+    std::map<std::string,std::string> headers;
+    void send() const { std::cout << method << " " << url << " (" << headers.size() << " headers)\\n"; }
+};
+
+class HttpRequestBuilder {
+    HttpRequest req_;
+public:
+    HttpRequestBuilder& url(std::string u)   { req_.url = std::move(u); return *this; }
+    HttpRequestBuilder& method(std::string m){ req_.method = std::move(m); return *this; }
+    HttpRequestBuilder& header(std::string k, std::string v){ req_.headers[k]=v; return *this; }
+    HttpRequestBuilder& body(std::string b)  { req_.body = std::move(b); return *this; }
+    HttpRequest build() { return req_; }
+};
+
+// Usage — fluent, readable construction instead of a 6-argument constructor
+auto req = HttpRequestBuilder()
+             .url("https://api.example.com/orders")
+             .method("POST")
+             .header("Content-Type","application/json")
+             .header("Authorization","Bearer xyz")
+             .body(R"({"item":"widget"})")
+             .build();
+req.send();`,
+examples:[
+  {title:'HTTP client libraries', body:'cpprestsdk, Boost.Beast-based clients, and most REST client wrappers expose a fluent request builder rather than a constructor with a dozen optional parameters.'},
+  {title:'SQL query builders', body:'ORM query builders (`QueryBuilder().select(...).from(...).where(...).build()`) are a direct application of Builder to construct SQL strings/AST incrementally.'},
+  {title:'Protocol buffer / packet construction', body:'Building a network packet with optional TLV (type-length-value) fields in firmware/networking code is commonly done via a builder that assembles the byte buffer field by field before finalizing it.'}
+],
+useWhen:['An object has many optional parameters/configuration steps and a telescoping constructor would be unreadable','Construction needs to happen in distinct, validated steps'],
+avoidWhen:['The object has few parameters — a normal constructor or designated initializers are simpler','Immutability is the only real goal — an aggregate/struct with named initialization may suffice']
+},
+
+{
+id:'prototype', category:'creational', name:'Prototype',
+alias:'Creates new objects by cloning an existing, fully-configured instance.',
+intent:'Specifies the kinds of objects to create using a prototypical instance, and creates new objects by copying this prototype — useful when object creation is expensive or the concrete type isn\'t known until runtime.',
+code:`class Shape {
+public:
+    virtual std::unique_ptr<Shape> clone() const = 0;
+    virtual void draw() const = 0;
+    virtual ~Shape() = default;
+};
+class Circle : public Shape {
+    int radius_;
+public:
+    explicit Circle(int r): radius_(r) {}
+    std::unique_ptr<Shape> clone() const override { return std::make_unique<Circle>(*this); }
+    void draw() const override { std::cout << "Circle r=" << radius_ << "\\n"; }
+};
+class Square : public Shape {
+    int side_;
+public:
+    explicit Square(int s): side_(s) {}
+    std::unique_ptr<Shape> clone() const override { return std::make_unique<Square>(*this); }
+    void draw() const override { std::cout << "Square s=" << side_ << "\\n"; }
+};
+
+// Usage — duplicate a configured prototype without knowing its concrete type
+void duplicateAndDraw(const Shape& prototype) {
+    auto copy = prototype.clone();
+    copy->draw();
+}`,
+examples:[
+  {title:'Game engine entity spawning', body:'Spawning 50 identical enemy units from one pre-configured "template" enemy object (already loaded with mesh, stats, AI state) is far cheaper than reconstructing each from scratch — clone the prototype instead.'},
+  {title:'CAD / graphics editors', body:'"Copy" and "duplicate" operations on a shape/layer in tools like a vector editor are direct Prototype clones — the new object inherits the original\'s exact configured state.'},
+  {title:'Object pools seeded from a template', body:'A firmware object pool that pre-clones a fully-initialized "default packet" prototype for each new buffer avoids repeating expensive field-by-field initialization on every allocation.'}
+],
+useWhen:['Object creation is expensive (deep config, expensive computation) and a similar object already exists to copy from','The concrete class to instantiate is only known at runtime (via an existing instance)'],
+avoidWhen:['Objects contain resources that are unsafe/wrong to duplicate (open file handles, unique hardware locks) without extra care','Simple objects where a normal constructor call is just as easy']
+},
+
+// ============ STRUCTURAL ============
+
+{
+id:'adapter', category:'structural', name:'Adapter',
+alias:'Converts one interface into another that a client expects.',
+intent:'Allows classes with incompatible interfaces to work together by wrapping one class with an adapter that translates calls into the interface the client already expects.',
+code:`// Existing, incompatible legacy interface
+class LegacyTempSensor {
+public:
+    double readFahrenheit() { return 98.6; }
+};
+
+// Interface the rest of the app expects
+class ITemperatureSensor {
+public:
+    virtual double readCelsius() = 0;
+    virtual ~ITemperatureSensor() = default;
+};
+
+// Adapter translates Fahrenheit -> Celsius behind the expected interface
+class LegacySensorAdapter : public ITemperatureSensor {
+    LegacyTempSensor& legacy_;
+public:
+    explicit LegacySensorAdapter(LegacyTempSensor& s): legacy_(s) {}
+    double readCelsius() override {
+        return (legacy_.readFahrenheit() - 32.0) * 5.0 / 9.0;
+    }
+};
+
+// Usage — client code only ever talks to ITemperatureSensor
+void printTemp(ITemperatureSensor& sensor) {
+    std::cout << sensor.readCelsius() << " C\\n";
+}`,
+examples:[
+  {title:'Wrapping legacy/third-party C APIs', body:'Adapting a C-style SDK (raw structs, error codes, callback registration) behind a clean modern C++ RAII/exception-based interface is one of the most common real-world uses of Adapter.'},
+  {title:'STL container adapters', body:'`std::stack`, `std::queue`, and `std::priority_queue` are literally Adapter pattern implementations — they wrap `std::deque`/`std::vector` and expose a restricted, purpose-specific interface.'},
+  {title:'Cross-vendor hardware driver interfaces', body:'A HAL that lets application code call `sensor->read()` uniformly while adapting to three different vendors\' incompatible register-level APIs underneath is standard practice in embedded firmware.'}
+],
+useWhen:['You need to use an existing class whose interface doesn\'t match what your code requires, and you can\'t/shouldn\'t modify it'],
+avoidWhen:['You control both interfaces — just make them consistent instead of adapting','Too many adapters stacked on adapters becomes its own maintenance burden']
+},
+
+{
+id:'bridge', category:'structural', name:'Bridge',
+alias:'Decouples an abstraction from its implementation so both can vary independently.',
+intent:'Splits a class hierarchy into two separate hierarchies — an abstraction and an implementation — connected by composition rather than inheritance, so each can be extended independently without a combinatorial explosion of subclasses.',
+code:`// Implementation hierarchy
+class Renderer {
+public:
+    virtual void renderCircle(float x, float y, float r) = 0;
+    virtual ~Renderer() = default;
+};
+class OpenGLRenderer : public Renderer {
+public: void renderCircle(float x,float y,float r) override { std::cout<<"[OpenGL] circle\\n"; }
+};
+class VulkanRenderer : public Renderer {
+public: void renderCircle(float x,float y,float r) override { std::cout<<"[Vulkan] circle\\n"; }
+};
+
+// Abstraction hierarchy — holds a reference to the implementation (the "bridge")
+class Shape {
+protected:
+    Renderer& renderer_;
+    explicit Shape(Renderer& r): renderer_(r) {}
+public:
+    virtual void draw() = 0;
+    virtual ~Shape() = default;
+};
+class Circle : public Shape {
+    float x_,y_,r_;
+public:
+    Circle(Renderer& r, float x,float y,float rad): Shape(r), x_(x),y_(y),r_(rad) {}
+    void draw() override { renderer_.renderCircle(x_,y_,r_); }
+};
+
+// Usage — any Shape works with any Renderer, independently extensible
+VulkanRenderer vk;
+Circle c(vk, 0,0,5);
+c.draw();`,
+examples:[
+  {title:'GUI framework windowing backends', body:'Qt\'s widget classes are bridged to platform-specific "peer" implementations (Windows/X11/macOS) so the widget hierarchy and the platform hierarchy each evolve independently.'},
+  {title:'Graphics APIs', body:'A game engine\'s Shape/Mesh abstraction bridged to a swappable Renderer backend (OpenGL, Vulkan, DirectX) — exactly the example above — is a standard real-world Bridge.'},
+  {title:'Device driver abstraction in embedded systems', body:'A `Display` abstraction bridged to different low-level `DisplayController` implementations (SPI vs I2C panels) lets you swap hardware without touching the drawing/UI logic layer.'}
+],
+useWhen:['You want to avoid a permanent binding between an abstraction and its implementation','Both the abstraction and implementation should be independently extensible via subclassing'],
+avoidWhen:['There\'s only ever one implementation — the extra indirection isn\'t earning its keep','The abstraction and implementation are tightly, permanently coupled by nature']
+},
+
+{
+id:'composite', category:'structural', name:'Composite',
+alias:'Composes objects into tree structures and treats individual objects and compositions uniformly.',
+intent:'Lets clients treat individual objects and compositions of objects through the same interface, representing part-whole hierarchies as trees (files/folders, UI widgets, org charts).',
+code:`class FileSystemNode {
+public:
+    virtual void print(int indent=0) const = 0;
+    virtual size_t size() const = 0;
+    virtual ~FileSystemNode() = default;
+};
+
+class File : public FileSystemNode {
+    std::string name_; size_t size_;
+public:
+    File(std::string n, size_t s): name_(std::move(n)), size_(s) {}
+    void print(int indent) const override {
+        std::cout << std::string(indent,' ') << name_ << " (" << size_ << "B)\\n";
+    }
+    size_t size() const override { return size_; }
+};
+
+class Directory : public FileSystemNode {
+    std::string name_;
+    std::vector<std::unique_ptr<FileSystemNode>> children_;
+public:
+    explicit Directory(std::string n): name_(std::move(n)) {}
+    void add(std::unique_ptr<FileSystemNode> child) { children_.push_back(std::move(child)); }
+    void print(int indent) const override {
+        std::cout << std::string(indent,' ') << name_ << "/\\n";
+        for (auto& c : children_) c->print(indent + 2);
+    }
+    size_t size() const override {
+        size_t total = 0;
+        for (auto& c : children_) total += c->size();
+        return total;
+    }
+};
+
+// Usage — Directory and File are used identically via FileSystemNode
+auto root = std::make_unique<Directory>("root");
+root->add(std::make_unique<File>("readme.txt", 120));
+auto src = std::make_unique<Directory>("src");
+src->add(std::make_unique<File>("main.cpp", 3400));
+root->add(std::move(src));
+root->print();
+std::cout << "Total size: " << root->size() << "B\\n";`,
+examples:[
+  {title:'File systems', body:'Files and directories are the canonical Composite example — `size()`, `print()`, and traversal operations work identically whether you\'re looking at one file or an entire nested directory tree.'},
+  {title:'UI widget/scene graphs', body:'Any GUI framework (Qt, game engine scene graphs) treats a single widget/node and a container of widgets through the same base interface, so layout/render code doesn\'t need to special-case groups.'},
+  {title:'Organizational / BOM (Bill of Materials) hierarchies', body:'Manufacturing and CAD software models an assembly as a tree of parts and sub-assemblies, computing total cost/weight recursively exactly like the directory `size()` example above.'}
+],
+useWhen:['Your data is naturally a part-whole tree, and clients should treat leaves and composites the same way'],
+avoidWhen:['The hierarchy is shallow/fixed and the uniform-interface overhead isn\'t needed','Leaf and composite nodes have very different operations that resist a common interface']
+},
+
+{
+id:'decorator', category:'structural', name:'Decorator',
+alias:'Attaches additional responsibilities to an object dynamically, as an alternative to subclassing.',
+intent:'Wraps an object with another object implementing the same interface, adding behavior before/after delegating to the wrapped object — allows composing behaviors dynamically at runtime instead of creating a subclass for every combination.',
+code:`class Coffee {
+public:
+    virtual std::string describe() const = 0;
+    virtual double cost() const = 0;
+    virtual ~Coffee() = default;
+};
+class SimpleCoffee : public Coffee {
+public:
+    std::string describe() const override { return "Coffee"; }
+    double cost() const override { return 2.00; }
+};
+
+// Base decorator — wraps another Coffee and forwards by default
+class CoffeeDecorator : public Coffee {
+protected:
+    std::unique_ptr<Coffee> wrapped_;
+public:
+    explicit CoffeeDecorator(std::unique_ptr<Coffee> c): wrapped_(std::move(c)) {}
+};
+class MilkDecorator : public CoffeeDecorator {
+public:
+    using CoffeeDecorator::CoffeeDecorator;
+    std::string describe() const override { return wrapped_->describe() + " + Milk"; }
+    double cost() const override { return wrapped_->cost() + 0.50; }
+};
+class SugarDecorator : public CoffeeDecorator {
+public:
+    using CoffeeDecorator::CoffeeDecorator;
+    std::string describe() const override { return wrapped_->describe() + " + Sugar"; }
+    double cost() const override { return wrapped_->cost() + 0.25; }
+};
+
+// Usage — stack decorators at runtime instead of needing MilkSugarCoffee subclass
+std::unique_ptr<Coffee> order = std::make_unique<SugarDecorator>(
+                                   std::make_unique<MilkDecorator>(
+                                     std::make_unique<SimpleCoffee>()));
+std::cout << order->describe() << " = $" << order->cost() << "\\n";`,
+examples:[
+  {title:'I/O stream stacking', body:'C++\'s own `std::istream`/`ostream` and Java\'s `BufferedInputStream`/`GZIPInputStream` chains are classic Decorators — each stream wraps another, adding buffering, compression, or encryption transparently.'},
+  {title:'Middleware / request handling pipelines', body:'Web framework middleware (logging, auth, compression wrapped around a request handler) is Decorator applied to a callable — each layer wraps the next and adds behavior before/after delegating.'},
+  {title:'UI component styling', body:'Wrapping a base UI widget with `ScrollableDecorator`, `BorderDecorator`, or `TooltipDecorator` to compose visual behaviors at runtime avoids an explosion of subclasses like `ScrollableBorderedTooltipButton`.'}
+],
+useWhen:['You need to add responsibilities to individual objects dynamically and transparently, without affecting other objects of the same class','Subclassing would produce a combinatorial explosion of classes for every feature combination'],
+avoidWhen:['A small, fixed number of variations exist — plain subclassing is simpler and easier to debug','Deep decorator stacks make debugging/stepping through code confusing — weigh that cost']
+},
+
+{
+id:'facade', category:'structural', name:'Facade',
+alias:'Provides a simplified, unified interface to a complex subsystem.',
+intent:'Defines a higher-level interface that makes a complex subsystem of classes easier to use, hiding the subsystem\'s internal complexity and reducing coupling between client code and subsystem internals.',
+code:`// Complex subsystem
+class CPU     { public: void freeze(){} void jump(long addr){} void execute(){ std::cout<<"CPU executing\\n"; } };
+class Memory  { public: void load(long addr, const std::string& data){} };
+class HardDrive{ public: std::string read(long lba,int size){ return "boot_data"; } };
+
+// Facade — one simple method hides the boot sequence's real complexity
+class ComputerFacade {
+    CPU cpu_; Memory mem_; HardDrive hd_;
+public:
+    void start() {
+        cpu_.freeze();
+        mem_.load(0x00, hd_.read(0, 1024));
+        cpu_.jump(0x00);
+        cpu_.execute();
+    }
+};
+
+// Usage — client doesn't need to know CPU/Memory/HardDrive exist
+ComputerFacade computer;
+computer.start();`,
+examples:[
+  {title:'SDK / library entry points', body:'Most well-designed SDKs (e.g., a cloud storage client exposing `client.uploadFile(path)`) are Facades over dozens of internal classes handling auth, retries, chunking, and networking.'},
+  {title:'Boot/initialization sequences in firmware', body:'A `SystemInit::boot()` call that internally sequences clock config, memory controller init, and peripheral bring-up (each a complex subsystem) is a textbook embedded Facade.'},
+  {title:'Compiler driver frontends', body:'Invoking `gcc file.cpp` hides an entire subsystem of preprocessing, parsing, optimization passes, assembly, and linking behind one simple command-line facade.'}
+],
+useWhen:['A subsystem is complex and most client code only needs a small, common subset of its functionality','You want to layer/decouple a subsystem from client code and other subsystems'],
+avoidWhen:['Clients genuinely need fine-grained access to subsystem internals — a facade would just get in the way','The subsystem is already simple enough that a facade adds an unnecessary layer']
+},
+
+{
+id:'flyweight', category:'structural', name:'Flyweight',
+alias:'Shares common state across many objects to reduce memory usage.',
+intent:'Minimizes memory usage by sharing as much data as possible with similar objects — separates intrinsic (shared, context-independent) state from extrinsic (unique, context-dependent) state passed in by the client.',
+code:`// Intrinsic state (shared, immutable) — the "flyweight"
+class GlyphStyle {
+    std::string font_; int size_;
+public:
+    GlyphStyle(std::string f, int s): font_(std::move(f)), size_(s) {}
+    void render(char c, int x, int y) const {
+        std::cout << "'" << c << "' at (" << x << "," << y << ") in " << font_ << " " << size_ << "pt\\n";
+    }
+};
+
+// Flyweight factory — ensures each distinct style is only stored once
+class StyleFactory {
+    std::unordered_map<std::string, std::shared_ptr<GlyphStyle>> cache_;
+public:
+    std::shared_ptr<GlyphStyle> get(const std::string& font, int size) {
+        std::string key = font + std::to_string(size);
+        auto it = cache_.find(key);
+        if (it != cache_.end()) return it->second;
+        auto style = std::make_shared<GlyphStyle>(font, size);
+        cache_[key] = style;
+        return style;
+    }
+};
+
+// Usage — a 500,000-character document shares a handful of GlyphStyle objects
+// instead of storing font+size on every single character (extrinsic x,y passed in).
+StyleFactory factory;
+auto boldStyle = factory.get("Arial", 12);
+boldStyle->render('H', 10, 20);
+boldStyle->render('i', 18, 20);  // reuses the SAME GlyphStyle instance`,
+examples:[
+  {title:'Text rendering engines', body:'Word processors and text editors share glyph/font-style objects across millions of characters instead of storing full styling data per character — exactly the example above.'},
+  {title:'Game world tile/particle rendering', body:'A game rendering thousands of trees or bullets shares one `TreeMesh`/`BulletSprite` (intrinsic mesh+texture data) while each instance only stores its unique position/rotation (extrinsic state).'},
+  {title:'String interning', body:'Interpreters and compilers intern identical string/symbol literals to a single shared object (Python\'s string interning, Java\'s String pool) so repeated identical strings don\'t each consume separate memory.'}
+],
+useWhen:['An application uses a huge number of objects that share significant common data','Memory cost of storing that data per-object would be prohibitive'],
+avoidWhen:['Object count is small enough that memory savings don\'t matter — the added complexity isn\'t worth it','Most state is actually unique per object (little to share) — Flyweight has nothing to exploit']
+},
+
+{
+id:'proxy', category:'structural', name:'Proxy',
+alias:'Provides a surrogate/placeholder that controls access to another object.',
+intent:'Provides an object that stands in for another object, controlling access to it — for lazy initialization, access control, caching, logging, or remote access — without the client knowing it\'s not talking to the real object directly.',
+code:`class Image {
+public:
+    virtual void display() = 0;
+    virtual ~Image() = default;
+};
+class RealImage : public Image {
+    std::string filename_;
+public:
+    explicit RealImage(std::string f): filename_(std::move(f)) {
+        std::cout << "Loading " << filename_ << " from disk (expensive)\\n";
+    }
+    void display() override { std::cout << "Displaying " << filename_ << "\\n"; }
+};
+
+// Proxy — defers the expensive load until display() is actually called
+class LazyImageProxy : public Image {
+    std::string filename_;
+    std::unique_ptr<RealImage> real_;
+public:
+    explicit LazyImageProxy(std::string f): filename_(std::move(f)) {}
+    void display() override {
+        if (!real_) real_ = std::make_unique<RealImage>(filename_); // load on first use
+        real_->display();
+    }
+};
+
+// Usage — object is only actually loaded the moment it's really needed
+Image* img = new LazyImageProxy("large_photo.png");
+std::cout << "Proxy created, no disk I/O yet\\n";
+img->display();  // NOW the real image loads
+delete img;`,
+examples:[
+  {title:'Lazy-loading in ORMs', body:'ORM frameworks return a lightweight proxy for a related database row that only fires the actual SQL query the first time a field is accessed ("lazy loading" of relationships).'},
+  {title:'Remote Procedure Call (RPC) stubs', body:'gRPC/RPC client stubs are Proxies — calling a method locally actually serializes the call, sends it over the network, and returns the deserialized result, while looking like a normal local call.'},
+  {title:'Smart pointers as protection/logging proxies', body:'A custom smart pointer wrapping a hardware register that logs every read/write, or checks access permissions before forwarding the operation, is a Proxy applied at the pointer level.'}
+],
+useWhen:['You need to control access to an object: lazy loading, permission checks, caching, or transparent remote access'],
+avoidWhen:['The indirection adds latency/complexity with no real access-control or lazy-loading benefit','Direct access is always safe and cheap — the proxy layer is then pure overhead']
+},
+
+// ============ BEHAVIORAL ============
+
+{
+id:'chain-of-responsibility', category:'behavioral', name:'Chain of Responsibility',
+alias:'Passes a request along a chain of handlers until one handles it.',
+intent:'Gives more than one object a chance to handle a request by chaining handlers together — the sender doesn\'t need to know which handler will ultimately process it, and handlers can be added/reordered independently.',
+code:`class Handler {
+protected:
+    std::unique_ptr<Handler> next_;
+public:
+    Handler* setNext(std::unique_ptr<Handler> next) {
+        next_ = std::move(next);
+        return next_.get();
+    }
+    virtual void handle(int level, const std::string& msg) {
+        if (next_) next_->handle(level, msg);
+    }
+    virtual ~Handler() = default;
+};
+class InfoLogger : public Handler {
+public: void handle(int level, const std::string& msg) override {
+    if (level <= 1) std::cout << "[INFO] " << msg << "\\n";
+    else Handler::handle(level, msg);
+}};
+class WarnLogger : public Handler {
+public: void handle(int level, const std::string& msg) override {
+    if (level == 2) std::cout << "[WARN] " << msg << "\\n";
+    else Handler::handle(level, msg);
+}};
+class ErrorLogger : public Handler {
+public: void handle(int level, const std::string& msg) override {
+    if (level >= 3) std::cout << "[ERROR] " << msg << "\\n";
+    else Handler::handle(level, msg);
+}};
+
+// Usage — build the chain, then fire requests through the head
+InfoLogger chain;
+auto* w = chain.setNext(std::make_unique<WarnLogger>());
+w->setNext(std::make_unique<ErrorLogger>());
+chain.handle(3, "Disk almost full");   // routed to ErrorLogger`,
+examples:[
+  {title:'Logging frameworks', body:'Log4cxx/spdlog-style severity filtering (DEBUG → INFO → WARN → ERROR handlers, each deciding whether to process or pass along) is precisely the example above.'},
+  {title:'GUI event bubbling', body:'A mouse-click event in a UI framework passes up through nested widgets (button → panel → window), each getting a chance to handle it before it propagates further — classic Chain of Responsibility.'},
+  {title:'Middleware chains in web servers', body:'Express.js/ASP.NET-style middleware pipelines (auth → rate-limiting → logging → route handler) chain request processors, each deciding to handle and stop, or call `next()`.'}
+],
+useWhen:['More than one object may handle a request, and the handler isn\'t known in advance','You want to issue a request without specifying the receiver explicitly, and decouple sender from receivers'],
+avoidWhen:['Exactly one specific handler should always process the request — direct dispatch is clearer','Long chains can make debugging "who actually handled this?" harder — worth the tradeoff']
+},
+
+{
+id:'command', category:'behavioral', name:'Command',
+alias:'Encapsulates a request as an object, enabling queuing, logging, and undo.',
+intent:'Turns a request into a standalone object containing all information about the request, letting you parameterize clients with different requests, queue/log them, and support undoable operations.',
+code:`class Command {
+public:
+    virtual void execute() = 0;
+    virtual void undo() = 0;
+    virtual ~Command() = default;
+};
+
+class Document { public: std::string text; };
+
+class InsertTextCommand : public Command {
+    Document& doc_; std::string text_; size_t pos_;
+public:
+    InsertTextCommand(Document& d, std::string t, size_t p): doc_(d), text_(std::move(t)), pos_(p) {}
+    void execute() override { doc_.text.insert(pos_, text_); }
+    void undo() override    { doc_.text.erase(pos_, text_.size()); }
+};
+
+class CommandHistory {
+    std::vector<std::unique_ptr<Command>> history_;
+public:
+    void execute(std::unique_ptr<Command> cmd) {
+        cmd->execute();
+        history_.push_back(std::move(cmd));
+    }
+    void undoLast() {
+        if (history_.empty()) return;
+        history_.back()->undo();
+        history_.pop_back();
+    }
+};
+
+// Usage
+Document doc;
+CommandHistory history;
+history.execute(std::make_unique<InsertTextCommand>(doc, "Hello", 0));
+std::cout << doc.text << "\\n";   // "Hello"
+history.undoLast();
+std::cout << "[" << doc.text << "]\\n";  // "[]"`,
+examples:[
+  {title:'Undo/redo systems', body:'Text editors, image editors (Photoshop), and IDEs implement undo/redo stacks by storing executed operations as Command objects, exactly as shown above.'},
+  {title:'GUI button/menu actions', body:'Qt\'s `QAction` and most GUI toolkits bind a button click to a Command object rather than a hardcoded function, so the same command can be triggered from a menu, toolbar, or keyboard shortcut.'},
+  {title:'Task queues / job schedulers', body:'A background job system that serializes "commands" (with parameters) onto a queue for a worker thread/pool to execute later decouples request submission from execution timing.'}
+],
+useWhen:['You need to parameterize objects with operations, queue/schedule requests, or support undo/redo','You want to decouple the object that invokes an operation from the one that performs it'],
+avoidWhen:['A direct function call is sufficient and undo/queuing/logging is never needed — the extra class hierarchy is unwarranted overhead']
+},
+
+{
+id:'interpreter', category:'behavioral', name:'Interpreter',
+alias:'Defines a grammar and an interpreter that evaluates sentences in that grammar.',
+intent:'Given a language, defines a representation for its grammar along with an interpreter that uses the representation to evaluate sentences — each grammar rule becomes a class, and evaluation is a tree walk over composed expression objects.',
+code:`class Expr {
+public:
+    virtual int eval() const = 0;
+    virtual ~Expr() = default;
+};
+class Num : public Expr {
+    int value_;
+public: explicit Num(int v): value_(v) {}
+    int eval() const override { return value_; }
+};
+class Add : public Expr {
+    std::unique_ptr<Expr> left_, right_;
+public:
+    Add(std::unique_ptr<Expr> l, std::unique_ptr<Expr> r): left_(std::move(l)), right_(std::move(r)) {}
+    int eval() const override { return left_->eval() + right_->eval(); }
+};
+class Mul : public Expr {
+    std::unique_ptr<Expr> left_, right_;
+public:
+    Mul(std::unique_ptr<Expr> l, std::unique_ptr<Expr> r): left_(std::move(l)), right_(std::move(r)) {}
+    int eval() const override { return left_->eval() * right_->eval(); }
+};
+
+// Usage — represents and evaluates: (3 + 4) * 2
+auto expr = std::make_unique<Mul>(
+                std::make_unique<Add>(std::make_unique<Num>(3), std::make_unique<Num>(4)),
+                std::make_unique<Num>(2));
+std::cout << expr->eval() << "\\n";  // 14`,
+examples:[
+  {title:'Expression/formula evaluators', body:'Spreadsheet formula engines and calculator apps parse an expression into a tree of `Num`/`Add`/`Mul` nodes exactly like above, then evaluate it recursively.'},
+  {title:'Regular expression engines', body:'Regex engines internally build an interpreter tree over grammar constructs (literal, concatenation, alternation, Kleene star) and walk it to match input strings.'},
+  {title:'Rule engines / filter expressions', body:'Query filter DSLs (e.g., "status=active AND age>18") in search/database tools are parsed into an expression tree and interpreted against each record.'}
+],
+useWhen:['You have a simple, well-defined grammar to interpret repeatedly, and a tree-based representation is a natural fit'],
+avoidWhen:['The grammar is complex — a real parser generator (ANTLR, Bison) or a bytecode VM scales far better than a hand-rolled Interpreter tree','Performance-critical parsing — tree-walking interpreters are typically slower than compiled/bytecode approaches']
+},
+
+{
+id:'iterator', category:'behavioral', name:'Iterator',
+alias:'Provides a way to access elements of a collection sequentially without exposing its representation.',
+intent:'Provides a uniform way to traverse the elements of an aggregate object without exposing its internal structure, letting multiple traversals happen independently and letting algorithms be written generically over any container.',
+code:`template<typename T>
+class Range {
+    std::vector<T> data_;
+public:
+    void add(T v) { data_.push_back(v); }
+
+    class Iterator {
+        typename std::vector<T>::iterator it_;
+    public:
+        explicit Iterator(typename std::vector<T>::iterator it): it_(it) {}
+        T& operator*() { return *it_; }
+        Iterator& operator++() { ++it_; return *this; }
+        bool operator!=(const Iterator& o) const { return it_ != o.it_; }
+    };
+    Iterator begin() { return Iterator(data_.begin()); }
+    Iterator end()   { return Iterator(data_.end()); }
+};
+
+// Usage — works seamlessly with range-based for, just like any STL container
+Range<int> r;
+r.add(1); r.add(2); r.add(3);
+for (int v : r) std::cout << v << " ";  // 1 2 3`,
+examples:[
+  {title:'The entire STL container library', body:'Every STL container (`vector`, `map`, `list`, `set`) exposes `begin()`/`end()` iterators — this IS the Iterator pattern, which is why one generic `std::sort`/`std::find` works across all of them.'},
+  {title:'Database result set cursors', body:'Database client libraries return a cursor/iterator over query results so rows can be streamed one at a time without loading the entire result set into memory.'},
+  {title:'Tree/graph traversal utilities', body:'A custom `DepthFirstIterator` over a scene graph or file-system tree lets calling code do `for (auto& node : DepthFirst(root))` without knowing the tree\'s internal linkage.'}
+],
+useWhen:['You want to traverse a collection without exposing its internal structure, or support multiple simultaneous/different traversal strategies over the same data'],
+avoidWhen:['A simple index-based loop over a known array is clear enough — don\'t add abstraction where none is needed']
+},
+
+{
+id:'mediator', category:'behavioral', name:'Mediator',
+alias:'Defines an object that encapsulates how a set of objects interact, reducing direct coupling.',
+intent:'Reduces chaotic many-to-many dependencies between communicating objects by forcing them to communicate only through a mediator object, which centralizes and controls the interaction logic.',
+code:`class Mediator {
+public:
+    virtual void notify(class Component* sender, const std::string& event) = 0;
+    virtual ~Mediator() = default;
+};
+
+class Component {
+protected:
+    Mediator* mediator_;
+public:
+    explicit Component(Mediator* m): mediator_(m) {}
+};
+class Button : public Component {
+public:
+    using Component::Component;
+    void click() { mediator_->notify(this, "click"); }
+};
+class TextField : public Component {
+public:
+    using Component::Component;
+    std::string text = "invalid input";
+};
+
+// Concrete Mediator — knows how Button/TextField should react to each other
+class FormMediator : public Mediator {
+    Button submitBtn_{this};
+    TextField field_{this};
+public:
+    void notify(Component* sender, const std::string& event) override {
+        if (sender == &submitBtn_ && event == "click") {
+            std::cout << "Submitting form with: " << field_.text << "\\n";
+        }
+    }
+    Button& submitButton() { return submitBtn_; }
+};
+
+// Usage — Button and TextField never reference each other directly
+FormMediator form;
+form.submitButton().click();`,
+examples:[
+  {title:'GUI dialog/form controllers', body:'A dialog box controller that coordinates enabling/disabling buttons based on checkbox and text field states (rather than each widget referencing every other widget directly) is a Mediator.'},
+  {title:'Air traffic control systems', body:'The canonical textbook analogy is real: aircraft don\'t coordinate directly with each other — they all communicate through a central control tower (the mediator) that manages runway/airspace access.'},
+  {title:'Chat room / pub-sub hub implementations', body:'A chat room object that receives messages from clients and routes them to other connected clients acts as a mediator, so clients never hold direct references to each other.'}
+],
+useWhen:['A set of objects communicate in complex, tangled ways, and you want to centralize that interaction logic in one place'],
+avoidWhen:['Only two objects interact — direct communication is simpler','The mediator itself risks becoming a bloated "god object" if too much logic accumulates there']
+},
+
+{
+id:'memento', category:'behavioral', name:'Memento',
+alias:'Captures and restores an object\'s internal state without violating encapsulation.',
+intent:'Captures an object\'s internal state so it can be restored later, without exposing that state\'s implementation details to the code that manages the saved snapshots (the "caretaker").',
+code:`class EditorMemento {
+    std::string content_;
+public:
+    explicit EditorMemento(std::string c): content_(std::move(c)) {}
+    std::string getState() const { return content_; }  // only Editor really needs this
+};
+
+class Editor {
+    std::string content_;
+public:
+    void type(const std::string& text) { content_ += text; }
+    std::string content() const { return content_; }
+    EditorMemento save() const { return EditorMemento(content_); }
+    void restore(const EditorMemento& m) { content_ = m.getState(); }
+};
+
+// Caretaker — stores snapshots but never inspects/modifies their contents
+class History {
+    std::vector<EditorMemento> snapshots_;
+public:
+    void push(const EditorMemento& m) { snapshots_.push_back(m); }
+    EditorMemento pop() { auto m = snapshots_.back(); snapshots_.pop_back(); return m; }
+};
+
+// Usage
+Editor editor; History history;
+editor.type("Hello");
+history.push(editor.save());
+editor.type(", World!");
+std::cout << editor.content() << "\\n";   // "Hello, World!"
+editor.restore(history.pop());
+std::cout << editor.content() << "\\n";   // "Hello"`,
+examples:[
+  {title:'Undo systems (paired with Command)', body:'Many undo implementations combine Command (what operation to reverse) with Memento (full state snapshots) — e.g., a graphics editor snapshotting entire canvas state at key points instead of reversing each operation individually.'},
+  {title:'Game save/checkpoint systems', body:'Save-game files are Mementos of full game state, captured by the game itself and handed to a save-manager "caretaker" that stores/loads them without understanding their internal format.'},
+  {title:'Database/transaction rollback', body:'Transaction savepoints capture enough state to roll back to a prior point without the transaction manager needing to understand every table\'s internal representation.'}
+],
+useWhen:['You need to save/restore an object\'s state (undo, checkpoints, snapshots) without exposing its internal structure to external code'],
+avoidWhen:['Frequent snapshots of large state are memory-expensive — consider storing diffs/deltas instead of full snapshots']
+},
+
+{
+id:'observer', category:'behavioral', name:'Observer',
+alias:'Defines a one-to-many dependency so observers are notified automatically of state changes.',
+intent:'Defines a subscription mechanism to notify multiple observer objects about any events that happen to the subject they\'re observing, without the subject needing to know anything concrete about its observers.',
+code:`class Observer {
+public:
+    virtual void onUpdate(double temperature) = 0;
+    virtual ~Observer() = default;
+};
+
+class WeatherStation {
+    std::vector<Observer*> observers_;
+    double temperature_ = 0;
+public:
+    void subscribe(Observer* o)   { observers_.push_back(o); }
+    void unsubscribe(Observer* o) {
+        observers_.erase(std::remove(observers_.begin(), observers_.end(), o), observers_.end());
+    }
+    void setTemperature(double t) {
+        temperature_ = t;
+        for (auto* o : observers_) o->onUpdate(temperature_);   // notify all
+    }
+};
+
+class PhoneDisplay : public Observer {
+public: void onUpdate(double t) override { std::cout << "Phone: " << t << "C\\n"; }
+};
+class WebDashboard : public Observer {
+public: void onUpdate(double t) override { std::cout << "Dashboard: " << t << "C\\n"; }
+};
+
+// Usage
+WeatherStation station;
+PhoneDisplay phone; WebDashboard dash;
+station.subscribe(&phone);
+station.subscribe(&dash);
+station.setTemperature(24.5);   // both observers notified automatically`,
+examples:[
+  {title:'GUI event systems / data binding', body:'Qt\'s signals & slots, and virtually every reactive UI framework, is Observer — a model change automatically propagates to every registered view/listener.'},
+  {title:'Pub-sub messaging systems', body:'Message brokers (Kafka, MQTT) and in-process event buses implement Observer at a distributed/decoupled scale — publishers never know who\'s subscribed.'},
+  {title:'Sensor/telemetry monitoring', body:'A firmware sensor manager notifying multiple subsystems (logging, alerting, display) whenever a new sensor reading arrives is the WeatherStation example applied directly in embedded systems.'}
+],
+useWhen:['A change to one object requires changing others, and you don\'t know/want to hardcode how many or which objects depend on it'],
+avoidWhen:['Notification order/reentrancy bugs become hard to reason about with many observers — watch for update cascades and memory leaks from forgotten unsubscribes']
+},
+
+{
+id:'state', category:'behavioral', name:'State',
+alias:'Alters an object\'s behavior when its internal state changes, appearing to change its class.',
+intent:'Lets an object alter its behavior when its internal state changes, by delegating state-specific behavior to separate state objects instead of a large conditional (if/switch) block scattered through the class.',
+code:`class TCPState {
+public:
+    virtual void open(class TCPConnection&) = 0;
+    virtual void close(class TCPConnection&) = 0;
+    virtual std::string name() const = 0;
+    virtual ~TCPState() = default;
+};
+
+class TCPConnection {
+    std::unique_ptr<TCPState> state_;
+public:
+    explicit TCPConnection(std::unique_ptr<TCPState> initial): state_(std::move(initial)) {}
+    void setState(std::unique_ptr<TCPState> s) { state_ = std::move(s); }
+    void open()  { state_->open(*this); }
+    void close() { state_->close(*this); }
+    std::string state() const { return state_->name(); }
+};
+
+class Established; // fwd decl
+class Closed : public TCPState {
+public:
+    void open(TCPConnection& c) override;   // defined below, transitions to Established
+    void close(TCPConnection&) override { std::cout << "Already closed\\n"; }
+    std::string name() const override { return "CLOSED"; }
+};
+class Established : public TCPState {
+public:
+    void open(TCPConnection&) override { std::cout << "Already open\\n"; }
+    void close(TCPConnection& c) override { c.setState(std::make_unique<Closed>()); }
+    std::string name() const override { return "ESTABLISHED"; }
+};
+void Closed::open(TCPConnection& c) { c.setState(std::make_unique<Established>()); }
+
+// Usage
+TCPConnection conn(std::make_unique<Closed>());
+conn.open();
+std::cout << conn.state() << "\\n";   // ESTABLISHED`,
+examples:[
+  {title:'Network protocol state machines', body:'TCP connection states (LISTEN, SYN_SENT, ESTABLISHED, CLOSED) are textbook State pattern territory — exactly the example above, common in real network stack implementations.'},
+  {title:'Media player / device controllers', body:'A media player\'s Playing/Paused/Stopped states each handle `play()`/`pause()`/`stop()` differently — State avoids a sprawling switch statement checking `currentState` everywhere.'},
+  {title:'Firmware device drivers', body:'A USB device driver modeled as Disconnected → Enumerating → Configured → Suspended states, each state object handling interrupts/commands differently, keeps state-specific logic isolated and testable.'}
+],
+useWhen:['An object\'s behavior depends heavily on its state, and you have large conditionals switching on a state variable throughout the class'],
+avoidWhen:['Only 2-3 simple states with trivial behavior differences exist — a simple enum + switch may be clearer than a full class hierarchy']
+},
+
+{
+id:'strategy', category:'behavioral', name:'Strategy',
+alias:'Defines a family of interchangeable algorithms, selectable at runtime.',
+intent:'Defines a family of algorithms, encapsulates each one, and makes them interchangeable at runtime — lets the algorithm vary independently from the clients that use it.',
+code:`class SortStrategy {
+public:
+    virtual void sort(std::vector<int>& data) = 0;
+    virtual ~SortStrategy() = default;
+};
+class QuickSortStrategy : public SortStrategy {
+public: void sort(std::vector<int>& d) override { std::sort(d.begin(), d.end()); std::cout<<"[quicksort]\\n"; }
+};
+class ReverseSortStrategy : public SortStrategy {
+public: void sort(std::vector<int>& d) override { std::sort(d.rbegin(), d.rend()); std::cout<<"[reverse sort]\\n"; }
+};
+
+class DataSorter {
+    std::unique_ptr<SortStrategy> strategy_;
+public:
+    void setStrategy(std::unique_ptr<SortStrategy> s) { strategy_ = std::move(s); }
+    void sortData(std::vector<int>& data) { strategy_->sort(data); }
+};
+
+// Usage — swap the algorithm at runtime without touching DataSorter
+std::vector<int> nums{5,3,1,4,2};
+DataSorter sorter;
+sorter.setStrategy(std::make_unique<QuickSortStrategy>());
+sorter.sortData(nums);
+
+// Modern alternative: std::function needs no class hierarchy at all
+std::function<void(std::vector<int>&)> strategy = [](std::vector<int>& d){ std::sort(d.begin(), d.end()); };
+strategy(nums);`,
+examples:[
+  {title:'Sorting/comparator customization', body:'`std::sort`\'s comparator parameter IS the Strategy pattern in its lightest form — the algorithm is fixed, but the comparison logic is swappable per call.'},
+  {title:'Payment processing systems', body:'An e-commerce checkout choosing between CreditCardStrategy, PayPalStrategy, or WalletStrategy at runtime based on user selection is a standard real-world Strategy use.'},
+  {title:'Compression/codec selection', body:'A file archiver choosing between ZipStrategy, GzipStrategy, or Lz4Strategy based on user preference or file type swaps the compression algorithm without changing the archiving workflow.'}
+],
+useWhen:['You have multiple variants of an algorithm and want to select/swap between them at runtime, avoiding conditional logic in the client'],
+avoidWhen:['There\'s only ever one algorithm and no realistic need for variation — a plain function is simpler','For simple cases, `std::function`/lambdas achieve the same result with far less boilerplate than a class hierarchy']
+},
+
+{
+id:'template-method', category:'behavioral', name:'Template Method',
+alias:'Defines the skeleton of an algorithm, deferring specific steps to subclasses.',
+intent:'Defines the overall skeleton of an algorithm in a base class method, deferring some specific steps to subclasses — subclasses can override individual steps without changing the algorithm\'s overall structure.',
+code:`class DataProcessor {
+public:
+    // Template method — the fixed algorithm skeleton (not virtual, can't be overridden)
+    void process() {
+        readData();
+        transform();
+        writeData();
+    }
+    virtual ~DataProcessor() = default;
+protected:
+    virtual void readData() { std::cout << "Reading from default source\\n"; }
+    virtual void transform() = 0;   // must be customized
+    virtual void writeData() { std::cout << "Writing to default sink\\n"; }
+};
+
+class CSVProcessor : public DataProcessor {
+protected:
+    void transform() override { std::cout << "Transforming CSV rows\\n"; }
+};
+class JSONProcessor : public DataProcessor {
+protected:
+    void readData() override { std::cout << "Reading JSON from network\\n"; }
+    void transform() override { std::cout << "Transforming JSON objects\\n"; }
+};
+
+// Usage — the sequence (read -> transform -> write) is fixed by the base class;
+// each subclass only customizes the steps it needs to.
+CSVProcessor csv; csv.process();
+JSONProcessor json; json.process();`,
+examples:[
+  {title:'Framework lifecycle hooks', body:'Android Activity\'s `onCreate/onStart/onResume` and most application framework base classes fix the overall lifecycle sequence while letting subclasses override individual steps.'},
+  {title:'Test framework setup/teardown', body:'JUnit/Google Test-style test fixtures fix the sequence (setUp → runTest → tearDown) as a template method, while individual test classes only override `runTest`.'},
+  {title:'Build/compilation pipelines', body:'A compiler driver fixing the stage order (preprocess → parse → optimize → codegen) while allowing per-target backends to override individual stages is Template Method applied to a build system.'}
+],
+useWhen:['Multiple classes share the same overall algorithm structure but differ in specific steps','You want to enforce an invariant sequence while still allowing controlled customization'],
+avoidWhen:['Subclasses need to change the ALGORITHM\'S STRUCTURE itself, not just individual steps — Strategy (composition) is more flexible than inheritance-based Template Method in that case']
+},
+
+{
+id:'visitor', category:'behavioral', name:'Visitor',
+alias:'Separates an algorithm from the object structure it operates on, via double dispatch.',
+intent:'Lets you define a new operation over a class hierarchy without modifying the classes themselves — each element accepts a visitor and calls back into the visitor\'s type-specific method ("double dispatch"), so new operations are added by writing a new visitor instead of touching every element class.',
+code:`class Circle; class Square;  // fwd decl
+
+class ShapeVisitor {
+public:
+    virtual void visit(Circle&) = 0;
+    virtual void visit(Square&) = 0;
+    virtual ~ShapeVisitor() = default;
+};
+class Shape {
+public:
+    virtual void accept(ShapeVisitor& v) = 0;
+    virtual ~Shape() = default;
+};
+class Circle : public Shape {
+public: double radius = 5;
+    void accept(ShapeVisitor& v) override { v.visit(*this); }
+};
+class Square : public Shape {
+public: double side = 4;
+    void accept(ShapeVisitor& v) override { v.visit(*this); }
+};
+
+// New operation added WITHOUT touching Circle/Square at all
+class AreaVisitor : public ShapeVisitor {
+public:
+    void visit(Circle& c) override { std::cout << "Circle area: " << 3.14159*c.radius*c.radius << "\\n"; }
+    void visit(Square& s) override { std::cout << "Square area: " << s.side*s.side << "\\n"; }
+};
+
+// Usage
+std::vector<std::unique_ptr<Shape>> shapes;
+shapes.push_back(std::make_unique<Circle>());
+shapes.push_back(std::make_unique<Square>());
+AreaVisitor areaCalc;
+for (auto& s : shapes) s->accept(areaCalc);   // double dispatch resolves the right visit()`,
+examples:[
+  {title:'Compiler AST processing', body:'Compilers apply multiple operations (type-checking, optimization, code generation) over the same fixed AST node hierarchy — Visitor lets each pass live in its own class without modifying the AST node classes.'},
+  {title:'Document/file format exporters', body:'A document model (Paragraph, Table, Image nodes) exporting to PDF, HTML, and Markdown each as a separate Visitor keeps format-specific logic out of the core document classes.'},
+  {title:'std::variant + std::visit (modern alternative)', body:'Modern C++ often replaces classic inheritance-based Visitor with `std::variant<Circle,Square>` and `std::visit`, achieving the same double-dispatch-like operation separation without a virtual class hierarchy.'}
+],
+useWhen:['You need to perform many unrelated operations across a stable object structure, and want new operations added without modifying the element classes'],
+avoidWhen:['The element class hierarchy changes frequently — every new element type requires updating EVERY visitor, which can become a maintenance burden','For a closed, small set of types, `std::variant`+`std::visit` is often simpler than a full Visitor class hierarchy']
+},
+
+];
+
+</script>
+<script>
+const CATS = {
+  creational: {label:'Creational', color:'var(--cat-creational)'},
+  structural: {label:'Structural', color:'var(--cat-structural)'},
+  behavioral: {label:'Behavioral', color:'var(--cat-behavioral)'}
+};
+
+function escapeHtml(s){
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function buildSidebar(){
+  const order = ['creational','structural','behavioral'];
+  const container = document.getElementById('navGroups');
+  order.forEach(catKey=>{
+    const items = PATTERNS.filter(p=>p.category===catKey);
+    const group = document.createElement('div');
+    group.className='nav-group';
+    group.innerHTML = `<div class="nav-group-label"><span class="dot" style="background:${CATS[catKey].color}"></span>${CATS[catKey].label} (${items.length})</div>`;
+    items.forEach((p,i)=>{
+      const el = document.createElement('div');
+      el.className='nav-item';
+      el.id='nav-'+p.id;
+      el.innerHTML = `<span class="num">${String(items.indexOf(p)+1).padStart(2,'0')}</span>${p.name}`;
+      el.onclick = ()=>navigate(p.id);
+      group.appendChild(el);
+    });
+    container.appendChild(group);
+  });
+}
+
+function renderHome(){
+  let html = `
+    <div class="cat-tag"><span class="dot" style="background:var(--accent)"></span>OVERVIEW</div>
+    <h2>C++ Design Patterns Field Reference</h2>
+    <p class="intent">23 Gang-of-Four patterns, each with a working C++17 implementation and 2–3 real production examples of where the pattern actually shows up — not the toy Animal/Shape examples. Pick one from the sidebar, or jump in below.</p>
+    <div class="section-label">ALL PATTERNS</div>
+    <div class="home-grid">`;
+  PATTERNS.forEach((p,i)=>{
+    html += `<div class="home-card" onclick="navigate('${p.id}')">
+      <span class="hc-num" style="color:${CATS[p.category].color}">${CATS[p.category].label.toUpperCase()}</span>
+      <h3>${p.name}</h3>
+      <p>${p.intent.slice(0,90)}${p.intent.length>90?'…':''}</p>
+    </div>`;
+  });
+  html += `</div>`;
+  return html;
+}
+
+function renderPattern(p, idx){
+  const cat = CATS[p.category];
+  let examplesHtml = p.examples.map((ex,i)=>`
+    <li><span class="ex-num">${String(i+1).padStart(2,'0')}</span>
+      <div><p class="ex-title">${ex.title}</p><p class="ex-body">${ex.body}</p></div>
+    </li>`).join('');
+
+  let useHtml = p.useWhen.map(u=>`<li>${u}</li>`).join('');
+  let avoidHtml = p.avoidWhen.map(a=>`<li>${a}</li>`).join('');
+
+  const prevNext = getPrevNext(p.id);
+
+  return `
+    <div class="cat-tag"><span class="dot" style="background:${cat.color}"></span>${cat.label.toUpperCase()} PATTERN</div>
+    <h2>${p.name}</h2>
+    <p class="pattern-alias">${p.alias}</p>
+    <p class="intent">${p.intent}</p>
+
+    <div class="section-label">C++ IMPLEMENTATION</div>
+    <div class="code-wrap">
+      <span class="code-label">C++17</span>
+      <pre><code class="language-cpp">${escapeHtml(p.code)}</code></pre>
+    </div>
+
+    <div class="section-label">WHERE THIS SHOWS UP IN THE REAL WORLD</div>
+    <ul class="examples">${examplesHtml}</ul>
+
+    <div class="section-label">WHEN TO USE / WHEN TO AVOID</div>
+    <div class="tradeoffs">
+      <div class="tradeoff-box use"><h4>USE WHEN</h4><ul>${useHtml}</ul></div>
+      <div class="tradeoff-box avoid"><h4>AVOID WHEN</h4><ul>${avoidHtml}</ul></div>
+    </div>
+
+    <div class="footer-nav">
+      <button onclick="navigate('${prevNext.prev ? prevNext.prev.id : ''}')" ${!prevNext.prev?'style="visibility:hidden"':''}>
+        <span><span class="dir">← PREV</span>${prevNext.prev?prevNext.prev.name:''}</span>
+      </button>
+      <button onclick="navigate('${prevNext.next ? prevNext.next.id : ''}')" ${!prevNext.next?'style="visibility:hidden"':''}>
+        <span style="text-align:right"><span class="dir">NEXT →</span>${prevNext.next?prevNext.next.name:''}</span>
+      </button>
+    </div>
+  `;
+}
+
+function getPrevNext(id){
+  const idx = PATTERNS.findIndex(p=>p.id===id);
+  return {
+    prev: idx>0 ? PATTERNS[idx-1] : null,
+    next: idx<PATTERNS.length-1 ? PATTERNS[idx+1] : null
+  };
+}
+
+function navigate(id){
+  const content = document.getElementById('content');
+  document.querySelectorAll('.nav-item').forEach(el=>el.classList.remove('active'));
+  if(!id || id==='home'){
+    content.innerHTML = renderHome();
+    document.getElementById('crumbCurrent').textContent = 'Overview';
+    window.location.hash = '';
+  } else {
+    const p = PATTERNS.find(x=>x.id===id);
+    if(!p) return;
+    content.innerHTML = renderPattern(p);
+    const navEl = document.getElementById('nav-'+id);
+    if(navEl) navEl.classList.add('active');
+    document.getElementById('crumbCurrent').textContent = p.name;
+    window.location.hash = id;
+    hljs.highlightAll();
+  }
+  document.getElementById('sidebar').classList.remove('open');
+  window.scrollTo(0,0);
+}
+
+window.addEventListener('hashchange', ()=>{
+  const id = window.location.hash.replace('#','');
+  navigate(id || 'home');
+});
+
+buildSidebar();
+navigate(window.location.hash.replace('#','') || 'home');
+
+</script>
+</body>
+</html>
