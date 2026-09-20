@@ -1,0 +1,323 @@
+# Module 6 — Data Link Layer
+
+@@ 6.01 | Basic | Concept | tags=dll,overview,reliability
+Q: What does the Data Link Layer do, and why does PCIe need one?
+SHORT: The Data Link Layer turns an unreliable serial link into a reliable one for TLPs. It stamps every TLP with a sequence number and an LCRC, checks them at the receiver, and uses ACK and NAK DLLPs with a replay buffer to resend anything that got corrupted. It also carries flow control initialization and updates, power-management handshakes, and reports link up and down to the layers above.
+DEEP:
+- **Reliable delivery:** sequence numbers plus LCRC plus replay buffer. The Transaction Layer never sees a corrupted or lost TLP unless the link itself is dead.
+- **Flow control transport:** InitFC1, InitFC2 and UpdateFC DLLPs carry the credit information the Transaction Layer needs. The Data Link Layer only moves them.
+- **Power management:** PM_Enter_L1, PM_Request_Ack and similar DLLPs run the L1 handshakes.
+- **Link state reporting:** DL_Up and DL_Down tell the Transaction Layer whether the link can carry traffic. Software can read this as Data Link Layer Link Active.
+- **Why it exists:** the specification targets a BER of about 1e-12, and at billions of bits per second something will eventually be wrong. Hardware replay keeps software out of the loop.
+FOLLOW:
+- Does the Data Link Layer look at TLP contents? => Only enough to frame it, number it and check the LCRC. It does not parse headers or the payload.
+- Who does end-to-end integrity? => The ECRC in the Transaction Layer, if enabled. The LCRC covers one link hop only.
+PITFALL: Saying the DLL guarantees delivery. It guarantees correct delivery across one link, and only while the link stays up.
+
+@@ 6.02 | Basic | Concept | fig=encap | tags=lcrc,sequence-number,framing,tlp
+Q: What does the Data Link Layer add to a TLP, and what does it look like on the wire?
+SHORT: It prepends a 2-byte field carrying a 12-bit sequence number and appends a 4-byte LCRC. The Physical Layer then adds framing: an STP start symbol and END symbol in 8b/10b, or a 4-byte STP token in 128b/130b. So on the wire a TLP is framing, sequence number, header, payload, optional ECRC, LCRC, and end marker.
+DEEP:
+- **Sequence number:** 12 bits, in a 16-bit field (4 reserved bits), placed in front of the header.
+- **LCRC:** 32-bit CRC over the sequence number and the whole TLP, so it protects the header, payload and ECRC together.
+- **Framing (8b/10b):** STP (start TLP) and END (or EDB for a nullified TLP) are control symbols.
+- **Framing (128b/130b):** an STP token at the start carries the TLP length, and the end is implied by that length.
+- **Cost per TLP:** roughly 6 bytes from the Data Link Layer plus 2 to 4 bytes framing, on top of the 12 or 16-byte header. It is why small TLPs are inefficient.
+FOLLOW:
+- Does the LCRC get recomputed on a replay? => No. The same TLP, with the same sequence number and same LCRC, is resent from the replay buffer.
+- Are DLLPs numbered? => No. DLLPs have no sequence number and are never replayed. They are protected only by a 16-bit CRC, and lost ones are recovered by later ones.
+PITFALL: Forgetting the LCRC covers the sequence number. A TLP with a good LCRC but the wrong sequence number is still a receiver-side problem.
+
+@@ 6.03 | Intermediate | Concept | fig=dllp | tags=dllp,format,types
+Q: What is a DLLP, what does it look like, and which types exist?
+SHORT: A DLLP is a 6-byte packet with a 1-byte type, 3 bytes of type-specific content and a 16-bit CRC. It travels between the two ends of one link and never crosses a switch. The main types are Ack, Nak, the flow control set (InitFC1, InitFC2, UpdateFC for P, NP and Cpl), the power-management DLLPs, and vendor-specific and Nop. DLLPs use no credits and are not replayed.
+DEEP:
+| Type | Encoding (byte 0) | Purpose |
+|---|---|---|
+| Ack | 00h | Acknowledge TLPs up to a sequence number |
+| Nak | 10h | Report a bad TLP, ask for replay |
+| PM_Enter_L1 | 20h | Software-directed move to L1 |
+| PM_Enter_L23 | 21h | Move to L2/L3 ready |
+| PM_Active_State_Request_L1 | 23h | ASPM L1 request |
+| PM_Request_Ack | 24h | Acknowledge a PM request |
+| InitFC1 P, NP, Cpl | 4xh, 5xh, 6xh | Initialize credits, round 1 (x = VC) |
+| InitFC2 P, NP, Cpl | Cxh, Dxh, Exh | Initialize credits, round 2 |
+| UpdateFC P, NP, Cpl | 8xh, 9xh, Axh | Return credits during operation |
+
+- **Layout:** byte 0 is the type (and VC for flow control), bytes 1 to 3 carry content such as the sequence number or credit values, bytes 4 to 5 are the CRC-16.
+- **On the wire:** with framing (SDP and END in 8b/10b) a DLLP occupies 8 bytes.
+- **No flow control on DLLPs:** they are always accepted. That is why credits can be returned even when the link is otherwise full.
+FOLLOW:
+- Why are DLLPs never replayed? => They are periodic or self-superseding. A later Ack covers an earlier one and a later UpdateFC carries a newer cumulative total.
+- Can a DLLP pass through a switch? => No. It is consumed at the next link partner. Each link has its own.
+PITFALL: Learning the encodings as trivia. What matters is the pattern: Ack and Nak carry a sequence number, flow control DLLPs carry credit counts, and none are replayed.
+VERIFY: Type encodings for PM, Vendor-Specific, Nop and the Data Link Feature DLLP in the Base Specification.
+
+@@ 6.04 | Intermediate | Concept | fig=replay | tags=ack,nak,replay,cumulative
+Q: Explain the ACK/NAK protocol and the replay buffer.
+SHORT: The sender keeps every transmitted TLP in a replay buffer until it is acknowledged. The receiver checks LCRC and sequence number. If good it accepts the TLP and sends an Ack, which is cumulative: acknowledging sequence N covers everything up to N. If bad it drops the TLP and sends a Nak with the last good sequence number. The sender purges up to that number and replays the rest, in order.
+DEEP:
+1. Sender assigns the next sequence number, transmits, and stores a copy.
+2. Receiver checks the TLP. Good: NEXT_RCV_SEQ advances and the TLP goes up to the Transaction Layer. Bad: it is discarded.
+3. Receiver sends Ack (covers all in-order TLPs so far) or Nak (report an error).
+4. On an Ack the sender frees buffer entries up to that sequence number.
+5. On a Nak the sender frees up to the reported number and retransmits everything still in the buffer, in original order.
+
+- **Cumulative:** the receiver does not have to send one Ack per TLP. It may coalesce them within a latency limit.
+- **Go-back-N:** later TLPs already in flight are dropped by the receiver as out of sequence and get sent again with the replay. That is why one error costs about a round trip of bandwidth.
+- **One Nak per error burst:** the receiver sets a NAK_SCHEDULED flag and does not send more Naks until it receives the expected TLP.
+- **Flow control credits:** a replay does not consume credits again. They were taken when the TLP was first sent.
+FOLLOW:
+- Why is the Ack cumulative? => It reduces DLLP traffic and simplifies state. One Ack retires many TLPs.
+- Does the Transaction Layer see the replay? => No. Replay is entirely between the two Data Link Layers.
+PITFALL: Imagining selective retransmit. PCIe replays everything after the first bad TLP.
+
+@@ 6.05 | Intermediate | Concept | tags=sequence-number,window,wrap,counters
+Q: How does the 12-bit sequence number work, and why can only 2048 TLPs be outstanding?
+SHORT: Sequence numbers count 0 to 4095 and wrap. The sender tracks NEXT_TRANSMIT_SEQ and ACKD_SEQ, the receiver tracks NEXT_RCV_SEQ. To tell a new TLP from an old duplicate after wrap, the spec limits unacknowledged TLPs to at most 2048, half the space. Numbers within 2048 behind the expected one are duplicates, and those within 2048 ahead are gaps.
+DEEP:
+- **Sender state:** NEXT_TRANSMIT_SEQ (next number to assign), ACKD_SEQ (last acknowledged).
+- **Receiver state:** NEXT_RCV_SEQ (the next number it expects).
+- **Why half:** modular arithmetic on a 12-bit field is only unambiguous if all live numbers sit inside a window of half the range. Then "behind" and "ahead" of the expected number never overlap.
+- **Classification at the receiver:**
+
+| Received seq vs NEXT_RCV_SEQ | Meaning | Action |
+|---|---|---|
+| Equal | The expected TLP | Accept if LCRC good |
+| Up to 2048 behind | Duplicate (already accepted) | Discard, but send Ack |
+| Otherwise (ahead) | A TLP was lost | Discard, send Nak |
+
+- **Practical limit:** at typical rates the buffer size or round trip runs out first, so the 2048 limit rarely binds. Tiny TLPs at very high rates and long round trips (retimers, long cables) get closer.
+FOLLOW:
+- Why ack a duplicate instead of ignoring it? => A duplicate usually means the sender did not see an earlier Ack. Acking it lets the sender move on.
+- What resets the counters? => Entering DL_Inactive/DL_Init (link down and back up) resets them on both sides, so they start from 0 in a fresh link.
+PITFALL: Thinking the sequence number is a global TLP ID. It is per link and per direction, and is unrelated to the requester's Tag.
+VERIFY: Initial values of NEXT_TRANSMIT_SEQ, ACKD_SEQ and NEXT_RCV_SEQ, and the exact Ack/Nak sequence number encoding (NEXT_RCV_SEQ minus 1).
+
+@@ 6.06 | Intermediate | Trap | tags=duplicate,nak-scheduled,out-of-sequence
+Q: A receiver sees TLP 10, then 12 (11 was corrupted and dropped), then 13. What does it send, and what does the sender do?
+SHORT: TLP 11 fails the LCRC, so the receiver drops it and sends one Nak carrying sequence 10. TLPs 12 and 13 are out of sequence, so they are dropped silently, with no additional Nak because NAK_SCHEDULED is already set. The sender receives the Nak, frees up to 10, and replays 11, 12, 13 in order. The receiver accepts them and normal Acks resume.
+DEEP:
+1. TLP 11 arrives with a bad LCRC: discard, send Nak(10), set NAK_SCHEDULED.
+2. TLP 12 arrives: its number is ahead of NEXT_RCV_SEQ (11), so it is out of sequence. Discard. No new Nak, because one is outstanding.
+3. TLP 13: same.
+4. Sender gets Nak(10): it frees up to 10 and replays 11, 12, 13.
+5. Receiver accepts 11 (clears NAK_SCHEDULED), 12 and 13, and sends Ack(13).
+
+- **Important:** the receiver sent one Nak, while the sender resent three TLPs. Error counters and replay volume are not one to one, and whether TLPs 12 and 13 also add to the Bad TLP count depends on how the implementation and spec version classify out-of-sequence TLPs.
+- **If the Nak is lost:** the DLLP CRC would fail (Bad DLLP), the sender never learns, and its replay timer eventually expires and replays anyway.
+FOLLOW:
+- What if TLP 11 arrives corrupted and the receiver cannot even tell it is a TLP (framing lost)? => It appears as a Receiver Error at the Physical Layer. TLP 12 later shows up as out of sequence and triggers a Nak.
+- Does the sender log anything on a Nak-triggered replay? => No AER bit is set for the Nak replay itself. The receiver logs Bad TLP. The replay does count toward REPLAY_NUM, though.
+PITFALL: Assuming each dropped TLP makes a Nak. One Nak covers the whole burst until the expected TLP arrives.
+VERIFY: Whether out-of-sequence TLPs that are discarded are counted as Bad TLP in AER.
+
+@@ 6.07 | Advanced | Numeric | tags=replay-buffer,sizing,bdp,round-trip
+Q: How large must the replay buffer be for a Gen4 x4 link, and what sets that size?
+SHORT: The buffer must hold every TLP sent during one round trip: the time for a TLP to reach the receiver, be checked, have its Ack scheduled and return. At about 7.88 GB/s and an assumed 1 microsecond round trip that is about 7.9 KB. With roughly 280-byte TLPs that is about 28 TLPs in flight. A smaller buffer stalls the sender waiting for Acks.
+DEEP:
+1. Link rate: 16 GT/s x 4 lanes x 128/130 = 63.0 Gb/s = about 7.88 GB/s per direction.
+2. Round trip (assumed): TLP transit, receiver LCRC check and logic, Ack coalescing wait, Ack transit, sender processing = about 1 microsecond. Real designs work from the spec's Ack latency limits for the width and Max_Payload_Size.
+3. Bytes in flight = 7.88 GB/s x 1 microsecond = about 7.9 KB.
+4. With 256 B payload plus about 24 B of overhead, a TLP is about 280 B, so about 28 TLPs.
+5. Add margin for at least one maximum-size TLP being sent and one being received when the Ack arrives.
+
+- **Scaling:** double the width or the rate and the buffer must double. Add retimers or long cables and it grows by the extra latency times the rate.
+- **Effect of too small a buffer:** the link idles waiting for Acks, so throughput falls below line rate even with zero errors. It is a performance bug that looks like nothing in the error counters.
+FOLLOW:
+- Which setting makes the required buffer larger? => Larger Max_Payload_Size raises the allowed Ack latency, and wider or faster links carry more bytes per microsecond.
+- How do Ack coalescing and buffer size interact? => Slower coalescing frees the receiver's DLLP bandwidth but keeps entries in the sender's buffer longer, so it needs a larger buffer.
+PITFALL: Sizing to the average round trip. Size to the worst case allowed by the Ack latency limits, or the buffer fills and the link stalls.
+VERIFY: The Ack latency limit table (by width and Max_Payload_Size) and REPLAY_TIMER formula in the Base Specification.
+
+@@ 6.08 | Advanced | Concept | tags=replay-timer,replay-num,rollover,recovery
+Q: What are REPLAY_TIMER and REPLAY_NUM, and when does a replay force the link to retrain?
+SHORT: REPLAY_TIMER runs at the sender while TLPs are unacknowledged. If it expires with no Ack or Nak progress, the sender replays the buffer and increments REPLAY_NUM, a 2-bit counter. If REPLAY_NUM would roll over from 3 back to 0, meaning repeated replays without progress, the Data Link Layer asks the Physical Layer to retrain the link by entering Recovery. Both events are logged as correctable errors.
+DEEP:
+- **REPLAY_TIMER:** starts when a TLP is sent (if not running) and resets on each Ack that makes progress. It is a few times the Ack latency limit, so a lost Ack or a stuck receiver triggers it.
+- **On expiry:** replay everything in the buffer, restart the timer, increment REPLAY_NUM, and log Replay Timer Timeout (AER correctable).
+- **On rollover:** REPLAY_NUM would go from 3 to 0, so the Data Link Layer stops transmitting and requests retraining. AER logs Replay Number Rollover.
+- **On progress:** an Ack that acknowledges at least one TLP resets REPLAY_NUM to 0.
+- **After retrain:** the replay buffer is kept, and replay resumes when the link is back in L0. If retraining fails, DL_Down follows.
+- **Why it matters:** repeated rollover events mean the link is bad enough to keep failing, and the retrain is the hardware's last attempt before declaring the link dead.
+FOLLOW:
+- Does a Nak-triggered replay increment REPLAY_NUM? => Replays increment it and progress in acknowledgment resets it. Check the spec for the exact Nak handling, since a Nak that also frees entries counts as progress.
+- What would a stuck receiver look like at the sender? => Replay Timer Timeouts, then Rollover, then Recovery, and possibly a link down if the partner never responds.
+PITFALL: Treating Replay Number Rollover as a benign counter. It means the link was one step from a forced retrain, which stalls all traffic for microseconds to milliseconds.
+VERIFY: The REPLAY_TIMER limit formula, and exactly which events (Nak, timer expiry, Ack with progress) increment or reset REPLAY_NUM.
+
+@@ 6.09 | Intermediate | Concept | tags=lcrc,crc32,crc16,polynomial,ecrc
+Q: Which CRCs does PCIe use, and what does each protect?
+SHORT: LCRC is a 32-bit CRC per link, covering the sequence number and TLP, checked and regenerated at every hop. ECRC is a 32-bit CRC from source to destination in the Transaction Layer, optional and left untouched by switches. DLLPs use a 16-bit CRC. The 32-bit CRC uses the same polynomial as Ethernet, 0x04C11DB7, and the DLLP CRC-16 uses 0x100B.
+DEEP:
+| CRC | Width | Scope | Checked by |
+|---|---|---|---|
+| LCRC | 32 | Sequence number and TLP, one link | Every receiver |
+| ECRC | 32 | TLP header and data, end to end | Final receiver (and switches may check) |
+| DLLP CRC | 16 | The 4 bytes of the DLLP | Every receiver |
+
+- **Polynomials:** CRC-32 is x^32+x^26+x^23+x^22+x^16+x^12+x^11+x^10+x^8+x^7+x^5+x^4+x^2+x+1 (0x04C11DB7). The DLLP CRC-16 polynomial is 0x100B.
+- **Why both LCRC and ECRC:** LCRC catches link errors and triggers replay. ECRC catches errors introduced inside a switch or a device between the links, where LCRC is regenerated over corrupted data and appears fine.
+- **Strength:** a 32-bit CRC detects every burst error up to 32 bits long and all but about 1 in 4 billion (2^-32) of longer or random error patterns, which is strong for link error patterns.
+FOLLOW:
+- Why does the switch regenerate the LCRC? => The sequence number is per link and differs on each hop, and the LCRC covers it, so it must be recomputed.
+- What happens when ECRC fails? => The Transaction Layer reports an uncorrectable ECRC Error (AER), and the packet is treated as bad by the receiver. It is not replayed by the Data Link Layer.
+PITFALL: Assuming LCRC protects end to end. A fault inside a switch's buffers gets a fresh good LCRC on the way out.
+VERIFY: The polynomial and initial values for LCRC and DLLP CRC in the Base Specification, and the ECRC masking of variant bits.
+
+@@ 6.10 | Advanced | Concept | tags=dlcmsm,dl-init,dl-active,dl-up,dl-feature
+Q: What is the Data Link Control and Management State Machine, and how does it decide the link is up?
+SHORT: The DLCMSM tracks the state of the Data Link Layer. It sits in DL_Inactive until the Physical Layer reports the link is up, optionally goes through DL_Feature to exchange capabilities, then DL_Init to run flow control initialization with InitFC1 and InitFC2, and finally DL_Active, where TLPs are accepted and sent. DL_Up is reported to the Transaction Layer only in DL_Active. Loss of the Physical Layer link returns it to DL_Inactive.
+DEEP:
+- **DL_Inactive:** the Physical Layer link is down or reset. No TLPs. Waits for the link to come up.
+- **DL_Feature:** (newer specs) exchange of Data Link Feature DLLPs to negotiate optional features, such as Scaled Flow Control.
+- **DL_Init:** send InitFC1 for each VC and credit type, then InitFC2. Move on when both sides have finished.
+- **DL_Active:** normal operation. Ack/Nak, replay, and UpdateFC all run here.
+- **Link down:** any loss of the Physical Layer link, or a reset, returns to DL_Inactive and the buffers and counters are cleared.
+- **What software sees:** the Data Link Layer Link Active bit in Link Status reflects DL_Active, and hot-plug software waits on it before touching a newly inserted device.
+FOLLOW:
+- Is the link "up" when the LTSSM reaches L0? => Physically yes, but not to the software layers. Until the DLCMSM reaches DL_Active, TLPs are not exchanged.
+- Can the DLCMSM be in DL_Init while the LTSSM is in Recovery? => The Physical Layer can retrain while the Data Link Layer keeps its state, as long as the link is not declared down. Full loss goes to DL_Inactive.
+PITFALL: Equating LTSSM L0 with a usable link. A link can sit in L0 but never reach DL_Active if flow control initialization does not complete.
+VERIFY: Whether DL_Feature applies at all rates in the spec version you target, and DLCMSM transition conditions.
+
+@@ 6.11 | Advanced | Concept | tags=flow-control,initfc1,initfc2,updatefc
+Q: Why does flow control initialization need both InitFC1 and InitFC2?
+SHORT: InitFC1 advertises each credit type to the partner. InitFC2 repeats the advertisement to confirm that the partner has received it, so neither side moves to DL_Active before the other knows its credits. Once a port has received InitFC1 for all three types it moves to InitFC2. Once it receives InitFC2 for any type, it considers the exchange done. After that the credits are refreshed with UpdateFC.
+DEEP:
+- **What is sent:** for each supported VC, the receiver advertises Posted, Non-Posted and Completion credits, each split into header credits and data credits.
+- **InitFC1 round:** send InitFC1-P, InitFC1-NP, InitFC1-Cpl repeatedly. Record the values received from the partner.
+- **InitFC2 round:** once InitFC1 was received for all types, send InitFC2. The reception of InitFC2 (or an UpdateFC) proves that the partner completed its InitFC1 phase.
+- **Why two rounds:** with only one, one side could finish while the other is still missing its first advertisement, since DLLPs are unacknowledged. The second round is the handshake.
+- **VC0 first:** VC0 is always initialized. Other VCs are initialized later by software enabling them.
+- **UpdateFC:** in DL_Active the receiver sends cumulative credit updates when the Transaction Layer frees buffer space, at least every 30 microseconds by the spec's timing rules (VERIFY).
+FOLLOW:
+- Can TLPs flow on VC0 before other VCs are initialized? => Yes. Only VC0 must be initialized to enter DL_Active.
+- What is infinite credit? => A value of 0 in the advertisement means the receiver has infinite credit for that type. It is used for Completion credits by endpoints and Root Complexes, which can always accept completions for requests they issued.
+PITFALL: Explaining InitFC2 as a repeat with no purpose. It is the acknowledgement of the first round in a protocol with no acknowledgements.
+VERIFY: UpdateFC timing limit, the scaled flow control field encodings, and the infinite credit rules for Completions.
+
+@@ 6.12 | Intermediate | Concept | tags=pm-dllp,l1,aspm,handshake
+Q: How do the power management DLLPs get a link into L1?
+SHORT: For software-directed power management, when a device is put into D1, D2 or D3hot, it sends PM_Enter_L1 upstream. The upstream port stops sending new TLPs, waits until all its TLPs are acknowledged, then replies with PM_Request_Ack. After that both sides go to electrical idle and the LTSSM enters L1. For ASPM the downstream port sends PM_Active_State_Request_L1 and the upstream port either accepts with PM_Request_Ack or rejects with a message.
+DEEP:
+1. Software writes the device's power state (D-state), or the device's ASPM timer expires after idle.
+2. Downstream side blocks new TLPs, waits for its own replay buffer to drain (all ACKed), and sends PM_Enter_L1 (or PM_Active_State_Request_L1 for ASPM), repeatedly.
+3. Upstream side stops new TLPs, waits for its Acks and credits to settle, then sends PM_Request_Ack repeatedly.
+4. When the downstream side sees PM_Request_Ack, it goes to electrical idle. The upstream side follows, and the LTSSM enters L1.
+5. Exit is triggered by either side and goes through Recovery.
+
+- **Why wait for Acks:** if a TLP were unacknowledged when the link went idle, it might be lost. The handshake guarantees a clean quiet point.
+- **ASPM rejection:** the upstream port can refuse with a PM_Active_State_Nak Transaction Layer message and the link stays in L0.
+- **Where the details are:** entry conditions and L1 substates are covered in the power management module.
+FOLLOW:
+- Why are PM DLLPs sent repeatedly? => DLLPs are unacknowledged, so repeats make sure at least one gets through a noisy link.
+- Can a TLP be pending when L1 entry starts? => It must be delivered and acknowledged first. The handshake does not begin until the transmit side is quiet.
+PITFALL: Expecting L1 entry to be immediate. It is a handshake with wait-for-Ack conditions, and traffic can hold it off.
+
+@@ 6.13 | Advanced | Debug | tags=aer,counters,bad-tlp,bad-dllp,receiver-error
+Q: The AER correctable status on an endpoint shows large Bad TLP counts but Replay Timer Timeout is zero. What does each counter mean and what does this pattern tell you?
+SHORT: Receiver Error means the Physical Layer lost sync or hit a decode or framing error. Bad TLP means a TLP failed LCRC or sequence checks. Bad DLLP means a DLLP failed CRC. Replay Timer Timeout and Replay Number Rollover are logged by the sender. Many Bad TLPs with no timeouts means the endpoint's receiver is seeing errors and its Naks are getting back to the sender, which is replaying successfully. The errors are mainly in the inbound direction.
+DEEP:
+| Status bit | Logged by | Meaning |
+|---|---|---|
+| Receiver Error | Receiver | PHY-level error: 8b/10b code violation, disparity, framing, or 128b/130b sync or block error |
+| Bad TLP | Receiver | LCRC failure or bad sequence number |
+| Bad DLLP | Receiver | DLLP CRC failure |
+| Replay Number Rollover | Sender | Repeated replays with no progress (2-bit counter rolls over) |
+| Replay Timer Timeout | Sender | No Ack within the timer, so it replayed |
+
+- **Direction rule:** errors are logged at the receiving end. Bad TLP at the endpoint means the root-port-to-endpoint direction is damaged. Look at the root port's counters for the other direction.
+- **Nak replays set no AER bit at the sender:** a Nak-triggered replay logs nothing there, although it counts toward REPLAY_NUM. Only Replay Timer Timeout and Replay Number Rollover appear in the sender's AER.
+- **This pattern:** Bad TLP high, Timeout zero, Rollover zero: errors are frequent but isolated, the return path (Ack and Nak DLLPs) is healthy, and each replay succeeds. You will see reduced throughput without failures.
+- **Receiver Error high with Bad TLP low:** the Physical Layer is failing, but errors are mostly in idle or DLLP periods, or masked. Suspect clocking, equalization or margin.
+- **Bad DLLP high:** the same physical cause as the others, seen on small packets. Check the return path.
+FOLLOW:
+- Bad TLP is high on the endpoint. Which side's transmitter do you suspect? => The root port's transmitter or the channel in that direction (or the endpoint's receiver). Do not read the endpoint's own transmit direction from that counter.
+- Both ends show similar counts? => Symmetric problem: reference clock, power noise, a shared channel issue such as the connector, or the environment (temperature).
+PITFALL: Reading counters as if they described the local transmitter. They describe what the local receiver saw.
+VERIFY: Bit positions of the correctable error status register, and whether your platform masks any of them in the Correctable Error Mask register.
+
+@@ 6.14 | Advanced | Concept | tags=surprise-down,dl-up,data-link-protocol-error,link-active
+Q: What are Surprise Down and Data Link Protocol errors, and how does the Data Link Layer report link up and down?
+SHORT: The Data Link Layer reports DL_Up when it enters DL_Active and DL_Down when the link is lost. If the link goes down while software did not expect it, for example a drive pulled without a hot-plug request, the port logs a Surprise Down Error, which is uncorrectable. A Data Link Protocol Error is logged when a received Ack or Nak refers to a sequence number that is not outstanding, meaning the partner's state is corrupt.
+DEEP:
+- **DL_Up and DL_Down:** signals to the Transaction Layer. On DL_Down, pending transactions are aborted and completions will not arrive.
+- **Link Active bit:** Data Link Layer Link Active in Link Status is set when DL_Active, and ports can optionally signal changes with an interrupt (Data Link Layer State Changed).
+- **Surprise Down Error:** DL_Down without a preceding intentional cause (Link Disable, hot reset, or slot power-off), logged as an uncorrectable error. Hot-plug capable slots may treat it as a normal removal.
+- **Data Link Protocol Error:** an uncorrectable error that indicates a fault inside the partner's Data Link Layer or a DLLP that refers to state that does not exist. Rare in the field.
+- **Consequence:** in-flight requests never complete, and the completion timeout on the requester handles them.
+FOLLOW:
+- How does an NVMe SSD pulled from a live slot appear? => The port sees DL_Down, logs Surprise Down (unless the slot expects it), and the NVMe driver sees timeouts and a controller that reads all 1s.
+- What ends a Surprise Down state? => A link retrain that reaches DL_Active again, or removal of the device by the OS.
+PITFALL: Treating a Surprise Down on a hot-plug slot as always a failure. It is the normal signature of a surprise removal.
+VERIFY: Which uncorrectable error bits map to Surprise Down and Data Link Protocol Error, and platform hot-plug behavior for them.
+
+@@ 6.15 | Principal | Numeric | tags=ber,throughput,go-back-n,replay
+Q: Estimate the throughput loss caused by replays at a given BER, for a Gen4 x4 link. At what BER does it become severe?
+SHORT: A 280-byte TLP is 2240 bits. With independent bit errors the chance a TLP is bad is about 2240 x BER. Each bad TLP wastes about a round trip, roughly 30 TLP times on this link. Efficiency is about 1 / (1 + 2240 x 30 x BER). At BER 1e-12 the loss is negligible. At 1e-6 it is about 6 percent, at 4.5e-6 about 23 percent, and at 1.5e-5 about half.
+DEEP:
+1. TLP bits: 280 B x 8 = 2240 bits.
+2. Probability a TLP is corrupted: p = 2240 x BER (valid for small BER).
+3. Window: about 30 TLPs in flight (a round trip of about 1 microsecond at 7.88 GB/s).
+4. Cost of one error: the bad TLP plus the in-flight ones behind it are discarded and resent, about W = 30 TLP times.
+5. Cost per delivered TLP: 1 + p x W slots. Efficiency = 1 / (1 + 2240 x 30 x BER) = 1 / (1 + 67,200 x BER).
+
+| BER | p x W | Throughput loss |
+|---|---|---|
+| 1e-12 | 6.7e-8 | negligible |
+| 1e-9 | 6.7e-5 | 0.007 % |
+| 1e-6 | 0.067 | about 6 % |
+| 4.5e-6 | 0.30 | about 23 % |
+| 1.5e-5 | 1.0 | 50 % |
+
+- **Assumptions:** independent errors and a steady traffic stream. In practice DFE errors come in bursts, so the same BER hits fewer TLPs and the loss is lower. Idle links lose almost nothing because there is little to replay.
+- **The message:** the spec BER (1e-12) makes replay overhead invisible. A link with an unnoticed BER of 1e-6 still looks alive but runs measurably slower, and shows up as a throughput dip and Bad TLP counters, not as a failure.
+FOLLOW:
+- Why does a wider or faster link suffer more for the same BER? => The window in TLPs grows with bandwidth times round trip, so each error wastes more.
+- How would you use this in a test? => Convert observed Bad TLP rate and throughput into an implied BER and compare against the lane margining results.
+PITFALL: Applying the raw BER to bytes instead of to the whole TLP. The loss depends on TLP size and window, not on the byte count alone.
+
+@@ 6.16 | Principal | Scenario | tags=triage,direction,replay-rollover,recovery,nvme
+Q: An NVMe SSD sees periodic stalls under heavy sequential writes, and AER shows Replay Number Rollover on the root port. How do you isolate which direction and which component is at fault?
+SHORT: Rollover at the root port means its transmitter sent TLPs that were never successfully acknowledged, several replays in a row. That points to the root-port-to-SSD direction or the SSD's Ack path. Read both ends' counters: Bad TLP or Receiver Error at the SSD confirms the downstream direction. Then swap slots, drives and cables, and run margining at the SSD's receiver to find the weak lane.
+DEEP:
+1. **Establish the direction:** the sender logs Rollover and Replay Timer Timeout. The receiver logs Bad TLP, Bad DLLP and Receiver Error. So root port Rollover plus SSD Bad TLP means downstream traffic is being damaged. Root port Rollover with no SSD errors suggests Acks from the SSD are not returning, so look at the upstream direction.
+2. **Correlate with workload:** heavy writes send large TLPs downstream, which raises exposure for that direction. Compare a read-heavy test.
+3. **Correlate with the LTSSM:** each rollover forces Recovery. Check Recovery entry counts and the retrain reason.
+4. **Isolate:**
+   - Swap the SSD with another unit and slot. Follow the fault (device, slot or system).
+   - Compare Gen4 and Gen3 operation. If the errors vanish at lower speed, it is margin.
+   - Check temperature and power delivery.
+5. **Measure:** lane margining at the SSD receiver (downstream direction) and at the root port receiver (upstream direction).
+6. **Impact on NVMe:** stalls of a few ms per retrain accumulate into long tail latency. If the stall exceeds the command timeout, the host resets the controller.
+
+- **Fix candidates:** equalization preset or retimer tuning, channel or connector repair, reference clock cleanup, or a firmware fix if the SSD's Ack timing is wrong.
+FOLLOW:
+- No AER errors at all but the stalls remain. What next? => Check if AER is masked or not reported by firmware (BIOS masks), read the raw register, and compare against the NVMe controller's own link error counters or vendor logs.
+- Could this be the SSD firmware rather than signal integrity? => Yes, if the SSD stops sending Acks (for example a stalled Data Link Layer in its controller). Bad TLP counts stay low but timeouts and rollover rise.
+PITFALL: Blaming the drive because the stalls appear on it. The counters say which direction, and the direction narrows which component.
+
+@@ 6.17 | Principal | Debug | tags=automation,aer,linux,windows,monitoring,rasdaemon
+Q: How would you automate Data Link Layer health monitoring across a validation lab or fleet?
+SHORT: Poll the AER correctable counters on every link at a fixed interval, convert them to rates, and alert on trends and on the dangerous ones (Rollover, Timeout, Data Link Protocol Error, Surprise Down). On Linux read sysfs aer_dev_correctable and use rasdaemon. On Windows use WHEA events. Store the rates with workload, temperature and firmware version so a failing link shows up as an outlier.
+DEEP:
+- **Linux:**
+  - `lspci -vvv -s <BDF>` shows `CESta:` with RxErr, BadTLP, BadDLLP, Rollover, Timeout.
+  - `/sys/bus/pci/devices/<BDF>/aer_dev_correctable` and `aer_dev_fatal` give per-error counters, and `aer_rootport_total_err_cor` gives root port totals.
+  - `rasdaemon` (`ras-mc-ctl`) logs AER events with timestamps. `dmesg` shows `AER: Corrected error received`.
+- **Windows:** the WHEA-Logger provider in the System event log records corrected and uncorrected PCIe errors, and the Windows Performance tooling can correlate them with workload.
+- **Design:**
+  - Sample counters before and after each test, and record deltas.
+  - Convert to rates (per minute, per GB moved) so tests of different lengths compare.
+  - Store per lane speed and width, temperature and firmware version.
+  - Alert on any Rollover, Surprise Down or protocol error, and on the correctable rate exceeding a threshold or trending up.
+- **Gotchas:**
+  - Counters are per-receiver, so poll both ends of the link.
+  - Some are sticky until cleared, so clear after read (write 1 to clear) or compute deltas.
+  - The firmware may mask or take ownership of AER (firmware-first), hiding errors from the OS.
+FOLLOW:
+- How do you set a threshold? => From the baseline distribution of healthy units at the same speed and workload, and a rate that would cost a defined amount of throughput (see the BER model), not a guess.
+- Why record the firmware version? => Retimer, BIOS and SSD firmware all change link behavior, and correlation with a version is often the first clue in a regression.
+PITFALL: Alerting on the raw count. Long tests always accumulate counts, so monitor rates and changes.
+VERIFY: WHEA-Logger event IDs and fields for PCIe corrected errors on your Windows version, and sysfs counter names on your kernel version.

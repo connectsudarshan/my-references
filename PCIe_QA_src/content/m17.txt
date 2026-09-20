@@ -1,0 +1,399 @@
+# Module 17 — Debug, Analyzers & Compliance
+
+@@ 17.01 | Basic | Concept | tags=toolbox,analyzer,scope,margining,host-tools
+Q: What tools do you use to debug a PCIe link and an NVMe SSD, and what can each one see?
+SHORT: A protocol analyzer sees ordered sets, TLPs and DLLPs on the wire, and the LTSSM is inferred from them. A scope or BERT sees analog signal quality. Lane margining measures the receiver's own timing and voltage margin in the running system. Host tools (lspci, setpci, nvme-cli, dmesg, fio) see config space, AER, link status and NVMe logs. SSD-side logs, telemetry and UART/JTAG show the firmware's view. No single tool sees every layer.
+DEEP:
+| Tool | Sees | Blind to |
+|---|---|---|
+| Protocol analyzer | Ordered sets, TLP and DLLP decode, timing, inferred LTSSM | Analog quality, the DUT's internal state, what the DUT's receiver actually decoded |
+| Scope, BERT, eye and jitter tools | Voltage versus time at a probed point, jitter, reference clock, Tx presets | Protocol behavior, and the receiver's internal eye after its own equalization |
+| Lane margining | Per-lane timing and voltage margin at the true receiver, in system | Why margin is low, and it is receiver-implementation dependent |
+| Host tools | Config space, AER, LnkSta, NVMe logs, kernel messages, load generation | Almost everything once the link is down, and usually the LTSSM history |
+| SSD-side logs, telemetry, UART, JTAG | Firmware asserts, PHY and LTSSM counters, FTL and NAND state | The host and channel side |
+
+- **Pick by layer:** physical problems go to scope and margining, LTSSM, Data Link and Transaction Layer problems go to the analyzer plus AER counters, and NVMe-level problems go to host tools plus SSD logs.
+- **Cheapest and least intrusive first:** counters and logs cost nothing and run in the failing setup. Reach for the analyzer or scope when the counters cannot separate the hypotheses.
+FOLLOW:
+- Which tool do you use first? => The host-side counters and logs, because they are non-intrusive and already in the failing system. They also tell you which layer the expensive tools should look at.
+- Why keep the analyzer if AER already counts errors? => AER counts the receiver's view without timing or context. The analyzer shows the packet sequence, who sent what, and what happened just before the error.
+PITFALL: Starting with the most powerful tool. A scope or an interposer changes the setup and burns days, while a counter delta often narrows the layer in minutes.
+
+@@ 17.02 | Basic | Concept | tags=linux,lspci,setpci,nvme-cli,fio,dmesg
+Q: Which Linux commands do you run first on a suspect NVMe SSD, and what do you read from each?
+SHORT: Run lspci -vvv as root on the SSD and on its upstream ports to read LnkCap, LnkSta, AER status and DevCtl. Dump raw config space for offline decoding. Read BAR0 CSTS to see if the controller answers. Use nvme smart-log and error-log for device health, dmesg or journalctl for AER and driver messages, and fio for load. Capture all of it before any reset.
+DEEP:
+```
+lspci -vvv -s 01:00.0              # LnkCap/LnkSta, DevCtl, CESta/UESta, L1SS
+lspci -xxxx -s 01:00.0             # raw 4 KB config dump, keep it for offline decode
+setpci -s 01:00.0 CAP_EXP+0x12.w   # raw Link Status (offset 0x12 in the PCIe capability)
+cat /sys/bus/pci/devices/0000:01:00.0/current_link_speed
+nvme smart-log /dev/nvme0          # temperature, media_errors, unsafe_shutdowns
+nvme error-log /dev/nvme0
+journalctl -k -b -1 | grep -Ei "nvme|aer|dpc|pcieport"   # previous boot's kernel log
+fio --name=rd --filename=/dev/nvme0n1 --rw=randread --bs=4k --iodepth=32 --ioengine=io_uring --direct=1 --time_based --runtime=600
+```
+- **lspci needs root:** without it, extended capabilities such as AER are not shown. Read the root port and any switch ports too, not just the SSD.
+- **What to compare:** LnkSta against LnkCap on both ends, CESta and UESta bits, DevCtl (MPS, MRRS), and whether ASPM is enabled.
+- **BAR0 reads:** `pcimem /sys/bus/pci/devices/0000:01:00.0/resource0 0x1c w` reads CSTS (offset 1Ch). A value of 0xFFFFFFFF means the read got no valid answer, usually a down link. On some platforms an MMIO read to a dead device is slow or escalates, so read config space first.
+- **Other tools:** `rasdaemon` (`ras-mc-ctl --errors`) keeps timestamped AER events, and `echo 1 > /sys/kernel/tracing/events/nvme/enable` turns on NVMe command tracepoints.
+- **Writes are different from reads:** setpci writes and fio on a raw device change state or destroy data. Reads are safe.
+FOLLOW:
+- The link looks fine in lspci but I/O times out. What next? => Read CSTS and the NVMe logs, then trace the command path (doorbell, SQE fetch, data, CQE, interrupt). See the NVMe over PCIe module and the scenarios module.
+- Why journalctl -b -1? => After a reboot that lost the drive, the interesting messages are in the previous boot's log, provided the journal is persistent.
+PITFALL: Running the commands after a reset or a driver reload. Sticky AER bits, driver counters and device state have already changed.
+VERIFY: setpci capability names (CAP_EXP) and lspci output labels on your pciutils version, and the sysfs attributes available on your kernel.
+
+@@ 17.03 | Basic | Concept | tags=windows,windbg,etw,powershell,vendor-tools
+Q: What are the Windows equivalents of the Linux PCIe and NVMe debug tools?
+SHORT: Device Manager and PowerShell Get-PnpDeviceProperty show the link speed and width the OS recorded. WinDbg kernel debugging with !pci dumps config space. Event Viewer shows WHEA-Logger PCIe error events and storage reset events. Windows Performance Recorder and Analyzer capture ETW traces of the storage stack, Get-StorageReliabilityCounter gives SMART-like data, and diskspd or fio generate load. Vendor tools cover NVMe logs.
+DEEP:
+- **Link facts:** the PCI device properties in Device Manager (Details tab) or `Get-PnpDeviceProperty -InstanceId <id>` list current and maximum link speed and width. Compare current against maximum.
+- **Config space and topology:** WinDbg in kernel mode: `!pci` dumps PCI config space, `!devnode` and `!devstack` show the device tree and stack. This needs a debug connection.
+- **Errors:** the Windows System event log has WHEA-Logger events for corrected and uncorrected PCIe errors, but only if firmware handed AER control to the OS. Storport and stornvme reset events (for example "Reset to device ... was issued") mark command timeouts.
+- **Tracing:** `wpr` records ETW with storage providers, and WPA shows I/O latency by layer. Use it to see which I/Os stalled and for how long.
+- **Health and load:** `Get-StorageReliabilityCounter` (temperature, error totals, wear), `Get-PhysicalDisk`, `diskspd` or Windows fio for stress.
+- **Gaps:** no setpci, no direct register access from user mode, and limited raw NVMe log access with the inbox driver. Use vendor CLI tools or an NVMe passthrough tool. A practical trick is to boot a Linux live image on the same hardware and run lspci, setpci and nvme-cli there.
+FOLLOW:
+- Windows shows no PCIe errors but the drive drops. Is the link healthy? => Not proven. Firmware may own AER so the OS never sees it, and the WHEA channel may be filtered. Check platform settings and use vendor or analyzer data.
+- Why compare Windows and Linux on the same box? => It splits OS and driver behavior from hardware. If the failure follows the hardware in both, the cause is below the OS.
+PITFALL: Assuming the absence of WHEA events means the link had no errors. It only means none were reported to the OS.
+VERIFY: DEVPKEY names for link speed and width, WHEA-Logger event IDs, stornvme and storport reset event IDs, and whether your NVMe passthrough tool supports the log pages you need.
+
+@@ 17.04 | Intermediate | Concept | fig=stack | tags=method,triage,bisect,layers
+Q: What is your disciplined method for debugging a PCIe or NVMe failure?
+SHORT: Define the failure precisely with numbers. Capture state before any reset destroys it. Split host, device and channel by swapping parts. Reduce variables. Bisect firmware, BIOS, OS, slot and drive. Reproduce with statistics so you know the failure rate. Then root-cause layer by layer from physical to LTSSM to Data Link to Transaction Layer to NVMe, and stop at the lowest layer that shows an anomaly.
+DEEP:
+1. **Define:** one sentence with a rate, for example "1 in about 200 warm reboots the SSD is absent at enumeration, Gen5 slot 3, BIOS 2.1". If you cannot write it, you are not ready to debug.
+2. **Capture first:** config space of the SSD and every upstream port, AER, LnkSta and LnkSta2, dmesg, NVMe logs, SSD debug logs, temperature. Analyzer ring buffers and SSD RAM logs are overwritten or lost by the next reset.
+3. **Split:** known-good SSD in the failing host, failing SSD in a known-good host, different slot or cable. The failure follows the culprit.
+4. **Reduce:** lowest speed that fails, ASPM off, one drive, minimal load, a pre-OS environment.
+5. **Bisect:** binary search on firmware, BIOS, OS and driver versions.
+6. **Reproduce with statistics:** for a 2 percent failure, a fix needs about 150 clean trials for 95 percent confidence, not 10 (rule of three, see the scenarios module).
+7. **Layer checklist:**
+   - Physical: power, refclk, channel, margin.
+   - LTSSM: state history, equalization result, speed and width.
+   - Data Link: Bad TLP, Bad DLLP, replay, flow control initialization.
+   - Transaction Layer: poison, UR, completion timeout, MPS and MRRS, ordering.
+   - NVMe: CSTS, queues, interrupts, firmware state.
+8. **Close the loop:** verify the fix at the failure rate, and add a regression test.
+FOLLOW:
+- Why stop at the lowest anomalous layer? => Upper-layer symptoms are usually consequences of lower-layer faults. A replay storm explains latency spikes, but the reverse is rarely true.
+- What is the exception? => A firmware hang can leave every PCIe layer clean while NVMe commands time out, so clean lower layers push you up to the device, not further down.
+PITFALL: Changing several variables at once (new BIOS, new drive, new cable) and losing the ability to say which one mattered.
+
+@@ 17.05 | Intermediate | Cross-layer | tags=ssd-side,telemetry,uart,jtag,firmware-counters
+Q: What visibility does the SSD itself give you for PCIe problems, and what do you ask the firmware team to provide?
+SHORT: The SSD can log what no external tool can: its own LTSSM history, Recovery and speed-change counts, equalization results, per-lane margin, Bad TLP and replay counters as its MAC saw them, and which reset (PERST#, CC.EN, FLR, subsystem reset) arrived and when. Access is through vendor log pages, host-initiated and controller-initiated telemetry, UART and JTAG.
+DEEP:
+- **Vendor log pages:** Get Log Page with a vendor-specific log identifier returns firmware counters and trace buffers.
+- **Telemetry:** the host-initiated log is a snapshot the host requests on demand. The controller-initiated log is created by the SSD itself on an internal event such as an assert, so it can capture the state of a crash.
+- **UART:** a firmware console for prints, register peeks and history dumps. **JTAG or SWD:** halts cores and reads the PCIe controller and PHY registers directly, useful when the firmware is hung.
+- **Counters to request:**
+  - LTSSM state history ring with timestamps.
+  - Recovery entries by reason, speed changes and failed speed changes, down-configuration events.
+  - Equalization phase results and the final preset or coefficients per lane.
+  - Bad TLP, Bad DLLP, LCRC, replay and Receiver Error counts, and flow control stall counts.
+  - Reset events with cause and timestamp, and the firmware boot phase timeline.
+- **Why it matters:** it is the only view of the SSD's own receiver and the only proof of which reset the SSD actually saw.
+- **Limits:** admin commands cannot read logs when the link is down, so the important data must be persisted or held for a UART or JTAG dump. A debug firmware build can change timing and hide a race.
+FOLLOW:
+- How do you line up an SSD-side log with a host-side trace? => Use a shared marker: a GPIO toggle from firmware, a unique command ID or LBA, or an analyzer trigger, since the clocks differ.
+- Who should define the counter set? => Validation, with firmware. Ask for counters that map to the layer checklist and that are readable in production firmware, not just a debug build.
+PITFALL: Trusting a debug-build result for a timing-sensitive failure. If the failure disappears on the debug build, timing changed.
+VERIFY: Log identifiers for the Error Information, SMART, Telemetry Host-Initiated and Telemetry Controller-Initiated pages and the vendor-specific range in the NVMe Base Specification, and any standardized telemetry defined by the OCP Datacenter NVMe SSD specification.
+
+@@ 17.06 | Intermediate | Concept | tags=analyzer,interposer,probe,visibility
+Q: Compare protocol analyzer connection methods, and what an analyzer can and cannot see.
+SHORT: An interposer sits between slot and device, a mid-bus probe attaches to a footprint designed into the board, and a cable or in-line tap sits inside a cabled link. All decode ordered sets, TLPs and DLLPs in both directions and follow the LTSSM. They cannot see analog quality, the device's internal state, or what the device's own receiver decoded. Any interposer changes the channel, which is a real Gen5 pitfall.
+DEEP:
+- **Interposer or in-line tap:** convenient, needs no board planning. It adds a connector pair, trace length and possibly an active retiming stage, so loss and reflections change.
+- **Mid-bus probe:** a footprint (pads or a probe connector) on the board under test, giving the least disturbance, but it must be designed in.
+- **What is visible:** framing, TLP headers and payloads, sequence numbers, LCRC as seen at the tap, Ack and Nak DLLPs, UpdateFC values, SKP and other ordered sets, EIEOS and EIOS, timing between events, and an inferred LTSSM state trail.
+- **What is not:**
+  - The device's receiver view. An LCRC error at the analyzer may be the analyzer's own front end, and a clean capture can hide an error the device saw.
+  - Analog margin and the internal eye.
+  - Internal credit state, firmware state and NVMe internals, except as they show on the wire.
+  - Behavior with the reference clock gated in L1.2, and sometimes the speed-change moments, where the analyzer may relock.
+- **The interposer effect:** a channel with little margin at Gen5 can train at Gen4, or become unstable, once an interposer adds a few dB of loss at Nyquist. An active interposer can also help a marginal channel and hide the fault.
+- **Rule:** compare LnkSta, AER counts and lane margin with and without the interposer before trusting a trace. If the failure changes, capture with a mid-bus probe or use device-side logging.
+FOLLOW:
+- The failure disappears with the interposer installed. What do you conclude? => The interposer changed the channel or timing, so the failure is likely margin or timing related. Verify with margining, and capture from a mid-bus probe.
+- Can the analyzer prove a receiver bug? => Only as a witness. If the wire shows a good TLP and the device NAKs it, the receiver is suspect, but the analyzer's own tap position and equalization can disagree with the device.
+PITFALL: Treating an analyzer capture taken through an interposer as a neutral observation of the failing link.
+VERIFY: The additional loss and retiming behavior of your specific interposer at 16 and 32 GT/s from the vendor, and how your analyzer handles speed changes and L1.2.
+
+@@ 17.07 | Advanced | Concept | tags=analyzer,trigger,filter,timestamp,correlation
+Q: How do you set up analyzer triggers, filters and timestamp correlation so the capture actually contains the failure?
+SHORT: Trigger on the symptom: a Nak DLLP, a replayed sequence number, Recovery entry from L0, a completion with UR or CA status, a poisoned TLP, or a missing completion. Place the trigger so most of the buffer holds the time before it. Use capture filters sparingly because dropped data is lost, and correlate timestamps with shared markers such as command IDs or a hardware trigger between instruments.
+DEEP:
+- **Useful triggers:**
+  - Nak DLLP, or the same sequence number appearing twice (a replay).
+  - LTSSM leaving L0 for Recovery, not counting L1 exit.
+  - Completion status UR or CA, poisoned TLP (EP bit), ECRC error.
+  - A non-posted request with no completion within a set time.
+  - A specific address range, TLP type, length or tag.
+  - An external signal such as PERST# or a firmware GPIO.
+- **Trigger position:** most failures are caused by something earlier. Use a mostly pre-trigger buffer so you see the lead-up, not just the event.
+- **Filters:** a capture filter (drop idle, SKP, Ack and UpdateFC DLLPs, or truncate payloads) extends capture time but permanently drops evidence. Ack and UpdateFC matter for flow control and replay debug, so keep them in that case. Display filters are lossless.
+- **Timestamp correlation:** the analyzer, host and SSD clocks are different domains.
+  - Use the NVMe Command Identifier in the SQE and CQE to tie a host trace (blktrace, ftrace nvme events) to TLPs.
+  - Have firmware toggle a GPIO wired to an analyzer or scope trigger input.
+  - Use trigger out of the analyzer to trigger the scope, so the analog eye is captured at the moment of the Nak.
+- **Buffer sizing:** see the capture-time numeric question in this module.
+FOLLOW:
+- Why not capture everything with no filter? => Full-rate capture fills a large buffer in seconds, so you would catch only the last few seconds before you stopped, not the failure.
+- What if the failure happens once per day? => Use a ring buffer with a hardware trigger on the earliest symptom, header-only capture, and automation to save and re-arm on each trigger.
+PITFALL: Free-running a capture and stopping it by hand after noticing the failure. The lead-up has been overwritten.
+
+@@ 17.08 | Intermediate | Concept | tags=scope,bert,eye,jitter,connector
+Q: What does an eye measured at the connector tell you, and what does it not tell you about the receiver?
+SHORT: A scope at the connector or a test fixture shows the transmitter's output, jitter, presets and reference clock, and the channel's effect if you probe beyond it. At Gen3 and above the raw eye is often closed by channel loss, so the tools apply reference equalization in software. It does not show the receiver's internal eye after its own CTLE, DFE and clock recovery, so a closed connector eye can still run error-free and a clean one can still fail.
+DEEP:
+- **Scope and eye tools:** Tx eye height and width against the compliance mask after a reference channel and reference receiver model, swing, common mode, presets P0 to P10, and refclk jitter and spread-spectrum profile.
+- **BERT:** stresses the receiver with calibrated jitter and noise, and counts errors, usually through loopback. Result: does the DUT keep the BER target under defined stress.
+- **What the connector eye means:** it characterizes the transmitter and the channel up to that point. It cannot include the receiver's adaptation.
+- **The internal eye:** the eye at the slicer after CTLE and DFE is not available on a scope. Lane margining is the tool that reaches it, by moving the receiver's own sampler.
+- **Practical limits:**
+  - Probing needs a test fixture or breakout, and the probe or fixture adds loading and needs de-embedding.
+  - The link must run a known pattern or compliance state, which is not the live-traffic condition.
+  - Bandwidth and cost of Gen5 real-time scopes are high.
+- **Use:** scope for the transmitter and refclk (compliance, characterization), margining for the receiver in system.
+FOLLOW:
+- The connector eye is closed at Gen5 but the link is stable. Is that a problem? => Not by itself. The receiver equalizes the loss, so what counts is the eye after equalization. Use margining and error rates to judge.
+- The eye looks great but Bad TLPs are high. Where do you look? => The receiver side: its equalization result, power noise, clock recovery, or crosstalk that the transmit-side view does not show. Run margining on that lane.
+PITFALL: Judging a Gen4 or Gen5 link by an unequalized eye at the pins. The spec measures after reference equalization for a reason.
+VERIFY: Reference channel, reference receiver and test-point definitions in the PCI-SIG electrical test specification for your generation.
+
+@@ 17.09 | Advanced | Concept | tags=margining,lane-margining,automation,receiver
+Q: Why is lane margining at the receiver the best in-system tool, and how do you use it in a validation flow?
+SHORT: It measures how much timing and voltage margin the real receiver has after its real equalization, per lane, on a live link, on a customer or lab system, with no extra hardware in the channel. It is scriptable across resets, temperatures and units, so you get margin distributions, not a single reading. It tells you how much margin exists, not why it is small, and the values are implementation-specific.
+DEEP:
+- **Why it is best:** the sample point is inside the actual receiver, after CTLE and DFE. Nothing is added to the channel, and it runs on production systems.
+- **Mechanism (see the Physical Layer module):** the Lane Margining at the Receiver capability provides per-lane controls to shift the sampling point in time or voltage and count errors against a limit. Software drives it from the Downstream Port side.
+- **Validation flow:**
+  1. Confirm the capability exists on the port and device, and that BIOS has not blocked it.
+  2. Establish a baseline distribution on known-good units and slots.
+  3. Margin every lane in both directions (each direction has its own receiver) at each speed, temperature and voltage corner.
+  4. Record the worst lane, the spread across lanes, and the change from baseline.
+  5. Gate on thresholds from silicon characterization, and trend across firmware, BIOS and reset cycles.
+- **Retimers:** the margining protocol can address retimer receivers too, so a retimed link can be examined per segment, if the retimer supports it.
+- **Interpretation:** a lane with much less margin than its neighbors points at a via, connector pin or PHY lane. Uniformly low margin points at loss, clock, or power. Falling margin with temperature points at a thermally sensitive component.
+- **Limits:** implementations differ in step count, resolution, and whether the error sampler is independent of the data path, so compare within one design. Margin is not a substitute for an error-rate test.
+FOLLOW:
+- Which direction does margining at the root port measure? => The SSD-to-host direction: the SSD transmitter, the channel and the root port receiver. Margining at the SSD receiver measures host to SSD.
+- Does the platform always let you margin? => No. Some root ports do not implement it or firmware locks it, so plan for the case where only the SSD side can be margined.
+PITFALL: Reporting one margin number per link. Report per lane and per direction, since the worst lane decides the link.
+VERIFY: Which data rates require Lane Margining at the Receiver support (and whether voltage margining is mandatory), the extended capability ID (0027h), the retimer receiver numbering, and the pciutils margining tool (pcilmr) and its minimum version.
+
+@@ 17.10 | Intermediate | Concept | tags=compliance,pci-sig,integrators-list,cbb,clb,loopback
+Q: How does the PCI-SIG compliance program work at a concept level, and what do the test boards and loopback do?
+SHORT: PCI-SIG runs Compliance Workshops where members test devices, and devices that pass are listed on the Integrators List. Electrical testing uses a Compliance Base Board (CBB) to test add-in cards and a Compliance Load Board (CLB) to test host systems. The tests cover transmitter, receiver, reference clock and channel. Receiver tests put the device into Loopback so a BERT can count errors on stressed data.
+DEEP:
+- **Compliance Workshops:** organized events where members test products with the reference test equipment and against other members' products.
+- **Integrators List:** the public list of products that passed the program for a given generation and form factor. It is what integrators consult for a pass.
+- **CBB and CLB:** the CBB is a reference host board into which an add-in card under test is inserted, with breakout to instruments. The CLB plugs into a system's slot as a reference load and lets the host's transmitter and clock be measured.
+- **Tx test:** the device enters a compliance state and emits patterns (and steps through presets), and a scope checks eye, jitter, swing and preset accuracy against reference receiver models.
+- **Rx test:** a BERT sends a calibrated stressed signal. At Gen3 and above the BERT first goes through link training and equalization with the DUT, then puts it into Loopback so it returns the received bits for error counting.
+- **Refclk and channel tests:** refclk jitter and spread-spectrum, and insertion loss, return loss and crosstalk of connectors and cables.
+- **Meaning:** passing shows the design meets the electrical envelope under reference conditions. See the Physical Layer module for why customer systems can still fail.
+- **In-house use:** run pre-compliance on your own samples, and complement it with margin and link-up yield testing in real platforms.
+FOLLOW:
+- Does an NVMe SSD also need NVMe compliance? => Yes, separately. NVMe protocol conformance and interoperability testing is run by a different program (commonly UNH-IOL) with its own integrators list.
+- Why is Loopback needed at all for the Rx test? => The BERT has no other view of what the device received, so the device echoes the bits back and the BERT counts the errors.
+PITFALL: Describing compliance as "the SSD is certified for all systems". It is a pass against reference conditions for a specific generation and form factor.
+VERIFY: Exact names and status of the PCI-SIG workshop and Integrators List programs, which generations and form factors (M.2, U.2, E1.S, E3.S) have active compliance programs, the CBB and CLB usage rules, and the NVMe compliance program details.
+
+@@ 17.11 | Advanced | Numeric | tags=analyzer,capture-buffer,filtering,line-rate
+Q: How long does a 64 GB analyzer capture buffer last at Gen4 x4 full line rate, and what does filtering buy you?
+SHORT: A Gen4 x4 link carries about 7.88 GB/s per direction after decoding. Capturing both directions at full rate is about 15.75 GB/s, so 64 GB fills in about 4.1 seconds (8.1 s for one direction), and Gen5 x4 halves that to 2 seconds. Dropping TLP payloads keeps about 26 of about 282 bytes per 256 B TLP, roughly 11 times longer: about 44 s at saturation, and less of a gain for traffic that is mostly small TLPs, which shrink far less than payload-heavy traffic.
+DEEP:
+Assumptions: Gen4 x4, 16 GT/s x 4 lanes x 128/130, the analyzer stores about one byte per decoded byte with no compression, a 256 B payload with a 4DW header, and a 64 GB buffer. Real analyzers add timestamp and metadata, so treat this as an upper bound (vendor detail, VERIFY).
+1. Per direction: 16e9 x 4 x 128/130 / 8 = 7.877 GB/s.
+2. Both directions saturated: 2 x 7.877 = 15.75 GB/s. Time = 64 / 15.75 = **4.06 s**. One direction only: 64 / 7.877 = 8.1 s.
+3. Gen5 x4: double the rate, so 2.03 s for both directions.
+4. Filtering payloads: one 256 B TLP is 256 + 16 (header) + 2 (sequence number) + 4 (LCRC) + 4 (framing token) = 282 B. Keeping everything but the payload is 26 B, a ratio of 10.8. Saturated: 4.06 x 10.8 = **44 s**.
+5. A realistic 4 KB random read workload at 3.5 GB/s of payload: upstream about 3.5 x 282/256 = 3.9 GB/s, plus about 0.2 GB/s downstream (assumed: doorbells, SQE completions, DLLPs), so about 4.1 GB/s total. Unfiltered: 64 / 4.1 = **16 s**. Header-only: the upstream data shrinks to 3.9 x 26/282 = 0.36 GB/s, while the small downstream TLPs stay near 0.2 GB/s, so about 0.56 GB/s and 64 / 0.56 = **about 114 s**.
+6. SKP ordered sets are about 16 B per 370 or so blocks, roughly 0.3 percent. They clutter the trace but barely change capture time.
+
+- **Conclusion:** even 64 GB gives seconds to minutes. So capture must be trigger-driven, with a ring buffer, pre-trigger depth and header-only or otherwise filtered capture for anything that takes longer to happen than that.
+- **What filtering costs:** dropping payload loses data corruption evidence. Drop what the hypothesis does not need.
+FOLLOW:
+- Which direction fills first in a read-heavy workload? => Upstream, since the SSD sends the data. Some analyzers let you allocate buffer per direction or filter one side.
+- How would you capture a failure that appears once per hour? => Trigger on the earliest symptom, header-only, hardware-trigger a save, re-arm automatically, and log which triggers fired.
+PITFALL: Quoting buffer time at full line rate for a trace of a real workload, or at the decoded rate for an analyzer that stores raw symbols with overhead.
+VERIFY: How your analyzer stores data (raw symbols versus decoded, timestamp overhead, compression) and the SKP ordered-set interval for 128b/130b in the Base Specification.
+
+@@ 17.12 | Advanced | Trap | tags=lnksta,link-up,retrain,lbms,health
+Q: The lab report says "link up at Gen5 x4, so the link is healthy". Why is that not proof, and what else do you check?
+SHORT: LnkSta only reports the speed and width at the moment you read it. It does not say how many times the link retrained or downtrained on the way, how much margin the receiver has, whether one lane is nearly dead, what the error rate is under load, or whether it will come up again on the next reset or at temperature. Healthy needs evidence over time: error rates, Recovery counts, margin per lane, throughput, and link-up yield.
+DEEP:
+- **What "up at Gen5 x4" proves:** at some point the LTSSM reached L0 at that speed and width, and the Data Link Layer became active.
+- **What it does not prove:**
+  - **Stability:** a link that retrains every minute looks identical to a stable link when you read LnkSta between retrains.
+  - **Margin:** a link at the edge of its budget still trains. Margin per lane decides if it survives a hot day.
+  - **Error rate:** replays cost throughput without changing LnkSta.
+  - **Each direction and each lane:** a link with one weak lane is still "x4".
+  - **Repeatability:** one good boot says nothing about the yield over hundreds of resets.
+  - **Retimer segments:** each segment negotiates separately (see the Equalization and Retimers module).
+- **Evidence to collect instead:**
+  - Clear then read the sticky Link Bandwidth Management Status and Link Autonomous Bandwidth Status bits (lspci shows BWMgmt and ABWMgmt) after a soak. If they set, the link changed speed or width.
+  - Correctable AER rates per hour under load, Replay Number Rollover, and vendor Recovery counters.
+  - LnkSta2 equalization results and per-lane margin at both ends.
+  - Throughput against the link ceiling, and link-up yield over many resets.
+- **Reverse trap:** LnkSta at Gen4 on a Gen5 device may be a slot limit or Target Link Speed setting, not a fault. Compare with both ends' LnkCap and Link Control 2 first.
+FOLLOW:
+- How would you catch a link that downtrains and recovers? => Poll LnkSta and the bandwidth status bits at a short interval, keep the LTSSM history from the SSD, and count Recovery entries.
+- Is a link at less than max speed always broken? => No. Check the capabilities and settings of both ends, including the slot, BIOS and ASPM policy, before calling it a fault.
+PITFALL: Signing off link health with one screenshot of lspci output.
+VERIFY: The exact conditions that set Link Bandwidth Management Status and Link Autonomous Bandwidth Status in the Base Specification, which differ for hardware-initiated and software-initiated changes.
+
+@@ 17.13 | Advanced | Debug | fig=ltssm | tags=ltssm,history,recovery,detect,cause-mapping
+Q: You have an LTSSM state history for a failing link. How do you map the patterns to causes?
+SHORT: Read where the machine loops and how often. Detect loops mean no receiver. Polling loops or Polling.Compliance mean no partner signal. A Recovery to Detect loop after a power cycle usually means a speed change or equalization that cannot complete. Periodic L0 to Recovery to L0 points to errors or lock loss under load. A Recovery followed by Configuration and a narrower width means a lane died.
+DEEP:
+| History pattern | Reading | Likely causes | Next evidence |
+|---|---|---|---|
+| Detect.Quiet and Detect.Active repeat | No receiver found | Device unpowered or held in reset, connector, missing lane | Rails, PERST#, connector, presence signals |
+| Polling.Active to Polling.Compliance | Termination present but partner silent | PERST# held, no refclk, firmware not started | Reset timing, refclk at the device |
+| Polling or Configuration back to Detect | Partner never completes training | Refclk, reset skew, signal integrity, lane wiring | Which lanes, TS1 seen or not |
+| L0 at Gen1, Recovery.Speed, Recovery.RcvrLock, timeout to Detect, repeated | Speed change fails and the link restarts | PLL or refclk at the higher rate, equalization failure, channel loss, retimer state, cold-only calibration | Force lower Target Link Speed, compare cold with warm, LnkSta2 equalization bits |
+| L0 to Recovery to L0 every few minutes | Errors or lock loss under load | Replay Number Rollover, Receiver Error, thermal drift, power noise, SSC | Correlate with load and temperature, Recovery initiator, AER |
+| Recovery to Configuration to L0 at lower width | A lane dropped out | Lane wiring, connector, PHY lane | Margin per lane, which lane went missing |
+| L0 to L1 to Recovery to L0 in microseconds | Normal ASPM traffic | None, but check exit latency | LTR and latency numbers |
+
+- **Count carefully:** exclude L1 exit Recoveries. Count Recovery entries from L0 per hour, and the duration in Recovery (microseconds versus milliseconds).
+- **Who initiated:** the analyzer shows which end left L0 first. The reason is in the controller's debug registers.
+- **The loop after a power cycle:** the link trained at Gen1, so Detect, Polling and Configuration are fine. The fault is in Recovery at the higher rate, and since a failed speed change should normally fall back to a lower speed, the return to Detect means the fallback also failed. Check for a retimer or clock that is not stable after a cold start.
+- State meanings and timeouts are in the LTSSM module.
+FOLLOW:
+- Cold boot fails, warm reset works. What do you suspect? => Power and reset sequencing, retimer or clock not ready, or temperature-dependent PLL calibration. Compare timing of rails, refclk and PERST# at both.
+- How would you tell a bad lane from a bad channel? => Margin per lane and per direction, and the lane numbers in the width change. One lane means a local fault, all lanes means loss, clock or power.
+PITFALL: Treating every Recovery entry as an error. L1 exit and speed changes go through Recovery by design.
+VERIFY: Recovery sub-state transitions and timeouts that lead to Detect in your specification revision, and how your tool names the LTSSM states.
+
+@@ 17.14 | Advanced | Debug | tags=temperature,bad-tlp,replay,throughput,eq-drift
+Q: Sequential read throughput is 7.0 GB/s at 25 C but drops to about 6.2 GB/s at 70 C, and Bad TLP counts rise on the root port. How do you debug it?
+SHORT: First prove it is PCIe replay and not SSD thermal throttling: check the SSD temperature and throttle counters, and compare the loss with the Bad TLP rate. An 11 percent loss implies a BER near 2e-6, or about 1e5 Bad TLPs per second. Then localize the temperature-sensitive part with local heating and cooling, run lane margining at both ends across temperature, and test whether a retrain at temperature restores the link.
+DEEP:
+1. **Rule out throttling:** `nvme smart-log` composite temperature and thermal management counters. Throttling cuts throughput without Bad TLPs. Here Bad TLPs rise on the receiver of the read direction, which is the root port, so replay is real.
+2. **Quantify with the replay model** (Data Link module, Gen4 x4, 282 B TLPs, window of 30 TLPs): efficiency = 1 / (1 + 67,200 x BER). A drop from 7.0 to 6.2 GB/s (efficiency about 0.886) gives BER = (1/0.886 - 1) / 67,200 = about 1.9e-6. Per-TLP error probability is 2240 x 1.9e-6 = 4.3e-3. At 7.0 GB/s that is about 24.8 million TLPs per second, so about 1e5 Bad TLPs per second.
+3. **Sanity check the counters:** if the measured rate is 10 per second, replay explains almost none of the loss. Note AER status bits are sticky flags and OS counters count reported events, so they undercount. Use the SSD's or root port's PHY counters, or the analyzer, for true rates.
+4. **Localize:** the chamber heats everything. Use a thermal head or spot heating and cooling on the SSD controller, the retimer, the root complex and the connector one at a time. Swap parts, and run margining on both ends at 25 C and 70 C.
+5. **Separate margin loss from stale equalization:** at 70 C, force a retrain (Retrain Link) or re-equalize. If errors vanish, equalization adapted at 25 C is stale. If they stay, real margin was lost.
+6. **Mechanisms to check:** channel and connector loss rising with temperature, CTLE or PLL drift in a PHY, refclk source or SSC generator drift, regulator noise at temperature.
+7. **Fix candidates:** re-equalization policy, preset tuning, clock or power fix, thermal design.
+FOLLOW:
+- LnkSta is unchanged at 70 C. Does that rule out link problems? => No. Replays and Bad TLPs happen with the link staying at Gen4 x4. Only a retrain or downtrain would change LnkSta.
+- What if the loss is 11 percent but Bad TLP rate is only about 50 per second? => Replay is not the main cause. Look at thermal throttling, firmware behavior at temperature, or flow control and latency effects.
+PITFALL: Blaming the SSD because it is the unit inside the chamber. The root port, retimer, board and connector are at 70 C as well.
+VERIFY: Which correctable errors your root port reports and how the OS counts them, and the temperature and throttle fields in your drive's SMART log.
+
+@@ 17.15 | Advanced | Debug | tags=warm-reboot,perst,enumeration,crs,timing
+Q: An NVMe SSD sometimes disappears from the bus after a warm reboot but always shows up after a cold power cycle. How do you find out why?
+SHORT: Warm reboot differs from cold in reset and power sequencing: the SSD keeps power, may not see a proper PERST# assertion, may have a dirty shutdown to recover from, and the BIOS enumerates on a fixed schedule. The suspects are the SSD being not ready in time, PERST# or refclk timing, and a link that does not retrain. Capture PERST#, refclk, the LTSSM and the first config reads at the failure to see which.
+DEEP:
+1. **Where does it fail?** The evidence points to a stage:
+
+| Observation at the failure | Meaning |
+|---|---|
+| LTSSM stays in Detect | No receiver termination: power, reset or connector |
+| Polling.Compliance | SSD terminated but silent: held in reset, no refclk, firmware not started |
+| L0 reached, config reads return CRS or the BIOS times out | SSD firmware not ready in time |
+| Config space reads fine, driver finds no controller | CSTS.RDY or firmware issue after enumeration |
+
+2. **Measure the reset:** scope PERST#, refclk and the 3.3 V rail through the reboot. Was PERST# asserted at all, for how long, and was refclk stable before it was released? The CEM parameters are about 100 ms from power valid to PERST# release, and refclk stable about 100 microseconds before release (VERIFY).
+3. **Dirty shutdown:** check `unsafe_shutdowns` in the smart-log. If a warm reboot without a shutdown notification forces power-loss recovery in firmware, the SSD may take seconds to become ready. A robust device brings the link up early and returns CRS or CSTS.RDY = 0 until ready. It should not delay training.
+4. **Time it:** from PERST# release to first TS1, to L0, to the first successful config read, and to CSTS.RDY. Compare the failing boot with a good one.
+5. **Confirm with a rescan:** after the OS is up, `echo 1 > /sys/bus/pci/rescan`. If the drive appears, the link and drive were slow, not dead.
+6. **Fix options:** firmware (start training and answer CRS sooner, shorten recovery), BIOS (longer wait or a proper PERST# pulse), platform (PERST# and refclk timing).
+FOLLOW:
+- Why does the rescan result matter? => It separates "not ready in time" from "not on the link". A drive that appears later was alive and late.
+- Would you also try hot reset and FLR? => Yes, as separate variables. A warm reboot may not toggle PERST#, so hot reset paths and SSD reset handling in the Resets module are relevant.
+PITFALL: Treating a warm reboot as a mild cold boot. It removes the power cycle that cleans up the SSD, retimer and clock state.
+VERIFY: PERST# and refclk timing parameters in the CEM specification, and the requirements for device readiness and CRS behavior after Conventional Reset in the Base Specification.
+
+@@ 17.16 | Principal | Debug | tags=correlation,nak,bios,poison,two-factor
+Q: Three failures each follow one variable: NAK storms after a specific TLP size, completion timeouts only with one host BIOS version, and poisoned TLPs from the SSD only on writes to one address range. How do you attack each one?
+SHORT: Treat each as an experiment on one variable. For the TLP size, sweep sizes and speeds, and use the analyzer as a witness to see whether the LCRC is wrong on the wire. For the BIOS, diff config space between versions and check settings like MPS, tags, ASPM and IOMMU. For poison, decide whether the address is a host address, an LBA or an SSD-internal buffer, then vary each independently.
+DEEP:
+| Failure | First question | Experiment | Likely causes |
+|---|---|---|---|
+| NAK storm at one TLP size | Is it deterministic or statistical? | Sweep payload length in DW steps at Gen1 to Gen5, and see if only some speeds fail | Framing, alignment or LCRC bug in the datapath (deterministic), or extra exposure to bit errors (statistical) |
+| Completion timeouts with one BIOS | What did the BIOS program differently? | `lspci -vvv` diff of the whole tree between BIOS versions, then change one setting at a time | Completion Timeout range, MPS or MRRS, 10-bit tags or extended tags, relaxed ordering, ASPM and L1 substates, IOMMU, C-state settings |
+| Poison on one address range | Which address is it? | Fix the LBA and move the host buffer, then fix the buffer and move the LBA | Host address bit or 4 KB crossing handling, internal SRAM or DRAM ECC on one region, firmware DMA descriptor bug |
+
+- **NAK storm details:** at Gen3 and above, the 128b/130b framing puts length in the STP token, so a bug that shows only at one length, or only at Gen3 and up, points to framing or datapath alignment. A random SI problem would grow smoothly with size and speed, not step at one size.
+- **Analyzer as a witness:** if the analyzer sees a bad LCRC on the wire, the transmitter or encoder is at fault. If the wire is clean and the receiver still NAKs, suspect the receiver or its equalization. The tap position matters.
+- **Timeout details:** the SSD is the requester when it reads host memory (SQE fetch, PRP list, write data). A late completion can come from the IOMMU walk, a deep CPU package C-state, or the root port in L1. Use the analyzer to check whether the completion was late or never sent.
+- **Poison details:** EP on an SSD memory write means the SSD marked its own data as bad, for example on an uncorrectable internal ECC error, or software or firmware set it. The receiver logs Poisoned TLP Received. Record the TLP header address, the NVMe command and its LBA, and the buffer address.
+FOLLOW:
+- The NAK storm is deterministic at one size and only above Gen2. What does that suggest? => A 128b/130b framing or alignment issue, not signal integrity. Confirm with the same size at Gen2, and by reading the wire LCRC.
+- Timeouts vanish when ASPM L1 is disabled in the new BIOS. What does that mean? => The exit latency or LTR handling under that BIOS is too slow for the device. Check L1 substate settings and completion timeout range.
+PITFALL: Changing the variable and a second thing at once. A two-factor experiment (hold one fixed, sweep the other) is the only way to separate host address from LBA from buffer.
+VERIFY: Poisoned TLP and Completion Timeout bit names and default completion timeout range in the Base Specification, and the 128b/130b STP token and framing rules.
+
+@@ 17.17 | Principal | Scenario | tags=automation,triage,pipeline,classification,evidence
+Q: How would you build a triage-automation pipeline that collects evidence on failure and classifies the failure signature?
+SHORT: Detect a failure event, then run a fixed, read-only collection sequence before any reset: config space of the SSD and all upstream ports, AER, LnkSta and LnkSta2, dmesg, NVMe logs, SSD debug and LTSSM logs, and temperatures, with timestamps. A rule-based classifier maps the evidence to a signature (link down, downtrain, correctable storm, uncorrectable error, controller fatal, clean-lower-layers timeout), stores it with the platform context, and escalates unknown signatures.
+DEEP:
+- **Trigger:** an NVMe timeout or controller reset in the kernel log, an AER event (`ras:aer_event`, rasdaemon), a link change in a poller, a harness I/O error, or an analyzer trigger.
+- **Collect, in this order (read-only, with per-step timeouts, and no reset):**
+  1. Timestamp, unique failure ID, DUT, slot, BIOS, kernel, firmware versions.
+  2. Config space (`lspci -xxxx`) for the SSD, every upstream port and any retimer. Config reads first, since they are safe on a dead link and return all 1s.
+  3. AER status and mask, LnkSta, LnkSta2 and the bandwidth status bits, DPC status.
+  4. BAR0 CSTS and CC only after config space shows a live device, since an MMIO read to a dead device can stall or escalate on some platforms.
+  5. dmesg and journal window, sysfs AER counters.
+  6. `nvme smart-log`, `error-log`, controller-initiated telemetry, vendor debug log, LTSSM history.
+  7. Temperatures and rails, analyzer save through its API.
+- **Classify (example rules):**
+
+| Evidence | Signature |
+|---|---|
+| Config all 1s or DLLLA clear, CSTS 0xFFFFFFFF | Link down or device gone |
+| Config live, LnkSta below LnkCap or width reduced | Downtrain (equalization or lane) |
+| Live link, rising CESta rates | Correctable storm (margin) |
+| UESta set: completion timeout, poison, UR, surprise down | Uncorrectable class |
+| Config live, CSTS.CFS set | Controller fatal (firmware) |
+| All layers clean, commands time out | Firmware stall or host-side (interrupt, IOMMU, driver) |
+
+- **Store and act:** one JSON record per failure with the raw dumps attached, dedup by signature and platform, trend by firmware and BIOS version, and page a human only on unknown signatures or a rate above the baseline.
+- **Feedback:** compare classifier labels with human root causes and add rules for what it misses.
+- **Guard rails:** do not clear sticky bits before saving, do not reset until collection ends (or the hold-off expires), and keep the collection from perturbing the failure.
+FOLLOW:
+- How do you keep the pipeline from destroying evidence? => Read-only steps, with clearing and resets in a separate stage that runs only after all evidence is saved and the record is written.
+- How do you measure the pipeline's value? => Time from failure to signature, percent of failures classified without a human, agreement with human root cause, and the share of failures with complete evidence.
+PITFALL: Building the collector so that it clears counters, reloads the driver, or reboots as its first step, and then finding the evidence is gone.
+VERIFY: Platform behavior of an MMIO read to a dead device (timeout versus machine check), and how DPC and hot-plug handling on your platform interact with collection.
+
+@@ 17.18 | Principal | Scenario | tags=stress,corners,soak,statistics,error-injection,pass-criteria
+Q: Design a stress and corner test plan for a Gen5 x4 SSD's PCIe link, with pass criteria and statistics.
+SHORT: Build a corner matrix of voltage, temperature, refclk (SSC on and off, frequency offset), slots and cables, and speeds. On each cell run reset cycles, long fio soaks with data verify, margin sweeps and error injection. Pass criteria: zero uncorrectable errors and miscompares, correctable rates below a threshold set from throughput impact, minimum lane margin above the characterization limit, and link-up yield with a stated upper bound from the rule of three.
+DEEP:
+| Axis | Levels |
+|---|---|
+| Rail voltage | Nominal, and the low and high limits of the form factor's supply tolerance |
+| Temperature | Cold, ambient, hot (case and ambient), plus thermal ramps |
+| Refclk | SSC off and on (down-spread, about 30 to 33 kHz modulation), frequency offset toward the plus and minus limits (VERIFY) |
+| Channel | Best and worst slot, cable and backplane length, with and without retimer, several units |
+| Speed and width | Gen1 to Gen5, and forced downtrain and retrain |
+| Events | Cold power cycle, warm reboot, hot reset, FLR, CC.EN toggle, L1.2 entry and exit |
+
+- **Test types per cell:**
+  - Reset and link-up cycles, thousands.
+  - Soak: 72 to 168 hours of mixed fio with `--verify=crc32c` on a scratch drive.
+  - Lane margining sweeps at each corner.
+  - Error injection: LCRC, poisoned TLP, UR, completion timeout, surprise down, with the recovery path verified (see the scenarios module).
+- **Pass criteria:**
+  - Zero uncorrectable errors and zero data miscompares.
+  - Correctable error rate below a threshold from the replay model, for example under 0.1 percent throughput loss.
+  - Worst-lane margin above the limit from silicon characterization, with no lane far below its neighbors.
+  - Link-up yield: 3,000 clean trials give a 95 percent upper bound of 0.1 percent failure, 30,000 give 0.01 percent (rule of three, 3 / n).
+  - Latency: no stalls beyond the QoS budget.
+- **Statistics traps:** failures cluster by unit, slot and temperature, so do not pool trials across units, and report per-corner and per-unit results. For a BER claim, 1e-12 at 95 percent confidence needs 3e12 error-free bits on that lane: 94 s at 32 Gb/s and 188 s at 16 Gb/s, per lane.
+- **Automation:** the evidence pipeline from this module runs on every failure, and the corner controller logs the environment with every result.
+FOLLOW:
+- One unit fails once in 3,000 cycles. Is it a fail? => The 95 percent upper bound with one failure is about 4.7 / n, near 0.16 percent. Investigate it as a real defect first. Do not average it away.
+- Why include SSC off? => Some systems run without spread spectrum, and a design that passes only with SSC on may depend on clock tolerance it does not have. Test both.
+PITFALL: Pooling all units and corners into one pass rate. A corner or unit that fails is hidden by the many that pass.
+VERIFY: Supply tolerance for your form factor, the refclk frequency tolerance and SSC parameters in the CEM and Base Specifications, and the fixtures used for refclk offset.

@@ -1,0 +1,345 @@
+# Module 15 — Resets, Hot-Plug & Form Factors
+
+@@ 15.01 | Basic | Concept | tags=reset,fundamental,hot-reset,flr,taxonomy
+Q: What kinds of reset does PCIe define, and how is each one triggered?
+SHORT: PCIe defines Conventional Reset and Function Level Reset. Conventional Reset is either a Fundamental Reset (the PERST# pin or an equivalent: cold if power is cycled, warm if power stays on) or a Hot Reset (TS1s with the Hot Reset bit, triggered by Secondary Bus Reset in the bridge above). Software can also reset a function through a D3hot to D0 transition when No_Soft_Reset is clear, or by disabling the link. FLR resets one function only.
+DEEP:
+Think of the resets as a ladder of scope, from one function up to the whole card.
+- **Fundamental Reset:** hardware, usually the PERST# pin (active low). Cold reset means power is removed and reapplied. Warm reset means PERST# asserts while power stays up (reboot button, watchdog, OS reboot). Everything in the device restarts, including the link.
+- **Hot Reset:** in-band. Software sets Secondary Bus Reset in Bridge Control of the port above the device. The port sends TS1s with the Hot Reset bit (the LTSSM side is in the LTSSM module) and every function below it resets.
+- **Link Disable:** software sets Link Disable in the port's Link Control. The link goes to Disabled and the device sees a link-down. Clearing the bit retrains.
+- **D3hot to D0:** when the function's No_Soft_Reset bit (PM Control/Status) is 0, the transition performs an internal soft reset and software must reinitialize the function. When it is 1, state is kept.
+- **FLR:** software sets Initiate Function Level Reset in the function's own Device Control register. Only that function resets, the link is untouched.
+- **Not PCIe resets:** NVMe CC.EN and NVM Subsystem Reset are NVMe-level. The Cross-layer questions in this module and in module 16 map them to the PCIe resets.
+FOLLOW:
+- Which resets can a driver trigger without touching a bridge? => FLR and the D3hot to D0 power-state write, because both use the function's own registers. Hot reset and link disable need the upstream port's registers.
+- Is every warm reboot a PERST# pulse? => Usually, but platforms differ in whether they pulse PERST#, drop slot power, or gate the reference clock. Scope it rather than assume (see the warm-reboot debug question).
+PITFALL: Calling every reset a "hot reset" and treating them as interchangeable. Their scope, sticky-bit behavior and recovery timing differ.
+VERIFY: The Conventional Reset definition in the Base Specification (Fundamental Reset, Hot Reset and the other events that must cause a reset), whether Link Disable is defined to reset the device below, and the No_Soft_Reset bit position (PM Control/Status).
+
+@@ 15.02 | Intermediate | Concept | fig=resets | tags=reset,sticky,scope,aer
+Q: What does each reset clear and what survives it, including sticky registers?
+SHORT: Only a Fundamental Reset restarts everything, including sticky registers such as AER status (unless the device keeps them alive with auxiliary power). Hot reset, FLR and D3hot to D0 reset function state and most config registers to defaults but leave sticky bits alone. FLR and D3hot to D0 leave the link up. NVMe CC.EN resets only the controller, and NSSR resets the whole NVMe subsystem.
+DEEP:
+The diagram shows the matrix. The columns to remember when writing tests:
+- **Link:** PERST#, hot reset and link disable drop the link and it retrains through Detect. FLR, D3hot to D0 and CC.EN do not touch it. NSSR may or may not, depending on the device.
+- **Config space:** BARs, Command (Bus Master and Memory Space Enable), MSI-X enables and similar registers go back to defaults on PERST#, hot reset, FLR and a soft-reset D3hot to D0. CC.EN leaves them alone.
+- **Sticky registers:** AER status, mask, severity and header log (attributes ROS, RWS, RW1CS) are not reset by hot reset, FLR or D3hot to D0. That is on purpose: the error information survives the reset that error recovery caused.
+- **Aux power:** the spec ties sticky retention across Fundamental Reset to auxiliary power. A typical SSD has none for this, so its AER status is normally lost across a warm reboot. Read and log AER before you reset.
+- **Device logic:** PERST# restarts all internal firmware and hardware. FLR must stop and clear that function's activity but not other functions.
+- **Test consequence:** stale W1C status bits from the last test make the next test look failed. Clear them (write 1) after every reset, and diff config space against a golden dump.
+FOLLOW:
+- Why keep sticky bits across hot reset? => So a fatal error that triggered DPC or a hot reset can still be diagnosed after recovery.
+- Does a D3hot to D0 transition clear AER status? => No. Under the sticky rule only a Fundamental Reset does, and only when auxiliary power is not keeping the bits alive.
+PITFALL: Assuming FLR or hot reset gives a clean slate for error registers. Sticky bits persist and will show old errors.
+VERIFY: The exact sticky rules (ROS, RWS, RW1CS attributes and the auxiliary power condition) in the Base Specification register-attribute section, and the list of state FLR must not reset.
+
+@@ 15.03 | Basic | Concept | tags=perst,power-sequencing,refclk,timing
+Q: What must be true before PERST# is deasserted, and which timings matter?
+SHORT: The order is: power rails stable, then the reference clock running and stable, then PERST# deasserts (rises). The CEM specification defines a minimum of 100 ms from power stable to PERST# inactive (T_PVPERL) and requires REFCLK stable for about 100 microseconds before PERST# rises. Deasserting too early starts link training while the device is still in its own power-on initialization.
+DEEP:
+1. Rails ramp (12 V where present, 3.3 V, 3.3 V aux) and reach their valid range. Power is "stable" from this moment.
+2. Hold PERST# asserted for at least T_PVPERL (100 ms) after power is stable.
+3. REFCLK (100 MHz differential) starts and stabilizes at least about 100 microseconds before PERST# deasserts (T_PERST-CLK).
+4. PERST# deasserts. The device begins receiver detection and link training, and its firmware continues booting in parallel.
+5. On power-down or warm reset the reverse holds: PERST# must assert before the rails or the clock become invalid, and on a warm reset it must stay asserted for a minimum width (T_PERST, about 100 microseconds).
+- **Who owns the signals:** the CPU or PCH on a desktop, a CPLD or BMC-controlled fan-out on a backplane, or a hot-plug controller per slot. Programmable delays in any of them can violate the timing.
+- **Why it matters for SSDs:** the SSD's controller PLLs and firmware boot are still settling. A short T_PVPERL or a noisy refclk gives yield problems that look like random link-up failures, not a hard fault.
+- **PERST# level:** a 3.3 V single-ended signal in the CEM and M.2 world (form-factor specs restate it).
+FOLLOW:
+- What happens if PERST# rises before the clock is stable? => The device's PLL may not lock, so training stalls in Detect or Polling on some units and works on others, which shows up as an intermittent link-up yield.
+- How do you prove a platform meets the sequence? => Scope 12 V, 3.3 V, REFCLK and PERST# at the slot connector with the SSD installed and read the cursor deltas, over many boots and temperatures.
+PITFALL: Trusting the schematic or the BIOS setting. Delays are often programmable and errata exist. Measure at the connector.
+VERIFY: T_PVPERL (100 ms), T_PERST-CLK (100 microseconds), T_PERST (100 microseconds), T_FAIL (power down to PERST# active, 500 ns) and PERST# voltage levels in the CEM specification, and any tighter values in the M.2, U.2 and EDSFF specifications.
+
+@@ 15.04 | Intermediate | Concept | tags=flr,device-control,transactions-pending,linux
+Q: How does Function Level Reset work, what does it reset, and how long must software wait?
+SHORT: An endpoint that advertises FLR capability in Device Capabilities resets when software sets Initiate Function Level Reset in Device Control. The function drops outstanding requests, clears its internal state and returns most registers to defaults, without touching the link, other functions, or sticky bits. It must complete within 100 ms, and software waits at least that long before accessing it.
+DEEP:
+1. **Quiesce:** the driver stops issuing I/O and clears Bus Master Enable. It then waits for Transactions Pending in Device Status to clear, or waits out the completion timeout, so late completions cannot land after the reset.
+2. **Initiate:** set the FLR bit (Device Control bit 15 on an endpoint that has it).
+3. **Wait:** at least 100 ms. The spec expects the function to be done within that time. Software must not send config requests during that window. After it, the function may still return CRS if CRS software visibility is on.
+4. **Restore:** BARs, Command, MSI-X, ASPM and so on go back to defaults, so software rewrites them. Linux does this in `pci_reset_function()`, which saves config space, resets, and restores it.
+- **Not reset:** the link and its state, sticky bits (AER), HwInit registers, and some link-related or captured fields. A multi-function device resets only the target function. For an SR-IOV PF, its VFs go with it.
+- **Linux handles:** `echo 1 > /sys/bus/pci/devices/<BDF>/reset`, and the `reset_method` file that lists which methods (flr, pm, bus and others) the kernel may use. The NVMe driver has reset prepare and done hooks so it can tear down and rebuild its queues.
+- **Capability check:** `lspci -vv` shows `FLReset+` or `FLReset-` in DevCap.
+FOLLOW:
+- Why wait for Transactions Pending? => A DMA that was in flight when the FLR hit could return a completion after the function came back, into a buffer that was reused, which corrupts memory.
+- What does FLR mean for an NVMe SSD? => It is a controller-level reset through PCIe. It resets controller state and PCIe function state but not the NAND contents or the link.
+PITFALL: A test script that issues FLR and reads the device immediately. It races the reset and reports bogus failures.
+VERIFY: The 100 ms completion and wait rule, the list of state FLR must not affect, and FLR capability of the SSDs in your fleet.
+
+@@ 15.05 | Intermediate | Concept | tags=crs,reset,readiness,enumeration,timing
+Q: How long can a device take to be ready after reset, and what is Configuration Request Retry Status?
+SHORT: After a Conventional Reset software waits about 100 ms (after link-up where it can tell) before its first config request, and a device may answer CRS (Configuration Request Retry Status, "not ready, ask again") until about 1 second after reset ends. With CRS Software Visibility on, a Vendor ID read that hits CRS returns 0001h, so software polls. A device silent after roughly 1 second should be treated as failed.
+DEEP:
+- **Timeline:** reset ends, then link training to DL_Active (Data Link Layer Link Active bit), then a 100 ms wait, then config reads. The device may still say CRS while its firmware finishes booting.
+- **CRS Software Visibility:** an enable in Root Control (capability in Root Capabilities). When set, a config read of Vendor ID that gets CRS returns 0001h. Other config requests are retried in hardware by the Root Complex.
+- **Two different "ready" clocks for an SSD:** PCIe ready (config space answers) and NVMe ready (CSTS.RDY after CC.EN, allowed up to CAP.TO, in 500 ms units). Enumeration can succeed and the driver still wait a long time.
+- **Firmware enumerators:** a BIOS waits a bounded time for a device to appear. An SSD slower than that shows as absent until a rescan or a reboot.
+- **Linux:** the PCI core polls until the Vendor ID stops reading as not ready and logs lines of the form "not ready 1023ms after FLR; waiting" and, on failure, "giving up".
+- **Absent or down:** config reads to a missing device complete with Unsupported Request or abort and read back as all ones (FFFFFFFFh), which is why software treats all ones as "no device".
+FOLLOW:
+- Why does the 100 ms wait exist? => It lets the device finish internal initialization before the first config access. The 1 second CRS allowance covers slow devices.
+- How would you test an SSD's boot-time tolerance? => Delay PERST# release and first access, measure time to first CRS-free config read and to CSTS.RDY, and compare to the budgets.
+PITFALL: Polling config space with a tight timeout right after reset and declaring the SSD dead. Slow-booting firmware is the usual reason.
+VERIFY: The 100 ms and 1 second rules and their conditions (speeds above 5.0 GT/s, Data Link Layer Link Active Reporting) in Base Specification section 6.6, the CRS Software Visibility bit names, and the Linux message text on your kernel.
+
+@@ 15.06 | Principal | Cross-layer | tags=nvme,reset,cc-en,nssr,flr,perst,state
+Q: For an NVMe SSD, what does each of CC.EN, NSSR, FLR, hot reset and PERST# reset, and which of them force re-enumeration?
+SHORT: CC.EN 1 to 0 is a controller reset: registers, queues and in-flight commands go, while PCIe config, link and media stay. NSSR (write 4E564D65h (ASCII "NVMe") to NSSR, only if CAP.NSSRS is 1) resets the whole NVM subsystem, every controller in it. FLR is a PCIe function reset that also resets the controller. Hot reset and PERST# are Conventional Resets that reset PCIe and NVMe state and need re-enumeration. Media is never erased by any of them.
+DEEP:
+Module 4 gave the scope table. Here is the state map for validation.
+| Trigger | NVMe state reset | PCIe config and BARs | Host must redo |
+|---|---|---|---|
+| CC.EN 1 to 0 | Controller registers, admin and I/O queues, in-flight commands, volatile features | Kept | AQA/ASQ/ACQ, CC, queues; MSI-X stays set |
+| FLR | Controller-level reset | Reset to defaults | Restore config space, then controller init |
+| NSSR | All controllers in the subsystem | Device dependent | Wait for the outcome; re-enumerate if the link dropped |
+| Hot reset | Controller reset | Reset to defaults | Re-enumerate, then controller init |
+| PERST# | Subsystem power-on state | Reset incl. sticky | Full enumeration and init |
+- **Order rule:** after CC.EN is cleared, wait for CSTS.RDY to read 0 (up to CAP.TO) before setting it again.
+- **In-flight I/O is lost:** no CQE arrives for commands outstanding at the reset. The host driver must cancel and requeue them (Linux cancels requests in its reset path).
+- **What persists:** NAND data, namespaces, persistent settings and logs. Volatile features, HMB registration and queue state do not. By the spec, an unsafe shutdown is counted when power is lost without a prior shutdown notification (CC.SHN), so these resets should not count, but vendors differ and some firmware counts them.
+- **NSSR outcome:** CSTS.NSSRO records that a subsystem reset happened. Whether the link drops afterwards is not something to assume.
+- **Bug class:** state cleared by CC.EN but stale after FLR or PERST#, for example a mapping cache, HMB descriptor or CMB content left over.
+FOLLOW:
+- Do doorbell values survive CC.EN 1 to 0? => No. Doorbells are controller registers and reset. Queue pointers restart at zero when the queues are created again.
+- How do you tell an NSSR from a power cycle afterwards? => Check CSTS.NSSRO and the SMART Power Cycles counter. NSSR does not remove power.
+PITFALL: Testing only CC.EN resets and generalizing. Each trigger has a different scope, and the firmware paths differ.
+VERIFY: The NVMe over PCIe Transport specification mapping of each PCIe reset to a Controller Level Reset or NVM Subsystem Reset, NSSR offset (20h), value (4E564D65h) and CAP.NSSRS, CSTS.NSSRO semantics, whether the link drops after NSSR, and whether CMB content survives CC.EN.
+
+@@ 15.07 | Intermediate | Concept | tags=hotplug,slot,registers,dllsc,presence
+Q: Which registers implement PCIe hot-plug, and what do the key fields mean?
+SHORT: Slot Capabilities, Slot Control and Slot Status, in the PCI Express Capability of the downstream port above the slot (valid when Slot Implemented is set). Capabilities describes the hardware: attention button, power controller, MRL sensor, indicators, Hot-Plug Capable and Surprise. Control enables events and drives power and indicators. Status reports events: presence, attention button, power fault, MRL and Data Link Layer State Changed.
+DEEP:
+| Register | Key fields | Role |
+|---|---|---|
+| Slot Capabilities | Attention Button Present, Power Controller Present, MRL Sensor Present, Attention and Power Indicator Present, Hot-Plug Surprise, Hot-Plug Capable, Slot Power Limit, Physical Slot Number, No Command Completed Support | Static description |
+| Slot Control | Enables for attention button, power fault, MRL change, presence change and Data Link Layer State Changed; Hot-Plug Interrupt Enable; indicator control; Power Controller Control | Software sets policy and drives the slot |
+| Slot Status | Attention Button Pressed, Power Fault Detected, MRL Sensor Changed, Presence Detect Changed, Command Completed, Presence Detect State, Data Link Layer State Changed | Events (write 1 to clear) and current state |
+- **Presence Detect State** comes from the connector's presence pins. **Data Link Layer State Changed** reports link up and down, and is the key event for NVMe slots that have no MRL or button.
+- **Power Controller Control** has inverted sense: 1 powers the slot off.
+- **Indicators** are on, blink or off. Blink is the "in transition, do not remove" convention.
+- **Command Completed:** software waits for it after each Slot Control write, unless the port sets No Command Completed Support. A missing completion shows up as a hot-plug command timeout in the kernel log.
+- **Delivery:** events reach software as an MSI (Hot-Plug Interrupt Enable) or through ACPI, depending on who owns hot-plug.
+- **Where to read:** `lspci -vvv -s <root port BDF>` shows SltCap, SltCtl and SltSta. None of it lives on the SSD.
+FOLLOW:
+- What does Hot-Plug Surprise mean? => The slot can lose its card without notice, so the removal is not an error condition by itself.
+- Why can two servers with the same SSD behave differently on hot-plug? => The slot logic (button, LED, power switch) and who handles the events sit on the platform side, not on the drive.
+PITFALL: Looking for hot-plug registers in the endpoint. They belong to the port.
+VERIFY: Field names, bit positions and the indicator and Power Controller Control encodings in the Base Specification Slot registers, and whether Slot Capabilities 2 or Slot Status 2 fields matter on your PCIe version.
+
+@@ 15.08 | Intermediate | Concept | tags=hotplug,acpi,native,osc,flow,hot-add,hot-remove
+Q: Walk through a hot-add and a hot-remove, and explain native PCIe hot-plug versus ACPI (firmware-first) hot-plug.
+SHORT: In a hot-add the slot sees presence, power comes up, the link trains, the OS waits for the device to be ready, enumerates it inside the parent bridge's reserved resources and binds the driver. Hot-remove is the reverse: quiesce, shut down, power off. In native hot-plug the OS handles Slot Status events itself (Linux pciehp). In ACPI hot-plug firmware handles the event and notifies the OS through ACPI. The OS may use native only if _OSC gives it control.
+DEEP:
+Hot-add:
+1. Insertion: ground and power pins mate first and presence last. A hot-swap controller or the slot power controller powers the slot with inrush limiting.
+2. Presence Detect Changed (and later Data Link Layer State Changed) fires an interrupt.
+3. Software powers the slot, sets indicators, and waits for the link to reach DL_Active.
+4. It waits for readiness (100 ms, then CRS handling).
+5. Enumerate: assign bus numbers, BARs, MPS and MRRS within the bridge's windows, then bind the driver, which runs controller init.
+Hot-remove:
+1. Request by attention button (a 5 second window to cancel), sysfs, or the OS UI.
+2. Driver shuts the controller down (flush, CC.SHN normal shutdown) and unbinds.
+3. Resources are released, indicators blink, slot power goes off, indicators go off.
+- **Native versus ACPI:** with `_OSC` the OS asks firmware for control of PCIe native hot-plug, PME, AER and so on. If firmware keeps hot-plug, its SMI or SCI handler runs first and the OS uses ACPI methods (`_EJx`, `_STA`, Notify). Linux runs pciehp for native and acpiphp for ACPI.
+- **Why firmware keeps control:** firmware-first error handling, platform LED and power sequencing, or bridges such as Intel VMD that own the hierarchy.
+FOLLOW:
+- How do you tell which mode a Linux box is in? => dmesg shows the `_OSC` result (for example "OS now controls [PCIeHotplug ...]") and whether pciehp or acpiphp registered slots under `/sys/bus/pci/slots`.
+- What differs for the test plan? => Timing (firmware adds latency), error handling ownership and LED behavior. Run the same cycles in both modes if the fleet has both.
+PITFALL: Assuming hot-plug behaves the same when firmware owns it. Timing, resource padding and error paths differ.
+VERIFY: `_OSC` control bit names for native hot-plug, the attention-button cancel window, and Linux message text on your kernel.
+
+@@ 15.09 | Advanced | Concept | tags=surprise-removal,dpc,surprise-down,hotplug,nvme
+Q: An SSD is pulled from a live slot with no notice. What happens at each layer, and how do DPC and Surprise Down interact with hot-plug?
+SHORT: The port loses receiver detect, the link goes down and the Data Link Layer reports DL_Down. Slot Status sets Presence Detect Changed and Data Link Layer State Changed. Outstanding non-posted requests never complete, and MMIO reads return all ones. If DPC is enabled and its trigger covers the event, the port contains the link and blocks traffic until software clears it, which must be coordinated with the hot-plug handler.
+DEEP:
+1. Electrical: the receiver detect on the port sees no termination, the LTSSM leaves L0 through Recovery to Detect.
+2. Data Link Layer: DL_Down (see module 6 for Surprise Down and DL_Up handling). In-flight TLPs are discarded, and completions time out (module 12 covers the completion timeout path).
+3. Slot events: presence and link-state changes raise the hot-plug interrupt. With Hot-Plug Surprise set, the OS treats this as a normal removal.
+4. Driver: the NVMe driver sees CSTS read as all ones (or errors from the block layer), fails outstanding commands and removes the controller.
+5. DPC (if enabled): the downstream port disconnects the link on trigger, drops or completes requests with Unsupported Request or Completer Abort, and stays contained until DPC Status is cleared. This protects the rest of the hierarchy.
+- **Interplay:** the hot-plug handler and DPC both react to the same link-down. The OS must not double-process it, and DPC must be recovered (cleared) or the port stays frozen and a re-insert fails.
+- **Policy choices:** many platforms mask Surprise Down or exclude it from DPC triggers on hot-plug slots, so removal is not escalated to a fatal error. Some firmware-first platforms escalate to a machine check instead, which defeats the purpose of a hot-plug slot.
+- **Test intent:** pull under load. Pass means the OS cleans up, neighbors keep running, no crash or hang, and a re-insert works.
+FOLLOW:
+- Why do MMIO reads return all ones? => The port completes the request with UR or the Root Complex substitutes all ones, because no completion can come from a missing device. Drivers rely on it as a removal test.
+- What if the removal happens during a write? => Writes not yet flushed to NAND are lost, and the file system sees I/O errors. That is expected, and the test checks that only that drive is affected.
+PITFALL: Judging a surprise-removal test only by whether the port reports an error. The pass criteria are OS cleanup, containment and successful re-insertion.
+VERIFY: DPC trigger conditions (including link-down cases) and status fields in Base Specification 6.x, whether Surprise Down is suppressed when Hot-Plug Surprise is set, and the pciehp and DPC coordination in your kernel version.
+
+@@ 15.10 | Advanced | Debug | tags=hotplug,resources,bus-numbers,bar,enumeration
+Q: A hot-added SSD shows up in lspci but the NVMe driver never binds until the next reboot. How do you debug it?
+SHORT: The link trained and the device enumerated, so the fault is above the link: no free bus numbers in the parent, no free MMIO window space (nobody reserved hot-plug padding), a stuck DPC or power state, or the device not ready when probed. Read dmesg for "no space for" or "failed to assign", check the parent bridge's bus range and windows with lspci, and then fix by reserving resources in firmware or with kernel parameters.
+DEEP:
+1. **dmesg first:** look for `pciehp` link-up lines, then `BAR 0: no space for` or `failed to assign`, bridge window lines, and `nvme ... probe failed`.
+2. **BAR state:** `lspci -vv` on the SSD. Region 0 shown as unassigned, or Memory Space disabled in Command, means resources failed.
+3. **Bus numbers:** `lspci -tv` and the parent's Secondary and Subordinate bus numbers. If they are equal there is no room for a switch carrier or bridge below.
+4. **Windows:** BAR0 is a 64-bit memory BAR of at least about 16 KB. Bridge memory windows have 1 MB granularity, so each hot-plug port needs at least 1 MB of window. The non-prefetchable window is 32 bits only, so a 64-bit non-prefetchable BAR must fit under 4 GB, and that region is scarce in a 24-slot system.
+5. **Why boot works:** at boot the resources are sized for the devices present. Hot-add needs slack that only firmware padding or an earlier reservation creates.
+6. **Non-resource causes:** DPC status still latched on the port, hot-plug interrupt not delivered, CRS not waited for, or the SSD's CSTS.RDY not coming up in the driver's window.
+7. **Reproduce:** if the first add works and the second fails, resources leaked or fragmented from the earlier remove.
+- **Fixes:** BIOS hot-plug bus and MMIO padding (preferred), Above 4G Decoding, and kernel parameters such as `pci=hpbussize=`, `pci=hpmmiosize=`, `pci=hpmmioprefsize=` and `pci=realloc`. A rescan (`echo 1 > /sys/bus/pci/rescan`) retries assignment.
+FOLLOW:
+- Why does a reboot fix it? => Boot enumeration re-plans all windows from scratch for whatever is installed.
+- Which resource is usually exhausted first? => The 32-bit non-prefetchable MMIO window, then bus numbers in deep switch trees.
+PITFALL: Treating "it shows up in lspci" as "enumerated correctly". The device can appear with no BAR assigned.
+VERIFY: Kernel parameter names and syntax for your kernel, BIOS option names for hot-plug padding, and whether your SSD's BAR0 is prefetchable.
+
+@@ 15.11 | Advanced | Debug | tags=warm-reboot,perst,power-cycle,refclk,not-detected
+Q: An SSD is not detected after a warm reboot but comes back after a full power cycle. What are the suspects and how do you separate them?
+SHORT: A power cycle resets things a warm reboot does not, so suspects are: the platform's warm-reset PERST# is missing, too short, or overlaps a gated reference clock; the SSD does not fully restart on PERST# alone (its PHY, PLL or firmware stays hung because rails never dropped); or the SSD needs longer to boot than the firmware waits. Scope PERST#, refclk and rails during a warm reboot first.
+DEEP:
+1. **Scope at the connector:** 12 V, 3.3 V, REFCLK and PERST# across a warm reboot. Does PERST# pulse at all? How wide? Is REFCLK present during and after it? Compare with a cold boot.
+2. **Split platform from SSD:** if PERST# and REFCLK are clean and the SSD still hangs, the SSD does not recover from a PERST#-only reset. If PERST# is missing or short, the platform is the suspect.
+3. **Is the drive alive?** Query it over SMBus with NVMe-MI. A drive that answers there but has no PCIe link has a hung PCIe block. A dead one has a hung controller.
+4. **Analyzer:** does the LTSSM leave Detect? Receiver detect requires the device's termination, which needs the device out of reset and powered.
+5. **Isolate rails:** power-cycle only 12 V, only 3.3 V, or only 3.3 V aux, to find which reset recovers it.
+6. **Prior session state:** an unclean shutdown or a crash leaves the SSD doing power-loss recovery for seconds. Check SMART Unsafe Shutdowns and time after boot.
+7. **Root port side:** Link Disable or Secondary Bus Reset left set, or the port stuck in Polling.Compliance.
+8. **Sweep:** vary PERST# assert width (100 microseconds to 100 ms) and the delay after refclk. A cliff tells you the margin.
+- **Report the result as a rate:** N warm boots, k failures, and the same for cold boots, so a fix can be shown.
+FOLLOW:
+- What single measurement splits platform from SSD fastest? => The PERST# pulse width and refclk presence during a warm reboot, at the connector.
+- Is "requires a power cycle" ever acceptable to ship? => No. It is a firmware or platform bug, and it will hit customers who cannot power cycle remotely.
+PITFALL: Documenting the power-cycle workaround instead of finding which reset the SSD does not survive.
+VERIFY: Platform warm-reset behavior (PERST# width, whether slot rails drop, whether refclk gates) and the PERST# minimum width in the CEM specification.
+
+@@ 15.12 | Basic | Concept | tags=m2,keys,sideband,power,form-factor
+Q: What are the M.2 keys and the sideband signals, and what limits an M.2 SSD's power?
+SHORT: M.2 is a card-edge module. SSDs use the M key (PCIe up to x4, or SATA) or the B+M key (up to x2), in 2230, 2242, 2260, 2280 and 22110 lengths. The connector carries PERST#, CLKREQ#, PEWAKE#, a PEDET pin that tells PCIe from SATA, SUSCLK (32.768 kHz) and DEVSLP (SATA). Power is 3.3 V only, with no 12 V rail, which caps the module at single-digit to low-double-digit watts.
+DEEP:
+- **Keys:** the notch position selects the socket type. B key has the notch in one place (pins 12 to 19 removed), M key in another (pins 59 to 66 removed). B+M has both, so it fits either socket. Key does not fully determine the protocol.
+- **Sizes:** widths are 22 mm; lengths 30, 42, 60, 80 and 110 mm. Enterprise M.2 uses 22110 for power-loss-protection capacitors.
+| Signal | Direction | Function |
+|---|---|---|
+| PERST# | Host to device | Fundamental Reset |
+| CLKREQ# | Open drain, device to host | Request REFCLK; used by L1 substates |
+| PEWAKE# | Open drain, device to host | Wake from low power |
+| PEDET | Sense | PCIe or SATA module (open or grounded) |
+| SUSCLK | Host to device | 32.768 kHz low-power clock |
+| DEVSLP | Host to device | SATA device sleep |
+- **Power:** a 3.3 V supply with a current limit on the connector pins. Consumer Gen4 drives typically draw a few watts to around 8 W in bursts, and Gen5 modules can go past that, so they need heat spreaders and throttle when hot.
+- **Hot-plug:** M.2 sockets are generally not designed for hot-plug, and have no staged pins or presence signal in the way EDSFF and U.2 do.
+- **Debug trap:** an M-key slot may be wired for SATA only, or its lanes may be shared with another port and switched by a BIOS option.
+FOLLOW:
+- How does the host know it should train PCIe? => The socket wiring and the PEDET pin describe whether the module is PCIe or SATA, and the slot's lanes must be routed to a PCIe root port.
+- Why do M.2 drives throttle more than U.2? => Small surface, no airflow guarantee, and heat from neighboring parts. A 3.3 V-only supply also limits current.
+PITFALL: Assuming every M-key slot is PCIe, or that key type equals protocol.
+VERIFY: Pin numbers and voltage levels of the sideband signals and the connector current limit in the PCI Express M.2 Specification, and typical SSD power figures on current datasheets.
+
+@@ 15.13 | Intermediate | Concept | tags=u2,u3,edsff,e1s,e3s,sff-8639,dual-port
+Q: How do U.2, U.3 and the EDSFF form factors (E1.S, E1.L, E3.S, E3.L) differ?
+SHORT: U.2 is the 2.5-inch hot-plug drive on the SFF-8639 connector: PCIe x4 or dual-port 2 x x2, optionally SAS/SATA, powered from 12 V. U.3 (SFF-TA-1001, with UBM management) uses the same connector but lets a tri-mode bay auto-detect NVMe, SAS or SATA drives. EDSFF (E1.S, E1.L, E3.S, E3.L) is a newer family on the SFF-TA-1002 connector, hot-plug, 12 V, better airflow, up to x4, x8 or x16, aimed at Gen5 and beyond.
+DEEP:
+| Form factor | Spec (verify) | Typical link | Note |
+|---|---|---|---|
+| U.2 | SFF-8639 | x4 or 2 x x2 | 2.5 in, 7 or 15 mm |
+| U.3 | SFF-TA-1001 (+UBM, SFF-TA-1005) | x4 | Same connector, tri-mode bay |
+| E1.S | SFF-TA-1006 | x4 (some x8) | Several thicknesses from thin to 25 mm |
+| E1.L | SFF-TA-1007 | x4 | Long, dense 1U |
+| E3.S / E3.L | SFF-TA-1008 | x4, x8, x16 | 1T and 2T thickness |
+- **Dual-port:** a DualPortEn# pin selects two x2 ports, each with its own PERST# and REFCLK. The SSD presents two controllers to two hosts, common in HA arrays.
+- **U.3 in practice:** compatibility between U.2 drives, U.3 drives and the two kinds of bay is directional, so check the vendor matrix. Backplane management (UBM) and interface-detect pins decide which protocol the controller talks.
+- **EDSFF:** designed for Gen5 and Gen6 channels, with sideband for LED, power disable, presence, SMBus and per-port reset. E1.S dominates hyperscale 1U; E3.S dominates 2U.
+- **Validation angles:** hot-plug on backplanes, per-port reset isolation, tri-mode controller behavior, LED and UBM control, and the channel loss through the connector and backplane.
+FOLLOW:
+- Why did the industry move from U.2 to EDSFF? => Better thermals and density, a connector built for higher data rates, and a family that scales in width and power.
+- What must a dual-port SSD do on a reset of one port? => Reset only that port's controller and state, leaving the other port's I/O running, which is a firmware validation topic in its own right.
+PITFALL: Treating U.2, U.3 and EDSFF as the same thing with different shapes. Sideband, management and power differ.
+VERIFY: Specification numbers (SFF-TA-1001, 1002, 1005, 1006, 1007, 1008), the U.2 and U.3 compatibility direction, thickness options and lane widths per form factor.
+
+@@ 15.14 | Advanced | Concept | tags=cem,oculink,cable,riser,backplane,signal-integrity,hotplug
+Q: What do add-in cards, cables (OCuLink and friends), risers and backplanes change for signal integrity and hot-plug?
+SHORT: Add-in cards use the CEM slot with 3.3 V and 12 V power and PERST#, PRSNT#, WAKE# and SMBus sideband. Cables (OCuLink SFF-8611, SlimSAS SFF-8654, MCIO) and risers or backplanes add connectors, vias and length, each spending channel loss and adding reflections, so Gen5 often needs a retimer where Gen4 did not. Hot-plug backplanes also need staged power pins, inrush limiting and per-slot PERST# and REFCLK.
+DEEP:
+- **CEM add-in cards:** x1 to x16 slots. A carrier card holds several M.2 or U.2 SSDs either by bifurcation (BIOS splits an x16 root port into x4 x4 x4 x4) or through a switch. If bifurcation is not set, only the first drive enumerates. The presence pins tell the slot the card width, and slot power is limited until the host sets the slot power limit.
+- **Cables:** OCuLink is a compact x4 cable used in workstations and docks. SlimSAS and MCIO are the usual choices for NVMe backplane cabling inside servers. Passive cable length shrinks with every generation, and longer runs need active cables or retimers.
+- **Signal integrity:** every extra connector pair, via transition and trace segment adds insertion loss at Nyquist and impedance discontinuities. A drive that is clean on a short bench fixture can fail through a real riser plus backplane at Gen5. Retimers, lane margining and equalization are covered in modules 3 and 5.
+- **Hot-plug electricals:** staged pins (ground and power first, signals next, presence last), a hot-swap controller or e-fuse for inrush, per-slot PERST# and REFCLK buffers so one insertion cannot glitch neighbors, and ESD protection.
+- **Retimers and hot-plug:** a retimer between the root port and the slot must handle a device appearing and disappearing downstream. Some hold the upstream link up while the downstream is empty and some do not, so test both.
+- **Mechanics:** connectors have limited mating cycles, so long insertion-cycle tests are part of validation.
+FOLLOW:
+- Why can Gen5 fail on a backplane that was clean at Gen4? => The Nyquist frequency doubles, so the same connectors, vias and length cost much more loss and reflection margin.
+- What does a shared PERST# on a backplane risk? => Inserting or resetting one drive resets its neighbors.
+PITFALL: Validating the drive only on the vendor's short fixture and not on the customer's actual riser, cable and backplane stack.
+VERIFY: Connector names and numbers (SFF-8611, SFF-8654, SFF-TA-1016), the CEM slot power classes (about 10, 25 and 75 W) and the passive cable length limits per generation.
+
+@@ 15.15 | Intermediate | Concept | tags=sideband,clkreq,prsnt,wake,smbus,nvme-mi,dual-port
+Q: Which sideband signals matter for an NVMe SSD, and what does each one do?
+SHORT: PERST# resets the device, CLKREQ# lets the device ask for the reference clock (needed for L1 substates), PRSNT# or a presence pin reports insertion, WAKE# lets the device wake the system, SMBus or I2C carries NVMe-MI out-of-band management, and dual-port drives add DualPortEn# and a second set of PERST# and clock signals. Which signals exist depends on the form factor.
+DEEP:
+| Signal | Function | Where you see it |
+|---|---|---|
+| PERST# | Fundamental Reset, host to device | All form factors |
+| REFCLK | 100 MHz differential clock (not sideband, but timed with it) | All |
+| CLKREQ# | Device requests clock, used for L1.1 and L1.2 | M.2, U.2, EDSFF |
+| PRSNT# / presence | Insertion detect for hot-plug | CEM, U.2, EDSFF |
+| WAKE# (PEWAKE# on M.2) | Device wakes host from low power | Most |
+| SMBus/I2C | NVMe-MI basic management and VPD | U.2, EDSFF, CEM |
+| DualPortEn#, second PERST#/REFCLK | Two x2 ports | U.2, EDSFF |
+| LED, power disable | Activity, fault and power control from the backplane | U.2, EDSFF |
+- **NVMe-MI out-of-band:** a BMC polls temperature, health and firmware status over SMBus without touching the PCIe link. It works even when PCIe is down, which makes it the best tool for "drive dead or link dead?".
+- **CLKREQ# and low power:** if it is not wired or the pull-up is wrong, L1 substates that gate the clock cannot work (module 11).
+- **Bring-up failures:** wrong PERST# polarity or level, floating CLKREQ#, a DualPortEn# strap read wrong, and SMBus address conflicts.
+- **Test:** toggle each signal individually with the rest quiet, and confirm the drive's response.
+FOLLOW:
+- What does the BMC learn from NVMe-MI that the host OS does not? => Health data when the host or link is down, and drive presence before the OS boots.
+- Why is WAKE# used at all with L1 substates? => WAKE# supports wake from L2 (main power off with aux power). Clock gating in L1 substates uses CLKREQ#, not WAKE#.
+PITFALL: Assuming every form factor exposes the same set of signals.
+VERIFY: Signal names, polarity, voltage and direction per form-factor specification, and the NVMe-MI basic management SMBus addressing.
+
+@@ 15.16 | Advanced | Numeric | tags=power,thermal,airflow,e3s,throttle
+Q: Estimate whether a 24-slot chassis of Gen5 x4 E3.S SSDs can run at full speed thermally and electrically, with stated assumptions.
+SHORT: Assume 18 W per drive at 14 GB/s sequential, a 25 W slot budget, 1.2 K/W from local air to the drive's composite temperature, and a 70 C throttle point. Electrically 18 W is 1.5 A at 12 V and 25 W is 2.1 A. The 24 drives dissipate 432 W and need about 76 CFM at a 10 K air rise. At 40 C local air the limit is 25 W, but at 50 C it falls to 16.7 W, so the drive would throttle to about 93 percent.
+DEEP:
+Assumptions (all hedged, replace with datasheet values): 18 W average at full sequential read, slot budget 25 W, 12 V supply, air density 1.2 kg/m3, specific heat 1005 J/(kg K), R = 1.2 K/W from local air to the SSD's composite temperature, throttle at a composite temperature of 70 C, 24 drives.
+1. Current: 18 W / 12 V = 1.5 A. Slot budget 25 W / 12 V = 2.08 A.
+2. Energy per byte: 18 W / 14 GB/s = 1.29 J/GB.
+3. Chassis power: 24 x 18 W = 432 W.
+4. Airflow at a 10 K rise: flow = P / (rho x cp x dT) = 432 / (1.2 x 1005 x 10) = 0.0358 m3/s, which is about 76 CFM, or about 3.2 CFM per slot. At 15 K it is about 51 CFM.
+5. Drive temperature: T = T_air + P x R. At 40 C air and 18 W: 40 + 21.6 = 61.6 C, with margin. At 25 W: 40 + 30 = 70 C, exactly at the limit.
+6. Throttle limit: P_max = (70 - T_air) / R. At 40 C: 25 W. At 50 C: 16.7 W, which is 93 percent of 18 W. If throughput scales with power, that is about 13 GB/s.
+- **Which air temperature:** downstream drives see air pre-heated by the drives in front. The worst slot sets the rating, so use local air, not chassis inlet.
+- **Form-factor envelope (commonly quoted, not spec quotes):** M.2 in the single-digit to about 10 W range, U.2 15 mm around 25 W, E1.S from about 12 to 25 W by thickness, E3.S about 25 W and up to about 40 W for thick or long variants.
+FOLLOW:
+- Where does throttling show in NVMe? => SMART log fields for Warning Composite Temperature Time and the thermal management transition counts and times, plus the step in throughput.
+- Is power really linear in throughput? => No. A first-order model like this shows the direction. Real drives have a fixed floor and step in power states.
+PITFALL: Using the inlet air temperature instead of the local air at each drive, which under-estimates the worst slot by tens of degrees.
+VERIFY: Form-factor power classes (SFF-TA-1006, SFF-TA-1008, SFF-TA-1023 and the U.2 specification), WCTEMP and CCTEMP semantics in Identify Controller, and the thermal management Feature IDs.
+
+@@ 15.17 | Principal | Scenario | tags=validation,hotplug,reset,scale,data-integrity,statistics
+Q: How would you validate hot-plug and reset robustness at scale, with thousands of cycles of each reset type?
+SHORT: Build a matrix of reset type by workload state by condition (temperature, voltage, form factor) and run thousands of cycles per cell. After every cycle check link speed and width, config space against a golden dump, NVMe identity, time to CSTS.RDY, AER and SMART deltas, and data integrity with LBA-seeded patterns. Pass means zero failures at a stated confidence. Freeze the rig on the first failure so the evidence survives.
+DEEP:
+1. **Reset types:** PERST# warm, cold power cycle, hot reset (SBR), link disable, FLR, D3hot to D0, CC.EN 1 to 0, NSSR, and surprise or orderly hot-plug where the fixture allows.
+2. **States when the reset hits:** idle, mixed I/O, heavy writes, mid-admin command, low power state (APST), during a firmware update or a format if in scope.
+3. **Per-cycle checks:** LTSSM reaches L0 at the expected speed and width within a time budget, config space diff clean (masking RO fields), identity and namespaces unchanged, CSTS.RDY within CAP.TO, first I/O succeeds, and AER uncorrectable and SMART media errors unchanged.
+4. **Data integrity:** write an LBA-seeded pattern with checksums. Data written before a completed Flush or with FUA (or on a PLP drive) must survive. Unflushed data on a volatile cache may be lost, so the expectation must depend on Identify's Volatile Write Cache and the PLP design. Check no stale or foreign data reads back.
+5. **Log:** timestamps for every step, dmesg, lspci dumps before and after, AER and SMART deltas, rail voltages, temperature, firmware version, analyzer capture on failure.
+6. **Statistics:** zero failures in N trials gives a 95 percent upper bound of about 3/N on the failure rate. 3000 cycles bounds it near 0.1 percent, 30000 near 0.01 percent. At about 20 s per cold cycle, 30000 cycles is about 167 hours on one rig, or about 21 hours across 8 rigs.
+7. **On failure:** stop, snapshot analyzer and registers, and keep the unit. Recovering by power-cycling erases the evidence.
+FOLLOW:
+- How do you show a fix worked? => Same matrix, same N, compare failure rate with confidence intervals, and repeat at the worst condition that failed.
+- What do you do with a 1 in 500 failure? => Build a trigger on the fault signature (for example LTSSM stuck in Polling.Compliance) so the analyzer captures it, then bisect by reset type and condition.
+PITFALL: Counting cycles without checking data integrity, or letting the rig auto-recover the first failure.
+VERIFY: Expected data-durability behavior for your SSD's Volatile Write Cache and PLP claims, and the cycle time budgets for your platform.
+
+@@ 15.18 | Principal | Cross-layer | tags=automation,rig,power-cycle,perst,logic-analyzer,yield
+Q: How would you build an automated reset and power-cycle test rig, and what metric would you report?
+SHORT: Combine a programmable multi-rail supply (ramp, delay and dropout control), a hardware-timed PERST# and REFCLK controller, a scope or logic analyzer on rails, clock and PERST#, a protocol analyzer for the LTSSM, and a host orchestrator. The headline metric is link-up yield: the fraction of cycles that reach L0 at target speed and width, enumerate and reach CSTS.RDY within budget, reported with a confidence bound.
+DEEP:
+- **Power:** a programmable supply per rail with remote sense, adjustable ramp slew and sequencing delay, brownout and glitch profiles, and current logging. Use solid-state switching, not relays that bounce.
+- **PERST# and REFCLK:** an FPGA or MCU timer with microsecond resolution, independent of the host OS. Program assert width, delay after refclk, and refclk gating. USB or OS-timed GPIO jitters by tens of milliseconds and cannot test a 100 microsecond corner.
+- **Observation:** a mixed-signal scope or logic analyzer for T_PVPERL and refclk-to-PERST# timing at the connector. A protocol analyzer for LTSSM timing, keeping in mind that an interposer changes the channel.
+- **Out-of-band:** NVMe-MI over SMBus to read health when PCIe is down.
+- **Orchestrator:** picks a scenario, runs it, evaluates, stores one record per cycle (settings, time to L0, time to RDY, result class), and stops on failure.
+- **Yield metric:** yield = successful cycles / cycles, by scenario and corner, with a Clopper-Pearson interval. Also the time-to-L0 histogram, and failures classified by stage: no Detect, Polling, Configuration, downtrain, enumeration, RDY timeout, data miscompare.
+- **Margin sweeps:** shrink T_PVPERL and PERST# width, skew refclk, slow the ramp, sag rails, and find the cliff. A cliff near the spec value is a risk even if yield is 100 percent at nominal.
+- **Validate the rig:** check its own timing with a scope, and run a known-good and a known-bad canary drive to catch rig false positives.
+FOLLOW:
+- Why report a lower confidence bound and not just the mean? => A 100 percent yield in 200 cycles still allows a rate above 1 percent. The bound states what the data proves.
+- What is the biggest source of false failures? => The rig: contact resistance, ground loops, an interposer, or software-timed signals violating the spec they are meant to test.
+PITFALL: Reporting only nominal-condition yield. Margins are where field failures come from.
+VERIFY: T_PVPERL, refclk and PERST# minimums in the CEM and form-factor specifications, and the effect of your analyzer interposer at Gen5.

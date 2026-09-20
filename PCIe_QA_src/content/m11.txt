@@ -1,0 +1,407 @@
+# Module 11 — Power Management
+
+@@ 11.01 | Basic | Concept | fig=pmstates | tags=d-states,l-states,mapping,overview
+Q: PCIe has D-states and L-states. What is the difference, and how do they map to each other?
+SHORT: D-states (D0, D1, D2, D3hot, D3cold) belong to a function and are set by software through the Power Management capability. L-states (L0, L0s, L1, L2, L3) belong to a link and are run by the ports and the LTSSM. They are separate families tied by rules: D0 allows L0, L0s and L1, D3hot forces the link into L1, and D3cold means the link is in L2 or L3.
+DEEP:
+| Device state | Link states allowed | What it means |
+|---|---|---|
+| D0 | L0, L0s, L1 (with L1.1 and L1.2 substates) | Function fully on. The link may still dip into ASPM idle states on its own |
+| D1, D2 | L1 | Optional intermediate states. Few NVMe SSDs implement them |
+| D3hot | L1 | Main power and reference clock present, config space accessible, software-directed L1 |
+| D3cold | L2 (aux power) or L3 (off) | Main power removed. State is lost unless aux power keeps some of it |
+
+- **Who owns what:** the D-state is per function and lives in a config register. The L-state is per link and lives in the LTSSM of both ports. A device can be in D0 with its link in L1, but it cannot be in D3hot with the link in L0 (apart from the brief transition).
+- **Multi-function devices:** the link enters L1 by software direction only when every function has left D0.
+- **Where the mechanics are:** L0s, L1 and L2 entry and exit are in the LTSSM module, and the PM DLLP handshake is in the Data Link Layer module. This module covers policy, registers and the NVMe layer on top.
+- **A third ladder:** NVMe adds its own power states PS0 to PSn inside the controller. They are independent of both D-states and L-states, which is why validation needs a matrix (last question of this module).
+FOLLOW:
+- Can you read a link's L-state from config space? => Not directly. You infer it from the D-state, the ASPM and substate enables, and counters or analyzer traces, because the LTSSM state is not a standard register.
+- Where does Gen6 L0p fit? => It is a partial-width low-power state inside L0, covered in the Gen5/6 module. It is not one of the classic L-states.
+PITFALL: Treating D-state and L-state as one ladder. Software moves the D-state, hardware moves the L-state (sometimes on its own), and the two must be checked separately.
+VERIFY: The rule for multi-function devices entering L1 and any allowed exceptions in the Power Management chapter of the Base Specification.
+
+@@ 11.02 | Basic | Concept | tags=pci-pm,pmcsr,d3hot,no-soft-reset
+Q: How does a function implement D-states, and what actually happens in D3hot?
+SHORT: A function has a Power Management capability (ID 01h). Its PMCSR register has a 2-bit PowerState field: 00 is D0, 01 is D1, 10 is D2, 11 is D3hot. In D3hot the function still answers configuration requests but does not service memory or I/O requests, so an NVMe doorbell write would be lost. Going back to D0 needs a recovery delay and may include an internal soft reset.
+DEEP:
+- **PMC (capabilities):** Version, D1_Support, D2_Support, PME_Support (a 5-bit mask of which states can raise PME) and Aux_Current.
+- **PMCSR (control and status):** PowerState, No_Soft_Reset, PME_En, PME_Status (write 1 to clear), plus Data_Select and Data_Scale.
+- **D3hot behaviour:** configuration space stays reachable so software can bring the function back. Other request types are not serviced. Treat NVMe BAR0 as unreachable.
+- **D3hot to D0:** software waits a minimum recovery time (10 ms in the PCI-PM definition) before touching the function. If No_Soft_Reset is 0 the function resets its internal state on the transition, and the driver must reprogram it. NVMe drivers simply re-run controller initialization.
+- **D3cold to D0:** power, reference clock and PERST# sequencing, full link training, then the same restore (see the Resets module).
+
+```
+Capabilities: [80] Power Management version 3
+    Flags: PMEClk- DSI- D1- D2- AuxCurrent=0mA PME(D0-,D1-,D2-,D3hot-,D3cold-)
+    Status: D0 NoSoftRst+ PME-Enable- DSel=0 DScale=0 PME-
+```
+This is typical of an NVMe SSD: no D1 or D2, no PME from any state (an SSD never needs to wake the host), and NoSoftRst+ meaning state survives D3hot.
+FOLLOW:
+- What does NoSoftRst+ buy you? => After D3hot the function keeps its state, so resume can be faster. The driver still must not assume it and usually re-initializes the controller anyway.
+- Why do NVMe SSDs skip D1 and D2? => They add little over D3hot and NVMe's own power states, and the platform gets its savings from L1.2 and APST.
+PITFALL: Writing D3hot and then poking BAR0. The request is dropped or returns UR, and a posted doorbell write is lost silently.
+VERIFY: The D3hot to D0 recovery time and the exact No_Soft_Reset semantics in the Power Management chapter, and how the NVMe Base Specification treats a D3hot to D0 transition (controller reset or not).
+
+@@ 11.03 | Basic | Concept | tags=aspm,software-directed,autonomous,apst
+Q: What is the difference between software-directed and autonomous power management?
+SHORT: In software-directed power management the OS or driver decides: it writes a D-state, the device goes to L1, and software brings it back. In autonomous power management the hardware decides without software in the loop: ASPM moves the link to L0s or L1 when it is idle, and NVMe APST moves the controller to a lower power state after an idle timer. Software only configures the policy and the limits.
+DEEP:
+| Mechanism | Who decides | Acts on | Entry trigger |
+|---|---|---|---|
+| D-state via PMCSR | OS and driver | Function, then the link (L1) | Config write, PM_Enter_L1 DLLP |
+| ASPM L0s and L1 | Hardware timers | Link only | Idle timer, PM_Active_State_Request_L1 DLLP |
+| L1 PM Substates | Hardware | Link (deeper L1) | L1 plus CLKREQ# and LTR conditions |
+| NVMe Set Features (Power Management) | Host driver | NVMe controller | Admin command |
+| NVMe APST | Controller | NVMe controller | Idle timers from a host-written table |
+
+- **Autonomous is only safe with latency information:** the OS must know each device's exit latency and how much latency the device tolerates (Link Capabilities, Device Capabilities, LTR). Otherwise a device can be put into a state that it cannot wake from fast enough.
+- **Software still owns the policy:** enabling ASPM, choosing APST tables and setting LTR limits are all software decisions. Only the moment of entry is autonomous.
+- **Why storage uses both:** D3 has a large resume cost (state reinit), so laptops rely on autonomous L1.2 plus APST for idle, and use software-directed states for system sleep.
+FOLLOW:
+- Is LTR a power-management mechanism? => No. It is information that the device sends to the platform so that the platform can decide how deep it may go. It gates L1.2 and package C-states.
+- Can the link enter ASPM L1 while the function is in D0 and busy? => Yes, if the link is idle at that moment. ASPM looks at link activity, not at what the device is doing internally.
+PITFALL: Assuming autonomous means unconfigured. A wrong exit-latency field or a wrong APST table turns autonomous savings into random latency spikes.
+
+@@ 11.04 | Intermediate | Concept | tags=aspm,linkcap,linkctl,exit-latency,acceptable-latency
+Q: Which registers configure ASPM, and how does the OS decide which states to enable?
+SHORT: Link Capabilities says what the port supports (ASPM Support: none, L0s, L1 or both) and its worst-case L0s and L1 exit latencies. Link Control holds the ASPM Control field that enables L0s and L1 entry. Device Capabilities holds the endpoint's acceptable L0s and L1 latency. The OS enables a state only if both ends support it and the exit latency along the path fits within the endpoint's acceptable latency.
+DEEP:
+| Register | Field | Use |
+|---|---|---|
+| Link Capabilities | ASPM Support | 00 none, 01 L0s, 10 L1, 11 both |
+| Link Capabilities | L0s Exit Latency, L1 Exit Latency | 3-bit range codes (for example L1: 000 under 1 us up to 111 over 64 us) |
+| Link Capabilities | Clock Power Management | Port can remove the reference clock through CLKREQ# |
+| Device Capabilities | Endpoint L0s and L1 Acceptable Latency | Longest exit latency the endpoint can tolerate; 111 means no limit |
+| Link Control | ASPM Control | 00 off, 01 L0s, 10 L1, 11 both. Set on both ends of the link |
+| Link Control | Enable Clock Power Management | Lets the port use CLKREQ# to gate the clock |
+
+- **OS algorithm (Linux style):** walk from the endpoint toward the Root Port, take the exit latencies of the two ends of each link (and add about 1 us per switch for L1), and compare with the endpoint's acceptable latency. If it does not fit, that state stays off.
+- **Worked example:** SSD L1 exit under 32 us (range code), Root Port L1 exit under 8 us, no switch. The larger value, 32 us, is tested against the acceptable latency. If Device Capabilities says L1 acceptable is 16 to 32 us, it is borderline. If it says no limit (which many SSDs report), it always passes.
+- **Consequence:** an SSD that reports no limit shifts the risk to the SSD's real behaviour and to LTR. The OS gate does not protect you.
+- **lspci view:** `LnkCap: ... ASPM L1, Exit Latency L1 <64us` and `LnkCtl: ASPM L1 Enabled`.
+FOLLOW:
+- Why must both ends be enabled? => The downstream component (the SSD) initiates ASPM L1 and the upstream component (root or switch downstream port) must accept it, and the OS programs both ends so that the negotiation cannot be refused by configuration.
+- Why is L0s off on almost every NVMe SSD? => Devices rarely advertise it, its savings are small, and its failed exits show up as Recovery entries (see the LTSSM module).
+PITFALL: Trusting a reported exit latency. The field is what the vendor declared, and a wrong value silently breaks the OS's latency arithmetic.
+VERIFY: Exit latency code tables, the location of the Enable Clock Power Management bit, whether Endpoint Acceptable Latency fields are still defined in your Base Specification revision, and how your kernel version adds switch hops.
+
+@@ 11.05 | Intermediate | Concept | tags=aspm,linux,windows,bios,policy,lspci
+Q: What BIOS and OS knobs decide whether ASPM is on, and how do you find the effective setting on a machine?
+SHORT: Several layers stack. The BIOS may program ASPM and decide whether the OS may control it (ACPI _OSC and the FADT flag). On Linux, `pcie_aspm.policy` (default, performance, powersave, powersupersave) and `pcie_aspm=off` or `force` set the policy. On Windows the power plan setting Link State Power Management is Off, Moderate or Maximum. The effective result is whatever `lspci -vv` shows in LnkCtl and L1SubCtl.
+DEEP:
+- **BIOS:** typical menus are ASPM support (disabled, L0s, L1, L0s and L1, auto), Native ASPM or Native PCIe control, and L1 substates or clock gating per root port. Names vary by vendor.
+- **Handoff to the OS:** if firmware does not grant ASPM control through _OSC (or the FADT says ASPM is unsupported), Linux leaves the BIOS setting alone and disables its own handling unless forced.
+- **Linux policy:**
+  - `default`: keep what firmware programmed.
+  - `performance`: turn ASPM off.
+  - `powersave`: enable what the capabilities and latency check allow.
+  - `powersupersave`: additionally enable L1 substates.
+  - Runtime: `/sys/module/pcie_aspm/parameters/policy`, and per link `/sys/bus/pci/devices/<BDF>/link/` (l0s_aspm, l1_aspm, l1_1_aspm, l1_2_aspm and PCI-PM variants).
+- **Windows:** Power Options, Advanced settings, PCI Express, Link State Power Management. It only applies if the platform grants ASPM control to the OS.
+- **Verify, do not assume:** after boot, read the real registers on both ends of the link:
+
+```
+lspci -vv -s 04:00.0 | grep -E "LnkCap:|LnkCtl:|L1Sub"
+```
+- **Validation habit:** record BIOS version, kernel command line and effective LnkCtl and L1SubCtl for every run, because the same SSD passes on one policy and fails on another.
+FOLLOW:
+- Why does an SSD pass on `performance` but fail on `powersave`? => `powersave` enables L1 and L1.2, so the link now passes through low-power exits that `performance` never exercises.
+- Does the OS setting change SSD firmware behaviour? => Not directly. It changes when the link asks for L1, which changes what the SSD firmware sees at its PHY.
+PITFALL: Reading the kernel policy and stopping there. The BIOS may have set states the OS does not know about, and the device's LnkCtl is the ground truth.
+VERIFY: Exact policy names on your kernel, the sysfs attribute names, the dmesg wording for the FADT case, and the Windows setting encodings (`powercfg` values 0, 1 and 2 map to Off, Moderate and Maximum).
+
+@@ 11.06 | Intermediate | Trap | tags=trap,d3hot,l1,l2,quiesce
+Q: A colleague says "the SSD is in D3hot, so its link is in L2" and also "L1 entry is instant because the device just asks for it". What is wrong?
+SHORT: D3hot puts the link in L1, not L2. L2 belongs to D3cold and only after the PME_Turn_Off handshake with main power removed. Also, L1 entry is not instant. The port must stop new TLPs, wait until everything it sent is acknowledged and credits settle, and only then exchange the DLLPs and go idle. With ASPM the upstream port can also refuse.
+DEEP:
+| | D3hot | D3cold |
+|---|---|---|
+| Main power and refclk | Present | Removed |
+| Link state | L1 | L2 (aux) or L3 |
+| Config space | Accessible | Not accessible |
+| Wake path | In-band: exit L1, send PM_PME | WAKE# or beacon, then retrain from Detect |
+| Exit path in the LTSSM | Recovery | Detect |
+
+- **Quiesce first:** the handshake (covered in the Data Link Layer module) does not start while TLPs are unacknowledged. Under heavy I/O the entry is delayed, and a link that never goes idle never enters ASPM L1. That is why a busy SSD shows low L1 residency.
+- **ASPM can be rejected:** the upstream component (root or switch downstream port) answers the SSD's PM_Active_State_Request_L1 with PM_Request_Ack, or refuses with a PM_Active_State_Nak message, and the link stays in L0.
+- **A traffic-arrival race:** a new TLP that arrives during entry typically has to wait until the link has entered L1 and exited again, so latency is entry time plus exit time.
+- **Validation angle:** count L1 entries and exits separately from D-state changes. Both should be exercised under load and at idle.
+FOLLOW:
+- Can a function in D3hot still send PME? => Yes, if PME_Support says so and PME is enabled. It first wakes the link out of L1 and then sends the PM_PME message.
+- Which state has the higher wake cost, D3hot or D3cold? => D3cold, because power, clock and reset sequencing plus full training come before any software restore.
+PITFALL: Mixing up "the device is in a low D-state" with "the link is in a low L-state". The first is a register value, the second is an observed LTSSM state.
+VERIFY: Whether any implementation-specific entry timing (idle time before an ASPM L1 request) is specified and which conditions permit the upstream port to refuse.
+
+@@ 11.07 | Intermediate | Concept | tags=pme,wake,beacon,d3cold,vaux
+Q: How does a device wake the system: PME, WAKE# and beacon, and where does Vaux come in?
+SHORT: PME is the wake request. If the link is in L1 with main power present, the device exits L1 and sends a PM_PME message upstream. If main power and clock are gone (D3cold, link L2), it uses the WAKE# sideband signal, or in principle an in-band beacon. Waking from D3cold needs auxiliary power (Vaux) so that the device can keep its PME logic alive. SSDs rarely use any of this because the host initiates all storage traffic.
+DEEP:
+1. Software enables PME (PME_En in PMCSR) for a function whose PME_Support bits include the current D-state.
+2. The event occurs (for example a network card sees a magic packet). The function sets PME_Status.
+3. In-band case (D3hot, link L1): the link exits L1, the function sends a PM_PME Message TLP addressed to the Root Complex with its Requester ID.
+4. Sideband case (D3cold, link L2): the device asserts WAKE# (or sends a beacon). The platform restores power and clock, the link trains from Detect, and then the PME message flows.
+5. The Root Port records it in the Root Status register (PME Status, PME Requester ID) and raises an interrupt, or the platform raises an ACPI event.
+6. The OS reads PME_Status in the device, services the event and clears it by writing 1.
+
+- **Vaux:** an auxiliary supply that stays on when main power is off. Aux_Current in PMC says how much the function needs. Without Vaux a function cannot signal PME from D3cold.
+- **Beacon:** an optional in-band signal used when there is no WAKE# pin. In practice platforms wire WAKE#.
+- **SSD view:** an NVMe SSD does not originate wake events. It is woken by host doorbell writes (L1 exit) or by power-up. PME_Support is usually zero, as in the PMCSR sample earlier.
+FOLLOW:
+- Which message asks the device to prepare for power removal? => PME_Turn_Off from the Root Complex, answered by PME_TO_Ack and PM_Enter_L23 (see the LTSSM module).
+- What if the device sends PME while the link is in L2 and there is no WAKE# wiring? => Nothing happens, because L2 has no clock and no link. Wake needs the sideband pin or a beacon path.
+PITFALL: Expecting PME to matter for SSD validation. For storage, the wake path that matters is the host-driven L1 exit and the D3 resume, not PME.
+VERIFY: Beacon support and electrical rules in your Base Specification revision, and PME_Support and Aux_Current decoding.
+
+@@ 11.08 | Intermediate | Concept | tags=nvme,power-states,enlat,exlat,identify,set-features
+Q: How are NVMe power states described, and how does the host use them?
+SHORT: Identify Controller reports NPSS (the highest state index, zero-based) and a descriptor for each state PS0 to PSn. Each descriptor has maximum power (MP), a Non-Operational flag, entry latency ENLAT and exit latency EXLAT in microseconds, and relative throughput and latency hints. PS0 is the highest-power state. The host selects a state with Set Features, Power Management (Feature ID 02h) or lets the controller move on its own with APST.
+DEEP:
+```
+$ nvme id-ctrl /dev/nvme0 -H
+npss      : 4
+ps    0 : mp:8.25W operational enlat:0 exlat:0 rrt:0 rrl:0
+          rwt:0 rwl:0 idle_power:- active_power:-
+ps    3 : mp:0.0400W non-operational enlat:210 exlat:1200 rrt:3 rrl:3
+          rwt:3 rwl:3 idle_power:- active_power:-
+ps    4 : mp:0.0050W non-operational enlat:1000 exlat:9000 rrt:4 rrl:4
+          rwt:4 rwl:4 idle_power:- active_power:-
+```
+(Values are illustrative, in the style of nvme-cli.)
+
+- **Operational states** (Non-Operational flag clear): the controller processes I/O. Lower-power operational states cap power, for example under a thermal or system power limit, at reduced performance.
+- **Non-operational states:** the controller cannot process I/O until it returns to an operational state. These are the idle-savings states.
+- **ENLAT and EXLAT:** the maximum time to enter the state and to exit it, in microseconds. The host adds them (with link exit latency) to judge how long a wake can take.
+- **Set Features (Power Management):** the state number goes in the low bits of CDW11, with a Workload Hint above it. A host-selected non-operational state normally has to be undone by the host selecting an operational one. APST exits automatically on the next command.
+- **Thermal:** host-controlled thermal management (thresholds TMT1 and TMT2) and the composite temperature thresholds are a separate mechanism that throttles performance rather than changing the power state.
+FOLLOW:
+- Does a lower state number mean lower power? => No. PS0 is the highest power, and the highest index is usually the deepest non-operational state.
+- What do the relative read and write throughput fields mean? => They rank operational states by performance (0 is best). They are hints for host policy, not guarantees.
+PITFALL: Reading NPSS as a count. It is zero-based, so npss 4 means five descriptors.
+VERIFY: Bit layout of the power state descriptor and MXPS scaling, Feature ID 02h CDW11 layout, the exit behaviour after a host-selected non-operational state, and the thermal feature ID and field names in the NVMe Base Specification 2.x.
+
+@@ 11.09 | Intermediate | Concept | tags=runtime-d3,storage,nvme,d3cold,apst
+Q: Why is Runtime D3 unusual for NVMe SSDs, and what do laptops use instead?
+SHORT: Runtime D3 puts an idle device into D3hot or D3cold while the system is running. For an SSD the resume cost is large: a D3hot exit delay, a controller reset and reinitialization, and for D3cold also power and reset sequencing. Meanwhile APST plus link L1.2 already brings an idle SSD down to a few milliwatts with a millisecond-scale exit. So most systems keep the SSD in D0 and use D3 only for system sleep.
+DEEP:
+| Path | Typical exit cost | State preserved | Savings |
+|---|---|---|---|
+| Link L1.2 (ASPM) | tens of microseconds | Everything | PHY power |
+| NVMe non-operational PS via APST | about 1 to 10 ms (EXLAT) | Everything (queues, config) | NAND and controller power |
+| D3hot | 10 ms plus controller reinit | Config space only if No_Soft_Reset | Small extra over the two above |
+| D3cold | Hundreds of ms to seconds | Nothing (needs shutdown first) | Zero device power |
+
+- **Linux:** the PCI core has runtime PM (`power/control`, `power/runtime_status`), but the mainline NVMe PCI driver historically implements only system-sleep callbacks and uses APST for runtime savings. Suspend behaviour depends on heuristics (deepest power state versus full shutdown) and on the platform's StorageD3Enable property.
+- **Windows:** the storage stack supports device idle power management on platforms that declare storage devices safe for D3, and the results are visible in modern standby reports.
+- **State loss:** entering D3cold requires an NVMe shutdown first (see the NVMe shutdown question). Coming back is a full bring-up, and any outstanding I/O has already been drained.
+- **Where it does make sense:** data center and embedded designs that switch off whole slots, and platforms where the SSD sits behind a power-gated rail and the rail must drop for a battery target.
+FOLLOW:
+- Why not always use D3cold when idle? => Resume latency and the risk of a failed re-initialization outweigh a few extra milliwatts. It also needs a clean shutdown each time.
+- What must the driver do before D3cold? => Drain I/O, delete queues, issue the NVMe shutdown notification and wait for completion, then save config state.
+PITFALL: Validating only system suspend. Runtime idle transitions happen thousands of times a day and hit different code paths in the SSD firmware.
+VERIFY: Whether the NVMe driver in your kernel version implements runtime PM, the StorageD3Enable handling and the current Windows behaviour for NVMe idle D3.
+
+@@ 11.10 | Advanced | Concept | tags=l1ss,l1.1,l1.2,clkreq,t-power-on,ltr
+Q: What are the L1 PM Substates, and what gates entry into L1.2?
+SHORT: L1 PM Substates split L1 into L1.0 (classic L1), L1.1 and L1.2. In both new substates the CLKREQ# sideband is deasserted so the platform can stop the reference clock. L1.1 keeps the link common-mode voltage. L1.2 also drops it and powers down more of the PHY, which saves the most but exits the slowest, needing T_POWER_ON plus common-mode restore time. Entering L1.2 also requires that the device's LTR meets the L1.2 threshold.
+DEEP:
+- **Capability (extended, ID 001Eh):** supports for PCI-PM and ASPM flavours of L1.1 and L1.2, Port Common Mode Restore Time, and Port T_POWER_ON (a scale plus value).
+- **Control 1:** enables for PCI-PM L1.1, PCI-PM L1.2, ASPM L1.1, ASPM L1.2, the Common Mode Restore Time to use, and LTR_L1.2_THRESHOLD (value plus scale).
+- **Control 2:** T_POWER_ON the software programs (scale plus value).
+- **CLKREQ#:** an open-drain sideband. The device deasserts it to say "you may stop the reference clock" and asserts it to request the clock back. Both the device and the platform's clock buffer must be wired for it.
+- **L1.1 exit:** restart the clock, then normal Recovery.
+- **L1.2 exit:** after CLKREQ# assertion the ports wait T_POWER_ON, re-establish common mode (Common Mode Restore Time), then run Recovery.
+- **LTR gate:** the port may enter L1.2 only if the latency tolerance the device has reported is at least LTR_L1.2_THRESHOLD, which the OS sets from the exit times. A device that reports a tight tolerance stays out of L1.2.
+
+```
+L1SubCap: PCI-PM_L1.2+ PCI-PM_L1.1+ ASPM_L1.2+ ASPM_L1.1+ L1_PM_Substates+
+          PortCommonModeRestoreTime=10us PortTPowerOn=10us
+L1SubCtl1: PCI-PM_L1.2+ PCI-PM_L1.1+ ASPM_L1.2+ ASPM_L1.1+
+          T_CommonMode=0us LTR1.2_Threshold=0ns
+L1SubCtl2: T_PwrOn=10us
+```
+(Illustrative lspci output.)
+FOLLOW:
+- Why does L1.2 fail on some platforms even when the SSD supports it? => CLKREQ# is not routed to the clock source, the clock takes longer to become stable than the programmed T_POWER_ON, or no LTR is being sent.
+- What is the difference between PCI-PM and ASPM substate enables? => PCI-PM substates apply when software put the device in D3hot, ASPM substates when the link goes idle in D0.
+PITFALL: Assuming L1.2 is only an SSD setting. It needs the SSD, the root port, the clock buffer and the OS all agreeing on timings.
+VERIFY: L1 PM Substates capability ID, register offsets, field names and bit positions, the exact meaning and interaction of T_POWER_ON and Common Mode Restore Time, whether the PCI-PM L1.2 entry also depends on the LTR threshold, and the snoop versus non-snoop rule for the LTR threshold.
+
+@@ 11.11 | Advanced | Concept | tags=ltr,obff,snoop,latency,l1.2
+Q: What is Latency Tolerance Reporting, and why does an SSD send it?
+SHORT: LTR is a message (Msg TLP) in which a device tells the platform the longest latency it can tolerate for memory requests it makes, given separately for snooped and non-snooped traffic. The platform uses the tightest value it has collected to decide how deep the CPU package, memory and PCIe links may sleep. An SSD sends a tight value when it has work and a large one when idle, which lets the link enter L1.2 and the SoC enter deep idle.
+DEEP:
+- **Enable:** Device Capabilities 2 advertises LTR support, and Device Control 2 has the LTR Mechanism Enable bit. The LTR extended capability holds Max Snoop Latency and Max No-Snoop Latency, which cap what the device may report.
+- **Message content:** for snoop and non-snoop, a value (10 bits), a scale (3 bits) and a Requirement bit. Scale steps are 1 ns, 32 ns, 1,024 ns, 32,768 ns, 1,048,576 ns and 33,554,432 ns, so the largest expressible tolerance is about 34 ms.
+- **Snoop and non-snoop:** snoop traffic is cache-coherent DMA, non-snoop is traffic that bypasses CPU caches. The platform's wake cost differs, so the device reports both.
+- **Aggregation:** switches combine the LTR of downstream ports (the minimum) and forward one upstream.
+- **What an SSD does:** in an active phase, it reports a small value (tens of microseconds) so that host memory responds fast. With empty queues and no background work, it reports a large value or no requirement.
+- **What LTR gates:** the LTR_L1.2_THRESHOLD check on the link (previous question) and the platform's package C-state selection.
+- **OBFF:** Optimized Buffer Flush/Fill lets the platform hint to devices when it is awake so that they batch their DMA. It is rarely used in practice and LTR does the practical work.
+FOLLOW:
+- What happens if a device never sends LTR? => The result depends on the platform policy and the Requirement bit rules. Many platforms then treat the device as unconstrained, but some keep the package shallow. Measure it, do not assume.
+- Why does an idle SSD sometimes block deep package idle? => Its last LTR was small (or zero) and was never relaxed, or its firmware keeps sending updates because of background activity.
+PITFALL: Treating LTR as a link-level feature. It is a system-level input, and a wrong value costs power at the package, not just at the link.
+VERIFY: LTR message format and encodings, Requirement bit semantics, aggregation rules, behaviour when no LTR has been sent, and OBFF status in your Base Specification revision.
+
+@@ 11.12 | Advanced | Concept | tags=apst,nvme,idle-timer,table,linux
+Q: How does NVMe Autonomous Power State Transition work, and what does the table contain?
+SHORT: APST lets the controller move itself to a lower power state after being idle. The host writes a table through Set Features (Feature ID 0Ch) with one entry per current power state: an idle time prior to transition (ITPT, in milliseconds) and an idle transition power state (ITPS). Idle time counts from the last command in the current state, and the controller returns to an operational state when a command arrives. Support is reported by Identify Controller.
+DEEP:
+- **Table format:** 32 entries of 8 bytes in a 256-byte buffer. Entry N applies when the controller is in power state N. Bits 7:3 are ITPS and bits 31:8 are ITPT. ITPT of zero means no transition.
+- **Enable:** bit 0 of CDW11 (APSTE). Identify Controller has an APST attribute that says whether the controller supports it.
+- **Linux approach** (`nvme_core.default_ps_max_latency_us`, default 100000): consider each non-operational state whose exit latency is within the limit, and set the idle time to 50 times (ENLAT + EXLAT), rounded up to milliseconds. Setting the limit to 0 disables APST.
+
+With the sample descriptors from the previous power-state question:
+
+| Current state | Idle time | Target |
+|---|---|---|
+| PS0, PS1, PS2 (assumed operational) | 71 ms (50 x 1,410 us) | PS3 |
+| PS3 | 500 ms (50 x 10,000 us) | PS4 |
+| PS4 | none | none |
+
+- **Why 50 times:** the time in a state has to repay the energy spent entering and leaving it. The multiplier is a heuristic and errs toward staying awake.
+- **Interaction with the workload:** any command resets the idle timer. A background writer that touches the drive every 400 ms never lets the state ladder reach PS4.
+- **Known problems:** some SSDs misbehave in the deepest state or with APST at all, so Linux carries quirks that disable APST or the deepest state for specific models.
+FOLLOW:
+- Is the host aware when APST changes state? => Not by any notification. Get Features (Power Management) returns the state the host last set, which may not reflect an APST-driven transition, so the transitions are silent to the host (verify on your controller).
+- What extra latency does an I/O see after APST entry? => Up to EXLAT for the state plus link exit latency. It shows up as first-I/O latency after idle.
+PITFALL: Comparing APST settings across kernels without noting the driver's latency limit. Two systems with the same drive can pick different target states.
+VERIFY: The APST table encoding (ITPS and ITPT bit positions), Feature ID 0Ch, the Identify Controller APST attribute, which operational state the controller returns to, and the driver's current formula and quirk list.
+
+@@ 11.13 | Advanced | Cross-layer | tags=shutdown,cc-shn,csts-shst,d3,rtd3,unsafe-shutdown
+Q: How does the NVMe Shutdown Notification relate to PCIe D3, and in what order do you use them?
+SHORT: They are independent. CC.SHN (normal or abrupt) tells the NVMe controller to flush and finish so that power can go away safely, and CSTS.SHST reports processing then complete. PCIe D3 only changes function and link power. Before removing power (D3cold) you do the NVMe shutdown first, wait for SHST to show complete, then move to D3hot and let the platform cut power. D3hot alone is not a flush.
+DEEP:
+1. Quiesce: stop new I/O, wait for outstanding commands, delete queues.
+2. Write CC.SHN = normal shutdown notification.
+3. Poll CSTS.SHST until it reads shutdown processing complete. Use a timeout based on the controller's reported RTD3 entry time (Identify Controller) or a driver default.
+4. Save PCI config state and write D3hot in PMCSR. The link goes to L1.
+5. If the platform removes power, PME_Turn_Off and the L2 sequence follow (LTSSM module).
+6. Resume: restore power and link, restore config, then reset the controller (CC.EN 0 then 1) and rebuild admin and I/O queues.
+
+- **Abrupt shutdown:** used when there is no time for a full flush (emergency, hung device). It is less clean, and the controller may need extra recovery work at next power-up.
+- **Unsafe shutdowns:** the SMART/Health log keeps a count of power losses that happened without a shutdown notification. It is the field evidence that a platform skipped step 2.
+- **After SHST complete:** the controller does not accept I/O until it is reset. Sequencing the shutdown before D3hot is a software step, and no hardware does it for you.
+- **Link loss is not a shutdown:** an SSD whose link drops (DPC, surprise removal) receives no notification and stays powered.
+FOLLOW:
+- Is a normal shutdown needed before D3hot if power stays on? => Generally not for data safety, because the device stays powered. It is needed before power removal or when the platform may remove it without warning.
+- What do RTD3 Entry and Resume Latency tell you? => The controller's worst-case time to complete a normal shutdown and to resume from a D3-style power cycle, so the host can size its timeouts.
+PITFALL: Assuming the PCIe PME_Turn_Off handshake flushes the SSD. It only quiesces the link. The flush is the NVMe shutdown.
+VERIFY: CC.SHN and CSTS.SHST bit positions and encodings, the RTD3 entry and resume fields, the default shutdown timeout used by your OS driver, and what the NVMe Base Specification requires before entering D3.
+
+@@ 11.14 | Advanced | Numeric | tags=numeric,exlat,enlat,latency-budget,l1.2
+Q: Given the NVMe power states below and a link that wakes from L1.2, which states are permissible for a host that tolerates 5 ms, and for one that tolerates 10 ms?
+SHORT: Wake latency is roughly link exit plus EXLAT. With link exit assumed at 0.11 ms, PS3 wakes in 1.31 ms and PS4 in 9.11 ms. At a 5 ms tolerance only PS3 is permissible. At 10 ms, PS4 passes the typical case (9.11 ms) but fails the conservative case where I/O arrives just as entry starts (10.11 ms), so it depends on whether the limit is soft or hard.
+DEEP:
+Assumptions (all illustrative): PS3 has ENLAT 210 us and EXLAT 1,200 us. PS4 has ENLAT 1,000 us and EXLAT 9,000 us. Link exit from L1.2 is 110 us, taken as a conservative sum of T_POWER_ON (70 us), common mode restore (10 us) and Recovery and clock restart (30 us).
+
+1. Typical wake: link exit + EXLAT. PS3: 0.11 + 1.20 = 1.31 ms. PS4: 0.11 + 9.00 = 9.11 ms.
+2. Conservative wake (I/O arrives while the entry is in progress and must wait for it): link exit + ENLAT + EXLAT. PS3: 0.11 + 0.21 + 1.20 = 1.52 ms. PS4: 0.11 + 1.00 + 9.00 = 10.11 ms.
+3. Compare with 5 ms: PS3 passes both (1.31 and 1.52). PS4 fails both. Even the EXLAT alone (9 ms) fails.
+4. Compare with 10 ms: PS3 passes. PS4 passes typical (9.11 ms) and fails conservative (10.11 ms) by 0.11 ms.
+5. APST idle timers under the Linux rule: PS3 at 50 x (210 + 1,200) us = 70.5 ms, so 71 ms. PS4 at 50 x (1,000 + 9,000) us = 500 ms.
+6. Sanity check on energy: assume 2 W during transitions. Enter and exit cost 2 W x 10 ms = 20 mJ. PS4 saves 40 mW - 5 mW = 35 mW over PS3, so break-even is 20 mJ / 35 mW = about 0.57 s. The 500 ms timer is the same order.
+
+- **Decision rule:** for a soft target (median or p99 responsiveness) use the typical wake. For a hard bound use the conservative wake and add margin.
+- **Where the numbers come from:** ENLAT and EXLAT from Identify Controller, link exit from the L1 substate registers (or measured), tolerance from the OS policy or workload.
+FOLLOW:
+- Would the answer change on a platform with L1.1 only? => The link exit is shorter (no common mode restore), so PS3 and PS4 shift by tens of microseconds. The NVMe part still dominates.
+- What if the SSD advertises EXLAT smaller than what you measure? => That is a firmware or spec violation. Measure EXLAT in validation (see the scale question) and file it against the device.
+PITFALL: Checking EXLAT alone. The link exit and the entry-in-progress case both add to the real worst-case wake.
+VERIFY: Whether T_POWER_ON and common mode restore overlap or add in the spec, and how the NVMe Base Specification defines ENLAT and EXLAT when a command arrives during entry.
+
+@@ 11.15 | Advanced | Debug | tags=debug,l1.2,d3,recovery,aer,dmesg
+Q: An SSD works for hours, then fails to respond after an idle period (an L1.2 exit) or never returns from D3. What do you collect, and what experiments do you run?
+SHORT: First classify the failure: is the link gone (reads return all ones, LnkSta not active), degraded (down-trained, Recovery loops) or up with a dead controller (CSTS not ready). Collect LnkSta, AER counters, LTSSM Recovery counts around the event, dmesg, and the exact ASPM and substate settings. Then bisect by turning features off one at a time: L1.2, then all ASPM, then APST. If disabling L1.2 fixes it, the exit timing or clock is suspect.
+DEEP:
+| Evidence | What it tells you |
+|---|---|
+| Config reads return FFFFFFFF, `DLActive-` | Link not up: the exit from L1.2 or D3cold did not train |
+| `LnkSta` speed lower than `LnkCap` | It retrained but fell back (equalization or margin) |
+| Recovery count per L1 exit above 1 | The exit needed several attempts: T_POWER_ON, clock start or CMRT too short |
+| AER correctable (RxErr, BadTLP) spikes right after wake | Receiver had not stabilized. Marginal exit |
+| AER uncorrectable or DPC event | Consequence, not root cause. Look for the first error |
+| `CSTS = 0xffffffff` or RDY clear | Link gone (all ones) versus controller alive but not ready |
+| dmesg: `Unable to change power state from D3cold to D0, device inaccessible` | Config space unreadable on resume |
+| dmesg: `controller is down; will reset: CSTS=0xffffffff` | The driver saw all ones on MMIO |
+
+Typical message wording differs by kernel; read the sequence, not the exact text.
+
+1. Record the environment: BIOS, kernel and firmware versions, temperature, `lspci -vv` for both ends (LnkCtl, L1SubCtl1 and 2, DevCtl2 LTR enable).
+2. Reproduce with a scripted idle-then-I/O loop and note the idle time that fails. A fixed idle time that always fails points at a timer (APST idle timer, ASPM idle timer or LTR threshold).
+3. Bisect:
+   - Disable L1.2 alone (`echo 0 > /sys/bus/pci/devices/<BDF>/link/l1_2_aspm`), then L1.1, then all ASPM (`pcie_aspm.policy=performance`).
+   - Disable APST (`nvme_core.default_ps_max_latency_us=0`) to separate NVMe state from link state.
+   - For D3, try a different resume path (D3hot only versus D3cold).
+4. Vary conditions: temperature, supply voltage, reference clock (SSC on and off), and the slot or root port.
+5. Capture the wake on a protocol analyzer or LTSSM log: CLKREQ# assertion, clock stable time, Recovery entries and the first TS1.
+FOLLOW:
+- L1.2 off fixes it. Is the SSD at fault? => Not necessarily. The exit budget is shared between the SSD, the root port, the clock buffer and the board. Compare the programmed T_POWER_ON with the measured clock stable time.
+- It fails only when cold. Why? => Regulator and clock start-up times stretch at low temperature, so a marginal T_POWER_ON that works at room temperature no longer covers them.
+PITFALL: Fixing the symptom by disabling ASPM everywhere and closing the bug. The platform then ships with a latent defect that another SSD or BIOS will expose.
+VERIFY: dmesg wording on your kernel, the sysfs link attribute names, and how your vendor tooling exposes LTSSM Recovery counts.
+
+@@ 11.16 | Principal | Cross-layer | tags=laptop,s0ix,modern-standby,ltr,pmc,l1.2,apst
+Q: How do NVMe non-operational states and link L1.2 combine in a real laptop idle or standby, and how do you check that they do?
+SHORT: The platform reaches its deepest idle only if three layers agree: the SSD sits in its deepest non-operational state, the link is in L1.2 with CLKREQ# deasserted so the clock can stop, and the SSD's LTR is relaxed so the SoC may enter deep package idle. If any leg is missing, the whole platform stays awake. Check each leg separately, then check the platform residency counters.
+DEEP:
+- **Leg 1, NVMe:** the SSD must actually reach the deepest state. Background housekeeping, periodic OS writes shorter than the APST idle time, or a quirk that disables the deepest state all keep it up. In suspend-to-idle the Linux driver may either put the SSD in the deepest power state (relying on ASPM) or shut it down fully, depending on heuristics and platform properties.
+- **Leg 2, link:** ASPM L1.2 must be enabled at both ends, CLKREQ# wired, and the LTR threshold satisfied.
+- **Leg 3, LTR:** a small or missing LTR from any device keeps the package shallow. Any one device can pin the platform.
+- **Evidence to collect:**
+  - SSD power at the rail with a power analyzer at a stable idle (compare to the datasheet in the deepest state).
+  - Link state through `lspci -vv` and the platform's L1 residency counters where available.
+  - Platform residency: on Intel systems package C-state and S0ix residency (`turbostat`, the PMC core debugfs files including LTR and residency, Windows `powercfg /sleepstudy`).
+  - The LTR the SSD currently reports and which device is the blocker.
+- **Failure ladder:** SSD in PS0 with L1 only costs hundreds of milliwatts. PS4 with a link stuck in L0 wastes the PHY power. Good PS4 and L1.2 with a bad LTR loses the SoC savings, which are the largest.
+- **Wake side:** the first I/O after wake pays link exit plus EXLAT. A laptop must confirm that resume-time storage reads still meet the OS's expectations.
+FOLLOW:
+- How does a data-center SSD differ? => Latency-critical servers usually disable ASPM and APST and stay in PS0 and L0. The validation goal is then stability at full power, not idle savings.
+- Why validate per firmware version? => Idle behaviour is firmware policy (timers, background scheduling, LTR updates). A new firmware can silently stop reaching PS4.
+PITFALL: Trusting the SSD's own report of being idle. Measure power and platform residency. A state that is configured but never reached earns nothing.
+VERIFY: Platform specifics: the PMC core debugfs file names, the Windows sleepstudy and modern standby storage requirements, StorageD3Enable handling, and the Linux suspend-to-idle NVMe decision logic for your kernel.
+
+@@ 11.17 | Principal | Scenario | tags=validation,stress,scale,latency,integrity,temperature
+Q: How would you validate power-state transitions on an SSD across many units and a long time, and prove the failure rate is low?
+SHORT: Build a harness that cycles every transition (ASPM L1 and its substates, NVMe non-operational states, D3hot and D3cold) under a controlled idle-then-I/O pattern, verifies data after each cycle, times the exit against EXLAT plus link exit, and logs link, AER and SMART counters. Run it across temperature and voltage corners on many units. For rare failures use the rule of three: about 3 divided by the target failure rate in clean cycles.
+DEEP:
+1. **Cycle definition:** idle for a set time, then a small I/O burst, repeat. Vary idle time (below, near and above each timer), burst size and queue depth, and whether a write is in flight when entry begins.
+2. **Data integrity:** write with a known pattern (per-LBA seed, or fio with `verify=crc32c`), and read back and compare after every cycle group. Include reads before and after exit and writes that straddle the transition.
+3. **Timing:** measure first-I/O latency after idle from the host (fio with think time, latency histograms) and compare with link exit plus EXLAT from the descriptor. Any sample above the budget is a defect against the descriptor.
+4. **Observation:** per cycle read LnkSta, AER correctable and uncorrectable counters, Recovery counts if available, SMART (media errors, unsafe shutdowns), and, where the controller exposes it, the current NVMe power state (Get Features reports the host-set value, so APST-driven states may need a vendor log).
+5. **Corners:** temperature (cold, ambient, hot), supply voltage margins, reference clock with and without spread spectrum, Gen speed, and different root ports and BIOS versions.
+6. **Correlation:** log temperature and rail voltage with each failure. Wake failures that cluster at cold plus low voltage point at clock or regulator start-up.
+7. **Statistics:** a failure rate below 1e-5 per cycle at 95 percent confidence needs about 3 / 1e-5 = 300,000 clean cycles. At 10 cycles per second that is about 8.3 hours per unit and condition, so run many units in parallel.
+8. **Timer-bound cycles:** an APST cycle cannot be shorter than its idle timer. With the 500 ms timer in the example, 300,000 cycles take about 42 hours at 2 cycles per second. For stress, write a test-only APST table with short idle times, and keep a separate run with production tables.
+
+- **Pass criteria:** zero data miscompares, zero AER uncorrectable errors, no link down-training, latency within budget, and no unexpected Recovery entries beyond the expected one per exit.
+- **Triage of failures:** save the trace and counters at the failing cycle and cycle number. A failure at cycle N right after a fixed idle time is deterministic. A random one is a margin issue.
+FOLLOW:
+- How do you know the device really entered the state? => Read the state or residency (Get Features, vendor log, rail power, L1 entry counts). A test that only sets the policy is not proof.
+- How do you avoid hiding bugs by long cycles? => Randomize idle times and mix I/O sizes. A fixed rhythm can miss races that only appear at particular gaps.
+PITFALL: Counting configured cycles instead of observed transitions. If the SSD never entered the deep state, a million passes prove nothing.
+VERIFY: Which counters your SSD, root port and vendor tooling actually expose (L1 entry counts, PS residency) and the exact fio options for think time and verification on your version.
+
+@@ 11.18 | Principal | Cross-layer | tags=matrix,d-states,l-states,ps,platforms,coverage
+Q: How would you design a power-state validation matrix across D-states, L-states, NVMe power states and host platforms?
+SHORT: Treat it as a state space with legal and illegal combinations. Enumerate the axes (D-state, link state and substates, NVMe power state, APST, LTR, link speed, reset type, workload, host platform), remove impossible cells, cover transitions and not only states, prioritize by risk with pairwise coverage, and require evidence that each state was actually observed. Automate it and gate on integrity, latency, counters and residency.
+DEEP:
+1. **Axes:**
+   - D-state: D0, D3hot, D3cold.
+   - Link: L0, L1, L1.1, L1.2, L2 through D3cold. L0s if the device supports it.
+   - NVMe: PS0 to PSn and APST on or off.
+   - Environment: link speed and width, LTR values, ASPM policy, host platform (root port, BIOS, OS), temperature and voltage.
+2. **Prune the impossible:** D3hot with the link in L0, D3cold with L1, NVMe I/O in a non-operational state, and so on. Document why each is excluded.
+3. **Cover transitions:** the interesting bugs are in edges (L0 to L1.2 under a write in flight, PS3 to PS4 during a flush, D3hot to D0 then immediate doorbell), and in orders (NVMe shutdown then D3, versus D3 then shutdown).
+4. **Reduce with pairwise coverage** for the axes that are mostly independent, and keep full coverage for the critical set: exits (latency and correctness), resume after D3cold, and low-power state under error injection.
+5. **Add stress and fault:** transitions under heavy I/O, with resets (FLR, hot reset, controller reset) mid-transition, and with injected errors during exit.
+6. **Evidence per cell:** observed state (not configured), transition count, exit latency versus budget, AER and Recovery deltas, SMART and data integrity results.
+7. **Platform matrix:** at least one client and one server platform, with different clock trees (some route CLKREQ#, some do not), different LTR handling and different OS drivers.
+8. **Automation:** a cell is a scripted test with setup, transition loop, verification and a pass or fail with logs. A dashboard shows coverage and failure rate per cell.
+
+- **Decision criteria:** risk from customer usage (laptop idle most of the time), history of bugs, and cost per cell. Cover breadth first, then depth in the cells that have failed.
+FOLLOW:
+- How do you stop the matrix from growing without bound? => Fix the reference platform set, use pairwise coverage, retire cells that pass for many releases, and add cells only when a bug escapes.
+- How do you report coverage to management? => By observed cells and transition counts versus the risk-ranked list, with open failures and the platform each one occurred on.
+PITFALL: Claiming coverage by configuration. A cell is covered only if the transition was observed and its effects were verified.

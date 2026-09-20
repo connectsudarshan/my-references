@@ -1,0 +1,331 @@
+# Module 10 — Interrupts (INTx / MSI / MSI-X)
+
+@@ 10.01 | Basic | Concept | tags=interrupts,in-band,msi,intx,posted-write
+Q: How does a PCIe device raise an interrupt, given that there are no interrupt pins?
+SHORT: PCIe has no sideband interrupt wires, so interrupts travel in-band as TLPs. MSI and MSI-X interrupts are simply posted memory writes: the device writes a small data value to an address the host pre-programmed, and the interrupt controller decodes that write into a CPU interrupt. Legacy INTx is emulated with Assert_INTx and Deassert_INTx message TLPs that mimic a level-sensitive wire.
+DEEP:
+- **MSI and MSI-X:** the driver programs an address and data into the device. To interrupt, the device sends a one-dword memory write TLP to that address with that data. On x86 the address range 0xFEExxxxx is claimed by the interrupt controller, not by memory.
+- **INTx emulation:** the device sends Assert_INTA (or B, C, D) when its internal interrupt goes active and Deassert_INTx when it clears. Messages are consumed at the next port and re-issued upstream, and the root complex maps them onto a system interrupt.
+- **Why in-band is good:** the interrupt is ordered with the device's data writes in the same posted stream. If the completion queue entry was written first, the interrupt cannot pass it (subject to ordering rules, see below).
+- **Why it matters for SSDs:** a modern NVMe SSD uses MSI-X, with one vector per completion queue, so completions land on the CPU that issued the command.
+- **Who asks for what:** a device reports which mechanisms it supports through capabilities (MSI 05h, MSI-X 11h), and the OS chooses, normally MSI-X, then MSI, then INTx.
+FOLLOW:
+- Is a device required to support INTx? => Native PCIe endpoints that generate interrupts must support MSI or MSI-X. INTx is legacy compatibility and is optional for many.
+- What about PME and hot-plug events? => They use the same in-band mechanisms, usually MSI or MSI-X, with the vector identified in the PCI Express Capabilities register.
+PITFALL: Imagining the interrupt as a signal separate from data. It is a memory write in the same stream, and the ordering of the two is the whole point.
+VERIFY: Whether native PCIe endpoints are required to support INTx, and the Message code values for Assert_INTx and Deassert_INTx.
+
+@@ 10.02 | Basic | Concept | tags=intx,assert,deassert,swizzle,interrupt-pin
+Q: How does INTx emulation work over PCIe, and how does the INTx-to-pin mapping change through bridges?
+SHORT: The device sends Assert_INTx when its interrupt goes active and Deassert_INTx when it clears, so the message pair behaves as a level-sensitive wire. There are four virtual wires, A to D, and a device picks one by its Interrupt Pin register (3Dh). A bridge forwards them upstream after rotating the letter by the device number of the port, so several devices can share the same wire. The root complex maps wires to system interrupts.
+DEEP:
+- **Interrupt Pin (3Dh):** 00h means no INTx, 01h to 04h mean INTA to INTD. Most single-function devices use INTA. The Interrupt Line register (3Ch) is a scratch byte for firmware to record the IRQ.
+- **Per-wire state in bridges:** a bridge or switch tracks each virtual wire as if wired-OR. It sends Assert upstream when the first source asserts and Deassert only when the last source deasserts.
+- **Swizzling:** upstream wire = (child wire + device number of the downstream port) mod 4.
+
+| Port device number | Child INTA | INTB | INTC | INTD |
+|---|---|---|---|---|
+| 0 | A | B | C | D |
+| 1 | B | C | D | A |
+| 2 | C | D | A | B |
+| 3 | D | A | B | C |
+
+- **Purpose:** spreading devices that all use INTA across the four upstream wires.
+- **At the root:** ACPI (`_PRT`) or the device tree maps each device and pin to an IRQ line on the interrupt controller. Devices at different depths can end up sharing one IRQ.
+- **Ordering:** Assert and Deassert messages are posted and stay in order with the device's other posted writes.
+FOLLOW:
+- Are Assert and Deassert messages routed to a memory address? => No. They are message requests routed to the local receiver only, consumed and regenerated at each bridge.
+- Why swizzle at all? => PCI had four shared lines, and rotating by slot number balanced the load. PCIe keeps the rule so old software and firmware maps still work.
+PITFALL: Expecting each device to have its own interrupt line. INTx wires are shared by many functions, so the handler must find out who actually raised it.
+VERIFY: The port device number rule and the mapping table in the Base Specification (INTx virtual wire mapping), and the Message code values.
+
+@@ 10.03 | Basic | Concept | tags=intx,sharing,level,disable,interrupt-status,latency
+Q: What are the problems with INTx, and what do the INTx Disable and Interrupt Status bits do?
+SHORT: INTx is shared, level-sensitive and one wire per function. Shared wires mean every handler on that line runs and has to poll its device. Level semantics mean the source must be cleared before the interrupt is acknowledged, or it fires again. The message path adds latency, and there is no per-queue routing. Command bit 10 (Interrupt Disable) blocks the function's INTx, and Status bit 3 (Interrupt Status) shows whether its INTx is pending.
+DEEP:
+- **Sharing:** each handler on the line reads its device to see whether it was the source, and that read is a non-posted transaction across the link, roughly a microsecond in a real system.
+- **Level semantics:** the device holds the interrupt until software clears the cause. If the driver clears it with a posted write and signals end of interrupt at once, the Deassert may not have arrived yet, and the interrupt fires again.
+- **Latency:** an Assert message crosses the fabric, the root complex converts it, and only one CPU gets it. There is no way to target a CPU per queue.
+- **One wire per function:** a multi-queue device cannot say which queue has work.
+- **INTx Disable and Interrupt Status:**
+  - Interrupt Disable (Command bit 10) stops the function from asserting INTx. It has no effect on MSI or MSI-X.
+  - Interrupt Status (Status bit 3) reflects the function's INTx state, and an OS can read it to tell whether a shared line was this device without touching device registers.
+- **NVMe:** the controller supports pin-based interrupts, and uses INTMS/INTMC to mask them, but that path is single-vector and only a fallback.
+FOLLOW:
+- Why do drivers read a register back after clearing the interrupt cause? => The read forces the earlier posted write to reach the device before the CPU signals end of interrupt, so the level is really gone.
+- When would you deliberately test INTx on an SSD? => For legacy compatibility (boot environments, old BIOS, virtualized hosts without MSI), and to verify pin-based behavior with INTMS and INTMC.
+PITFALL: Believing Interrupt Disable turns off all interrupts. It only affects INTx, and a device using MSI-X keeps interrupting.
+VERIFY: Bit positions of Interrupt Disable (Command bit 10) and Interrupt Status (Status bit 3) in the Base Specification.
+
+@@ 10.04 | Intermediate | Concept | tags=msi,capability,multiple-message,per-vector-mask,64-bit
+Q: How is the MSI capability structured, and how does a device generate up to 32 vectors from one address?
+SHORT: The MSI capability (ID 05h) holds Message Control, a Message Address (32 or 64 bit), a 16-bit Message Data, and optionally per-vector Mask and Pending registers. Multiple Message Capable says how many vectors the device wants, as a power of two up to 32, and Multiple Message Enable says how many software granted. The device makes vector n by replacing the low bits of Message Data with n, so all vectors share one address.
+DEEP:
+- **Message Control bits:** MSI Enable (bit 0), Multiple Message Capable (3:1), Multiple Message Enable (6:4), 64-bit Address Capable (7), Per-Vector Masking Capable (8).
+- **Layout, 64-bit variant:** Message Address at +4, Upper Address at +8, Message Data at +0Ch, Mask Bits at +10h, Pending Bits at +14h. The 32-bit variant has Data at +8, then Mask at +0Ch and Pending at +10h.
+- **Vector encoding:** the field 2^(MMC) is the requested count: 000b is 1, 001b is 2, 010b is 4, 011b is 8, 100b is 16, 101b is 32. Software programs a base Message Data with the low log2(N) bits zero, and the device ORs vector number n into them.
+- **One address, one CPU:** on x86 the destination CPU is in the message address, so without interrupt remapping every vector of an MSI function lands on the same CPU. That, plus the 32-vector limit and contiguous allocation, is why MSI does not suit multi-queue devices.
+- **Masking:** with per-vector masking, a masked vector that fires sets its Pending bit and is delivered on unmask. Without it, the OS cannot mask at the device.
+- **Enable rule:** software enables MSI or MSI-X on a function, not both. Linux disables MSI before it enables MSI-X.
+FOLLOW:
+- Can an NVMe SSD use MSI with more than one vector? => Yes, multi-message MSI is allowed, and the NVMe specification lists it as an option. In practice SSDs use MSI-X and MSI is a fallback.
+- What does the OS do if it grants fewer vectors than requested? => Multiple Message Enable is set lower, and the device must fold its interrupt sources onto the granted vectors.
+PITFALL: Assuming vectors in MSI can be steered to different CPUs independently. They share one address, so unless the interrupt controller remaps, they go to the same place.
+VERIFY: Message Control bit positions and the Mask and Pending register offsets for 32-bit and 64-bit variants, what the specification says when MSI and MSI-X are both enabled, and any Extended Message Data bits added in recent revisions.
+
+@@ 10.05 | Intermediate | Concept | fig=msix | tags=msi-x,table,pba,bir,vector-control,function-mask
+Q: How is MSI-X structured, and how do the table, the PBA and the mask bits work?
+SHORT: The MSI-X capability (ID 11h) points to two structures in device BARs. The MSI-X Table holds up to 2048 sixteen-byte entries of Message Address (low and high), Message Data and Vector Control, and the Pending Bit Array (PBA) holds one bit per vector. Each entry has its own address and data, so each vector can target a different CPU. Vector Control bit 0 masks one vector, and Function Mask in Message Control masks all of them.
+DEEP:
+- **Capability fields:** Message Control has Table Size (bits 10:0, N-1 encoded), Function Mask (bit 14) and MSI-X Enable (bit 15). The Table Offset/BIR register (at +4) and PBA Offset/BIR (at +8) each hold a BAR indicator in bits 2:0 (0 to 5 for BAR0 to BAR5) and a QWORD-aligned offset in bits 31:3.
+- **Table entry (16 bytes):** Message Address Lower (+0), Upper (+4), Message Data (+8), Vector Control (+0Ch, bit 0 is Mask).
+- **PBA:** one bit per vector packed into 64-bit words. It is read-only to software.
+- **Masking flow:**
+  1. A masked vector (or one under Function Mask) that wants to fire sets its PBA bit instead.
+  2. When software unmasks it, the device sends the message and clears the PBA bit.
+  3. Several events while masked collapse into one message.
+- **Rule for changes:** software must mask an entry before changing its address or data.
+- **Why it is better than MSI:** up to 2048 vectors, arbitrary per-vector address and data, and no contiguity requirement.
+- **Requirements:** the table and PBA live in memory space, so the BAR must be programmed and Memory Space Enable must be on, and Bus Master Enable must be on for the device to send the message.
+FOLLOW:
+- Can the MSI-X table share a BAR with device registers? => Yes, but the specification wants registers not to share a 4 KB page with the table or the PBA, so that a hypervisor can trap them separately.
+- What does MSI-X Enable with Function Mask do? => Nothing is sent, and events accumulate in the PBA until the function mask is cleared.
+PITFALL: Rewriting a live vector's address and data without masking it first. A message in flight can go to the old CPU with the new data, or the other way around.
+VERIFY: Bit positions in Message Control, Table Size encoding, the QWORD alignment of table and PBA offsets, and the page-sharing rule in the MSI-X section of the Base Specification.
+
+@@ 10.06 | Intermediate | Numeric | tags=msi-x,table-size,pba,bar-footprint,worked-example
+Q: How big are the MSI-X table and PBA for N vectors, and what BAR footprint results?
+SHORT: The table takes 16 bytes per vector and the PBA takes one bit per vector rounded up to whole 8-byte words. So 129 vectors need 2064 bytes of table and 24 bytes of PBA. The maximum of 2048 vectors needs 32 KB of table and 256 bytes of PBA. The Table Size field stores N minus 1 in 11 bits.
+DEEP:
+1. Table bytes = N x 16.
+2. PBA bytes = ceil(N / 64) x 8.
+3. Table Size field = N - 1.
+
+| N | Table | PBA | Table Size field |
+|---|---|---|---|
+| 1 | 16 B | 8 B | 0 |
+| 32 | 512 B | 8 B | 31 |
+| 65 | 1040 B | 16 B | 64 |
+| 129 | 2064 B | 24 B | 128 |
+| 2048 | 32768 B (32 KB) | 256 B | 2047 |
+
+- **Example, a 128-queue SSD:** one vector per I/O queue plus one for the admin queue makes 129. `lspci` prints `MSI-X: Enable+ Count=129`. Table at BAR0 offset 2000h occupies 2000h to 280Fh. PBA at 3000h.
+- **Register encoding:** Table Offset/BIR = 00002000h (offset 2000h, BIR 0), PBA Offset/BIR = 00003000h.
+- **BAR footprint:** if the maximum table sits alone in a BAR, the table needs 32 KB and the PBA a further 256 B. With both in one BAR that is 32 KB + 256 B, so the BAR is rounded up to 64 KB.
+- **Page rule:** table and PBA sit on their own 4 KB pages (2000h and 3000h above) so they do not share pages with doorbells or other registers.
+FOLLOW:
+- Why is the PBA measured in 64-bit words? => Its offset and access are QWORD aligned, so it is an array of 8-byte words.
+- Does the SSD need to use all vectors the table offers? => No. Table Size is what the function can expose, and software enables as many as it allocates.
+PITFALL: Computing PBA as N / 8 bytes. For non-multiples of 64 vectors, the array is rounded up to whole 64-bit words.
+VERIFY: The PBA rounding rule (QWORD units) and the maximum table size in the MSI-X section of the Base Specification.
+
+@@ 10.07 | Intermediate | Concept | tags=x86,apic,fee00000,interrupt-remapping,iommu
+Q: What is the memory write of an MSI or MSI-X interrupt on x86, and where does interrupt remapping fit in?
+SHORT: On x86 the write goes to an address in 0xFEExxxxx. The address carries the destination CPU (APIC ID) and the data carries the vector and delivery mode. The host bridge routes it to the local APIC, not to DRAM. With an IOMMU and interrupt remapping enabled, the address and data instead hold an index into an interrupt remapping table, whose entry supplies the real destination and vector, and is checked against the requester ID.
+DEEP:
+- **Compatibility format:** address bits 31:20 are FEEh, bits 19:12 are the destination APIC ID, and low bits hold redirection hint and destination mode. Data bits 7:0 are the vector and bits 10:8 the delivery mode.
+- **Remappable format:** an address bit marks the request as remappable, and a handle in the address (plus a subhandle in the data) indexes the interrupt remapping table. The entry holds destination, vector, mode and a source check.
+- **Why remap:** it allows destinations above 255 APIC IDs (x2APIC), lets the kernel retarget an interrupt by editing a table entry rather than reprogramming the device, and stops a device or VM from raising an interrupt it was not assigned.
+- **Faults:** a request that is invalid, not present or from the wrong requester is blocked and logged by the IOMMU, for example `DMAR: [INTR-REMAP] Request device [3b:00.0] fault index ...` on Intel.
+- **Other architectures:** on Arm the write goes to a translation register of the GIC ITS, and the data is an event ID that the ITS looks up with the device ID.
+- **Test trick:** in a test rig you can point the address at ordinary memory to capture the message, but on a system the address must be one the interrupt controller decodes.
+FOLLOW:
+- Does the interrupt write go through the DMA address translation? => Interrupt requests are recognized separately and handled by interrupt remapping, not by the DMA page tables.
+- Why might a VM guest's interrupts fail after enabling passthrough? => The remapping entry or requester ID check is wrong or missing, which shows up as an IOMMU interrupt fault.
+PITFALL: Describing the interrupt write as memory traffic that lands in DRAM. It is decoded as an interrupt by the platform, and it is the reason for special address ranges.
+VERIFY: Address and data field layouts for the compatibility and remappable formats in the Intel SDM and VT-d specification (and the AMD IOMMU and Arm GIC equivalents), and the exact fault message text on your kernel.
+
+@@ 10.08 | Intermediate | Debug | tags=proc-interrupts,lspci,sysfs,windows,perfmon,tools
+Q: How do you inspect an NVMe SSD's interrupts on Linux and Windows?
+SHORT: On Linux, `cat /proc/interrupts` shows per-CPU counts for each `nvme0qN` vector, `/proc/irq/<n>/effective_affinity_list` shows where each lands, and `lspci -vvv` shows the MSI-X count, enable state and table location. On Windows, Device Manager shows the resources (MSI interrupts have negative IRQ numbers), and Performance Monitor's Interrupts/sec and DPC counters show rates. Verify the queue count, spread and rate match what you expect.
+DEEP:
+```
+ 168:  0  4211  0  0  IR-PCI-MSIX-0000:3b:00.0   1-edge   nvme0q1
+```
+- **Linux:**
+  - `grep nvme /proc/interrupts`: the name `nvme0q0` is the admin queue and `nvme0qN` are I/O queues. Each row's counts should climb on the CPU that submits to that queue.
+  - `cat /proc/irq/168/smp_affinity_list` and `effective_affinity_list`: the allowed and actual CPU. Kernel-managed NVMe vectors reject writes to `smp_affinity`.
+  - `ls /sys/bus/pci/devices/0000:3b:00.0/msi_irqs` lists the vector numbers, and `/sys/kernel/irq/168/` has `chip_name`, `hwirq`, `actions` and `per_cpu_count`.
+  - `lspci -vvv -s 3b:00.0` shows `MSI-X: Enable+ Count=129 Masked-` and the table and PBA BAR and offset. `MSI: Enable-` means MSI is off.
+  - `nvme list-subsys` maps the controller to its PCI address, and `/sys/block/nvme0n1/mq/*/cpu_list` shows which CPUs use each hardware queue.
+  - `mpstat -I SUM` and `sar -I` show interrupt rates per CPU.
+- **Windows:**
+  - Device Manager, View, Resources by type, Interrupt request: MSI/MSI-X entries show as negative numbers.
+  - Performance Monitor: `Processor Information\Interrupts/sec`, `% Interrupt Time`, `% DPC Time`, `DPCs Queued/sec`. Windows Performance Analyzer (xperf) attributes ISR and DPC time to drivers.
+  - The MSI mode of a device is controlled by the `MSISupported` value under the device's `Interrupt Management\MessageSignaledInterruptProperties` registry key, and `MessageNumberLimit` caps its vectors.
+- **What to check:** vectors granted versus queues created, even spread across CPUs, and rates that match the workload.
+FOLLOW:
+- How can you tell a queue is using an interrupt versus polling? => An interrupt-driven queue's `/proc/interrupts` count rises under load. A poll queue has no vector, and its counter stays flat.
+- Why does `/proc/interrupts` show fewer NVMe vectors than CPUs? => The device or the driver capped the queue count, and CPUs share hardware queues.
+PITFALL: Reading a single snapshot. Interrupt counters are cumulative, so take two samples and compute a rate.
+VERIFY: The sysfs and procfs paths on your kernel version, and the Windows counter names and registry key on your Windows version.
+
+@@ 10.09 | Advanced | Cross-layer | tags=nvme,multi-queue,affinity,blk-mq,scaling
+Q: Why does MSI-X scale for multi-queue NVMe, and how are vectors, queues and CPUs paired?
+SHORT: NVMe gives each CPU (or group of CPUs) its own submission and completion queue pair, and MSI-X gives each completion queue its own vector with its own CPU target. A command is submitted, completed and interrupted on the same CPU. That avoids locks on shared queues, cross-CPU wakeups and cache line bouncing. MSI cannot do this, since all its vectors share one address and so one CPU on x86.
+DEEP:
+- **Pairing:** with 64 CPUs, the driver creates up to 64 I/O queue pairs plus the admin queue, and requests 65 vectors. Vector 0 serves the admin CQ. I/O CQ n uses vector n and is pointed at the CPU that owns SQ n.
+- **Why it scales:** the submitting CPU writes only its own SQ tail doorbell, and the completion interrupt runs on that CPU, so the completion touches memory already cache-hot for that queue. No global lock is needed.
+- **Managed affinity:** Linux spreads vectors across CPUs automatically (managed IRQ affinity), so the kernel, not irqbalance, owns placement, and it retargets vectors when CPUs go offline.
+- **Fewer vectors than CPUs:** several CPUs share a queue, and the vector targets one of them. Fewer queues means more contention, but it still works.
+- **Fewer vectors than queues:** the driver reduces the number of I/O queues to what it got, or several CQs share a vector and the handler scans each of them.
+- **Cost of sharing:** a shared vector must check every CQ mapped to it and serve them one after another.
+FOLLOW:
+- Why can you not spread MSI vectors like this? => All vectors of one MSI function share the same message address, and on x86 that address names the destination CPU.
+- What happens to the CQ of a CPU that goes offline? => The managed vector is shut down and the queue is quiesced, and its commands are drained first.
+PITFALL: Testing scaling with fewer vectors than CPUs and blaming the SSD for the contention that sharing causes.
+VERIFY: How the Linux nvme driver adjusts queue count when fewer vectors are allocated than requested, and the Windows NVMe driver's queue and vector assignment behavior.
+
+@@ 10.10 | Advanced | Cross-layer | tags=nvme,iv,create-io-cq,coalescing,intms,intmc,fallback
+Q: How do NVMe queues name their interrupt vectors, and how do coalescing and INTMS/INTMC work?
+SHORT: The Admin CQ always uses vector 0. Each I/O CQ names a vector in the IV field of Create I/O Completion Queue, and the IEN bit says whether it interrupts at all. Interrupt Coalescing (Set Features FID 08h) sets an aggregation threshold and time, and Interrupt Vector Configuration (FID 09h) disables coalescing per vector. INTMS and INTMC mask vectors for pin-based and MSI interrupts only, not MSI-X.
+DEEP:
+- **Create I/O CQ:** CDW10 holds QID and queue size, CDW11 holds PC (bit 0, contiguous), IEN (bit 1, interrupts enabled) and IV (bits 31:16). An IV past the vectors available is rejected as an invalid interrupt vector.
+- **Sharing:** many CQs may name the same vector. With pin-based or single-message MSI, all CQs use vector 0.
+- **Coalescing (FID 08h):** THR in bits 7:0 (a 0's based count of completions) and TIME in bits 15:8 (in 100 microsecond units). A vector is signaled when the count reaches the threshold or the timer expires, whichever comes first. `nvme set-feature /dev/nvme0 -f 8 -v 0x0107` means 8 completions or 100 microseconds.
+- **Per-vector control (FID 09h):** the vector number and a Coalescing Disable bit, so a latency-sensitive vector can opt out.
+- **INTMS/INTMC (BAR0 0Ch and 10h):** write 1 to a bit in INTMS to mask that vector and in INTMC to unmask it. They apply to pin-based and multi-message MSI. For MSI-X you use the MSI-X mask bits.
+- **Fallback:** if the OS obtains fewer vectors than queues, queues share vectors. If it gets only MSI or INTx, the device still works, on vector 0.
+- **Queue count versus vector count:** Set Features Number of Queues (FID 07h) sets the number of queues and does not by itself allocate vectors.
+FOLLOW:
+- Does coalescing apply to the admin queue? => Do not assume. Check the specification wording for vector 0 and test it on your controller.
+- How do you read the current setting? => `nvme get-feature /dev/nvme0 -f 8 -H` (and `-f 9 -c <vector>` for the per-vector setting).
+PITFALL: Using INTMS/INTMC to mask an MSI-X vector. The registers are not defined for MSI-X, so the mask has no effect.
+VERIFY: FID 08h and 09h field layout (THR, TIME, IV, CD), the Create I/O CQ CDW11 fields, coalescing behavior on the admin vector, and INTMS/INTMC applicability, in the NVMe Base Specification 2.x and the NVMe over PCIe Transport Specification.
+
+@@ 10.11 | Advanced | Numeric | tags=interrupt-rate,coalescing,iops,cpu-cost,latency
+Q: At 1 million IOPS, how many interrupts per second result with and without coalescing, and what does it cost in latency?
+SHORT: With one interrupt per completion, 1M IOPS is 1M interrupts per second. On 64 vectors that is 15.6K per vector, one every 64 microseconds. At an assumed 1.5 microseconds of CPU per interrupt that costs 1.5 cores. With aggregation threshold 8 and time 100 microseconds, 64 vectors drop to about 390K per second (2.6 times fewer), and 8 vectors drop to 125K per second (8 times fewer). The price is added completion latency.
+DEEP:
+Assumptions: 4 KB random IO, completions spread evenly, 1.5 microseconds of fixed CPU cost per interrupt (entry, handler, exit), and a controller that signals on threshold reached or time expired, starting the timer at the first pending completion.
+1. **No coalescing, 64 vectors:** 1,000,000 / 64 = 15,625 per vector per second, so one completion every 64 microseconds. Total 1M interrupts per second. CPU = 1,000,000 x 1.5 us = 1.5 cores of interrupt overhead.
+2. **THR = 8, TIME = 100 us, 64 vectors:** eight completions would take 8 x 64 = 512 us to accumulate, so the 100 us timer fires first. A cycle is about 100 us plus about 64 us of average wait for the next completion, so 164 us. That is 6,098 interrupts per vector, or about 390K per second. Each interrupt carries 100/64 + 1 = about 2.6 completions. CPU falls to about 0.59 core. Added latency is up to 100 us.
+3. **THR = 8, TIME = 100 us, 8 vectors:** each vector sees 125,000 per second, one every 8 us, so the threshold hits after 64 us. That is 15,625 per second per vector, 125K total. CPU is about 0.19 core, with added latency up to about 56 us for the first completion in a batch.
+4. **QD1:** with one command outstanding, the threshold is never reached, so every completion waits the full 100 us. An 80 us read becomes about 180 us.
+
+- **Lesson:** coalescing helps when each vector sees many completions in a short time, and hurts low queue depth latency.
+- **Not counted:** per-completion work (CQE processing, blk-mq completion) does not shrink, only the fixed per-interrupt cost.
+FOLLOW:
+- Why do most Linux systems leave coalescing off? => Per-CPU queues with managed affinity, and a large enough queue count, keep the interrupt rate per vector modest, and added latency is unwelcome.
+- What is the alternative for very high IOPS? => Polling queues, or software adaptive schemes, which trade CPU for latency, covered next.
+PITFALL: Applying a coalescing setting to a test that runs QD1 and calling the extra latency a firmware regression.
+VERIFY: Whether the controller starts the coalescing timer at the first pending completion, the units of TIME and the 0's based THR in the NVMe Base Specification.
+
+@@ 10.12 | Advanced | Concept | tags=polling,hybrid-polling,io-uring,poll-queues,latency
+Q: When does polling beat interrupts for NVMe, and how do poll queues and hybrid polling work?
+SHORT: Polling has the host spin on the completion queue phase bit instead of waiting for an interrupt. It saves the interrupt and wakeup cost, a few microseconds, which matters when the device latency is only tens of microseconds, and it costs a busy core. Linux uses dedicated poll queues, created without interrupts, driven by io_uring with `hipri` or the polling flag. Hybrid polling sleeps for part of the expected latency before spinning.
+DEEP:
+- **Mechanism:** the CQ head entry has a phase bit. The host checks it in a loop, and when it flips, the entry is new. No vector is needed, so the queue is created with interrupts disabled (IEN = 0).
+- **Linux setup:** `modprobe nvme poll_queues=4` (or `nvme.poll_queues=4` at boot) gives dedicated poll queues. Run fio with `--ioengine=io_uring --hipri=1 --direct=1`. Some kernels also expose `/sys/block/nvme0n1/queue/io_poll`.
+- **Hybrid polling:** rather than spin from submission, the kernel sleeps for an estimated fraction of the latency (`io_poll_delay`) and then polls, cutting CPU with a small latency penalty. Support for this differs by kernel version.
+- **When it wins:** low-latency devices (an assumed 10 us read), where 2 to 4 us of interrupt and wakeup overhead is 20 to 40 percent, at low queue depth.
+- **When it loses:** NAND devices at 80 us or more, where the same saving is a few percent, and any deep-queue throughput test that is CPU bound.
+- **Cost:** each poll queue burns 100 percent of a core while active.
+- **Validation:** poll queues exercise host paths that interrupt mode barely touches, such as CQ phase handling across wraparound, and they bypass the interrupt path entirely.
+FOLLOW:
+- Why does polling help latency but not throughput? => At high queue depth interrupt cost is amortized over many completions, and the CPU spins without new work to do.
+- Do poll queues consume interrupt vectors? => No, which also relieves vector pressure on devices with limited vectors.
+PITFALL: Benchmarking polling on a slow NAND SSD and concluding it is useless, or on a fast device and ignoring the CPU cost.
+VERIFY: The nvme `poll_queues` module parameter, `io_poll` and `io_poll_delay` sysfs behavior, and whether hybrid polling exists in your kernel version.
+
+@@ 10.13 | Advanced | Trap | tags=ordering,cqe,posted-write,relaxed-ordering,dma-rmb
+Q: The host takes the MSI-X interrupt but reads a stale completion queue entry. How is that possible when posted writes are ordered?
+SHORT: PCIe keeps posted writes in order, so the CQE and MSI-X writes stay in order if they share a traffic class and path and have Relaxed Ordering clear. If the CQE or MSI-X write had RO set, or the paths differ, or the host reads CQE fields without a memory barrier after seeing the phase bit, the CPU can see the interrupt first or read stale data. Ordering rules are in the Flow Control and Ordering module.
+DEEP:
+- **Normal case:** the device writes data, then the CQE, then the MSI-X message, all posted, all in one stream. A posted write may not pass a posted write, so the platform must make the earlier writes visible before it delivers the interrupt.
+- **How it breaks:**
+  - **Relaxed Ordering on the CQE or the MSI-X write:** RO (or IDO) on the later TLP is what lets it pass earlier posted writes, so the CQE can overtake the data, or the interrupt can overtake the CQE. Check that the NVMe controller does not set RO on CQE or MSI-X writes.
+  - **Different route or traffic class:** if the two writes take different paths or TCs, no ordering is guaranteed.
+  - **Host side:** the driver sees the phase bit of the CQE, then reads the other fields. Without a read barrier (Linux uses `dma_rmb()`) the CPU may reorder those loads.
+- **How to prove which:** an analyzer trace shows the order and attributes (TC, RO, IDO, No Snoop) of the three writes on the wire. If wire order is correct, the fault is host-side.
+- **Related note:** RO on the data writes alone does not let the CQE pass them, because the CQE write has RO clear. It only lets a data write pass earlier writes, which matters for overlapping writes to the same address.
+FOLLOW:
+- Can an ISR read of a device register act as a barrier? => Yes. The read completion cannot pass the device's earlier posted writes, so it flushes them, at the cost of an MMIO read. NVMe drivers avoid it and rely on ordering plus barriers.
+- Where should you check attributes first? => The TLP header of the CQE write and the MSI-X write in a trace: TC, Relaxed Ordering, ID-Based Ordering and No Snoop.
+PITFALL: Blaming the device first. With correct wire ordering, missing barriers in host software are just as likely a cause.
+VERIFY: The ordering table in the Base Specification (posted versus posted with Relaxed Ordering and IDO), and the NVMe requirement for the ordering of CQE and interrupt writes.
+
+@@ 10.14 | Advanced | Debug | tags=interrupt-storm,spurious,nobody-cared,level,stuck
+Q: An interrupt storm or spurious interrupts appear on an NVMe SSD. How do you tell them apart and find the cause?
+SHORT: A storm is far too many interrupts (the rate per vector far above the completion rate, often pinning a core), a spurious interrupt is one that finds no work. Compare the interrupt rate with the IOPS rate, then check for a level-triggered line that is never cleared (INTx or pin-based), a completion queue head doorbell that is not advancing, a broken phase bit, a masked or mis-coalesced vector, or a device that signals without a CQE.
+DEEP:
+1. **Measure:** two `/proc/interrupts` samples give interrupts per second per vector. Compare with IOPS from fio or `iostat`. Interrupts much larger than completions is a storm.
+2. **Level-triggered line (INTx or pin-based NVMe):** the source stays asserted until cleared. The kernel may print `irq N: nobody cared` and disable the line if nearly all of the last 100,000 interrupts were unhandled. Check Interrupt Status in Status (bit 3) and INTMS.
+3. **MSI-X, edge-like:** repeated messages usually mean the device keeps signaling because the CQ head doorbell was not written, or firmware signals without posting an entry. Read the CQ head and tail and compare with the phase.
+4. **Spurious cases that are benign:**
+   - A shared vector where another CQ's handler already consumed the entry.
+   - An interrupt that arrives after a polled completion.
+   - A late coalesced interrupt for entries already processed.
+5. **Harmful cases:**
+   - Coalescing settings that give a different interrupt rate than intended.
+   - A mask that is toggled repeatedly, re-sending the pending message each time.
+   - A firmware bug that signals on doorbell writes or repeatedly for one CQE.
+6. **Isolate:** stop the workload. If interrupts continue at a steady rate, the device signals without work. Compare INTx, MSI and MSI-X modes and firmware versions.
+- **Evidence:** the interrupt count versus completions, the CQ head, tail and phase, Interrupt Status, and a trace of the message writes if you have an analyzer.
+FOLLOW:
+- Why does the kernel disable an IRQ that fires too often? => To stop one broken device from starving the CPU, it disables the line after too many interrupts are unhandled.
+- Does a storm always mean a device bug? => No. A driver that fails to update the CQ head doorbell, or misreads the phase bit, is the other main suspect.
+PITFALL: Calling every handler that finds no CQE a bug. A few are normal, and only a high sustained rate is a defect.
+VERIFY: The kernel's spurious interrupt threshold and message text for your version, and the NVMe rules for when a controller re-signals after a CQ head doorbell update in MSI and MSI-X mode.
+
+@@ 10.15 | Principal | Debug | tags=lost-interrupt,pba,mask,rearm,timeout,nvme
+Q: NVMe I/O times out although the controller posted the completion. How do you find out whether an interrupt was lost, and why?
+SHORT: If the timeout handler finds the CQE already there (Linux logs `I/O ... timeout, completion polled`), the data path worked and the interrupt did not arrive. Then check the delivery chain in order: Bus Master Enable, MSI-X Enable and masks, the PBA pending bit, the table entry contents, interrupt remapping and the affinity path, and the driver's re-arm logic and CQ head doorbell handling.
+DEEP:
+1. **Confirm it is an interrupt problem:** the CQ entry with the right phase is in host memory but the ISR never ran. Compare the CQ contents with `/proc/interrupts` for that vector.
+2. **Device-side gating (`lspci -vvv`):**
+   - Bus Master Enable on the SSD and on every bridge above (upstream forwarding).
+   - MSI-X Enable set, Function Mask clear, Masked flag off.
+3. **PBA:** read the PBA bit of the vector from BAR memory. A pending bit stuck at 1 means the device wanted to signal but the vector is masked (or was masked and never unmasked). If it is 0 and no message was sent, the device did not try.
+4. **Mask and unmask race:** the driver masks a vector, handles work, unmasks. The device must then send exactly one message for anything pending. A device that clears the pending bit without sending, or software that unmasks before the completion path is ready, loses the wake-up.
+5. **Table entry:** address and data must be as programmed. After a reset or Function Level Reset, table contents may be lost, and drivers must restore them. If the table was written while Memory Space Enable was off or into the wrong BAR (wrong BIR), entries stay at reset defaults, and an address of 0 sends the interrupt to the wrong place.
+6. **Remapping and affinity:** an IOMMU interrupt remapping fault log (invalid entry, wrong requester) or a race during an affinity change can drop the interrupt.
+7. **Re-arm logic and coalescing:** the driver must consume all valid entries and write the CQ head doorbell. With coalescing, a low-rate vector waits for the timer, and a broken timer means it never fires.
+- **Evidence to save:** CQ head and tail, phase, PBA and mask state, `lspci` output, IOMMU log, and an analyzer trace showing whether an MWr to the vector address occurred.
+FOLLOW:
+- The trace shows the MWr was sent but the CPU did not run the ISR. What next? => Follow the platform: interrupt remapping fault log, the effective affinity CPU (offline, isolated or busy with interrupts disabled), and the IRQ line disabled by the kernel.
+- The trace shows no MWr and PBA is clear. What is the cause? => The device did not decide to signal: coalescing state, an internal firmware event, or a CQE posted without generating the interrupt.
+PITFALL: Assuming the polled completion proves the device is healthy. It proves the data path worked once, and the cause can still be the device's decision to signal.
+VERIFY: The Linux timeout log message text, the exact NVMe rule for re-signaling after a CQ head doorbell write, and whether MSI-X table contents survive Function Level Reset for your device.
+
+@@ 10.16 | Principal | Scenario | tags=numa,affinity,cross-socket,latency,irq-balance
+Q: p99 latency of an SSD is 30 percent worse when the workload runs on socket 1 than on socket 0. How do you determine whether interrupt affinity is the cause?
+SHORT: Find which NUMA node the SSD hangs off, then check where its vectors and their queues run. Interrupts, CQ memory and doorbells on the far socket cross the inter-socket link each time, adding latency and contention. Compare runs pinned near and far with fio, read the effective affinity of each vector, and check the queue-to-CPU map. Fix by pinning the workload and vectors to the SSD's socket, or by making managed affinity spread correctly.
+DEEP:
+1. **Topology:** `cat /sys/bus/pci/devices/0000:3b:00.0/numa_node`, `lscpu` and `numactl -H`. The device is local to one socket.
+2. **Where interrupts run:** `/proc/irq/<n>/effective_affinity_list` for each `nvme0qN`, and `/sys/block/nvme0n1/mq/*/cpu_list`. A vector serving CPUs on socket 1 may target a CPU on socket 0, or the opposite.
+3. **A/B test:** `fio` with `--cpus_allowed` on each socket, same block size and depth, and compare IOPS, average and p99 latency. Repeat with the vector affinity changed (for unmanaged IRQs, `smp_affinity_list`).
+4. **What crosses the socket:** the doorbell write, the interrupt, CQ and SQ memory accesses, and the data buffers. The device DMA to memory on the far node also crosses the link.
+5. **Estimate:** assume 100 ns per cross-socket access and about 5 such accesses per IO, so about 0.5 us on an 80 us read, under 1 percent unloaded. The bigger effect appears in tail latency under load when the inter-socket link is busy, and in IOPS at high queue depth.
+6. **Decide:** if pinning near removes the gap and moving only the interrupt changes it partly, affinity is a contributor. If not, look at memory placement, power management and IOMMU.
+- **Fix:** run the application on the SSD's node, use one queue per local CPU, and avoid `irqbalance` moving vectors across sockets. Windows offers interrupt affinity policy for the device.
+FOLLOW:
+- Why is the effect bigger on p99 than on average? => Cross-socket traffic is affected by queueing on the inter-socket link, which mostly hurts the tail.
+- What if the SSD is dual-port and connected to both sockets? => Then locality depends on the path, so check which port each queue and its vector use.
+PITFALL: Using unloaded numbers to dismiss NUMA. The penalty grows with link utilization, so measure under load.
+VERIFY: The 100 ns cross-socket estimate for your platform (measure it), and whether your kernel's managed IRQ affinity respects NUMA locality for NVMe queues.
+
+@@ 10.17 | Principal | Scenario | tags=validation,msi-x,boundary,pba,remapping,test-plan
+Q: How would you design a validation plan for an SSD's MSI-X implementation?
+SHORT: Test the table and PBA against the specification from the register level up: vector count boundaries, masking and pending semantics, enable and mask interactions, contents after resets, and the TLPs the device actually sends. Then test with real hardware paths: interrupt remapping faults, affinity changes under load, and error conditions such as a disabled BAR. Use a PCIe exerciser or analyzer to see the messages, and a scoreboard that counts expected against received interrupts per vector.
+DEEP:
+1. **Boundaries:** Table Size of 1, 2 and 2048 vectors if supported, and the largest the SSD claims. Confirm the N-1 encoding, table and PBA offsets on QWORD boundaries, BIR pointing to an implemented BAR, and the table inside the BAR size.
+2. **Delivery:** for each vector, program a unique address and data, trigger it (an admin or I/O completion), and check the message: length 1 DW, address and data as programmed, requester ID, 3DW header when the address is below 4 GB, TC0 and attributes.
+3. **Masking and PBA:**
+   - Mask, trigger, verify no message and PBA bit set. Trigger several times, unmask, verify exactly one message and PBA cleared.
+   - Function Mask on and off, with the same checks.
+   - MSI-X Enable off with MSI enabled, and the both-enabled case only if the specification defines it.
+   - PBA is read-only and a read has no side effect.
+4. **Update rules:** change address and data with the vector masked, and check the next message uses the new values.
+5. **Reset behavior:** table contents, mask bits (reset to masked) and PBA after Function Level Reset, controller reset (CC.EN 0 then 1), D3hot to D0, and hot reset.
+6. **Command bits:** Bus Master Enable off means no messages, and Memory Space Enable off means table writes are not decoded.
+7. **Platform and IOMMU:** enable interrupt remapping and check remapped delivery, an invalid index or wrong requester ID producing a logged fault, and no lost interrupt while the kernel changes affinity under load.
+8. **Stress:** all vectors firing concurrently, masking and unmasking during traffic, and interrupts at line rate. Verify no message is lost or duplicated beyond what masking allows.
+9. **Scoreboard:** per vector expected count versus received, latency histogram, and errors logged.
+- **Pass criteria:** every message matches its entry, no unexpected loss, one message per unmask.
+- **Automation:** a test driver or exerciser that owns the table (so the kernel does not rewrite it), with an analyzer capture on failure.
+FOLLOW:
+- How do you inject the IOMMU faults? => Program a table entry whose handle is outside the remapping table or not present, or send from a function whose requester ID does not match the source check.
+- Which failures are most valuable to find? => Lost wake-ups around unmask, wrong state after resets, and wrong message address or data bits (for example the upper address not sent), which only show up on real platforms.
+PITFALL: Validating only through a stock OS driver. The kernel hides table writes and masks, so many corner cases never occur. Use a driver or exerciser that controls them.
+VERIFY: Reset values of MSI-X Enable, Function Mask and per-vector Mask bits after each reset type, and the TLP format rule for addresses below 4 GB, in the Base Specification.

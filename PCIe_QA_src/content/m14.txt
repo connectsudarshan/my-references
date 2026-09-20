@@ -1,0 +1,354 @@
+# Module 14 — Gen5/6, FLIT, CXL & Security
+
+@@ 14.01 | Intermediate | Concept | tags=gen5,ssd,thermal,retimer,connector,margining
+Q: What changes for an SSD design and validation team when moving from Gen4 to Gen5?
+SHORT: The protocol is the same but the physics and the product are not. Gen5 runs 32 GT/s NRZ on a tighter loss budget, so many slots and backplanes need retimers. Controllers and NAND run hotter, so thermal throttling becomes a first-order performance limit. Connectors, cables and form factors are chosen for signal integrity, and equalization results and lane margin become ship gates rather than nice-to-haves.
+DEEP:
+The channel physics is covered in the electricals module (Nyquist 16 GHz, 36 dB budget). This question is about what it does to an SSD program.
+- **Ceiling:** a Gen5 x4 link carries about 15.75 GB/s after 128b/130b and about 14 GB/s of payload (see the numeric question later in this module). Enterprise Gen5 drives quote sequential reads near that, so link efficiency and platform overhead now matter as much as NAND and controller speed.
+- **Power and thermals:** a Gen5 controller pushing full rate dissipates noticeably more than a Gen4 one, and the drive throttles when the controller or NAND reaches its limit. Validate at thermal steady state with airflow representative of the chassis. Link error rates also climb with temperature, so run margining hot, not just at room temperature.
+- **Topology:** longer paths (riser, cable, backplane) usually add a retimer, which adds latency, a power cost, another LTSSM segment, and firmware and preset tuning. Every retimer becomes a new variable in the regression matrix.
+- **Connectors and form factors:** edge connectors, M.2 sockets and cable assemblies vary in loss, so the same drive can pass in one enclosure and fail in another. EDSFF E1.S and E3.S and cabled U.2/U.3 backplanes are common Gen5 choices.
+- **Validation shift:** per-lane margin and the equalization status bits move from a debug aid to a tracked metric, precoding negotiation is part of link bring-up, and the test matrix includes Gen5 devices in Gen4 and Gen3 slots.
+FOLLOW:
+- A Gen5 SSD in a Gen4-only slot? => It trains at Gen4, capped near 7 GB/s. Test all speed pairs, not just the top one.
+- Which new number should every Gen5 test record? => Margin per lane at the trained speed, with temperature, not just link-up pass or fail.
+PITFALL: Validating Gen5 only on a short evaluation board. System channels, retimers and thermals are where Gen5 fails.
+VERIFY: Retimer latency and power figures, connector ratings, and thermal budgets against your platform and the current EDSFF and form-factor specifications.
+
+@@ 14.02 | Basic | Concept | tags=gen6,pam4,fber,fec,gray,precoding
+Q: Restate Gen6 PAM4 as system consequences: why is FEC mandatory, and what do Gray coding and precoding do?
+SHORT: PAM4 gives four voltage levels at 32 GBaud, so the raw first-bit error rate (FBER) is targeted at about 1e-6 instead of NRZ's 1e-12. That is about a million times more raw errors, so Gen6 corrects most of them with forward error correction and catches the rest with a flit CRC and replay. Gray coding makes the likeliest slicer mistake a one-bit error, and precoding keeps DFE error bursts short so FEC can correct them.
+DEEP:
+- **Scale of the raw error rate:** a x4 link at 64 GT/s moves 256 Gb/s per direction. At FBER 1e-6 that is about 256,000 raw bit errors per second per direction, all being corrected without software noticing.
+- **Gray coding:** the four levels map to 00, 01, 11, 10, so adjacent levels differ by one bit. The most likely error, landing in a neighboring level, costs one bit instead of two.
+- **Precoding:** a DFE turns one wrong decision into a burst. Precoding (the previous electricals module covers the mechanism) shortens that burst so it fits within what a small FEC can correct.
+- **System consequences:**
+  - The link has no "error-free" state any more, so "no replays" is no longer a health signal by itself.
+  - Health has to be judged from FBER, corrected-error rates and flit retry rates, when the device or analyzer exposes them.
+  - The unit of error control becomes a fixed block (the flit), which is the reason FLIT mode exists.
+  - Electrical tests move to PAM4 metrics such as three separate eye heights, level mismatch and SNR-like measures.
+- **Same Nyquist, less SNR:** the electrical cost is the roughly 9.5 dB SNR loss described in the earlier Gen6 questions.
+FOLLOW:
+- Is FBER measured after equalization? => It is the error rate at the receiver's decision point before FEC, after the receiver's equalization has done its work.
+- Why still need a CRC after FEC? => The lightweight FEC corrects a limited number of byte errors per group. Larger or unlucky bursts get past it, and the CRC detects them so the flit is replayed.
+PITFALL: Comparing Gen6's FBER of about 1e-6 with Gen5's 1e-12 as if they were the same metric. Gen6's is a raw rate that FEC and CRC then clean up, while Gen5's is the rate the link has to live with.
+VERIFY: The FBER target and how it is defined, the Gray mapping, and the precoder details in the Base Specification.
+
+@@ 14.03 | Intermediate | Concept | fig=flit | tags=flit,256-byte,fec,crc,dlp
+Q: What does a 256-byte FLIT contain, and how does it compare with non-FLIT framing?
+SHORT: In FLIT mode all traffic moves in fixed 256-byte flits: 236 bytes of TLP area, 6 bytes of Data Link Payload (DLP), 8 bytes of CRC and 6 bytes of FEC. The CRC covers the first 242 bytes, and the FEC is three interleaved groups that protect the whole flit including the CRC. Non-FLIT mode instead frames each TLP separately with a start token, a sequence number and an LCRC.
+DEEP:
+| Bytes | Field | Notes |
+|---|---|---|
+| 0 to 235 | TLP area (236 B) | TLP bytes packed back to back, or unused in a NOP flit |
+| 236 to 241 | DLP (6 B) | Flit sequence, ack/nak and replay command, and link-management content |
+| 242 to 249 | CRC (8 B) | Over the TLP area and the DLP |
+| 250 to 255 | FEC (6 B) | Three groups of 2 bytes, over everything before them |
+
+- **Overhead:** 20 of 256 bytes, or 7.8 percent. The FEC is 6 B (2.3 percent), the CRC 8 B (3.1 percent) and the DLP 6 B (2.3 percent), leaving 236 B, 92.2 percent, for TLPs.
+- **Interleave:** consecutive bytes belong to different FEC groups, so a burst of up to three consecutive bytes touches each group once and stays correctable. Each group can fix a single byte error.
+- **What the CRC and FEC do:** the FEC tries to correct first, then the CRC decides whether the (possibly corrected) flit is good. A bad CRC triggers a Nak and replay.
+- **NOP flits:** when there are no TLPs the link still sends flits with an empty TLP area, so the DLP information (acks, credits, power management) keeps flowing.
+- **Contrast with non-FLIT:** each TLP carries a framing token, a 12-bit sequence number and a 32-bit LCRC, and DLLPs are separate 6-byte packets with their own CRC-16.
+FOLLOW:
+- Can a TLP span two flits? => Yes. TLP bytes fill the 236-byte area back to back, so a TLP can start in one flit and finish in the next.
+- Does the CRC cover the FEC bytes? => No. The CRC covers the TLP area and the DLP, and the FEC covers those plus the CRC.
+PITFALL: Treating the 256 bytes as payload. Only 236 bytes hold TLPs, and headers come out of that budget.
+VERIFY: The exact byte positions, the FEC group layout and interleave, which DLP bytes carry what, and whether TLPs may straddle flit boundaries, all in the Base Specification. The 236 + 6 + 8 + 6 split matches published PCI-SIG material, but confirm before quoting.
+
+@@ 14.04 | Advanced | Concept | tags=flit,framing,lcrc,sequence-number,dllp,encoding
+Q: Why does FLIT mode replace the 128b/130b framing and the per-TLP LCRC and sequence numbers?
+SHORT: With FEC, errors are handled in fixed-size blocks, so the natural unit for detection and retry is the flit and not the TLP. FLIT mode therefore drops the per-TLP framing tokens (at 64 GT/s there is also no 128b/130b sync header), and replaces the per-TLP sequence number and LCRC with a flit sequence number and one CRC per flit. That saves about 10 bytes per TLP and makes the pipeline deterministic, at the price of a fixed 20 bytes of overhead per flit.
+DEEP:
+| Function | Non-FLIT (Gen3 to Gen5) | FLIT mode |
+|---|---|---|
+| Framing | 128b/130b sync header plus STP/SDP/EDS tokens (END belongs to 8b/10b) | Implied by the flit position |
+| Per-TLP integrity | 32-bit LCRC each TLP | 8-byte CRC per flit |
+| Ordering and replay | 12-bit sequence number per TLP | Flit sequence number, about 10 bits |
+| Acknowledgement | Ack and Nak DLLPs, cumulative | Ack and Nak carried in the DLP of each flit |
+| Link-management packets | 6-byte DLLPs with CRC-16 | Carried in DLP bytes and flit types |
+| Error correction | None | 6 bytes of FEC |
+
+- **Why a fixed block:** FEC needs a fixed codeword. Making the CRC and the retry unit the same block makes the decode pipeline simple and its latency constant.
+- **Why per-TLP overhead hurts at 64 GT/s:** a x16 link moves about 500 million flits per second, and TLPs of a few tens of bytes would need per-TLP framing, sequence numbers and CRC checks at that rate. One flit-level check is cheaper.
+- **What stays:** the Transaction Layer's TLPs, flow control (carried differently), and the enumeration and config model. NVMe over a flit-mode link needs no software change.
+- **Other consequences:** L0s is not supported in flit mode per current understanding (L0p covers its purpose; confirm in the spec), and the Bad TLP style counters change meaning because there is no per-TLP LCRC. A validator needs to learn the new logging capabilities.
+- **Debug consequence:** analyzers that decode TLPs from 128b/130b framing cannot decode flit-mode traffic. A flit-aware analyzer is needed.
+FOLLOW:
+- Do lower speeds use flits too? => Once flit mode is negotiated, the link stays in it, including at lower speeds, according to the negotiation rules. Confirm how the encoding at each rate works in the spec.
+- Where did the LCRC's job go? => Detection is the flit CRC, and correction or retry is FEC plus flit replay.
+PITFALL: Looking for Bad TLP and LCRC counters on a flit-mode link. They may not exist in the same form.
+VERIFY: The flit sequence number width, L0s support in flit mode, the flow control mechanism in flit mode, and the error logging capabilities added for flit mode.
+
+@@ 14.05 | Advanced | Concept | tags=flit,ack-nak,replay,selective-nak,retry-buffer
+Q: How do ACK, NAK and replay work at the flit level?
+SHORT: Flits are numbered (mostly implicitly, with explicit numbers in some flits such as the first replayed one) and each DLP carries acknowledgement information. The receiver applies FEC, checks the CRC and accepts good flits in order. A bad flit is dropped and a Nak names the last good one, so the transmitter replays from there (go-back-N). PCIe 6.x also defines a selective Nak. Replay is rare, with a retry probability around 5e-6 per flit at the FBER target.
+DEEP:
+1. The transmitter sends flits and keeps flits with payload in a retry buffer until they are acknowledged.
+2. The receiver runs FEC, then checks the CRC. Good: accept, advance the expected sequence, and later acknowledge via the DLP.
+3. Bad: discard, and send a Nak for the last good sequence number.
+4. On a Nak, the transmitter replays in order. The replayed flits are marked with a replay command in the DLP, and the first replayed flit carries its explicit sequence number.
+5. With selective Nak, the transmitter resends the damaged flit and the receiver keeps later good flits in a buffer, so less bandwidth is wasted on a single error.
+6. Timers (replay timer and replay count) cover a lost Nak or Ack, similar in spirit to the non-FLIT DLL.
+
+- **Retry buffer sizing:** the buffer must cover a round trip of flits. A x4 Gen6 link is 32 GB/s, so a 1 microsecond round trip is 32 KB, or 125 flits. Compare about 7.9 KB for Gen4 x4 in the Data Link module. Retimers and long channels add to this.
+- **How rare is replay:** a flit has 2048 bits, so at FBER 1e-6 about 2.05e-3 of flits contain at least one bit error, about 1 in 490. FEC corrects nearly all of them, leaving about 5e-6 needing replay, roughly 400 times fewer. At 125 million flits per second on x4, that is about 625 replays per second at the worst target and a bandwidth loss of about 5e-6 x 125 = 0.06 percent.
+- **Difference from non-FLIT:** the unit is the flit, not a TLP. A partially received TLP is discarded with its flit.
+FOLLOW:
+- Why is replay probability so much lower than the raw flit error probability? => FEC repairs most flits before the CRC check, so only uncorrectable patterns cause a Nak.
+- What does a validator watch? => Retry and Nak counts, FEC corrected counts when exposed, and replay timer events, converted to rates per flit.
+PITFALL: Assuming selective Nak means no go-back-N at all. Both exist, and behavior depends on what each side implements.
+VERIFY: Sequence number width and where it sits in the DLP, the replay command encodings, selective Nak support requirements, the retry probability figure, and the timers.
+
+@@ 14.06 | Advanced | Numeric | tags=bandwidth,gen5,gen6,flit,efficiency,x4
+Q: Compare the effective payload bandwidth of a Gen5 x4 and a Gen6 x4 link with 256-byte payload TLPs.
+SHORT: Gen5 x4 gives 15.75 GB/s after 128b/130b, and with 256 B payloads and 26 B of per-TLP overhead about 14.3 GB/s of payload. Gen6 x4 gives 32 GB/s raw, 29.5 GB/s of TLP area after flit overhead (236/256), and about 27.8 GB/s of payload. The ratio is about 1.94, not 2, and it moves with TLP size, being larger for small payloads.
+DEEP:
+Assumptions: x4, one direction, 256-byte payload, 16-byte TLP headers, no ECRC, no flow control or ack traffic counted, and flit-mode TLP headers the same size as non-FLIT ones.
+
+1. **Gen5 raw:** 32 GT/s x 4 lanes x 128/130 / 8 = 15.75 GB/s.
+2. **Gen5 per-TLP overhead:** 4 B framing token + 2 B sequence number + 16 B header + 4 B LCRC = 26 B. Efficiency = 256 / 282 = 90.8 percent.
+3. **Gen5 payload:** 15.75 x 0.908 = about 14.3 GB/s.
+4. **Gen6 raw:** 64 GT/s x 4 / 8 = 32 GB/s (no line-code overhead at the PHY).
+5. **Flit efficiency:** 236 / 256 = 92.2 percent, so 29.5 GB/s of TLP bytes.
+6. **Gen6 per-TLP overhead:** the 16 B header only, since framing, sequence number and LCRC are gone. Efficiency = 256 / 272 = 94.1 percent.
+7. **Gen6 payload:** 29.5 x 0.941 = about 27.8 GB/s. Ratio = 27.8 / 14.3 = 1.94.
+
+| Payload | Gen5 x4 GB/s | Gen6 x4 GB/s | Ratio |
+|---|---|---|---|
+| 64 B | 11.2 | 23.6 | 2.11 |
+| 128 B | 13.1 | 26.2 | 2.00 |
+| 256 B | 14.3 | 27.8 | 1.94 |
+| 512 B | 15.0 | 28.6 | 1.91 |
+
+- **Why the ratio moves:** flit overhead is a fixed 7.8 percent, while non-FLIT overhead is a per-TLP cost of 10 bytes that hurts small TLPs most. Gen6 wins more than 2x for small payloads and less than 2x for large ones.
+- **Replay cost:** about 0.06 percent at the target retry rate (see the previous question), negligible.
+- **Real SSDs:** a Gen5 x4 drive around 14 GB/s is at the link limit, so a Gen6 x4 drive can aim for roughly 27 to 28 GB/s, before NAND, controller and host limits.
+FOLLOW:
+- How does a read-heavy workload change this? => The data flows as completions from the SSD to the host, plus a stream of small read request TLPs the other way. Each direction has its own budget, so compute the data direction and check that the request direction has headroom.
+- What if the flit-mode header is bigger than assumed? => Use the real header size in step 6. With 20 B the Gen6 payload efficiency drops to 92.8 percent, and the payload figure to about 27.4 GB/s.
+PITFALL: Doubling the Gen5 payload number and calling it Gen6. Flit overhead costs 7.8 percent, and the per-TLP savings only partly offset it.
+VERIFY: Flit-mode TLP header sizes and any optional header extensions, and the exact overhead in the current Base Specification.
+
+@@ 14.07 | Advanced | Concept | tags=flit,latency,fec,accumulation,replay,cxl
+Q: What latency does FLIT mode add, and when does replay hurt?
+SHORT: FLIT mode adds a fixed FEC and CRC decode time of a couple of nanoseconds, plus a flit accumulation delay because the receiver needs the whole flit before it can act: 2 ns on x16, 8 ns on x4 and 32 ns on x1 at 64 GT/s. Replay adds about a round trip but happens roughly once per 200,000 flits at the target. For NVMe, whose latencies are tens of microseconds, this is noise. For memory-semantic devices it matters.
+DEEP:
+- **Accumulation delay:** a flit is 2048 bits. At 64 GT/s, that takes 2048 / (64 x lanes) ns: 2 ns on x16, 4 ns on x8, 8 ns on x4, 16 ns on x2, 32 ns on x1. It is a per-hop, store-and-forward style cost, so it also applies at each switch and retimer hop.
+- **FEC and CRC decode:** on the order of 2 ns for the lightweight FEC, by design, plus the CRC check.
+- **Replay:** costs about one round trip (about 1 microsecond in the earlier model, less on a short channel) plus the queueing behind it. With a retry probability near 5e-6, a typical flow sees it once in about 200,000 flits, so the effect is on the latency tail more than the mean.
+- **Compared with non-FLIT:** the Gen5 receiver could start a TLP as soon as its bytes and LCRC were in. Gen6 waits for the flit, but Gen5 also waited for the LCRC. In return, tail effects from replays are rarer.
+- **Where it matters:**
+  - NVMe SSD I/O: a 4 KiB read takes tens of microseconds in the NAND, and tens of nanoseconds of link latency change nothing.
+  - CXL.mem style loads: a CPU waits on each miss, and a few nanoseconds per hop are visible. Newer CXL revisions define latency-optimized flit variants for this reason (check the current CXL specification).
+  - Tail latency: rare replays and L0p transitions show up at p99.9 and beyond.
+FOLLOW:
+- Does a wider link help latency? => Yes for the accumulation part: x16 accumulates a flit four times faster than x4.
+- What would a latency validation measure? => Round trip for small reads with FEC and CRC in play, compared with a non-FLIT link at Gen5, and the p99.9 while error injection is active.
+PITFALL: Quoting the FEC decode time as the total added latency. Accumulation and any retimer hops matter as much.
+VERIFY: The FEC and CRC latency numbers and how flit latency is defined for retimers and switches.
+
+@@ 14.08 | Advanced | Concept | tags=flit,negotiation,training,fallback,non-flit
+Q: How is FLIT mode negotiated, and what happens when one partner does not support it?
+SHORT: Flit mode support is advertised in the training sequences, and the mode is decided once, during the initial link training from Detect. If both ports support it, the link runs in flit mode and stays there across speed changes and Recovery until the link goes down. If either port lacks support, the link runs in non-FLIT mode. A port at 64 GT/s must use flit mode, so a Gen5 SSD in a Gen6 slot trains non-FLIT at 32 GT/s or below.
+DEEP:
+- **Decision point:** made during the first training, not at each speed change. A link that trained in flit mode at 32 GT/s stays in flit mode if it later moves to 64 GT/s or drops to a lower rate.
+- **Reset of the decision:** anything that takes the LTSSM back through Detect (link down, PERST#, a fresh training) allows a new decision.
+- **What software sees:** newer pciutils and the kernel report a flit-mode indication in the Link Status 2 area. Read it alongside speed and width.
+- **Fallback:** a non-FLIT partner produces a non-FLIT link at any speed up to 32 GT/s. There is no non-FLIT 64 GT/s.
+- **Mixed hierarchies:** a switch may run flit mode on one link and non-FLIT on another. The Transaction Layer bridges them, since TLPs are still TLPs.
+- **Validation matrix:** every combination of {flit, non-flit} x {each speed} x {each partner type}, plus speed changes in both directions after flit mode is entered, plus retimers in the path (they must not disturb the negotiation).
+- **Typical failure modes:** the platform expects flit but the link trains non-FLIT because of a setting or an old partner; the training sequence field is misparsed by a retimer or device; behavior after hot reset or PERST# differs from a cold boot.
+FOLLOW:
+- Can software force a link to non-FLIT? => Not through a standard OS control. Some platform firmware offers a setting, and the Base Specification is the reference for what is allowed.
+- Is 64 GT/s possible without flit mode? => No. Flit mode is required at 64 GT/s.
+PITFALL: Assuming the mode is re-evaluated after every speed change. It is negotiated once and sticks until the link goes down.
+VERIFY: The training sequence fields and the training state where flit mode is negotiated, the Link Capabilities 2 and Link Status 2 bit names, the behavior at speeds below 64 GT/s, and which resets return the LTSSM through Detect.
+
+@@ 14.09 | Intermediate | Concept | tags=l0p,power,partial-width,flit,aspm
+Q: What is L0p, and how does it differ from L0s and L1?
+SHORT: L0p is a flit-mode power state, introduced with PCIe 6.0, in which a link stays in L0 but runs on fewer lanes, for example x4 down to x1, with the idle lanes in electrical idle. It does not pass through Recovery, so it can be entered and left while traffic continues. The two ports negotiate it and it applies to both directions. It replaces the role L0s played, cheaply trading bandwidth for power at light load.
+DEEP:
+| State | What idles | Traffic | Exit |
+|---|---|---|---|
+| L0s | One direction, all lanes | None in that direction | FTS sequences, fast but link specific |
+| L1 | Both directions, all lanes | None | Through Recovery, microseconds to milliseconds |
+| L0p | Some lanes, both directions | Continues on the active lanes | Lanes retrain in the background, no Recovery |
+
+- **Mechanism at concept level:** the ports agree to change width using flit-level messages. Active lanes keep carrying flits while others go idle. To widen the link, the idle lanes are brought back and re-aligned before flits are striped across them again.
+- **Policy:** hardware or firmware watches link utilization and applies hysteresis. Software controls are defined in config space.
+- **Why not just L1:** L1 needs an idle link and a Recovery on exit. L0p gives savings at low but nonzero load without a stall.
+- **Validation:**
+  - Correctness across transitions: no lost or duplicated flits, no false errors, replay works during the change.
+  - Behavior when a burst arrives while narrowed: latency until the link widens and the throughput in the meantime.
+  - Interaction with L1, speed change, reset and error recovery.
+  - Power measurement at each width, and NVMe tail latency with L0p enabled against disabled.
+FOLLOW:
+- Does L0p change the link speed? => No, only the width. Speed changes still go through Recovery.
+- Does L0p need flit mode? => Yes. It relies on the flit-level negotiation.
+PITFALL: Treating L0p as a lower-latency L1. It saves less power than L1 but avoids the exit penalty, and it narrows bandwidth while active.
+VERIFY: Which widths are allowed, whether L0p is symmetric or can be per direction, the control and status register names, and how the LTSSM shows L0p.
+
+@@ 14.10 | Basic | Concept | tags=gen7,pcie7,128gt,roadmap
+Q: What is PCIe 7.0 (Gen7), and what stays the same as Gen6?
+SHORT: PCIe 7.0 doubles the rate again to 128 GT/s per lane, still PAM4 and still FLIT mode with FEC. PCI-SIG released the specification in June 2025, and a x16 link reaches about 512 GB/s bidirectional raw. Because the symbol rate doubles to 64 GBaud, the Nyquist frequency rises to 32 GHz, so channel loss and reach become hard again in a way Gen6 avoided. PCIe 8.0 at 256 GT/s was announced for around 2028.
+DEEP:
+| Gen | Rate | Modulation | Symbol rate | Nyquist | x4 raw per direction |
+|---|---|---|---|---|---|
+| 5 | 32 GT/s | NRZ | 32 GBaud | 16 GHz | 16 GB/s |
+| 6 | 64 GT/s | PAM4 | 32 GBaud | 16 GHz | 32 GB/s |
+| 7 | 128 GT/s | PAM4 | 64 GBaud | 32 GHz | 64 GB/s |
+
+- **Arithmetic:** x16 at 128 GT/s is 128 x 16 / 8 = 256 GB/s per direction, so 512 GB/s in both directions.
+- **What carries over:** PAM4, FLIT mode, FEC, and a FBER target of the same order as Gen6, which keeps the Gen6 protocol machinery useful.
+- **What changes:** the channel. Twice the Nyquist frequency means much more loss per inch, so expect shorter reach, more retimers, cables and optical or other alternatives to copper, and much harder signal-integrity validation.
+- **CXL:** CXL 3.x is built on PCIe 6.0, and CXL 4.0 (released November 2025) is built on PCIe 7.0 at 128 GT/s.
+- **For an SSD engineer:** Gen7 is not a product concern for storage yet, but the same three ideas (PAM4, FLIT, FEC) will determine validation for years, so master them at Gen6.
+FOLLOW:
+- Why does Gen7 stress channels more than Gen6 did? => Gen6 kept the symbol rate and paid with SNR. Gen7 doubles the symbol rate as well, so loss at Nyquist grows a lot.
+- Is Gen6 hardware available? => Check current vendor announcements and platform availability. Mainstream storage deployments are still largely Gen4 and Gen5.
+PITFALL: Extrapolating Gen6 conclusions to Gen7 electrically. The Nyquist frequency doubles, so the channel story is new.
+VERIFY: PCIe 7.0 feature list beyond rate and PAM4, its FEC and flit details, and current product availability.
+
+@@ 14.11 | Basic | Concept | tags=cxl,flex-bus,cxl-io,cxl-cache,cxl-mem,device-types
+Q: What is CXL in the PCIe context, and what are its three protocols and device types?
+SHORT: CXL runs over the PCIe physical layer, the same lanes and connectors. CXL.io is essentially PCIe (enumeration, config, DMA, interrupts), CXL.cache lets a device coherently cache host memory, and CXL.mem lets the host load and store device-attached memory. A Flex Bus port starts as PCIe and negotiates the alternate protocol during link training. Type 1 devices use io plus cache, Type 2 io, cache and mem, and Type 3 io and mem, such as memory expanders.
+DEEP:
+- **Flex Bus:** one set of lanes can carry PCIe or CXL. The CXL alternate protocol is negotiated in the LTSSM using modified training sequences, then the link trains to its operating speed. If the partner does not support CXL, the link runs as plain PCIe.
+- **Device types:**
+  - Type 1: caching devices without host-visible memory, for example some SmartNICs.
+  - Type 2: accelerators with their own memory, such as GPUs.
+  - Type 3: memory expanders and memory modules. The host uses CXL.mem to reach their memory.
+- **Enumeration:** every CXL device is also a PCIe function. It has a class code identifying it (a CXL memory device for Type 3) and Designated Vendor-Specific Extended Capabilities (DVSEC) that describe CXL features. Linux binds cxl drivers to it, and `lspci` labels these devices CXL.
+- **Memory mapping:** device memory is mapped into the host physical address space through host-managed device memory (HDM) decoders, appears as a NUMA node, and is accessed by ordinary loads and stores with CPU caching. That is different from a BAR, which is normally uncached MMIO.
+- **Versions and rates:** CXL 1.1 and 2.0 run at 32 GT/s (Gen5), 3.x at 64 GT/s (Gen6) and CXL 4.0 at 128 GT/s (Gen7). CXL 2.0 added switching and pooling, and 3.x added fabrics and sharing.
+- **Reuse of your PCIe knowledge:** CXL.io is the PCIe transaction layer, so config space, AER, DPC, FLR and hot-plug all apply.
+FOLLOW:
+- Is CXL.mem carried in TLPs? => No. CXL.cache and CXL.mem use their own link-layer messages multiplexed with CXL.io flits and packets, while CXL.io uses PCIe TLPs.
+- Does a Type 3 device look like an NVMe SSD to software? => No. It is a memory device with an HDM region and mailbox commands, not a block device.
+PITFALL: Thinking of a CXL memory device as a PCIe device with a big BAR. Its memory is cacheable system memory managed by the host with coherence rules.
+VERIFY: Class codes and how your lspci version labels CXL devices, the CXL DVSEC vendor ID and IDs, the exact alternate-protocol negotiation steps, and which CXL version needs which PCIe rate.
+
+@@ 14.12 | Principal | Cross-layer | tags=cxl,ssd,memory-semantic,cmm,type3,validation
+Q: Why does an SSD firmware or validation engineer meet CXL, and how would you plan validation of a CXL memory or memory-semantic storage device?
+SHORT: CXL shares the PHY, connectors and E3.S-style form factors with NVMe SSDs, and CXL memory modules and memory-semantic SSDs are built by teams with SSD controller, firmware and validation skills. Link bring-up, equalization, margining, AER, DPC, FLR and hot-plug all transfer directly. What is new is byte-addressable, cacheable access: latency tails, memory RAS (poison, media errors), decoders and interleave, persistence semantics, and telemetry through the CXL mailbox.
+DEEP:
+- **What transfers unchanged:** everything below and inside CXL.io. Link training and speed, margin, correctable and uncorrectable error handling, FLR and reset, config space and DOE, and hot-add and remove in EDSFF slots.
+- **What is new:**
+  - **Memory latency:** a CPU load stalls until the device answers. A DRAM-based module typically answers in a few hundred nanoseconds, but a NAND-backed memory-semantic device needs a DRAM cache, and a miss that takes tens of microseconds is catastrophic for a load. Validate hit-rate and miss-latency tails.
+  - **Memory RAS:** media errors show up as poison on CXL.mem reads, not as an NVMe status code. The host handling (machine check or page offline) needs testing.
+  - **Configuration:** HDM decoder programming, interleave sets, and the memory attribute table (CDAT) the device exposes through DOE so the OS can tier memory.
+  - **Management:** the CXL mailbox for health, logs, firmware update and error injection.
+  - **Persistence:** flush semantics and power-fail handling for devices that claim persistence.
+- **Plan:**
+  1. Link matrix at the CXL speed, with Flex Bus negotiation, including a PCIe-only fallback.
+  2. Functional: enumeration, decoder programming, memory tests, mailbox commands.
+  3. Performance: idle and loaded latency, bandwidth, and p99.9 read latency under mixed traffic and background media activity.
+  4. Error and RAS: injected errors, poison behavior, surprise removal, reset during traffic.
+  5. Power and thermal, and interaction with L0p and L1.
+FOLLOW:
+- Can a device expose both NVMe and CXL.mem? => Such hybrid devices have been proposed, with block access on the PCIe function and memory access through CXL. Check the specific product.
+- What is CDAT for? => A table describing the device's memory latency and bandwidth, read over the DOE mailbox, so software can place data in the right tier.
+PITFALL: Applying NVMe latency expectations. A 100 microsecond miss is fine for a block read but breaks a CPU load.
+VERIFY: The current CXL specification revision for CDAT, mailbox command sets, poison handling and persistence flows, and the class code used by memory devices.
+
+@@ 14.13 | Intermediate | Concept | tags=ide,security,encryption,integrity,selective-ide
+Q: What is PCIe Integrity and Data Encryption (IDE), and what does it protect?
+SHORT: IDE protects TLPs in transit with AES-GCM: integrity through a message authentication code, and optionally confidentiality through encryption. Link IDE covers one link between adjacent ports. Selective IDE covers chosen streams between a host and an endpoint across switches. Keys are set up through an authenticated SPDM session using the IDE key management protocol, typically carried over DOE. It defends against a physical attacker probing or altering traffic on the link.
+DEEP:
+- **Threat model:** someone with an interposer, a compromised cable or retimer, or a malicious component on the path. IDE stops them reading or modifying TLPs undetected.
+- **Scope:** Link IDE protects each hop and needs every hop to be secure. Selective IDE protects a stream end to end while switches only forward it.
+- **Crypto:** AES-256-GCM, with the authentication tag aggregated over several TLPs to reduce overhead. Two operating styles trade latency and strictness: containment mode holds data until the tag checks, and skid mode releases data earlier and detects afterwards.
+- **Cost:** the tag and framing add link overhead, and encryption and authentication hardware must run at line rate. On a Gen5 x4 SSD that is over 14 GB/s in each direction, which is real silicon area and power.
+- **Not the same as data at rest:** IDE protects the wire. NVMe encryption at rest (self-encrypting drives, TCG Opal, media encryption) protects the media. A compromised host still sees plaintext.
+- **Validation:**
+  - Stream setup, key programming and teardown, and rekeying while traffic flows.
+  - Tag failures and error injection, and what the link and the driver do afterward.
+  - Behavior across resets, FLR, retimers and switches.
+  - P2P between devices and IDE.
+  - Throughput and latency with IDE on versus off.
+FOLLOW:
+- Where do the keys come from? => From an SPDM secure session between host or platform security firmware and the device. The IDE key management messages ride on it.
+- Does IDE work in flit mode? => IDE is defined for both formats, with different encapsulation. Check the specification for the exact form.
+PITFALL: Calling IDE "PCIe disk encryption". It protects data moving across the link, not stored data.
+VERIFY: Tag sizes, the exact names of the operating modes, the stream and prefix encoding in each flit mode, and the IDE extended capability contents.
+
+@@ 14.14 | Advanced | Concept | tags=doe,spdm,cma,tdisp,tee-io,attestation
+Q: What are DOE, SPDM, CMA and TDISP, and how do they fit together?
+SHORT: DOE (Data Object Exchange) is a config-space mailbox: software writes a data object, sets Go, and reads the response. It is a transport. SPDM is the DMTF protocol that runs over it, and CMA (Component Measurement and Authentication) uses SPDM to authenticate a device with certificates and read signed firmware measurements. TDISP uses that secure channel with IDE to let a trusted VM lock, attest and run a device interface (a PF or VF).
+DEEP:
+- **DOE:** an extended capability with control and status registers and two mailboxes (write and read). Objects carry a vendor ID, an object type and a length. A discovery object tells software which protocols an instance supports. Responses may take a while, so software polls the Busy and Data Object Ready state or uses an interrupt, with a timeout.
+- **SPDM:** version and capability negotiation, certificate chain retrieval, challenge and response authentication, measurements, and key exchange that produces a secure session.
+- **CMA:** answers "is this the genuine device, with signed firmware at the expected version?". A platform can refuse a device that fails authentication or a measurement policy.
+- **IDE key management:** runs inside the secure SPDM session to program IDE keys.
+- **TDISP:** the trusted VM's security manager moves a device interface through states (unlocked, locked, run, error). Locking freezes its configuration, attestation proves what it is, and running lets it DMA into the trusted VM's private memory over IDE. Implementations sit under names such as Intel TDX Connect, AMD SEV-TIO and Arm CCA device assignment.
+- **Why DOE is in config space:** it works at enumeration, before BARs are assigned, so authentication can happen early.
+- **SSD relevance:** NVMe devices assigned to confidential VMs need TDISP and IDE support in the controller, and each VF can be a device interface. NVMe can also carry SPDM through security commands. Firmware must handle attacks on locked configuration by entering the error state.
+FOLLOW:
+- Who initiates DOE exchanges? => Host software or platform firmware, using config accesses. The device only answers.
+- Is DOE only for security? => No. It is a general mailbox. CXL also uses it to read CDAT tables.
+PITFALL: Mixing up the transport (DOE), the protocol (SPDM), the data protection (IDE) and the policy (TDISP).
+VERIFY: DOE register names and timeouts, object type numbers for SPDM and secured SPDM, TDISP state and message names, NVMe SPDM support via Security Send and Receive, and which TEE-IO products are shipping.
+
+@@ 14.15 | Principal | Debug | tags=downtrain,gen5,triage,lnksta2,equalization,checklist
+Q: A Gen5-capable SSD trains at Gen4 or Gen3. Give a systematic checklist that ties link capability, training and equalization together.
+SHORT: Work from cheap to expensive. First prove both sides advertise and are allowed to run Gen5: LnkCap, LnkCap2 supported speeds, and Target Link Speed at the root port, including BIOS caps. Then read what happened: LnkSta2 equalization phases and requests, AER, and any LTSSM log for a failed speed change. Then split variables: slot, cable, retimer, drive, temperature, reset type. Finally measure margin and fix the weak lane or channel. A downtrain is designed fallback, so find which step failed.
+DEEP:
+1. **Capability on both sides:** `lspci -vvv` on the root port and the SSD. `LnkCap` (max speed and width) and `LnkCap2: Supported Link Speeds` must include 32 GT/s on both, and the root port's `LnkCtl2: Target Link Speed` must allow it. Many BIOSes cap the slot speed. If the platform tops out at Gen4, there is nothing to debug.
+2. **Topology:** a chipset lane, a Gen4 switch or a Gen4-only retimer in the path limits speed. Check every hop.
+3. **What happened during training:** `LnkSta2` equalization bits (8 GT/s) and the 16 and 32 GT/s equalization status in the Physical Layer 16.0 and 32.0 GT/s extended capabilities, and whether the Link Equalization Request bit was set. No phase 3 completion at 32 GT/s while lower rates complete means equalization at the top rate failed and the link fell back.
+4. **LTSSM history:** with an analyzer or the device's internal log look for Recovery.Speed entries toward 32 GT/s followed by a return to the lower rate, and which sub-state timed out (Phase 2 or 3 equalization, RcvrLock). Check the data rate identifiers in the training sequences to see what each side advertised.
+5. **Retimer:** presence and firmware, that it is out of reset and clocked before the root port trains, and its per-segment status. Compare a run with and without it.
+6. **Physical:** swap slot, cable and drive. Run lane margining and look for one weak lane or one lopsided receiver. Repeat cold and hot.
+7. **Reset and sequencing:** PERST# timing and reference clock stability, and whether the SSD firmware advertises Gen5 only after it finishes loading. Compare cold boot with warm reset.
+8. **Downtrain by policy:** some platforms and drivers lower the speed after error events. Check logs.
+9. **Gen3 rather than Gen4:** the same list, but the 16 GT/s stage is the failing one. Equalization at 16 GT/s is what failed, so focus on presets there.
+FOLLOW:
+- It is Gen5 on the bench slot and Gen4 in the server. What differs? => Channel loss, the retimer, connectors, a BIOS cap or thermals. Measure margin on the bench first to see how much you have.
+- Cold boot gives Gen4 and warm reset gives Gen5. What does that suggest? => Sequencing or timing (device or retimer not ready when the root port trains), or temperature. See the boot-yield automation in the equalization module.
+PITFALL: Trusting LnkSta alone. It says where the link ended up, not why.
+VERIFY: Bit names for LnkSta2 and the 16 and 32 GT/s equalization status registers, how flit mode maps onto 128b/130b blocks below 64 GT/s, how your BIOS caps speeds, and whether your platform lowers speed after errors.
+
+@@ 14.16 | Principal | Scenario | tags=validation,strategy,gen4,gen5,gen6,tooling,flit,fec
+Q: How does an SSD validation strategy change from Gen4 to Gen5 to Gen6: new tests, new failure modes and new tooling?
+SHORT: Gen4 validation asks whether it links and how much margin it has. Gen5 makes margin, channel, retimers, thermals and precoding dominant. Gen6 adds a new layer: flit-mode protocol tests, FEC, CRC and replay behavior with error injection, PAM4 electrical measurements, flit and non-flit negotiation matrices, L0p, and flit-aware analyzers. Pass criteria shift from error-free to statistical, using FBER, retry rates and corrected-error trends.
+DEEP:
+| Area | Gen4 | Gen5 | Gen6 |
+|---|---|---|---|
+| Signal | NRZ, eye and jitter | NRZ 32 GT/s, tight margin, retimers, precoding | PAM4, three eyes, SNR-style metrics, FBER |
+| Data Link | TLP, LCRC, replay | Same | Flits, CRC, FEC, selective Nak, L0p |
+| Error signal | Bad TLP, replays | Same plus margin | FBER, FEC corrections, flit retries |
+| Negotiation | Speed and width | Plus precoding | Plus flit or non-flit |
+| Tools | TLP analyzer | Low-loss interposers, in-line analyzers | Flit-aware analyzers, PAM4 BERT |
+
+1. **Keep the old regression** and add the new dimensions: boot-yield soak, margin at temperature, speed-pair matrix (Gen6 device in Gen5, Gen4 and Gen3 slots).
+2. **Add flit tests:** negotiation combinations; injected single-byte errors (expect correction, no replay); two errors in one FEC group (expect Nak and replay); CRC errors; selective versus go-back-N replay; sequence wrap; replay during power-state changes; retry buffer limits with retimers and long paths; L0p entry and exit under load.
+3. **New failure modes:** stuck replay loops, ack starvation, mis-negotiated flit mode, miscorrection that only the CRC catches, counter definitions that differ between vendors, L0p glitches, latency tails.
+4. **Make it statistical:** a claim such as "flit retry rate is below 1e-6" needs enough flits. With zero events, the rule of three says about 3 million flits for 95 percent confidence, only 24 ms at x4 line rate. A claim of 1e-12 needs 3e12 flits, about 6.7 hours on one x4 link. Plan test time from this.
+5. **Track margin, not only pass or fail:** corrected-error rate is a margin proxy. A rising rate at temperature warns before replays appear.
+6. **Tooling:** flit-aware protocol analyzers, PAM4 test equipment, host and device counters where exposed, error injectors in the PHY or the DLL, and log capture in the kernel.
+7. **Decision criteria and report:** pass or fail per FBER and retry-rate bounds at corner conditions, with confidence and test duration stated.
+FOLLOW:
+- How many flits demonstrate a retry rate under 1e-6 with 95 percent confidence? => About 3 / 1e-6 = 3 million flits with zero events, or 24 ms at 125 million flits per second.
+- What stays valid from a Gen4 plan? => Everything above the flit boundary: enumeration, NVMe behavior, AER classes, reset and hot-plug. Only the Data Link and PHY details change.
+PITFALL: Treating FEC-corrected errors as harmless. They consume margin, and a link can look perfect until the corrected rate crosses the cliff.
+VERIFY: Which FEC, CRC and retry counters the specification defines and your hardware exposes, and current flit-aware tooling capabilities.
+
+@@ 14.17 | Advanced | Trap | tags=gen6,doubling,tags,credits,latency,flit
+Q: A colleague says a Gen6 SSD will simply double Gen5 numbers. What is wrong with that?
+SHORT: The raw rate doubles, the delivered performance does not. Flit overhead takes 7.8 percent, so a x4 link delivers 29.5 GB/s of TLP bytes against Gen5's 15.75, a ratio of 1.87, and about 1.94 for payload at 256 B once per-TLP savings are counted. Beyond the link, the bandwidth-delay product doubles, so tags, credits and buffers must double too. Random IOPS, latency and NAND behavior do not follow link speed at all.
+DEEP:
+- **Link arithmetic:** the numeric question in this module gives 14.3 versus 27.8 GB/s of payload at MPS 256. That is 1.94x, and it varies with TLP size.
+- **Bandwidth-delay product:** at a 1 microsecond round trip, a Gen5 x4 link needs 15.75 KB of data in flight, and a Gen6 x4 link needs 32 KB. Read requests need twice the outstanding tags or larger read sizes, receivers need twice the buffer, and flow control credits must cover twice the bytes. If the root complex or drive was sized for Gen5, throughput stops well short of double.
+- **Replay buffer:** it must also double, as in the Data Link module, and retimers add more.
+- **IOPS and latency:** 4 KiB random reads at low queue depth are limited by NAND read latency and firmware, not by the link. Adding link bandwidth does nothing there. The link adds a few nanoseconds of flit accumulation and FEC.
+- **Drive-side limits:** the controller, NAND channels, DRAM and internal buses have to scale as well, and the power and thermal budget rises.
+- **Platform limits:** the host memory bandwidth, the PCIe root complex ports, and the software stack.
+- **Error behavior:** the raw error rate is a million times higher and is hidden by FEC. The link may look clean while margin is being consumed.
+- **How to answer in an interview:** say "the ceiling roughly doubles minus flit overhead, then every resource that sets the achieved number must scale, and I would measure where the first one saturates".
+FOLLOW:
+- Which resource usually saturates first when you move an SSD to a faster link? => Outstanding read tags, host-side queue depth, or the controller and NAND. The link is often not the first limit.
+- What number would you check to catch a tag shortage? => Achieved bandwidth against outstanding requests times size divided by round-trip time, from the Flow Control and outstanding-reads discussions in earlier modules.
+PITFALL: Quoting the marketing rate (64 GT/s) as a throughput. Convert with the flit and TLP overhead first, and then find the next bottleneck.
+VERIFY: The flit-mode header sizes and exact overhead used in the arithmetic, and the tag and credit limits of your platform.

@@ -1,0 +1,361 @@
+# Module 16 — NVMe over PCIe (Cross-layer)
+
+@@ 16.01 | Basic | Cross-layer | tags=nvme,endpoint,class-code,bar0,msix
+Q: How does an NVMe SSD appear to the host as a PCIe device?
+SHORT: An NVMe SSD is an ordinary PCIe endpoint with class code 01h/08h/02h (mass storage, non-volatile memory, NVM Express), one 64-bit memory BAR (BAR0) that holds the controller registers and doorbells, and MSI-X for interrupts. Everything NVMe does is a memory read or write: host MMIO into BAR0, and device DMA into and out of host memory. Commands live in queues in memory, not in config space or I/O ports.
+DEEP:
+- **Binding:** the class code 010802h makes the Linux `nvme` driver claim the device. `lspci -nn` shows `[0108]` and `lspci -vv` shows the prog-if as NVM Express and `Kernel driver in use: nvme`.
+- **BAR0:** a 64-bit memory BAR. The controller registers sit at the start, doorbells begin at offset 1000h. The BAR is at least a few pages, and may also carry the MSI-X table and PBA, and the CMB or PMR, or those sit in other BARs (device dependent).
+- **Capabilities:** Power Management, MSI-X (one vector per completion queue), the PCI Express capability (LnkCap, DevCap with FLReset), AER, and usually LTR, L1 substates and Device Serial Number. SR-IOV appears on enterprise drives.
+- **Two traffic directions:** host to device is small MMIO (register access, doorbells, optional CMB writes). Device to host is everything else: the SSD is a bus master, needs Bus Master Enable, and its DMA goes through the IOMMU.
+- **Out-of-band:** NVMe-MI runs over SMBus/I2C or as MCTP over PCIe VDM. It does not use the queues and works when the data path is broken.
+- **Command sets:** NVM, ZNS and others are command sets over the same transport. For example, ZNS Zone Append returns the assigned LBA in the CQE, and looks like an ordinary write on the bus.
+FOLLOW:
+- What happens with Bus Master Enable clear? => The SSD cannot DMA, so it cannot fetch commands or return data. The driver sets it during probe.
+- Why is BAR0 64-bit? => It can map above 4 GB. But a 64-bit non-prefetchable BAR behind a bridge still has to fit the bridge's 32-bit non-prefetchable window (see the hot-plug debug question in module 15).
+PITFALL: Thinking NVMe commands travel through config space or a special bus. It is plain memory reads and writes.
+VERIFY: The class code, the BAR0 size and prefetchable requirement, and where the MSI-X table and PBA live, in the NVMe Base and NVMe over PCIe Transport specifications.
+
+@@ 16.02 | Basic | Concept | tags=bar0,registers,cap,cc,csts,doorbell,dstrd
+Q: What is in the NVMe BAR0 register space, and how are the doorbell addresses computed?
+SHORT: BAR0 begins with CAP (capabilities, 8 bytes), VS (version), INTMS and INTMC (interrupt mask), CC (controller configuration), CSTS (status), NSSR (subsystem reset), AQA, ASQ and ACQ (admin queue attributes and base addresses), then doorbells from offset 1000h. The SQ y tail doorbell is at 1000h + (2y x stride) and the CQ y head doorbell at 1000h + ((2y+1) x stride), where stride is 4 << CAP.DSTRD bytes.
+DEEP:
+| Offset | Register | Purpose |
+|---|---|---|
+| 00h | CAP (8 B) | MQES, timeout, doorbell stride, NSSR support, supported command sets, page sizes, CMB and PMR support |
+| 08h | VS | Spec version implemented |
+| 0Ch, 10h | INTMS, INTMC | Mask and unmask pin-based or MSI interrupts (not MSI-X) |
+| 14h | CC | EN, command set, memory page size, arbitration, shutdown notification, queue entry sizes |
+| 1Ch | CSTS | RDY, fatal status, shutdown status, subsystem-reset-occurred |
+| 20h | NSSR | Write 4E564D65h (ASCII "NVMe") to start an NVM Subsystem Reset |
+| 24h, 28h, 30h | AQA, ASQ, ACQ | Admin queue sizes and base addresses |
+| 1000h | Doorbells | 16-bit indexes, 4-byte registers spaced by the stride |
+- **Example:** with DSTRD = 0 the stride is 4 bytes. SQ0 tail is at 1000h, CQ0 head at 1004h, SQ1 tail at 1008h, CQ1 head at 100Ch. With DSTRD = 1 the stride is 8 bytes.
+- **What a doorbell holds:** an index. For an SQ it is the new tail. For a CQ it is the new head. Only the low 16 bits matter.
+- **Why a stride exists:** so a virtualization layer can map one doorbell per page to a guest.
+- **Bus cost:** doorbell writes are posted 4-byte MWr. Register reads (CSTS, CAP) are non-posted MRd and stall the CPU for a round trip, so drivers keep them out of the I/O path.
+FOLLOW:
+- Are doorbell writes ordered against each other? => They are posted writes to one device on one path, so they arrive in order. A later tail value implies the earlier entries are already in place, provided the driver wrote the entries first.
+- Why do drivers avoid reading CSTS or doorbells in the fast path? => Every MMIO read is a non-posted request that stalls the core for about a microsecond or more.
+PITFALL: Treating a doorbell as a counter of new commands. It is the queue index, and writing a wrong index corrupts the queue.
+VERIFY: All offsets, CAP field positions (MQES, TO in 500 ms units, DSTRD, NSSRS, CSS, MPSMIN and MPSMAX, CMBS, PMRS), the stride formula, and the NSSR value in the NVMe Base Specification register chapter.
+
+@@ 16.03 | Intermediate | Concept | tags=bring-up,init,cc-en,admin-queue,csts
+Q: What does NVMe controller bring-up look like as PCIe transactions?
+SHORT: Config writes assign BAR0 and enable Memory Space and Bus Master. The driver then reads CAP and VS, writes AQA, ASQ and ACQ, writes CC with EN set, and polls CSTS.RDY, all MMIO in BAR0. Then admin commands, delivered through the admin queue in host memory, identify the controller, set the number of queues and create the I/O queues. Each step is visible on an analyzer as config or memory TLPs in a recognizable order.
+DEEP:
+1. **Enumeration:** CfgWr to BAR0 and Command (Memory Space, Bus Master), MSI-X enable in its capability.
+2. **Read state:** MMIO reads of CAP and VS, and CSTS.RDY = 0 and CC.EN = 0 confirm a clean start.
+3. **Admin queues:** host allocates them, then MWr to AQA, ASQ (64-bit) and ACQ (64-bit).
+4. **Enable:** MWr to CC with EN = 1, page size 4 KB, entry sizes 64 B (SQ) and 16 B (CQ), command set, arbitration.
+5. **Ready:** MRd of CSTS repeated until RDY = 1, at most CAP.TO times 500 ms.
+6. **Admin commands:** SQE written into host memory, doorbell MWr, SQE fetch, then results as MWr into host memory (Identify data is a 4 KB DMA write). Typical order: Identify Controller, Identify Namespace, Set Features (Number of Queues), Create I/O Completion Queue, Create I/O Submission Queue, then features such as HMB and async event requests.
+7. **Interrupts:** MSI-X table entries are written (MWr into the table) early: vector 0 before the first admin command, unless the driver polls, and each I/O vector before Create I/O Completion Queue, which names the vector. In a trace these writes appear before the Identify completion, not after the admin commands.
+8. **I/O starts.**
+- **What to check on a trace:** the first bus-master TLP is the admin SQE fetch. If no MRd ever arrives after the ASQ doorbell, look at Bus Master Enable, IOMMU mapping and the ASQ address.
+- **Failure signatures:** RDY never sets (firmware not booting, or CAP.TO too short), RDY sets but the admin SQE fetch returns UR or CTO (IOMMU or address), or Identify data arrives but CQE never posts.
+FOLLOW:
+- Why is CC set only after AQA, ASQ and ACQ? => The controller uses those addresses as soon as it becomes ready, so they must be valid first.
+- What does CAP.TO bound? => The worst-case time for CSTS.RDY to change after CC.EN changes, in 500 ms units.
+PITFALL: Polling CSTS.RDY forever. Use CAP.TO as the timeout, and on expiry treat the controller as failed.
+VERIFY: Admin opcodes (Identify 06h, Create I/O SQ 01h, Create I/O CQ 05h, Set Features 09h), the Number of Queues Feature ID (07h), and the CC field encodings for entry sizes and page size.
+
+@@ 16.04 | Basic | Concept | tags=queues,sq,cq,phase-tag,doorbell,queue-depth,shadow-doorbell
+Q: How do NVMe submission and completion queues work, and how does queue depth relate to PCIe tags?
+SHORT: Each queue is a circular buffer in memory. The host owns the SQ tail and writes 64-byte commands, and the controller owns the SQ head and reports it in CQEs. The controller owns the CQ tail and writes 16-byte completions with a phase tag that flips each time the queue wraps, and the host owns the CQ head. Doorbells publish the tail (SQ) and head (CQ). Queue depth is an NVMe concept and is not the number of PCIe tags.
+DEEP:
+- **SQE:** 64 B. Holds opcode, command ID, namespace, PRP or SGL pointers and command fields.
+- **CQE:** 16 B. DW2 has SQ Head Pointer and SQ ID, DW3 has the command ID, the phase tag bit and the status field.
+- **Phase tag:** the host expects phase 1 on the first pass, and the expected value flips after every wrap. The host consumes an entry when its phase matches, so no tail register needs reading.
+- **Full and empty:** the SQ is full when tail + 1 equals head. The host learns the head from the SQ Head Pointer in CQEs.
+- **Sizes:** the admin queue holds up to 4096 entries. I/O queues can be up to CAP.MQES + 1 entries, and many queue pairs (Linux uses one pair per CPU).
+- **Queue depth versus tags:** a read command posts data with MWr and needs no tags, while a write command makes the SSD issue several MRds, each holding one tag until its completions return. Tag count (module 7 and 8) limits reads in flight on the link, whatever the queue depth is.
+- **Shadow doorbells:** a Doorbell Buffer Config admin command lets a host and a virtual controller use memory instead of MMIO doorbells, with an EventIdx to suppress redundant doorbell writes. Physical PCIe SSDs mostly use real doorbells.
+- **ZNS:** Zone Append changes only the command semantics. The CQE returns the LBA the drive picked.
+FOLLOW:
+- Why doesn't the host read the CQ tail register? => The phase tag tells it whether an entry is new, so the completion path is a memory read with no MMIO.
+- What does a queue-full condition mean on the bus? => The host has stopped ringing doorbells for new commands. Check CQ head doorbell writes are being made, or the controller cannot free SQ entries.
+PITFALL: Equating NVMe queue depth with the PCIe outstanding-request limit. They are separate resources.
+VERIFY: CQE field layout, phase tag initial value, admin queue size limits, and the Doorbell Buffer Config opcode (7Ch) in the NVMe Base Specification.
+
+@@ 16.05 | Intermediate | Concept | fig=nvmeflow | tags=read,4kb,tlp,flow,doorbell,cqe,msix
+Q: What does one 4 KB NVMe read look like on the PCIe bus, TLP by TLP?
+SHORT: The host writes the 64-byte SQE into host memory, then a 4-byte doorbell MWr goes to the SSD. The SSD fetches the SQE with a 64-byte MRd (a CplD returns it), reads the media, and writes the 4 KB into host memory as MWr TLPs of up to MPS bytes. It then posts a 16-byte CQE with MWr, sends an MSI-X MWr, and after the host processes it the host writes the CQ head doorbell. Only the SQE fetch is a non-posted request.
+DEEP:
+1. **SQE in memory:** an ordinary CPU store to the SQ ring, no PCIe traffic yet.
+2. **Doorbell:** posted MWr, 4 bytes, host to SSD, to the SQ tail doorbell.
+3. **SQE fetch:** MRd of 64 bytes (or several SQEs together), and a CplD with the payload back to the SSD. This is the one non-posted step.
+4. **PRP or SGL fetch:** only when the buffer needs more than PRP1 and PRP2. A 4 KB aligned buffer needs neither a list.
+5. **Data:** the SSD reads NAND and issues MWr TLPs into host memory, each at most MPS, none crossing a 4 KB boundary. Reads never need tags for the data.
+6. **CQE:** one 16-byte MWr into the CQ ring, with the phase tag set.
+7. **Interrupt:** a 4-byte MSI-X MWr to the interrupt controller address in the vector's table entry.
+8. **Host:** the interrupt handler sees the phase tag, processes the CQE, and finishes the request.
+9. **CQ head doorbell:** posted MWr from host to SSD, telling it the entry is consumed.
+- **Ordering that matters:** data MWr, then CQE MWr, then the MSI-X MWr are one posted stream. The producer/consumer rule guarantees the host sees data before the CQE, and the CQE before the interrupt handler runs.
+- **Where time goes:** the SQE fetch round trip is about a microsecond or a bit more. The NAND read is tens of microseconds. The data phase at Gen4 x4 is under a microsecond. The rest is software.
+FOLLOW:
+- Which TLPs in this flow carry a completion? => Only the SQE fetch (and any PRP or SGL list fetch). Everything else is posted.
+- Where would a PRP list fetch appear? => Between the SQE fetch and the first data MWr, as another MRd and CplD, for transfers larger than two pages.
+PITFALL: Forgetting that the host's SQE write is not a bus event. It becomes visible on the bus only as the controller's later MRd.
+VERIFY: Whether your controller fetches one SQE or several per MRd, and whether its CQE and MSI-X writes are separate TLPs in the order shown.
+
+@@ 16.06 | Advanced | Numeric | tags=tlp-count,bytes,read,write,overhead,mps,rcb
+Q: How many TLPs and how many bytes cross the link for one 4 KB read and one 4 KB write?
+SHORT: With MPS 256, MRRS 512, 64-bit host addresses and no lists, a 4 KB read is 22 TLPs and about 4.75 KB on the wire, of which 19 TLPs and 4606 B go device to host. A 4 KB write is 30 TLPs and about 4.9 KB, of which 4594 B go host to device. The data phase is 88 to 89 percent of the busy direction. If the host returns 64-byte completions the write costs 78 TLPs.
+DEEP:
+Assumptions: per-TLP link overhead 10 B (2 B sequence + 4 B LCRC + 4 B STP framing at 128b/130b), no ECRC, 4DW (16 B) headers for host memory and device BAR addresses, 3DW (12 B) for completions and for MSI-X to a 32-bit interrupt address, no PRP list, one SQE per fetch, no doorbell batching, and DLLPs and SKPs ignored.
+4 KB read (device writes data to host):
+| Step | TLP | Direction | Count | Wire bytes each | Total |
+|---|---|---|---|---|---|
+| SQ tail doorbell | MWr 4 B | host to SSD | 1 | 30 | 30 |
+| SQE fetch | MRd 64 B | SSD to host | 1 | 26 | 26 |
+| SQE completion | CplD 64 B | host to SSD | 1 | 86 | 86 |
+| Data | MWr 256 B | SSD to host | 16 | 282 | 4512 |
+| CQE | MWr 16 B | SSD to host | 1 | 42 | 42 |
+| MSI-X | MWr 4 B | SSD to host | 1 | 26 | 26 |
+| CQ head doorbell | MWr 4 B | host to SSD | 1 | 30 | 30 |
+Total 22 TLPs, 4752 B. SSD to host: 19 TLPs, 4606 B (efficiency 4096 / 4606 = 88.9 percent). Host to SSD: 3 TLPs, 146 B.
+4 KB write (device reads data from host), MRRS 512, completions of 256 B: the two doorbells, SQE MRd and CplD as above, then 8 MRd of 512 B (26 B each) and 16 CplD of 256 B (278 B each), CQE and MSI-X. Total 30 TLPs, 4896 B. Host to SSD 4594 B (89.2 percent), SSD to host 302 B.
+- **RCB and completion size:** if the host splits completions into 128 B pieces the write is 46 TLPs and the host to SSD direction is 4946 B (82.8 percent). At 64 B pieces it is 78 TLPs and 5650 B (72.5 percent).
+- **Batching:** one doorbell per N commands, one SQE fetch for several entries, and a CQ head doorbell per N completions cut the control TLPs. At 4 KB the control overhead is only about 2 percent of the busy direction, so the data TLP size matters far more.
+FOLLOW:
+- Which direction is the bottleneck for reads and for writes? => Reads load the SSD to host direction, writes load the host to SSD direction. Full duplex means mixed traffic can exceed either alone.
+- How many tags does one 4 KB write use? => 9 non-posted requests (the SQE fetch plus 8 data reads), each holding a tag until its completions return.
+PITFALL: Counting only data TLPs. The control TLPs matter for small I/O rates, and the completion split matters for writes.
+VERIFY: Framing overhead for your generation (8b/10b, 128b/130b or FLIT), the header sizes for your address map, and what completion size your Root Complex actually returns.
+
+@@ 16.07 | Principal | Numeric | tags=iops,ceiling,gen4,gen5,4k-random,overhead
+Q: What is the PCIe ceiling on 4 KB random read IOPS for a Gen4 x4 and a Gen5 x4 SSD, and how honest a predictor is it?
+SHORT: The busy direction carries about 4606 B per 4 KB read at MPS 256. Gen4 x4 (7.877 GB/s) allows about 1.71 M IOPS and Gen5 x4 (15.75 GB/s) about 3.42 M, or about 1.70 M and 3.39 M with SKP and DLLP overhead. It is an upper bound, not a prediction. Gen4 drives usually hit controller or NAND limits first, while Gen5 drives come close enough that PCIe efficiency matters.
+DEEP:
+1. Link rate: Gen4 x4 = 16 GT/s x 4 x 128/130 / 8 = 7.877 GB/s. Gen5 x4 = 15.754 GB/s, per direction.
+2. Bytes per read (SSD to host) from the previous question: 16 data TLPs x 282 B + MRd 26 B + CQE 42 B + MSI-X 26 B = 4606 B.
+3. IOPS = link bytes per second / bytes per IO.
+| Host MPS | Bytes per IO | Gen4 x4 | Gen5 x4 |
+|---|---|---|---|
+| 128 | 5022 | 1.57 M | 3.14 M |
+| 256 | 4606 | 1.71 M | 3.42 M |
+| 512 | 4398 | 1.79 M | 3.58 M |
+4. Extras: one SKP ordered set per about 370 blocks costs about 0.3 percent, and a few DLLPs per IO another 0.5 percent. That gives about 4642 B and 1.70 M and 3.39 M at MPS 256.
+- **Sanity check:** 3 M IOPS at 4 KB is 12.3 GB/s of payload, and with about 4.6 KB per I/O on the wire it is about 13.8 GB/s, which is 88 percent of the Gen5 x4 raw rate. That is inside the PCIe envelope but leaves little headroom.
+- **Honesty about measured numbers:** datasheet random-read figures for current drives are typically below the ceilings, roughly 1.0 to 1.6 M for Gen4 x4, and about 1.5 to 2.6 M for consumer Gen5 x4 drives with enterprise Gen5 drives reaching around 3 M. The controller, NAND parallelism, firmware and host CPU cost per I/O usually bind first. PCIe becomes the limit only if MPS is small, the link is down-trained, or completions are split finely.
+- **Use:** a measured IOPS well below the bound says look at the host and the drive. A measured IOPS near the bound says look at MPS, batching and link efficiency.
+FOLLOW:
+- How many I/Os must be in flight to reach 1.7 M at 80 microseconds latency? => By Little's law 1.7 M x 80 microseconds = 136 outstanding commands.
+- Do reads and writes share the ceiling? => No. They load opposite directions, so a mixed workload can use both.
+PITFALL: Quoting the PCIe ceiling as a drive's expected performance. It is an upper limit and shows the drive is not link-limited, not that it will reach it.
+VERIFY: Current datasheet IOPS for the drives you compare, and the MPS your platform actually negotiates on the path.
+
+@@ 16.08 | Advanced | Concept | tags=sequential,throughput,mps,mrrs,tags,credits,gen4,gen5
+Q: Why does Gen4 x4 sequential throughput top out near 7 GB/s and Gen5 x4 near 14 GB/s, and how do MPS, MRRS, tags and credits shape it?
+SHORT: The link's raw rate is 7.88 and 15.75 GB/s. Each TLP carries roughly 26 bytes of overhead, so a 256-byte payload is about 91 percent efficient, giving 7.15 and 14.3 GB/s, and about 1 percent less for SKPs and DLLPs. Real drives report about 7.0 to 7.4 and 14 to 14.8 GB/s. MPS sets the payload efficiency, and tags, MRRS and credits decide whether the link stays full.
+DEEP:
+| MPS | Efficiency (26 B overhead) | Gen4 x4 | Gen5 x4 |
+|---|---|---|---|
+| 128 | 83.1 % | 6.55 GB/s | 13.09 GB/s |
+| 256 | 90.8 % | 7.15 GB/s | 14.30 GB/s |
+| 512 | 95.2 % | 7.50 GB/s | 14.99 GB/s |
+With about 1 percent for SKP and DLLPs: 7.08 and 14.16 at MPS 256, and 7.42 and 14.84 at MPS 512.
+- **MPS:** the smallest MPS on the path wins, so a switch or root port at 128 B costs 8 to 9 percent. Drives quoted at the top of the range imply an MPS 512 path.
+- **Tags and MRRS (SSD reading host memory, the write path):** bytes in flight = bandwidth x round trip. Gen5 x4 at 2 microseconds needs about 31.5 KB, or about 62 reads of 512 B. With 32 tags of 512 B at 2 microseconds you cap near 8.2 GB/s. Extended or 10-bit tags and a larger MRRS are needed at Gen5.
+- **Credits (SSD writing host memory, the read path):** the Root Complex must advertise enough posted data credits and return them fast. At a 1 microsecond credit loop Gen4 x4 needs about 7.9 KB, or about 490 credits of 16 B. Verify with the analyzer's InitFC and UpdateFC values (module 8).
+- **Other limits:** IOMMU translation, host memory bandwidth, NUMA distance, and the controller's DMA engine.
+FOLLOW:
+- Why can a drive quote more than 91 percent of raw? => A platform with MPS 512 reaches about 95 percent, so about 7.4 and 14.8 GB/s fit in one direction. A quote above that would not.
+- What if sequential reads are fine but sequential writes are much lower? => Look at tags and MRRS on the SSD, and the Root Complex's completion size, since writes make the SSD issue reads.
+PITFALL: Blaming the SSD for a shortfall against the raw link rate. Part of the gap is TLP overhead by design.
+VERIFY: Datasheet sequential figures for the drives in question, and the negotiated MPS and MRRS on the actual platform (`lspci -vv` DevCtl).
+
+@@ 16.09 | Intermediate | Concept | tags=prp,sgl,scatter,tlp-size,list-fetch
+Q: What is the PCIe cost of PRP versus SGL, and of scattered buffers?
+SHORT: PRP lists describe a buffer as page-sized 8-byte pointers, and SGLs describe it as 16-byte descriptors of any byte length. On PCIe, a long PRP or SGL list needs extra MRd and CplD fetches before or during the transfer, and a scattered buffer is moved in more, smaller TLPs. Contiguous 4 KB pages cost the same either way. Fragments smaller than MPS cut efficiency.
+DEEP:
+- **PRP:** PRP1 and PRP2 hold up to two pages. Beyond that PRP2 points to a list page of 512 entries, whose last entry chains to the next list page. A 128 KB read with an aligned buffer needs PRP1 plus a 31-entry list (248 B), fetched by MRd before the SSD can write those pages.
+- **SGL:** the first descriptor can sit in the command. Others live in segments in host memory, each 16 B and each with its own length. Bit bucket descriptors let the controller skip data without sending it.
+- **Data TLP sizing:** each TLP is at most MPS, must not cross a 4 KB boundary, and stays inside one fragment.
+| Buffer layout for 4 KB | Data TLPs | Wire bytes | Efficiency |
+|---|---|---|---|
+| 16 fragments of 256 B (or contiguous) | 16 | 4512 | 90.8 % |
+| 32 fragments of 128 B | 32 | 4928 | 83.1 % |
+| 64 fragments of 64 B | 64 | 5760 | 71.1 % |
+- **Latency:** a list fetch is a dependent round trip. Controllers prefetch lists, but a long chain adds latency to the first data byte.
+- **Host side:** Linux uses PRPs by default and can use SGLs when the controller advertises them (the `sgl_threshold` parameter controls it).
+FOLLOW:
+- Does SGL reduce bus traffic for a contiguous buffer? => No. Same data TLPs, plus a descriptor to read.
+- What does a bit bucket save? => Data that the host does not want is not transferred at all, saving MWr TLPs on reads.
+PITFALL: Assuming SGL is always faster. It removes host copies for scattered buffers but adds descriptor fetches, and tiny fragments become tiny TLPs.
+VERIFY: The PRP list chaining rule, SGL descriptor types and the Identify Controller SGL support field in the NVMe Base Specification, and the Linux `sgl_threshold` default.
+
+@@ 16.10 | Intermediate | Concept | tags=msix,interrupts,coalescing,polling,vector
+Q: How does NVMe use MSI-X, and what does interrupt coalescing do to latency and PCIe traffic?
+SHORT: Each completion queue names an interrupt vector when it is created. The controller signals a completion by sending a 4-byte posted MWr to the address and data in that vector's MSI-X table entry, after the CQE write. Interrupt coalescing (Set Features: a count threshold and a time in 100 microsecond units) delays the interrupt to reduce the rate. It lowers CPU load at high queue depth and adds latency at low queue depth.
+DEEP:
+- **Vectors:** Linux allocates one MSI-X vector per I/O queue (usually per CPU) plus one for admin, and sets affinity so the completion lands on the submitting CPU.
+- **On the bus:** a 4-byte MWr, 26 B or 30 B on the wire, negligible bandwidth. Its cost is CPU time.
+- **Ordering:** the MSI-X MWr follows the CQE in the same posted stream, so the handler sees the CQE.
+- **Masking:** a masked vector sets its pending bit in the PBA and fires on unmask. INTMS and INTMC are for pin-based and MSI interrupts, not MSI-X.
+- **Coalescing:** the aggregation threshold and aggregation time come from the Interrupt Coalescing feature, and the Interrupt Vector Configuration feature can turn coalescing off per vector. Default is usually none, because it hurts latency.
+- **Polling:** io_uring with poll queues creates CQs without interrupts. There is no MSI-X traffic and the CPU polls the CQ in memory.
+- **Debug:** an I/O timeout with a posted CQE means the interrupt was lost. Check `/proc/interrupts` for per-queue counts, MSI-X masks, the IOMMU interrupt remapping, and look for the MWr to the interrupt address on the analyzer.
+FOLLOW:
+- What does coalescing do at QD1? => It can add up to the aggregation time to every completion. That is why it is usually off for latency-sensitive workloads.
+- Why is the interrupt a separate posted write and not part of the CQE? => The CQE is a memory write for polling hosts. The interrupt is a separate message to the interrupt controller, so both models work.
+PITFALL: Turning on coalescing to raise IOPS and forgetting the QD1 latency hit.
+VERIFY: The Interrupt Coalescing and Interrupt Vector Configuration Feature IDs (08h and 09h) and their units, and the MSI-X table entry format (module 10).
+
+@@ 16.11 | Advanced | Concept | tags=cmb,pmr,p2p,bar,queue-placement,acs
+Q: Where can queues live, and what do CMB and PMR change on the PCIe side?
+SHORT: SQs and CQs normally live in host memory. A Controller Memory Buffer (CMB) is SSD memory exposed through a BAR that can hold SQs, CQs, lists and data. Host writes to a CMB SQ are posted MWr that skip the SQE fetch round trip, but CPU reads from CMB are slow non-posted MMIO reads, so CQs stay in host memory. A CMB also enables peer-to-peer DMA. A Persistent Memory Region (PMR) is meant to survive resets and needs flush discipline.
+DEEP:
+- **Host-memory queues (default):** coherent, cacheable, DMA by the SSD, with the doorbell and SQE-fetch round trip on every submission.
+- **SQ in CMB:** the host writes 64-byte entries by MMIO into the BAR (write-combining helps), so the SSD does not need the MRd and CplD. This shortens submission latency by about one round trip.
+- **CQ in CMB:** the host polls with MMIO reads, each a full non-posted round trip. That is slow and stalls the core, so CQs belong in host memory.
+- **Data in CMB and P2P:** another endpoint (an RDMA NIC or GPU) can DMA into the CMB directly. Behind one switch it routes by address without the Root Complex. Through the Root Complex it requires P2P routing support, and ACS redirect or the IOMMU may force it upstream (module 13). Linux exposes it through p2pdma.
+- **BAR consequence:** a CMB adds to BAR size and needs window space, which affects hot-plug padding (module 15).
+- **PMR:** persistent memory behind a BAR, enabled and controlled by its own registers. Because host writes are posted, they are not persistent when the instruction retires. The host must use the specified flush mechanism, which is the same posted-write visibility problem discussed in module 2 (a read after the write forces earlier writes out).
+- **Validation:** MMIO write and read throughput to the CMB, P2P bandwidth and errors (UR, CTO, ACS blocks), behavior of CMB and PMR contents across CC.EN, FLR and PERST#, and window sizes.
+FOLLOW:
+- Why is reading the CMB from the CPU so slow? => MMIO reads are uncached, non-posted, and typically limited to small sizes, so each is a round trip of about a microsecond.
+- Why can P2P silently fail on some platforms? => The Root Complex may not route between root ports, or ACS blocks it, and the request ends as UR, CTO or a logged error.
+PITFALL: Placing CQs in the CMB to save host memory and then seeing polling latency collapse.
+VERIFY: CMBLOC, CMBSZ, CMBMSC and PMRCAP, PMRCTL registers and fields, what may be placed in the CMB, whether contents survive resets, and the PMR flush mechanisms.
+
+@@ 16.12 | Intermediate | Concept | tags=hmb,dram-less,latency,ftl,set-features
+Q: How does a DRAM-less SSD use Host Memory Buffer, and why is it sensitive to PCIe latency?
+SHORT: With HMB the host gives the SSD a region of host DRAM (Set Features, Host Memory Buffer) that the controller uses through ordinary DMA, typically to cache flash-translation mapping. Each miss in the controller's small SRAM becomes a small MRd to host memory in the middle of the I/O, adding a round trip of a microsecond or more to that command's latency. It also needs re-enabling after every reset.
+DEEP:
+- **Mechanism:** the host allocates buffers, builds a descriptor list, and enables HMB with Set Features (Feature ID 0Dh). The controller reads and writes them as normal bus-master requests. The driver picks the size within the controller's minimum and preferred values, and on Linux the `nvme.max_host_mem_size_mb` module parameter limits it.
+- **Capacity reality:** a full mapping table needs about 4 B per 4 KB, roughly 1 MB per GB of flash (about 1 GB for 1 TB). A 64 MB HMB covers only about 6 percent of a 1 TB drive, so it helps localized workloads and helps little on uniform random reads.
+- **PCIe cost:** a few small MRd and CplD pairs per I/O, plus write-backs. Bandwidth is negligible. Latency is not, because these reads are dependent steps.
+- **What inflates it:** ASPM L1 exit and LTR, IOMMU translation misses, host memory in a low-power state, and contention with other DMA. Each shows as a tail in latency.
+- **Validation:** compare QD1 random read latency with HMB on and off (a Linux module parameter or Set Features can turn it off), test under DMA contention and with L1 enabled, and check that HMB is re-enabled after CC.EN, FLR and PERST# and after resume from sleep.
+- **Security angle:** the SSD can read and write that host memory, so the IOMMU should confine it to the HMB region.
+FOLLOW:
+- Why does a PERST# lose HMB? => The controller state is gone, and the host must re-run the Set Features to hand the descriptors back.
+- What is the first symptom of HMB trouble in the field? => Random read latency and tails that are worse than the same drive's DRAM-equipped sibling under the same workload.
+PITFALL: Judging a DRAM-less drive on sequential tests. HMB shows up in random latency.
+VERIFY: HMB Feature ID (0Dh), the preferred and minimum size fields in Identify Controller, the Linux `max_host_mem_size_mb` default and whether 0 disables HMB, and the descriptor format.
+
+@@ 16.13 | Advanced | Cross-layer | tags=timeout,completion-timeout,nvme-timeout,reset,driver
+Q: NVMe command timeouts versus the PCIe Completion Timeout: which fires first, and what does the driver do?
+SHORT: The PCIe Completion Timeout is set in Device Control 2, with a default range of about 50 microseconds to 50 ms. It fires in the requester long before the Linux NVMe timeouts of 30 s for I/O and 60 s for admin commands. A stalled PCIe read is caught by hardware and logged first. An NVMe timeout means the controller never posted a completion, which after clean PCIe logs points to the drive or firmware. The driver then aborts, then resets the controller.
+DEEP:
+Both sides have requesters:
+- **Host requester:** a CPU MMIO read to BAR0 (for example CSTS). If the SSD does not answer, the Root Complex times out, logs it, and returns all ones to the CPU (some platforms escalate it to a machine check).
+- **SSD requester:** its MRd for an SQE, PRP list or data. A missing completion times out in the SSD, which logs it, and usually fails the command internally or hangs. The host sees nothing until its own NVMe timeout.
+Timeline in Linux:
+1. PCIe CTO: milliseconds, hardware, AER or DPC.
+2. Command timeout: the driver logs `I/O <id> QID <n> timeout, aborting` and sends an Abort (admin).
+3. If that fails or the controller is unresponsive: `... timeout, reset controller`. The reset toggles CC.EN, waits for CSTS.RDY, recreates queues and requeues the requests.
+4. If CSTS reads all ones the driver logs that the controller is down, and resets or removes it.
+- **The nesting:** CAP.TO (500 ms units) bounds controller ready waits, the NVMe command timeouts are tens of seconds, and the CTO is normally the smallest of the three.
+- **Use in triage:** AER CTO time before the NVMe timeout means a link or path fault. NVMe timeout with clean PCIe logs points to the SSD or its firmware (module 2 has the triage flow).
+FOLLOW:
+- What if the CTO is programmed to 64 s? => It exceeds the NVMe timeout, so the driver's own reset MMIO reads can stall the CPU up to the CTO, and the reset looks hung.
+- What state do in-flight commands end in after the reset? => They are cancelled and requeued or failed. The SSD never posts their CQEs.
+PITFALL: Treating the NVMe timeout as the first symptom. Look earlier in the AER log for a CTO.
+VERIFY: The CTO ranges and default in Device Capabilities 2 and Device Control 2 (module 12), the Linux defaults (`nvme_core.io_timeout`, `admin_timeout`), and the exact driver message text on your kernel.
+
+@@ 16.14 | Advanced | Debug | tags=sequential,plateau,gen4,checklist,iommu,numa,fio
+Q: Sequential read plateaus at 3.2 GB/s on a Gen4 x4 drive. What do you check, and in what order?
+SHORT: 3.2 GB/s is about what a Gen3 x4 or Gen4 x2 link can deliver (ceiling about 3.5 GB/s), so read LnkSta first. If the link is 16 GT/s x4, check MPS, MRRS, AER counters, IOMMU mode, NUMA and IRQ placement, workload parameters (block size and queue depth), thermal and power state, and finally the drive's own limits. Change one variable at a time.
+DEEP:
+1. **Link:** `lspci -vv -s <BDF>`, compare LnkCap to LnkSta. 8 GT/s x4 or 16 GT/s x2 gives a ceiling of 3.94 GB/s raw, about 3.5 after overhead, so 3.2 fits. Then triage the link (modules 4 and 5).
+2. **Payload sizes:** DevCtl MaxPayload and MaxReadReq. MPS 128 caps Gen4 x4 at about 6.5 GB/s, which alone would not explain 3.2.
+3. **Errors:** AER correctable counters before and after the run. Rising Bad TLP and replays cut throughput (module 6).
+4. **Credits and tags:** with an analyzer, InitFC values and whether the SSD stalls on credits, and how many tags the SSD uses.
+5. **IOMMU:** `dmesg | grep -i iommu`. Strict translation on every DMA can cut throughput. Try passthrough mode as an experiment.
+6. **CPU and NUMA:** SSD on one socket and fio on the other, IRQs on the wrong CPUs, or one core saturated (`perf top`, `mpstat -P ALL`). Pin fio and IRQs local to the SSD's node.
+7. **Workload:** throughput = QD x block size / latency. QD 4 of 128 KiB at 160 microseconds gives 3.3 GB/s. Raise QD and jobs, and use `--direct=1` with io_uring or libaio.
+8. **Thermal and power:** `nvme smart-log` temperature and thermal transition counts, `nvme get-feature -f 2` for the power state, and APST settings.
+9. **Drive limits:** state of the drive (fresh versus preconditioned, SLC cache, capacity used), the datasheet sequential figure for its capacity point, and reading unmapped LBAs.
+- **Decision:** if a known-good drive in the same slot does 7 GB/s the drive or its firmware is the cause. If both are stuck, it is the platform.
+FOLLOW:
+- Which single check separates link from everything else? => LnkSta speed and width, and the same drive in another slot.
+- What would low sequential read with high bad-TLP counts tell you? => A signal-integrity problem causing replays, not a host or drive throughput limit.
+PITFALL: Tuning fio first. Confirm the link and the negotiated MPS before touching software.
+VERIFY: Which figures on the drive's datasheet apply to your capacity and workload, and the tools available on your platform for IOMMU and NUMA inspection.
+
+@@ 16.15 | Advanced | Debug | tags=iops,qd32,doorbell,coalescing,little-law,triage
+Q: Measured 4 KB random read IOPS is half the datasheet at QD32. How do you find out why?
+SHORT: First apply Little's law: 32 outstanding at 500 K IOPS implies 64 microseconds per I/O, so compare latency to the drive's. Then compute PCIe bytes per I/O (about 4.6 KB) to show whether the link is a limit, check the link speed and width, and check the test conditions behind the datasheet number. Then look at doorbell batching, interrupt coalescing, and per-queue and per-core limits.
+DEEP:
+1. **Little's law:** IOPS = QD / latency. 500 K IOPS at QD32 is 64 microseconds mean. If the drive's true latency is 80 microseconds, QD32 on one queue can only give 400 K. Datasheet numbers are often at QD128 or 256 across several threads.
+2. **PCIe bytes per I/O:** about 4606 B upstream (question 16.06). 500 K IOPS is 2.3 GB/s, 29 percent of Gen4 x4. So PCIe is not the limit unless the link is degraded: Gen3 x2 tops out near 430 K IOPS.
+3. **Link and MPS:** LnkSta, DevCtl and AER, as in the plateau question.
+4. **Doorbells:** count doorbell MWr per I/O on the analyzer. Two per I/O means no batching. At 500 K IOPS that is 1 M MMIO writes per second, which costs CPU. Batch submits (io_uring, `iodepth_batch_submit`).
+5. **Interrupts:** `/proc/interrupts` shows the interrupt rate. A coalescing setting (feature 08h) can hold completions and stretch latency. Try polled I/O for comparison.
+6. **Queue and CPU limits:** one queue per core, and a single core typically sustains from a few hundred thousand to roughly a million IOPS, depending on the I/O stack. Use several jobs pinned to different cores and check each core's utilization.
+7. **Test conditions:** LBA format and alignment (`nvme id-ns`), raw device versus filesystem, span of LBAs read, preconditioned versus fresh, thermal state.
+- **Decision:** if bytes per IO x IOPS is far below link capacity and CPU is not saturated, look at the drive: its own queue arbitration, thermal throttle, or firmware settings.
+FOLLOW:
+- What tells you the drive is not being fed enough? => Latency stays flat as QD rises but IOPS rises linearly. If IOPS stops growing with QD while latency climbs, the drive is saturated.
+- Why check the LBA span? => Reading a small or empty span can be faster or slower than the datasheet condition because of caching and unmapped reads.
+PITFALL: Comparing a single-thread QD32 result to a multi-thread QD256 datasheet number.
+VERIFY: The datasheet's stated queue depth, thread count and span, and the Interrupt Coalescing feature settings on your drive.
+
+@@ 16.16 | Advanced | Trap | tags=cqe,ordering,relaxed-ordering,dma-rmb,coherency
+Q: The driver sees the CQE but the data buffer still holds old data. Where can the ordering fail?
+SHORT: Data MWr then CQE MWr are one posted stream, and a posted write without Relaxed Ordering cannot pass an earlier posted write, so the CQE cannot legally be visible before the data. First read the wire order on the analyzer. If the CQE really left the SSD before the last data TLP, it is a device bug. If the wire order is right, check Relaxed Ordering and IDO bits, the path and IOMMU, then the host side: missing barriers or non-coherent DMA.
+DEEP:
+1. **Wire order:** on the analyzer, is the CQE MWr after every data MWr for that command? An SSD with separate data and CQE engines can post the CQE early. This is a plausible firmware or hardware bug.
+2. **Ordering attributes:** in the TLP header Attr field, RO (Relaxed Ordering) and IDO. The rule is that a posted write with RO clear may not pass earlier posted writes. Data with RO set is fine as long as the CQE (and the MSI-X message) have RO clear, since they cannot pass the data. A CQE with RO set breaks the guarantee.
+3. **Same path:** are data and CQE in the same traffic class and virtual channel, through the same route? Different paths do not order.
+4. **IOMMU, ATS and ACS:** translated and untranslated requests can take different routes (for example ACS redirect), and different routes do not order against each other.
+5. **Root complex:** confirm it honors ordering for RO = 0 writes on your platform.
+6. **Host CPU:** the driver must read the phase tag, then execute a read barrier (Linux `dma_rmb()`), then read the rest of the CQE and the data. On weakly ordered CPUs a missing barrier reorders the reads. On non-coherent DMA systems a missing cache invalidate returns stale data.
+7. **Software drivers:** user-space stacks need the same barriers and cache attributes.
+- **Data point:** the analyzer sees the link, not host memory visibility. So the trace proves the device side and the host side needs its own checks.
+FOLLOW:
+- Why use Relaxed Ordering on data at all? => It lets the Root Complex reorder data writes for memory efficiency, and is safe when the completion signal itself is not relaxed.
+- Does the MSI-X write have the same guarantee? => Yes, if it is posted with RO clear it follows the CQE in the same stream.
+PITFALL: Adding a delay or a second read in the driver to hide it. Find the actual ordering violation.
+VERIFY: The ordering table rules for posted requests with RO set and clear, Attr bit positions, and the barrier requirements of your CPU architecture and driver.
+
+@@ 16.17 | Principal | Scenario | tags=analyzer,timeline,trace,latency,reconstruction
+Q: You have a protocol analyzer trace of a slow NVMe read. How do you reconstruct the full command timeline and find where the time went?
+SHORT: Anchor on the SQ doorbell MWr, match the SQE fetch MRd and CplD, decode the command fields from the CplD payload (opcode, command ID, PRP1, SLBA, NLB), follow the data MWr into the PRP address, find the CQE MWr by command ID, then the MSI-X MWr and the CQ head doorbell. Time each gap, and attribute it to the host (interrupt to doorbell), the link and host memory (fetch round trip), or the drive (doorbell to fetch, fetch to first data).
+DEEP:
+Illustrative trace for one 4 KB read (times in microseconds from the doorbell):
+| Time | TLP | Detail |
+|---|---|---|
+| 0.00 | MWr host to SSD | BAR0 + 1008h, data 0005h: SQ1 tail = 5 |
+| 0.42 | MRd SSD to host | tag 1Ah, 16 DW, SQ base + 4 x 40h (head 4) |
+| 1.31 | CplD host to SSD | tag 1Ah, 64 B: opcode 02h read, CID 0031h, PRP1, SLBA, NLB = 7 (512 B LBAs) |
+| 72.4 | MWr SSD to host | 256 B to PRP1: first data TLP |
+| 73.1 | MWr SSD to host | 16th 256 B TLP, last byte at PRP1 + FFFh |
+| 73.2 | MWr SSD to host | 16 B CQE: SQHD 5, SQID 1, CID 0031h, phase 1, status 0 |
+| 73.3 | MWr SSD to host | 4 B to interrupt address, vector data |
+| 79.8 | MWr host to SSD | BAR0 + 100Ch, data 0005h: CQ1 head = 5 |
+Method:
+1. **Anchor:** find the doorbell, note the queue and new tail, compute the SQE address from the SQ base and old head.
+2. **Match the fetch:** by tag, and check the CplD is 64 B and complete.
+3. **Decode the command:** CID, opcode, PRP or SGL, LBA and length. Verify data bytes = (NLB + 1) x LBA size.
+4. **Follow the data:** all MWr addresses fall inside the PRP range, none cross 4 KB, sizes sum to the length.
+5. **Find the CQE:** by CID and SQID. Check the phase tag matches the expected value, status is success, and SQHD equals the new head.
+6. **Gaps:** doorbell to fetch 0.42 (SSD arbitration), fetch round trip 0.89 (host memory plus IOMMU), fetch to first data 71.1 (firmware, FTL and NAND), data phase 0.7, data to CQE 0.1, CQE to interrupt 0.1, interrupt to CQ doorbell 6.5 (host).
+- **Reading the gaps:** a fetch round trip well above a microsecond or two points at ASPM L1 exit, IOMMU faults or a slow Root Complex. A long fetch-to-data gap is the drive. A long interrupt-to-doorbell gap is host software.
+FOLLOW:
+- What if the CQE appears before the last data TLP? => That is an ordering bug in the SSD (see the CQE ordering question).
+- How do you correlate to host tracing? => Use a marker MMIO write that appears in both logs, or synchronize clocks, and compare the host's submit and complete times to the doorbell and doorbell-return times.
+PITFALL: Using host-observed latency to blame the drive. The trace shows the drive's part is only the fetch-to-data gap.
+VERIFY: How your analyzer decodes NVMe fields, and the queue base addresses and depth for the queue under test.
+
+@@ 16.18 | Principal | Cross-layer | tags=correlation,latency,histogram,replay,recovery,aspm,credit-stall,design
+Q: How would you design cross-layer validation that correlates NVMe command latency histograms with PCIe events such as replays, Recovery entries, credit stalls and ASPM exits?
+SHORT: Collect per-command latency on the host, and PCIe events from counters and analyzers, on one aligned time base. Compare histograms with and without events, attribute the tail commands to event windows, and confirm causality by injecting each event (ASPM, replays, speed change) and watching the histogram shift. Report tail latency explained by PCIe events, and flag unexplained tail as a drive or host issue.
+DEEP:
+1. **Latency data:** per-I/O timestamps from fio latency logs, or eBPF on block request issue and complete, into HDR histograms per workload. Add the drive's vendor telemetry if available.
+2. **PCIe events:** AER counter deltas (Bad TLP, Replay Timer Timeout, Rollover), LTSSM Recovery entries and L1 or L0s entries and exits (analyzer or device counters), credit stalls (analyzer flow-control state or device counters), link speed and width changes, and SSD-side error counters.
+3. **Time alignment:** a marker (an MMIO write to a scratch or vendor register, or a config access) issued by the test host and visible in both the host log and the analyzer trace. Repeat it to measure clock offset and drift.
+4. **Tail attribution:** for each I/O above p99.9, check for events in [submit, complete]. Compare that fraction to random windows of the same length. A large lift means correlation.
+5. **Causality by injection:** force ASPM L1 on and off, inject LCRC errors at a controlled rate, drop the link speed, throttle credits. The histogram should shift in proportion (dose response).
+6. **Controls:** run at steady state, fixed temperature and fixed firmware, and exclude drive-internal causes such as garbage collection and thermal throttling using SMART and telemetry.
+7. **Sample size:** p99.99 needs at least 1e6 I/Os per condition to see about 100 tail events, and more events to prove correlation.
+- **Output:** per-run overlay of histograms annotated with event rates, a table of tail latency explained by each event type, and a gate that fails the build when unexplained tail rises.
+- **Decision criteria:** for example, no Recovery entries in the run, replay rate under the agreed limit, and the p99.99 latency under budget both with and without ASPM.
+FOLLOW:
+- What if correlation is high but injection changes nothing? => A shared cause, such as thermal or a host interrupt, drives both. The injection test separates causation from correlation.
+- How does this connect to the NVMe timeout question? => Latency spikes that approach the command timeout precede resets, so long tails are early warnings of a timeout storm.
+PITFALL: Treating correlation as cause, or ignoring drive-internal tail sources such as garbage collection.
+VERIFY: Which PCIe counters your platform, analyzer and SSD actually expose, and how your tools timestamp events.

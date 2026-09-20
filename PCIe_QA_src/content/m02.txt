@@ -1,0 +1,238 @@
+# Module 2 — Layered Architecture
+
+@@ 2.01 | Basic | Concept | fig=stack | tags=layers,tlp,dllp
+Q: Describe the three PCIe layers and what each one owns.
+SHORT: The Transaction Layer builds and consumes TLPs (requests and completions) and owns flow control accounting and ordering. The Data Link Layer makes each hop reliable with sequence numbers, LCRC, ACK/NAK and replay, and carries flow-control and power-management DLLPs. The Physical Layer frames, scrambles, encodes and serializes the data and runs link training (the LTSSM).
+DEEP:
+| Layer | Unit it handles | Main jobs |
+|---|---|---|
+| Transaction | TLP | request/completion semantics, addressing and routing, flow-control credits, ordering, virtual channels, ECRC |
+| Data Link | DLLP, and TLPs with seq# and LCRC | ACK/NAK, replay buffer, flow-control initialization and updates, power-management handshakes, link up/down status |
+| Physical | symbols, blocks, ordered sets | framing, byte striping, scrambling, 8b/10b or 128b/130b encoding, SerDes, LTSSM, equalization |
+
+Each layer talks to its peer through the layers below it. Sending goes down the stack and receiving goes up.
+FOLLOW:
+- Which layer owns link training? => The Physical Layer, through the LTSSM.
+- Which layer numbers TLPs? => The Data Link Layer.
+PITFALL: Placing flow control in the Data Link Layer. Credits are accounted in the Transaction Layer; the Data Link Layer only transports the initialization and update DLLPs.
+
+@@ 2.02 | Basic | Concept | fig=encap | tags=memory-write,walkthrough
+Q: Walk a memory write from Device A down its stack and up Device B's stack.
+SHORT: A's Transaction Layer builds a memory write TLP (header, data, optional ECRC) once it has flow-control credits. The Data Link Layer adds a sequence number and LCRC and keeps a copy in the replay buffer. The Physical Layer frames, scrambles, encodes and serializes it. B reverses the steps: the LCRC and sequence number are checked and an ACK DLLP returns, then B's Transaction Layer checks the header and delivers the write. Nothing is returned to the requester because the write is posted.
+DEEP:
+1. A's TL checks it holds enough posted-header and posted-data credits for the TLP, then builds header, payload and optional ECRC.
+2. A's DLL assigns the next sequence number, computes the LCRC, stores the TLP in the replay buffer, and hands it down.
+3. A's PL adds framing, stripes bytes across lanes, scrambles, encodes, and transmits.
+4. B's PL recovers symbols or blocks, removes framing, and passes the TLP up.
+5. B's DLL verifies LCRC and sequence number. Good: it schedules an ACK DLLP. Bad: it schedules a NAK.
+6. B's TL checks the header (routing, type, malformed checks), consumes the data, and later returns the credits to A through an UpdateFC DLLP.
+7. A's DLL frees the replay-buffer copy when the ACK arrives.
+FOLLOW:
+- When does A discard its replay copy? => When an ACK covering that sequence number arrives.
+- When does B return credits? => After its Transaction Layer drains the write from its receive buffer, through an UpdateFC DLLP.
+PITFALL: Treating the ACK as proof the write reached its destination. An ACK only says the next link received the TLP intact.
+
+@@ 2.03 | Basic | Concept | fig=dllp | tags=tlp,dllp,ordered-set
+Q: What is the difference between a TLP, a DLLP and an ordered set?
+SHORT: TLPs carry transactions: they are variable length, sequence-numbered, LCRC-protected, replayable, and routed across switches. DLLPs are small link-local control packets (ACK/NAK, credits, power management) with their own 16-bit CRC that are not sequenced or replayed. Ordered sets are Physical Layer patterns (TS1/TS2, SKP, electrical idle) for training, clock compensation and idle entry.
+DEEP:
+| | TLP | DLLP | Ordered set |
+|---|---|---|---|
+| Created by | Transaction Layer | Data Link Layer | Physical Layer |
+| Crosses switches | Yes (header and payload unchanged) | No, one link only | No, one link only |
+| Protection | LCRC per hop, optional ECRC end to end | 16-bit CRC | Pattern match, repetition |
+| Recovery | ACK/NAK and replay | Periodic repetition and timers | Repetition and LTSSM timeouts |
+| Examples | MRd, MWr, CfgRd, Cpl | Ack, Nak, InitFC, UpdateFC, PM_* | TS1, TS2, SKP, EIOS, EIEOS, FTS |
+FOLLOW:
+- Are DLLPs acknowledged? => No. Credit updates repeat periodically, and other DLLP loss is handled by protocol timers such as the replay timer.
+- Can a switch forward a DLLP? => No. DLLPs terminate at the port that receives them.
+PITFALL: Calling ACK and NAK "TLPs." They are DLLPs.
+
+@@ 2.04 | Basic | Concept | tags=posted,non-posted,completion,requester
+Q: Which PCIe requests are posted, which are non-posted, and which need completions?
+SHORT: Memory writes and messages are posted: the requester expects no completion. Memory reads, I/O reads and writes, configuration reads and writes, and AtomicOps are non-posted: the completer must answer with a completion (with data for reads, without data for writes and errors). The requester is who issues a request and the completer is who executes it.
+DEEP:
+- **Posted:** MWr, Msg/MsgD. Fire and forget, so they cost no round trip and can stream at full link rate.
+- **Non-posted:** MRd, IORd, IOWr, CfgRd0/1, CfgWr0/1, FetchAdd, Swap, CAS. I/O and configuration writes are non-posted, so they return a completion without data.
+- **Completions:** Cpl (no data) and CplD (with data), with a completion status of Successful, Unsupported Request, Configuration Request Retry Status, or Completer Abort.
+- **Why it matters:** reads pay a round-trip latency and consume a tag, while writes are limited only by flow-control credits. That difference shapes performance and ordering rules.
+FOLLOW:
+- Is a configuration write posted? => No. It is non-posted and returns a Cpl without data.
+- Who tracks an outstanding read? => The requester, using a tag that identifies the request until its completion (or completions) return.
+PITFALL: Assuming a memory write is acknowledged end to end. Only link-level ACK exists.
+
+@@ 2.05 | Intermediate | Concept | tags=lcrc,ecrc,end-to-end
+Q: What is end to end and what is per hop in a TLP? Compare LCRC and ECRC.
+SHORT: The header, payload and optional ECRC belong to the TLP and are forwarded by switches unchanged. The sequence number, LCRC, framing and DLLPs belong to one link and are rebuilt at every hop. LCRC therefore catches corruption on a single link, and ECRC can catch corruption inside a switch or bridge that the regenerated LCRC would hide.
+DEEP:
+- A switch checks the incoming LCRC, moves the TLP through its internal buffers and logic, then computes a new LCRC on the way out. Corruption inside the switch happens after the check and before the recompute, so LCRC covers the corrupted data and the error goes unnoticed.
+- ECRC is generated by the requester's Transaction Layer and checked by the final receiver (and optionally by switches), so it covers the path.
+- ECRC is optional: it costs 4 bytes per TLP and generation and checking logic, and is enabled through the AER capability (ECRC Generation and Check enables).
+- ECRC covers fields that stay constant along the path. Variant bits (such as the EP bit and the type bit that changes when a Type 1 configuration request converts to Type 0) are treated as fixed values in the calculation.
+- An ECRC error is reported as an uncorrectable, normally non-fatal error.
+FOLLOW:
+- Why is ECRC off on many platforms? => It is optional, adds 4 bytes and some latency, and many designs rely on internal parity and ECC in switches and controllers instead.
+- Which error can only ECRC catch? => Data corruption that occurs inside a switch or bridge after the LCRC check and before the LCRC is regenerated.
+PITFALL: Believing LCRC gives end-to-end data integrity through switches.
+VERIFY: The exact list of variant bits excluded from ECRC and the default severity of an ECRC error in the AER Uncorrectable Error Severity register.
+
+@@ 2.06 | Intermediate | Concept | tags=dll,dlcmsm,initfc,dl-up
+Q: Besides ACK/NAK, what else does the Data Link Layer do?
+SHORT: It runs the Data Link Control and Management State Machine (DL_Inactive, DL_Init, DL_Active) that tells the Transaction Layer when the link is usable. It initializes flow control with InitFC1 and InitFC2 DLLPs, carries UpdateFC credit updates, transports the power-management handshakes (for example PM_Enter_L1 and PM_Request_Ack), and reports link up or down for hot plug and status registers.
+DEEP:
+- **Bring-up:** the LTSSM reaching L0 is not enough. The DLL must exchange InitFC1 then InitFC2 DLLPs for the virtual channel (at least VC0) before it reports DL_Active and lets TLPs flow.
+- **Feature exchange:** newer revisions add a Data Link Feature state for exchanging optional features before flow-control initialization.
+- **Down handling:** if the link goes down (DL_Inactive), the Transaction Layer discards outstanding TLPs and the replay buffer is cleared. Completion timeouts are what eventually clean up non-posted requests.
+- **Status:** the Data Link Layer Link Active bit in Link Status, and the Data Link Layer State Changed bit in Slot Status, are driven from this layer. Hot plug and surprise-down handling depend on them.
+FOLLOW:
+- What must finish before DL_Active? => Flow-control initialization (InitFC1 and InitFC2 exchange) for VC0.
+- What happens to in-flight TLPs when the link drops? => They are discarded, so higher layers rely on completion timeouts and software recovery.
+PITFALL: Assuming an LTSSM in L0 means the Data Link Layer is up. Both must be up before TLPs move.
+VERIFY: DL_Feature state details (added in newer revisions) in the Data Link Layer chapter of the Base Specification.
+
+@@ 2.07 | Intermediate | Concept | tags=pipe,phy,mac
+Q: How is the Physical Layer split in real silicon, and what is PIPE?
+SHORT: The Physical Layer has a logical sublayer (framing, byte striping, scrambling, encoding, LTSSM) and an electrical sublayer (SerDes, TX drivers, RX equalization, CDR, detection circuits). Chips usually implement this as a digital MAC/PCS and an analog PHY/PMA connected by the PIPE interface, so the same controller can be paired with different PHYs.
+DEEP:
+- **PIPE** (PHY Interface for PCI Express) defines the signals between MAC and PHY: transmit and receive data, receiver detection, power state control, data rate selection, polarity, equalization requests and results, and the parallel clock.
+- **Ownership:** the LTSSM and equalization protocol (which presets and coefficients to request) live in the MAC. RX adaptation (CTLE, DFE gain and tap tuning) lives in the PHY.
+- **Why validation cares:** PIPE-level monitors and simulation models make LTSSM behavior visible before silicon, and many bring-up failures are MAC-to-PHY assumptions such as power-state timing or rate-change sequencing.
+- **Naming trap:** PIPE power-down states (P0, P0s, P1, P2 and their newer sub-states) describe the PHY. They are not the same as link L-states.
+FOLLOW:
+- Who owns the LTSSM? => The MAC side, which drives the PHY through PIPE.
+- Where does receiver adaptation run? => Inside the PHY, as analog and DSP adaptation loops for CTLE and DFE.
+PITFALL: Mapping PIPE P-states one to one onto link L-states.
+VERIFY: PIPE revision specifics (signal names and P-state sub-states vary by version).
+
+@@ 2.08 | Intermediate | Concept | tags=switch,cut-through,nullified
+Q: How does a switch treat a TLP as it passes through? What is a nullified TLP?
+SHORT: Each switch port has a full Physical and Data Link Layer. The ingress DLL checks and ACKs the TLP, the switch's Transaction Layer routes it by address or ID and arbitrates virtual channels, and the egress DLL assigns a new sequence number and LCRC. A switch may forward cut-through before the LCRC is verified. If the LCRC then fails, the switch nullifies the outgoing TLP so the downstream receiver discards it, and the upstream link replays the good copy.
+DEEP:
+- **Store-and-forward versus cut-through:** cut-through cuts latency but forwards data before it is known to be good.
+- **Nullifying:** the switch ends the packet with the EDB (end bad) symbol or token and an inverted LCRC. The receiver drops it without treating it as a normal link error.
+- **Recovery:** the ingress link still NAKs the corrupted TLP and the sender replays it, so the corrected copy follows later.
+- **Credits:** the switch consumes credits at the egress port from the next device and returns credits upstream as its buffers drain. Each link has independent credits.
+FOLLOW:
+- Why not always store-and-forward? => It adds about a packet time of latency per hop, which matters at high speed and for latency-sensitive traffic.
+- Does a nullified TLP consume a sequence number? => The receiver discards it without treating it as a normal bad TLP, and it should not advance NEXT_RCV_SEQ. The exact sequence accounting on the sending side is in the Data Link Layer rules (verify in spec).
+PITFALL: Assuming every dropped TLP means a link error. Nullified TLPs are expected switch behavior.
+VERIFY: Sequence-number and error-reporting treatment of nullified TLPs in the Base Specification.
+
+@@ 2.09 | Advanced | Concept | tags=errors,aer,layers
+Q: Which errors are detected at each layer, and how do they map to AER?
+SHORT: The Physical Layer detects receiver errors (bad decode, framing, alignment) and training or link-down problems. The Data Link Layer detects bad TLPs (LCRC or sequence errors), bad DLLPs, replay timeouts and replay rollover, and protocol errors. The Transaction Layer detects poisoned TLPs, completion timeouts, unexpected or aborted completions, unsupported requests, flow-control violations, malformed TLPs and ECRC errors.
+DEEP:
+| Layer | Detects | AER class |
+|---|---|---|
+| Physical | Receiver Error | Correctable |
+| Data Link | Bad TLP, Bad DLLP, REPLAY_NUM Rollover, Replay Timer Timeout | Correctable |
+| Data Link | Data Link Protocol Error, Surprise Down Error | Uncorrectable (usually fatal) |
+| Transaction | Poisoned TLP, Completion Timeout, Completer Abort, Unexpected Completion, Unsupported Request, ECRC Error, ACS Violation | Uncorrectable non-fatal by default (severity is programmable) |
+| Transaction | Receiver Overflow, Flow Control Protocol Error, Malformed TLP | Uncorrectable (usually fatal) |
+
+Correctable errors are recovered by hardware (replay, retrain). Their counts are still the earliest sign of a marginal link. Uncorrectable errors mean a transaction or the link failed and software must decide how to recover.
+FOLLOW:
+- Which correctable errors usually indicate signal-integrity trouble? => Receiver Error, Bad TLP and Bad DLLP first, then Replay Timer Timeout and REPLAY_NUM Rollover when it gets worse.
+- Can severity be changed? => Yes. The Uncorrectable Error Severity register selects fatal or non-fatal for each uncorrectable error type.
+PITFALL: Ignoring correctable errors because "they are corrected." A rising rate is a leading indicator of link marginality.
+
+@@ 2.10 | Advanced | Cross-layer | tags=nvme,dma,read,tags,credits
+Q: Trace an NVMe SSD fetching a submission queue entry from host memory across PCIe.
+SHORT: The SSD is the requester. Its Transaction Layer builds a memory read request for 64 bytes (no payload) with a tag, using a non-posted header credit. The TLP goes through any switch to the Root Complex, which reads memory (through the IOMMU) and returns a completion with data. The completion is matched to the tag, its payload is consumed, and the credits go back to the sender through UpdateFC DLLPs.
+DEEP:
+1. The controller decides to fetch entry N of the submission queue (after the host rings the doorbell with a posted MMIO write to the SSD's BAR).
+2. TL builds MRd with 64-bit address, length 16 DW, requester ID, and a tag. It needs one non-posted header credit at the upstream link.
+3. Each hop adds sequence number and LCRC and ACKs the previous hop. A switch routes by address (no downstream window matches, so it forwards upstream).
+4. The RC translates the address if an IOMMU is in use, reads memory and returns CplD with the 64 bytes, routed by ID back to the SSD.
+5. The SSD matches the tag, then treats the command as received. Reads larger than MPS return as several completions, split on read completion boundaries.
+6. Posted writes from the SSD (data to host, completion queue entries, MSI-X messages) travel the other way without completions.
+FOLLOW:
+- What must the SSD guarantee about completion credits? => Endpoints that issue reads normally advertise infinite completion credits and must be able to consume every completion, which avoids a deadlock class.
+- Why do read-heavy SSD workloads care about MRRS and tags? => A read request larger than MPS returns as multiple completions, and the number of tags bounds how many reads are in flight across the round trip.
+PITFALL: Forgetting the IOMMU and switch hops when explaining a latency number for host-memory access.
+
+@@ 2.11 | Advanced | Trap | tags=posted,ordering,flush,ack
+Q: A posted write was ACKed at the link level. Is the data visible at the target? How do you make sure?
+SHORT: Not necessarily. The ACK says only that the next port received the TLP without errors, and the write may still sit in a switch buffer or a host write queue. The ordering rules say a non-posted read may not pass an earlier posted write on the same path, so software follows a write with a read from the same device (a "flush read") to force earlier writes to become visible.
+DEEP:
+- **Link ACK versus visibility:** ACK is per link and protects delivery. It says nothing about the write being applied to the final device or memory.
+- **Ordering guarantees:** a posted write may always pass a non-posted request (required for deadlock avoidance), but a non-posted request cannot pass an earlier posted write. So a read to the same device is ordered behind every earlier posted write on that path.
+- **Errors are asynchronous:** a posted write to a bad address produces no completion. The receiver reports it through error messages (for example ERR_NONFATAL) and AER logs, long after the writing instruction retired.
+- **Where this shows up:** doorbell writes to an SSD (posted MMIO writes) followed by a status read; and drivers that use a read of a benign register to flush the write buffer.
+FOLLOW:
+- What does the "producer/consumer" ordering rule protect? => A consumer that sees the flag or completion must also see the data written before it, so data writes cannot be passed by the later flag write.
+- What if the write was to a device that has gone away? => No completion returns. The error is logged, and only later reads or timeouts reveal it.
+PITFALL: Assuming a link ACK equals target visibility, or that a posted write failure will be reported to the store instruction that issued it.
+
+@@ 2.12 | Advanced | Numeric | tags=tags,latency,bdp,10-bit-tags
+Q: How many outstanding reads do you need to saturate a link with a 1 microsecond round trip?
+SHORT: Multiply the link bandwidth by the round-trip time to get bytes in flight, then divide by the read size. Gen4 x4 (7.88 GB/s) at 1 microsecond needs about 7.9 KB in flight, or roughly 31 reads of 256 bytes. Gen5 x16 (about 63 GB/s) needs about 63 KB, or 246 reads, which is why extended and 10-bit tags exist.
+DEEP:
+Bytes in flight = bandwidth x round-trip time (the bandwidth-delay product).
+
+| Link | Bandwidth | In flight at 1 us | 256 B reads outstanding |
+|---|---|---|---|
+| Gen4 x4 | 7.88 GB/s | 7.9 KB | 31 |
+| Gen5 x4 | 15.75 GB/s | 15.8 KB | 62 |
+| Gen5 x16 | 63 GB/s | 63 KB | 246 |
+| Gen6 x16 | about 118 GB/s | about 118 KB | about 460 |
+
+- The original tag field is 5 bits (32 outstanding), the extended tag field is 8 bits (256), and 10-bit tags extend this further.
+- Latency is not fixed: each switch hop, retimer, IOMMU miss or host memory queue adds to the round trip, so the required tag count rises with topology depth.
+- Undersized tag pools show up as a plateau below the link rate that improves when you add queue depth or fewer hops.
+FOLLOW:
+- Why did 10-bit tags appear? => Faster links and longer paths (switches, retimers) increase the bandwidth-delay product beyond what 256 tags can cover with small reads.
+- How does a larger read size help? => Fewer requests are needed for the same bytes in flight, but the split into completions and MRRS limits still apply.
+PITFALL: Sizing tags for the unloaded latency. Under load, queueing raises the round trip.
+VERIFY: Maximum outstanding requests with 10-bit tags and the requester and completer capability bits required to use them.
+
+@@ 2.13 | Advanced | Debug | tags=replay,correctable,marginal
+Q: You see thousands of replays but no uncorrectable errors. Which layer is at fault and what is the likely cause?
+SHORT: The Data Link Layer is doing its job by recovering from errors that originate in the Physical Layer or the channel: a marginal link with elevated bit errors. Bad TLP counts point to corrupted TLPs, Bad DLLP to corrupted ACK/NAK or credit packets, Replay Timer Timeout to lost ACKs, and Receiver Error to symbol-level errors. Look at signal integrity, equalization, reference clock, temperature and margins, not at the Transaction Layer.
+DEEP:
+1. **Read the counters:** `lspci -vv` shows CESta (correctable status) bits such as RxErr, BadTLP, BadDLLP, Rollover and Timeout. Log them with timestamps.
+2. **Correlate:** does the rate change with temperature, link speed, traffic pattern, or specific lanes?
+3. **Check the training history:** count Recovery entries and speed downshifts, and the equalization phase status bits in Link Status 2.
+4. **Compare speeds:** if errors disappear at the next lower speed, the channel or equalization margin is the problem.
+5. **Measure margin:** run per-lane margining (Gen4 and above) or an eye scan on the bench.
+6. **Suspects:** connector or cable, retimer configuration, reference clock (SSC or SRIS settings), power noise, and PCB via or trace defects on specific lanes.
+FOLLOW:
+- Why is Replay Timer Timeout worse than Bad TLP? => A NAK triggers a fast replay, but a timeout means the ACK or NAK itself was lost, so the sender waited a full timer period before replaying.
+- When does this become an uncorrectable problem? => When REPLAY_NUM rolls over repeatedly and forces retrains, or when the link drops, showing up as surprise-down or completion timeouts.
+PITFALL: Filing this as a firmware bug. The Transaction Layer is fine; the fault is below it.
+
+@@ 2.14 | Principal | Scenario | tags=triage,timeout,drop,layers
+Q: A request disappears: no completion comes back and nothing is logged. Walk down the stack to find where it could have been dropped.
+SHORT: Start at the top with routing and access control (the address matches no window, or ACS blocked it), then flow control (the credits never freed), then the Data Link Layer (DL_Down discards TLPs), then the Physical Layer (link in Recovery or gone). Finally check the completer, which may have dropped the request or never sent the completion. The completion timeout on the requester is what turns silence into an error.
+DEEP:
+1. **Transaction Layer, routing:** the address falls outside every window, so the request is a master abort or Unsupported Request. Check BAR programming, bridge windows, and IOMMU mappings.
+2. **Transaction Layer, access control:** ACS redirect or block, or a DPC-contained downstream port silently drops TLPs.
+3. **Flow control:** one credit type stopped returning (a stuck receiver or a switch buffer full of something else), so the request sits behind a credit stall.
+4. **Data Link Layer:** the link went DL_Down, discarding TLPs, and completion timeouts follow.
+5. **Physical Layer:** LTSSM stuck in Recovery or retraining repeatedly.
+6. **Completer:** the endpoint firmware hung, the function is in a reset or low-power state, or the completion was generated but blocked by an ordering or credit stall.
+7. **Observation:** the completion timeout (default range 50 microseconds to 50 milliseconds, programmable) and the associated AER logs are what let you see any of this.
+FOLLOW:
+- How would an analyzer trace narrow this down? => Look for the request TLP leaving the requester, at each hop if you can tap several, and for the matching completion. The last hop that saw the request tells you where it stopped.
+- How do you tell a credit stall from a dead endpoint? => Credit stall: UpdateFC DLLPs stop and new TLPs are not transmitted at the stalled port. Dead endpoint: credits and ACKs still flow but no completion returns.
+PITFALL: Assuming the endpoint is at fault before proving the request left the requester and reached it.
+VERIFY: Completion timeout ranges and default value from the Device Control 2 register description in the Base Specification.
+
+@@ 2.15 | Principal | Cross-layer | tags=nvme,timeout,mapping,triage
+Q: An NVMe command times out on the host. How do you decide whether the cause is PCIe or NVMe/firmware?
+SHORT: Separate what the host can prove about the link from what it cannot. If the link state, AER counters and completion timeouts show a PCIe problem (down-training, replays, link retrain, surprise-down, DPC), fix it at the PCIe layer. If the link is clean and the controller reads back normally (CSTS ready, no fatal status), the fault is in NVMe processing or firmware.
+DEEP:
+| Symptom | Likely layer | Evidence |
+|---|---|---|
+| MMIO reads return all ones | Link or device gone | LnkSta not Active, DL Link Active clear, surprise-down in AER |
+| Doorbell write posted, no fetch seen | Routing or endpoint | analyzer: no MRd for the queue entry, BAR or ACS state |
+| Fetch seen, no completion entry or interrupt | Firmware or MSI-X | analyzer: MWr for CQE or MSI-X message missing, MSI-X table and mask state |
+| Interrupt seen, host misses it | MSI-X or OS | vector and affinity, masked vector in the table |
+| Sporadic latency spikes with replay counts | Physical or DLL | correctable-error rates, Recovery entries, L1 exit latency |
+| Controller reports fatal status (CSTS.CFS) | NVMe or firmware | log pages, controller reset behavior |
+
+Method: read link state and AER, read controller status, then capture a trace across the doorbell, fetch, data, completion and interrupt chain and note where it stops.
+FOLLOW:
+- What single read tells you fastest whether the device is reachable? => A read of the controller capability or status register: all ones means the link or device is gone.
+- Where do ASPM and L1 exit latency fit? => They add latency spikes on wake, so intermittent timeouts under low load and low power settings are worth testing with ASPM disabled.
+PITFALL: Treating an NVMe timeout as a firmware defect before reading link state and AER.

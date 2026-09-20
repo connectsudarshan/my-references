@@ -1,0 +1,276 @@
+# Module 5 — Equalization & Retimers
+
+@@ 5.01 | Basic | Concept | fig=eq | tags=equalization,isi,channel-loss
+Q: Why does PCIe need equalization at high data rates?
+SHORT: The copper channel (package, board, connector, cable) loses high frequencies more than low ones, so each bit smears into its neighbours. That inter-symbol interference closes the receiver's eye. Equalization gives the high frequencies back, using a shaped transmitter, a receiver filter and a decision-feedback stage, so the receiver can still slice the bit correctly.
+DEEP:
+- **The problem:** the channel acts like a low-pass filter. A single 1 among 0s arrives as a low, wide pulse whose tail leaks into the next several bit times. That leakage is inter-symbol interference (ISI).
+- **Why it grows with speed:** the Nyquist frequency moves up (4 GHz at Gen3, 8 GHz at Gen4, 16 GHz at Gen5) where loss per inch is much higher, while the bit time shrinks, so the same tail spans more bits.
+- **Three tools:** TX equalization (pre-shape the launched waveform), receiver CTLE (a linear filter that boosts highs) and receiver DFE (subtracts the ISI of already-decided bits).
+- **Where it is not needed:** at 2.5 and 5 GT/s the fixed de-emphasis of the transmitter is enough for normal channels.
+FOLLOW:
+- Why does the link train at Gen1 first if the target is Gen5? => Every device supports 2.5 GT/s, it needs no adaptive equalization, so it is the safe place to negotiate. Then the speed change to 8 GT/s and above triggers equalization.
+- Can a link at 16 GT/s work with no equalization? => Only on a very short, clean channel, and the spec still runs the equalization procedure. The receiver adapts inside regardless.
+PITFALL: Thinking equalization is one block. TX FIR, CTLE and DFE do different jobs and are tuned by different mechanisms.
+
+@@ 5.02 | Basic | Concept | tags=tx-eq,fir,de-emphasis,preshoot
+Q: What does the transmitter equalizer do, and what are pre-cursor, cursor and post-cursor?
+SHORT: The transmitter runs each bit through a 3-tap FIR filter. The cursor tap is the current bit, the pre-cursor tap adds a scaled copy of the next bit (preshoot), and the post-cursor tap adds a scaled copy of the previous bit (de-emphasis). The result lowers the amplitude of long runs of identical bits relative to transitions, which pre-compensates the channel's loss of highs.
+DEEP:
+- **Taps:** C-1 (pre-cursor), C0 (cursor) and C+1 (post-cursor). The pre and post taps are normally negative, so they subtract.
+- **De-emphasis:** after a transition the following identical bits are sent at a reduced level. The transition bit keeps the full swing, so high-frequency content is relatively stronger.
+- **Preshoot:** the bit just before a transition gets a boost, which sharpens the leading edge.
+- **Peak power is constant:** the sum of the absolute tap values is fixed (the full-swing budget). Equalization lowers low-frequency amplitude rather than raising the peak.
+- **Who chooses the settings:** the link partner asks for them, since it is the receiver that knows what it sees.
+FOLLOW:
+- Is TX equalization the same as "amplifying" the signal? => No. The peak swing stays put. The low-frequency part is attenuated, which is why a lot of equalization costs eye height.
+- Which tap fights the ISI from earlier bits? => The post-cursor tap. Long channels need more of it.
+PITFALL: Saying the transmitter "boosts" the high frequencies. It attenuates the low ones.
+
+@@ 5.03 | Intermediate | Concept | tags=gen1,gen2,de-emphasis,presets
+Q: How did equalization work at Gen1 and Gen2, and what changed at Gen3?
+SHORT: Gen1 uses a fixed -3.5 dB de-emphasis. Gen2 lets the transmitter use -3.5 dB or -6 dB, chosen through training or a Link Control 2 field. Neither adapts to the actual channel. Gen3 replaced that with a negotiated, per-lane, per-direction adaptive procedure: presets and coefficients requested by the receiving side, plus receiver CTLE and DFE requirements.
+DEEP:
+| Rate | Encoding | TX equalization | Adaptation |
+|---|---|---|---|
+| 2.5 GT/s | 8b/10b | Fixed -3.5 dB de-emphasis | None |
+| 5 GT/s | 8b/10b | -3.5 dB or -6 dB | Choice of two, not adaptive |
+| 8 GT/s | 128b/130b | 3-tap FIR, presets P0 to P10 and coefficients | Four-phase negotiation, per lane |
+| 16, 32 GT/s | 128b/130b | Same mechanism, tighter budgets | Same four phases |
+
+- **Why the change:** at 8 GT/s the Nyquist frequency is 4 GHz, where real channels lose far more than a fixed setting can compensate, and channels differ widely (a short M.2 trace versus a long backplane). A static setting is wrong for most of them, so it had to become adaptive.
+- **Per lane:** each lane has its own channel, so each gets its own settings.
+FOLLOW:
+- Is the Gen2 -6 dB setting negotiated adaptively? => No. It is a static selection via the Selectable De-emphasis bit and the Link Control 2 field. It is not a training loop.
+- Does Gen3 equalization only run at 8 GT/s? => No. It runs for each higher rate you reach, using that rate's own settings.
+PITFALL: Assuming equalization is a single event during link-up. A Gen5 device that trained through 8 and 16 GT/s has run the procedure at each of those rates.
+VERIFY: Selectable De-emphasis field and Link Control 2 details for 5 GT/s.
+
+@@ 5.04 | Intermediate | Concept | tags=presets,p0-p10,coefficients
+Q: What are the transmitter presets P0 to P10, and which one is flat?
+SHORT: They are eleven predefined 3-tap FIR settings covering combinations of preshoot and de-emphasis, so two ports can agree on a starting point by sending a 4-bit number instead of coefficients. P4 is the flat one, with no preshoot and no de-emphasis. P0 is pure de-emphasis at -6 dB, and P1 is -3.5 dB.
+DEEP:
+- **Purpose:** a quick common vocabulary. A receiver can ask "use P7" instead of sending three coefficients, and the transmitter maps the preset to its own coefficient values.
+- **Rough map:** P0 (-6 dB de-emphasis), P1 (-3.5 dB), P2 (-4.4 dB), P3 (-2.5 dB), P4 (no equalization), P5 and P6 (preshoot only, small), P7 and P8 (3.5 dB preshoot plus -6 dB or -3.5 dB de-emphasis), P9 (preshoot only, larger), P10 (de-emphasis tied to the boost limit, used for special cases).
+- **Typical usage:** platforms often start from a moderate preset and tune from there, and firmware can pin per-lane presets in the Lane Equalization Control registers.
+- **After presets:** if a preset is not good enough the receiver requests explicit coefficients in later phases.
+FOLLOW:
+- Does every transmitter implement all 11 presets? => Yes, every port must support all of them at the rates where equalization applies. Exact dB values have a tolerance.
+- Why is P4 useful in validation? => It is the reference flat waveform. Comparing eye or margin at P4 against the negotiated preset shows how much the equalization buys you on that channel.
+PITFALL: Memorizing preset dB values as facts. Interviewers care that you know the trade-off (more de-emphasis for a lossier channel, more preshoot for a bandwidth-limited one) more than the table.
+VERIFY: The exact preshoot and de-emphasis dB for P2 and P5 through P10 in the Base Specification's transmitter preset table.
+
+@@ 5.05 | Intermediate | Numeric | tags=fir,coefficients,de-emphasis,math
+Q: Given a flat sum of tap magnitudes of 1, what post-cursor coefficient gives -6 dB de-emphasis, and what gives -3.5 dB?
+SHORT: With no pre-cursor tap, C0 = 1 - |C+1|. De-emphasis is 20 log10((C0 - |C+1|) / (C0 + |C+1|)). For -6 dB the ratio is 0.5, so C+1 = -0.25 and C0 = 0.75. For -3.5 dB the ratio is 0.668, so C+1 = -0.166 and C0 = 0.834.
+DEEP:
+1. Take the fixed budget C0 + |C+1| = 1 (the peak amplitude, at a transition).
+2. After a transition, a run of identical bits sits at C0 - |C+1| (the steady low-frequency level).
+3. De-emphasis in dB = 20 log10((C0 - |C+1|) / 1).
+4. For -6.02 dB: the ratio is 0.5, so C0 - |C+1| = 0.5 and C0 + |C+1| = 1, giving C0 = 0.75 and |C+1| = 0.25.
+5. For -3.5 dB: the ratio is 10^(-3.5/20) = 0.668, so C0 = 0.834 and |C+1| = 0.166.
+
+```
+P0  (-6.0 dB)  ->  C+1 = -0.25, C0 = 0.75
+P1  (-3.5 dB)  ->  C+1 = -0.166, C0 = 0.834
+```
+
+- **What it shows:** a lot of equalization means the steady-state level is only half the peak level. Equalizing costs eye height at low frequency, so the receiver has to be able to tell the smaller level from noise.
+- **In a real preset table:** the pre-cursor tap and headroom constraints (FS and LF) also shape the values. This simplified model matches the post-cursor-only presets.
+FOLLOW:
+- What happens to the signal energy at DC when you go from P4 to P0? => The DC (long-run) level drops by 6 dB while the transition amplitude is unchanged.
+- Why not send a bigger amplitude instead? => The transmitter swing is bounded by the specification and by its supply, so the peak is fixed and equalization redistributes energy.
+PITFALL: Quoting -6 dB as "6 dB of boost". It is a 6 dB reduction of the steady level relative to the transition level.
+VERIFY: The definition of preset ratios in terms of FS, LF and coefficient constraints.
+
+@@ 5.06 | Intermediate | Concept | fig=eqphases | tags=eq-phases,phase0,phase1,phase2,phase3
+Q: Walk through the four phases of Gen3+ link equalization.
+SHORT: Phase 0: the downstream port hands the upstream port a preset and receiver hint using EQ TS2 (sent at the old rate, applied when the new rate starts). Phase 1 (at the new rate) both sides check the link works with those presets and exchange FS and LF. In Phase 2 the upstream port tunes the downstream port's transmitter. In Phase 3 the downstream port tunes the upstream port's transmitter. Each side tunes the other's TX.
+DEEP:
+- **Phase 0:** just before the rate change, at 2.5 or 5 GT/s, the downstream port sends its chosen TX preset and Rx preset hint for the upstream port. The upstream port applies the preset when it arrives at the new rate.
+- **Phase 1:** both ports are at the new rate in Recovery.Equalization and advertise their preset, FS and LF in TS1. The goal is a link that works well enough (bit, symbol and block alignment, and a BER good enough to continue) and to publish the tuning ranges.
+- **Phase 2 (USP tunes DSP):** the upstream port evaluates what it receives, then requests new TX coefficients or presets from the downstream port through TS1 fields, iterating until satisfied or timed out.
+- **Phase 3 (DSP tunes USP):** the same in the other direction.
+- **Why the receiver drives it:** only the receiver knows the eye quality at its own slicer.
+- **Done when:** both directions are tuned. The LTSSM then continues through Recovery.RcvrLock and RcvrCfg to L0.
+FOLLOW:
+- Which port controls the timing of the phases? => The downstream port initiates and leads Phase 3, the upstream port leads Phase 2. If a phase times out, equalization is counted as unsuccessful. The LTSSM then goes through Recovery.Speed and retries or drops to a lower rate.
+- Where does the receiver's own EQ (CTLE and DFE) adapt? => Internally and continuously during all the phases. It has no protocol messages.
+PITFALL: Mixing up which port tunes which transmitter. In Phase 2 the upstream port is the one asking, and it is the downstream port's TX that changes.
+VERIFY: Which side evaluates in Phase 2 versus Phase 3, and the exact per-phase timeouts (order of tens of ms).
+
+@@ 5.07 | Advanced | Concept | tags=fs,lf,coefficient,tuning,ts1
+Q: What are FS and LF, and how does a coefficient-tuning request work?
+SHORT: FS (full swing) is the maximum transmitter output amplitude expressed in coefficient units, and LF (low frequency) is the smallest steady-state level the transmitter can produce. A receiver asks for a new setting by sending a TS1 with the requested preset or coefficients. The transmitter checks it against FS and LF, applies it or rejects it, and reports that in its own TS1, so the receiver can compare eyes and choose.
+DEEP:
+- **Coefficient units:** the three taps are integers in a shared range. FS is the sum of tap magnitudes. LF is the level of a long run, so LF = C0 - |C-1| - |C+1| in a simple model.
+- **Constraints:** a request must stay inside limits, for example the pre-cursor is limited to keep the transmitter linear. A request that violates FS or LF is rejected.
+- **Request and response:** the receiver sends a TS1 carrying the full set it wants (a preset, or the three coefficient values). The transmitter echoes the values in its own TS1 once applied, or sets a Reject Coefficient Value bit if the request breaks the FS or LF constraints.
+- **Loop:** request, wait for a settling time, measure the eye or error metric, then request again. Implementations use steepest descent or an exhaustive search of a small neighbourhood.
+- **Timeout:** each phase has a bounded window, so implementations limit their search.
+FOLLOW:
+- Why not just always use the best preset and skip coefficients? => Presets are coarse. Coefficient tuning finds a better point for a specific lane, and when it fails you can still fall back on the preset.
+- Why might a device use a fixed preset and skip tuning? => Platform tuning has already been done at bring-up, so the device uses the preset from firmware or from Lane Equalization Control and finishes training in a predictable time.
+PITFALL: Treating a rejected request as an error. It is a normal limit-hit and the tuning algorithm should handle it.
+VERIFY: Symbol positions and field names in TS1 for the coefficient request and response, and the FS and LF value ranges.
+
+@@ 5.08 | Intermediate | Concept | tags=ctle,dfe,rx-eq,rx-preset
+Q: How does receiver equalization work, and why does the spec barely define it?
+SHORT: The receiver applies a CTLE (a linear filter that boosts high frequencies) and often a DFE (which subtracts the ISI expected from the bits it has already decided). It adapts continuously and locally, so no protocol messages are needed. The spec defines a reference receiver for compliance testing, and an Rx preset hint in Phase 0, but leaves the actual algorithms to the implementer.
+DEEP:
+- **CTLE:** an analogue filter with programmable peaking (dB of gain at Nyquist), placed before the sampler. It amplifies noise and crosstalk along with the signal.
+- **DFE:** subtracts a weighted sum of previously decided bits from the incoming sample, so it removes post-cursor ISI without amplifying noise. Errors can propagate: one wrong decision affects the next few samples, giving burst errors.
+- **Why the spec leaves it open:** vendors compete on receiver performance. What matters is that the receiver meets a defined BER under a defined stressed eye.
+- **Reference receiver:** the specification defines a reference CTLE and DFE model for channel compliance and for the stressed-eye test, so everyone measures the same thing.
+- **Rx preset hint:** a 3-bit suggested starting CTLE setting sent in the equalization TS2 and in Lane Equalization Control, which the receiver may use or ignore.
+FOLLOW:
+- Why does DFE cause burst errors? => A wrong decision feeds back and corrupts the next few decisions, so errors come in short bursts rather than isolated. That motivates precoding at Gen5.
+- Can you see the receiver EQ state from software? => Not through the spec. Vendor debug registers and the Lane Margining feature give the outcome, not the coefficients.
+PITFALL: Assuming a "bad eye" on a scope means the receiver fails. The receiver's DFE and CTLE can recover eyes that look closed at the pin.
+VERIFY: Reference CTLE and DFE parameters per rate, and the Rx preset hint encoding.
+
+@@ 5.09 | Advanced | Concept | tags=perform-equalization,redo-eq,linkctl3,speed-change
+Q: When does equalization run, and how can software force it to run again?
+SHORT: It runs the first time the link goes to a rate of 8 GT/s or above, during a speed change through Recovery.Equalization. It can be repeated: a port can request it (Link Equalization Request), and software can set the Perform Equalization bit in Link Control 3 before triggering a retrain. Reset, hot reset or a cold link-up also re-run it.
+DEEP:
+- **First use:** on the first transition to each new rate, the equalization phases run because no settings are stored for that rate.
+- **Redo via hardware:** if the receiver detects degradation (e.g. rising BER), it sets its Link Equalization Request bit, optionally with an interrupt, to ask software to redo equalization.
+- **Redo via software:** set Perform Equalization in Link Control 3 (in the Secondary PCI Express Extended Capability), then request a retrain (Retrain Link) or a speed change. The next Recovery does a full equalization pass.
+- **Rates are independent:** each rate has its own Lane Equalization Control and status bits, so a Gen5 link tracks 8, 16 and 32 GT/s equalization separately.
+- **Cost:** equalization takes milliseconds to tens of milliseconds, during which the link is not carrying traffic.
+FOLLOW:
+- Why does re-equalizing help? => Temperature, voltage or cable position can change since the last training. Retraining lets both sides find new settings.
+- What is the risk of forcing EQ on a live device? => The link is down during it. TLPs are held and completion timeouts can fire if the redo is slow, so it should be done at a controlled quiet point.
+PITFALL: Expecting every retrain to redo equalization. Ordinary Recovery from L1 reuses the stored settings and skips it.
+VERIFY: Names and bit positions in Link Control 3 and Link Status 2 for each rate (8, 16, 32 GT/s), and which retrains skip equalization.
+
+@@ 5.10 | Advanced | Debug | tags=lnksta2,lane-eq-control,registers,eq-status
+Q: Which registers tell you whether equalization completed and what was chosen?
+SHORT: Link Status 2 has, per rate, Equalization Complete and Phase 1, 2 and 3 Successful bits, plus Link Equalization Request. The Lane Equalization Control registers hold the per-lane TX presets and Rx hints used or requested. These live in the Secondary PCI Express Extended Capability (8 GT/s) and its 16 and 32 GT/s counterparts.
+DEEP:
+- **Link Status 2:** Current De-emphasis Level, Equalization 8.0 GT/s Complete, Phase 1 Successful, Phase 2 Successful, Phase 3 Successful, Link Equalization Request 8.0 GT/s.
+- **Higher rates:** the 16 GT/s and 32 GT/s Physical Layer Extended Capabilities carry the same kind of status and a per-lane control array.
+- **Lane Equalization Control:** one entry per lane holding the downstream TX preset, downstream Rx preset hint, upstream TX preset and upstream Rx preset hint.
+- **Reading the result:**
+  - Complete = 1, all phases successful: normal.
+  - Phase 1 fail: the link does not work at the new rate at all (channel, clocking).
+  - Phase 2 or 3 fail: the tuning did not converge (marginal channel, mismatch, retimer).
+- **Tools:** `lspci -vvv` on Linux (Secondary PCI Express capability), `setpci` for raw access, vendor tools on Windows.
+FOLLOW:
+- The link runs at 16 GT/s but the 8 GT/s Phase 3 bit is 0. Is that a problem? => Possibly not. Check whether the bit is defined as sticky per rate and whether that rate was actually trained through. Compare with a known-good system.
+- Do the preset registers show what the receiver finally settled on? => No. They show requested or default presets. The final coefficients are internal unless the vendor exposes them.
+PITFALL: Reading Complete = 1 as "the eye is good". Complete only means the procedure finished without timing out.
+VERIFY: Exact bit names and layout for the 16 GT/s and 32 GT/s status and control registers.
+
+@@ 5.11 | Advanced | Concept | tags=precoding,gen5,dfe,burst-errors
+Q: What is precoding and why was it added at 32 GT/s?
+SHORT: A DFE causes burst errors because one wrong decision corrupts the next few. Precoding transforms the transmitted data so a burst of errors turns into fewer, shorter events after the receiver's decoder, which improves how errors look to the link CRC and the replay logic. At 32 GT/s the ports can negotiate precoding in the training sequences, and it is an integral part of the PAM4 signalling in Gen6.
+DEEP:
+- **Problem:** with a DFE, the error probability is not independent per bit. A single symbol error may become several bit errors in a row.
+- **Idea:** the transmitter applies a simple, reversible filter (a 1/(1+D) style precoder) before sending. The receiver undoes it after the slicer. An error burst caused by DFE feedback collapses into two edge errors rather than a long run.
+- **At Gen5:** the receiver requests precoding via the training sequence, and the transmitter enables it. It is negotiated per lane.
+- **At Gen6:** PAM4 raises the raw BER to about 1e-6, so precoding is used together with FEC and a lightweight CRC to bring the residual error rate down.
+FOLLOW:
+- Why do errors matter beyond BER? => Burst length interacts with what the CRC and FEC can correct, and the error count a validator sees in counters. The same raw BER with bursts causes more replay events than with isolated errors.
+- Is precoding part of the equalization phases? => It is negotiated in the same training exchange, but it is not one of the four phases.
+PITFALL: Calling precoding a form of equalization. It changes error statistics, not the eye.
+VERIFY: Which rates define precoding, how it is requested in TS1 and the exact precoder polynomial.
+
+@@ 5.12 | Principal | Trap | tags=over-equalization,margin,tuning,crosstalk
+Q: A colleague says "just use the highest-boost preset to be safe". What is wrong with that?
+SHORT: More equalization is not safer. Boost raises the high-frequency gain, so it also amplifies crosstalk, reflections and noise, and de-emphasis lowers the low-frequency level that the receiver's threshold needs. Past an optimum point, the eye closes again. Every channel has a best setting, and margin (not the preset number) is the measure that tells you which one it is.
+DEEP:
+- **Two failure modes:** under-equalization leaves ISI. Over-equalization adds noise and can add distortion and overshoot at edges, and reduces steady-state eye height.
+- **Crosstalk and reflections:** these are high-frequency and not fixed by equalization. Boosting highs makes them worse.
+- **Receiver limits:** a CTLE with too much peaking saturates the front end and reduces the DFE's effective input range.
+- **How to find the optimum:** sweep presets (or fix the TX and vary the RX) and measure per-lane margin or BER at each. Choose the setting with the widest margin, not the highest boost.
+- **Short channels:** a short, clean channel prefers a flat preset (P4 or similar). The negotiated preset on such a channel showing modest equalization is a healthy sign.
+FOLLOW:
+- Your Gen5 link passes with a high-boost preset but fails with a mid one. Which do you trust? => Neither by itself. Measure the margin across temperature and voltage. A setting that only works at one point has no headroom.
+- Why does margin beat a pass/fail link-up? => Link-up is binary and hides the edge of failure. Margin shows how far from it you are.
+PITFALL: Optimizing for "the link comes up" during bring-up. A link that trains only with an extreme setting fails first in the field.
+
+@@ 5.13 | Intermediate | Concept | tags=retimer,redriver,repeater
+Q: What is the difference between a redriver and a retimer?
+SHORT: A redriver is an analog device that amplifies and filters the signal without recovering the clock or understanding the protocol. It boosts noise and jitter along with the signal. A retimer is protocol-aware: it recovers the clock, decodes the bits, and retransmits with a fresh clock and its own transmitter, so the channel is split into two independent segments. Retimers reset accumulated jitter and noise. Redrivers do not.
+DEEP:
+| | Redriver | Retimer |
+|---|---|---|
+| Clock recovery | No | Yes (CDR) |
+| Protocol awareness | No | Yes, has its own LTSSM |
+| Resets jitter | No | Yes |
+| Equalization | Fixed or programmed gain and EQ, invisible to link partners | Full link equalization on each segment |
+| Latency | Very small | Tens of nanoseconds |
+| Typical use | Short, moderate loss | Long channels, backplanes, risers, Gen5 and beyond |
+
+- **Retimer segments:** the retimer trains with the root port on one side and with the endpoint on the other. Each segment does its own equalization.
+- **Redriver problems:** it can break receiver detection, compliance and equalization negotiation, since the partners see a channel that is neither the real one nor a clean one.
+- **Gen5 trend:** at 32 GT/s the loss budget is tight enough that most long or connector-heavy topologies need retimers.
+FOLLOW:
+- Does a retimer add latency to TLPs? => Yes, a small amount in each direction, tens of ns. Rarely visible but it counts in tight completion or latency budgets.
+- Can a link have more than one retimer? => The specification allows up to two between the two link ends. Each segment must be within its own channel budget.
+PITFALL: Treating a redriver as a lower-cost retimer. They solve different problems and a redriver cannot fix a jitter problem.
+VERIFY: Maximum number of retimers and the retimer latency budget in the Base Specification.
+
+@@ 5.14 | Advanced | Concept | tags=retimer,ltssm,skp,sris
+Q: How does a retimer behave in the LTSSM, and how do the two ports know it is there?
+SHORT: A retimer has a forwarding mode in which it passes bits through, and it also runs its own LTSSM on each side to train each segment. Ports discover it through Retimer Present bits in the TS2 ordered sets, which lets them adjust timeouts, N_FTS and clock-tolerance assumptions. The retimer absorbs clock differences by adding or removing SKP ordered sets, and each segment can run on a slightly different clock.
+DEEP:
+- **Two segments:** the root-port-facing side acts as an upstream port and the endpoint-facing side as a downstream port. Each side trains and equalizes independently.
+- **Forwarding:** after training, TLPs, DLLPs and ordered sets are passed through, with SKP ordered sets inserted or dropped to absorb the clock offset between the two segments.
+- **Discovery:** TS2 has Retimer Present and Two Retimers Present bits, so each port learns how many retimers are in the path.
+- **Effects on training:** timers are extended to allow for the retimer's own training time. Equalization may take longer.
+- **Clocking:** the segments may use separate reference clocks, so a retimer supports common-clock and separate-clock modes.
+- **Configuration:** a retimer usually has its own register interface (I2C, SMBus or a management port) with firmware, presets and per-lane settings.
+FOLLOW:
+- If the endpoint's Link Status shows Gen5 x4, does that prove the retimer's other side is Gen5 x4 too? => It proves the end-to-end link works at that rate, but each retimer segment negotiates separately. Read the retimer's own status to see per-segment results.
+- What does the port do with TS1 that the retimer has modified? => The retimer forwards or rewrites the training fields as the specification requires so both ports see a consistent end-to-end view.
+PITFALL: Assuming a retimer is a transparent wire in debug. Every retimer adds a component with its own firmware version, configuration, and failure modes.
+VERIFY: Which TS2 bits and symbol carry Retimer Present, SKP handling rules, and the retimer-related timeout extensions.
+
+@@ 5.15 | Principal | Scenario | tags=triage,retimer,gen5,backplane,downtrain
+Q: A Gen5 x4 SSD behind a retimer on a backplane trains at Gen4, or fails intermittently at Gen5. How do you triage it?
+SHORT: First prove where the downtrain happens: read the equalization status bits at the root port and the endpoint, and the retimer's own segment status. Then split the variables: swap the drive, the slot and the retimer firmware and preset settings, and compare cold-boot to warm-reset. Finally use lane margining or an in-line analyzer to see whether one lane or one segment is the weak point.
+DEEP:
+1. **Capture state:** current link speed and width, `LnkSta2` phases per rate, AER counters, and the LTSSM log if available. Record which lanes and which segment.
+2. **Segment isolation:** read the retimer's per-segment link state and error counters. A failure on the root-port-side segment points to the host board and connector. A failure on the endpoint side points to the backplane, connector or drive.
+3. **Split the variables:**
+   - Swap the drive between slots and against a known-good drive.
+   - Try the drive in a direct-attach slot with no retimer, if there is one.
+   - Update or roll back retimer firmware, and check its register configuration against the vendor's platform tuning guide.
+4. **Reset sequence:** confirm the retimer is out of reset and its reference clock is stable before the root port starts training. A late retimer makes the root port train against nothing and fall back.
+5. **Margin:** run lane margining at the receivers to find the weak lane, then sweep presets to see how much the margin moves.
+6. **Environment:** repeat at temperature and voltage corners, and with a different cable or connector.
+
+- **Interposers:** a passive analyzer interposer adds loss, so a Gen5 link that works normally may fail with it in place. Use it with that in mind.
+FOLLOW:
+- The link is stable at Gen4 but flaky at Gen5. Ship it at Gen4? => Only as a documented workaround. It hides a margin problem that may also lurk in the Gen4 path and it loses half the bandwidth.
+- Cold boot fails, warm reset works. What does that suggest? => A power-up sequencing or reset-timing issue (retimer or drive not ready by the time the root port trains), or a temperature-dependent margin.
+PITFALL: Blaming the drive first. In a retimed topology the drive is one of four or five things in the chain, so isolate before deciding.
+
+@@ 5.16 | Principal | Debug | tags=automation,link-up-yield,perst,margining,regression
+Q: One boot in about two hundred comes up at a lower speed. How do you build automation that quantifies and root-causes it?
+SHORT: Run a soak test that repeatedly resets the link (PERST# toggle, hot reset, or power cycle) and records the final speed, width, equalization status bits, AER counters and lane margin every time. From a few thousand cycles you get a link-up yield and a distribution by lane and preset, and you can correlate failures with temperature, voltage, slot and firmware.
+DEEP:
+- **Loop:** reset, wait for the link (with a timeout), read `LnkSta`, `LnkSta2`, AER and margin, log everything with a timestamp and the conditions, repeat for N cycles (thousands).
+- **Reset types to compare:** PERST# assertion (fundamental reset), secondary bus reset (hot reset), and full power cycle. A failure pattern that appears only in one type points to a specific mechanism.
+- **Metrics:**
+  - Link-up yield: the fraction of cycles reaching target speed and width.
+  - Time to L0: distribution, including tail.
+  - Equalization phase failures: which phase, which lane.
+  - Margin: minimum per-lane timing and voltage margin.
+- **Correlate:** temperature (chamber or hot/cold), supply voltage corners, slot and cable, firmware version, reference-clock source.
+- **Pass criteria:** a stated target, such as zero downtrains in 10,000 cycles at each corner, with a confidence bound rather than a hunch.
+- **Evidence for triage:** on any failure, capture the LTSSM log and the retimer's status before the next reset erases it.
+
+```
+for i in 1..N:
+    toggle PERST# (or power cycle)
+    wait link up (timeout T)
+    record speed, width, LnkSta2 EQ bits, AER, margin
+    if speed < target: dump LTSSM log + retimer status; flag
+```
+FOLLOW:
+- What sample size do you need to claim 1 in 1000 or better? => Roughly 3000 clean cycles gives about 95% confidence that the failure rate is below 1 in 1000 (the rule of three). More for tighter claims.
+- Why log the conditions with every cycle? => A failure that clusters at one temperature or one slot is a margin issue. One that is uniform is a logic or sequencing issue.
+PITFALL: Reporting "passed 100 cycles". At a 1-in-200 failure rate, 100 clean cycles happens about 60% of the time.

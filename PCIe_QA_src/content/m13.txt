@@ -1,0 +1,330 @@
+# Module 13 — Virtualization & I/O Services
+
+@@ 13.01 | Basic | Concept | fig=sriov | tags=sriov,pf,vf,virtualization
+Q: What is SR-IOV, and what is the difference between a Physical Function and a Virtual Function?
+SHORT: SR-IOV (Single Root I/O Virtualization) lets one physical PCIe device present many lightweight Virtual Functions (VFs) that a hypervisor can hand to different VMs. The Physical Function (PF) is a full function that owns the SR-IOV capability and manages the VFs. Each VF has its own routing ID, BAR slice and interrupt vectors, so the IOMMU can isolate it, but the link and the device internals are shared.
+DEEP:
+- **PF:** a normal function with full config space plus the SR-IOV Extended Capability. The host driver uses it to create VFs, assign resources and do administration.
+- **VF:** a lightweight function. It has its own routing ID (so DMA it issues carries a unique requester ID), a slice of the memory window defined by the PF's VF BAR registers, its own MSI-X, and its own Bus Master Enable. Its Vendor ID reads as FFFFh, and software takes the IDs from the PF.
+- **Why routing IDs matter:** the IOMMU, ACS source validation and error reporting all key on the requester ID. A distinct ID per VF is what turns "one device" into "many isolatable devices".
+
+| Owned per VF | Shared with the PF and other VFs |
+|---|---|
+| Routing ID (requester ID on DMA) | The physical link: speed, width, LTSSM state, retimers |
+| Slice of the VF BAR (doorbells, registers) | Device internals: cores, DRAM, NAND, firmware |
+| MSI-X table and vectors | Most link and power controls, which live in the PF |
+| Own FLR and Bus Master Enable | Bandwidth and thermal envelope |
+
+- **Multi-function versus SR-IOV:** a multi-function device fixes its functions at design time, each with full config space and at most 8 (or 256 with ARI). VFs are created on demand, are cheap, and can number in the hundreds. MR-IOV (several root complexes sharing one device) was specified but is effectively obsolete; multi-host sharing is done with dual-port devices, NTB or CXL.
+- **FLR and migration:** each VF can be reset with its own FLR, while an FLR of the PF tears the VFs down. Moving a running VM with a VF attached needs device-specific state save and restore. The spec's own VF Migration feature is separate and rarely implemented.
+FOLLOW:
+- Can a VF exist without a PF driver? => No. The PF must be enumerated and configured first. On Linux the PF driver has to implement the enable path behind `sriov_numvfs`.
+- Do ten busy VFs get ten links? => No. They share the PF's link and the device's internals, so ten VFs share one x4 pipe and one controller.
+PITFALL: Treating a VF as a small independent device. Bandwidth, firmware, thermals and much of the reset domain are shared with the PF.
+VERIFY: Which config registers a VF implements itself versus inherits from the PF (Device Control MPS and MRRS, AER), and the effect of a PF FLR on its VFs.
+
+@@ 13.02 | Intermediate | Concept | tags=sriov,capability,totalvfs,numvfs,vf-bar,vf-mse
+Q: Walk through the SR-IOV Extended Capability and the order software enables VFs in.
+SHORT: The PF's SR-IOV capability holds TotalVFs (maximum), InitialVFs, NumVFs (how many software wants), First VF Offset and VF Stride (where VF routing IDs sit), Supported and System Page Size, and the VF BARs. SR-IOV Control has VF Enable, VF MSE and ARI Capable Hierarchy. Software writes NumVFs first, then sets VF Enable, then VF MSE so the VF BAR windows decode.
+DEEP:
+1. Read TotalVFs, First VF Offset and VF Stride, and the supported page sizes.
+2. Write System Page Size (usually 4 KB). VF BAR slices are aligned to it, which is what lets a hypervisor map one VF's registers with one page.
+3. Size the VF BARs with the usual write-ones-and-read-back method. The value is the size per VF. The window the PF must reserve is that size times the VF count, so firmware often reserves for TotalVFs.
+4. Write NumVFs, which must be at most TotalVFs and can only be changed while VF Enable is 0.
+5. Set VF Enable. The VFs now exist, but the device may need time before they answer config reads.
+6. Set VF MSE. It is one bit that gates memory decoding for every VF, because VFs have no memory-enable bit of their own. Each VF driver then sets its Bus Master Enable.
+
+```
+Capabilities: [1b8] Single Root I/O Virtualization (SR-IOV)
+  IOVCap: Migration-, Interrupt Message Number: 000
+  IOVCtl: Enable+ Migration- Interrupt- MSE+ ARIHierarchy+
+  IOVSta: Migration-
+  Initial VFs: 32, Total VFs: 32, Number of VFs: 8, Function Dependency Link: 00
+  VF offset: 1, stride: 1, Device ID: 0a54
+  Region 0: Memory at ... (64-bit, non-prefetchable)
+```
+
+- **InitialVFs versus TotalVFs:** many devices report the same value for both. Where they differ, InitialVFs is what is available at start-up and TotalVFs is the ceiling.
+- **Linux shortcut:** writing `sriov_numvfs` in sysfs does steps 4 to 6, and writing 0 disables and destroys the VFs.
+FOLLOW:
+- Why is VF MSE separate from the PF's Memory Space Enable? => The PF's bit gates the PF's own BARs. VF MSE gates the VF BAR windows, since a VF's own Command register has no working memory-enable.
+- Can you change NumVFs while VFs are enabled? => No. Disable first, which destroys the VFs, then write the new number. On Linux, write 0 to `sriov_numvfs` before writing a new non-zero value.
+PITFALL: Assuming VFs exist as soon as NumVFs is written. Only VF Enable creates them.
+VERIFY: Capability ID (0010h), register names and bit positions, the wait time required after VF Enable, and exact `lspci` output formatting on your pciutils version.
+
+@@ 13.03 | Advanced | Numeric | tags=sriov,routing-id,ari,bus-numbers,first-vf-offset,vf-stride
+Q: A PF at 3B:00.0 reports First VF Offset 0x10 and VF Stride 2, and you enable 128 VFs. Compute the VF routing IDs and what it means for bus numbers.
+SHORT: VF n has routing ID = PF routing ID + First VF Offset + (n - 1) x VF Stride, counting VFs from 1. Here the PF is 0x3B00, so VF1 is 0x3B10, VF2 is 0x3B12, VF120 is 0x3BFE, and VF121 wraps into 0x3C00 on the next bus. The 128 VFs therefore span two bus numbers, so the upstream bridge must forward buses 3B and 3C, and the hierarchy must use ARI.
+DEEP:
+Assumptions: PF routing ID 0x3B00 (bus 0x3B, function 0), ARI enabled so the low 8 bits of the ID are one function number, arithmetic modulo 2^16.
+
+1. VF1 = 0x3B00 + 0x10 + 0 x 2 = 0x3B10, bus 3B, function 0x10.
+2. VF2 = 0x3B00 + 0x10 + 1 x 2 = 0x3B12.
+3. VF64 = 0x3B00 + 0x10 + 63 x 2 = 0x3B00 + 142 = 0x3B8E.
+4. VF120 = 0x3B00 + 0x10 + 119 x 2 = 0x3B00 + 254 = 0x3BFE, the last VF on bus 3B.
+5. VF121 = 0x3B00 + 0x10 + 120 x 2 = 0x3B00 + 256 = 0x3C00, bus 3C function 0.
+6. VF128 = 0x3B00 + 0x10 + 127 x 2 = 0x3B00 + 270 = 0x3C0E.
+
+- **Bus range:** the last VF is on bus 3C, so the bridge above the SSD must have a subordinate bus number of at least 3C. Otherwise config requests to those VFs are not forwarded, and completions addressed to a VF on 3C cannot be routed back by ID through that bridge. Enumeration firmware or the OS must reserve the extra bus numbers.
+- **Why ARI:** without ARI the low 8 bits are split into a 5-bit device number and a 3-bit function number, and a downstream port only reaches device 0. VF1 at 0x3B10 would be device 2, function 0, which cannot be addressed. ARI Forwarding Enable on the downstream port above the device (Device Control 2), plus ARI Capable Hierarchy in SR-IOV Control, lets the whole 8 bits act as the function number.
+- **Bus cost in general:** buses used = (bus of last VF) minus (PF bus) plus 1. A PF with 256 VFs at offset 1 and stride 1 ends at 0x3C00, so it also needs two buses.
+- **IOMMU view:** each VF has a different requester ID, and the ones on bus 3C sit under a different root-table entry.
+FOLLOW:
+- Is VF n always PF + n? => No. That holds only for offset 1 and stride 1. Always compute from the two registers.
+- How do you see the resulting IDs on Linux? => `lspci -t` after enabling, or the `virtfn*` symlinks under the PF's sysfs directory, which point at the VF BDFs.
+PITFALL: Forgetting that the VF count can push routing IDs onto a bus number the bridge above does not cover.
+VERIFY: Modulo-2^16 wrap rules, what offset and stride a device reports when ARI Capable Hierarchy is clear, and whether the reported values can change with NumVFs.
+
+@@ 13.04 | Intermediate | Debug | tags=sriov,debug,vf-enable,bus-range,ari,mmio
+Q: You write a number to sriov_numvfs and the VFs do not appear. How do you find out why?
+SHORT: A write to NumVFs alone creates nothing, so first confirm VF Enable actually got set (the sysfs path does it and returns an error if it fails). Then check the usual blockers: the PF driver support, ARI Forwarding on the downstream port above the endpoint, enough bus numbers above the endpoint, enough MMIO space for the VF BARs, BIOS SR-IOV and Above 4G settings, and whether the device needs time or resources before VFs answer.
+DEEP:
+1. **Capability and limits:** `cat sriov_totalvfs`. Zero means no capability, a BIOS setting turning it off, or a driver that does not expose it. `lspci -vvv` shows Total VFs and the VF offset and stride.
+2. **The write itself:** an error from the write plus the matching `dmesg` line usually names the cause. Typical lines say a VF bus is out of range of the bridge's bus range, or that there are not enough MMIO resources for SR-IOV (wording varies by kernel).
+3. **Bus numbers:** compute the last VF's bus as in the previous question. If the bridge's subordinate bus is too small, firmware or the OS did not reserve enough. Fix with firmware settings or, on Linux, options such as `pci=realloc` and `pci=hpbussize=`.
+4. **ARI:** on the upstream bridge, DevCtl2 should show ARIFwd+, and the PF's IOVCtl should show ARIHierarchy+. If not, VFs land on device numbers that cannot be addressed.
+5. **MMIO:** VF BAR total is (per-VF size x NumVFs). Large NVMe VFs with big BARs can exhaust the 32-bit window, so check Above 4G Decoding is on and the parent window is large enough.
+6. **Readiness:** VFs may return all 1s until the device finishes setup. NVMe VFs may also enumerate but be unusable until resources are assigned (next question).
+7. **Confirm:** `lspci -t`, the `virtfn*` links, and a config read of each VF.
+FOLLOW:
+- VFs appear in lspci but there are no NVMe block devices. Why? => The VF probed as an NVMe controller but likely has no queues or interrupts assigned, or its secondary controller is offline. Read the driver's dmesg lines and the secondary controller list.
+- Does creating VFs need the IOMMU? => No. Assigning VFs to VMs does, so test creation with and without it.
+PITFALL: Debugging the PF driver first when dmesg already says a bus or MMIO range was exceeded.
+VERIFY: Exact kernel message texts, BIOS option names, and the option syntax for bus reservation on your kernel.
+
+@@ 13.05 | Advanced | Cross-layer | tags=nvme,sriov,primary-controller,secondary-controller,flexible-resources
+Q: How does NVMe build on SR-IOV, and what are primary and secondary controllers?
+SHORT: NVMe Virtualization Enhancements define a primary controller (the PF's controller) and secondary controllers, one per VF. The primary controller assigns flexible resources, queues and interrupt vectors, to secondary controllers and moves them Online or Offline with the Virtualization Management admin command. Each VF then looks like an ordinary NVMe controller with its own registers, and namespaces are attached to it.
+DEEP:
+- **Primary controller:** administers the virtualization. Identify Primary Controller Capabilities reports how many flexible queue and interrupt resources exist, how many secondary controllers, and the allocation granularity.
+- **Secondary controllers:** Identify Secondary Controller List reports each secondary's controller ID, its VF number, whether it is Online, and the queue and interrupt resources it currently has.
+- **Flexible resources:** the primary hands out a pool of queue resources and interrupt vector resources to secondaries before they are brought Online. With 128 queue pairs in the pool and 32 VFs, the average is 4 per VF, and how they are split is a configuration choice. The VF's MSI-X table size follows its interrupt allocation.
+- **Namespaces:** attached to a secondary controller with Namespace Attachment. Private namespaces give isolation, shared namespaces are visible to several controllers.
+- **Independent controller state:** each VF has its own CC, CSTS and admin queue. Disabling one VF controller (CC.EN to 0) or an FLR affects only its queues. PF reset or VF disable affects them all.
+- **Tools:** nvme-cli has `nvme primary-ctrl-caps`, `nvme list-secondary` and `nvme virt-mgmt` for these.
+- **Validation angle:** over-assignment and under-assignment, bring-up order (resources before Online), enabling a controller with fewer resources than its minimum, VF FLR under neighbor load, PF reset with active VFs, and firmware update while VFs are live.
+FOLLOW:
+- Is a secondary controller exactly a VF? => It is associated with one. The Secondary Controller List ties each secondary to its VF number.
+- Can an NVMe VF be live-migrated? => Only with a mechanism to save and restore controller state, including in-flight commands and queue pointers. NVMe 2.x added controller-state migration commands, and the details are still device dependent.
+PITFALL: Assuming each VF automatically gets a fair share of queues. The primary allocates explicitly, and an unassigned VF cannot run I/O.
+VERIFY: Command opcode and action codes for Virtualization Management, Identify CNS values for the primary capabilities and secondary list, resource types (VQ and VI), and which NVMe revision defined migration commands.
+
+@@ 13.06 | Basic | Concept | tags=iommu,dma-remapping,iova,vt-d,amd-vi,smmu
+Q: What does an IOMMU do, and why is every address an NVMe SSD uses for DMA an IOVA?
+SHORT: An IOMMU sits between DMA-capable devices and memory, translating device-visible addresses (IOVAs) to physical addresses and enforcing per-device permissions. Intel calls it VT-d, AMD calls it AMD-Vi, and Arm calls it the SMMU. With it on, the driver maps each buffer, and the SSD's PRPs, SGLs and queue base addresses are IOVAs, so the SSD never sees a physical address and cannot reach memory that was not mapped for it.
+DEEP:
+- **Identification:** the IOMMU looks up the requester ID (plus PASID, if present) to pick a translation domain. VF routing IDs are why each VF can have its own domain.
+- **What it protects:** a buggy or malicious device cannot read or corrupt memory outside its mappings. It also allows a device to be assigned to a VM, and lets scattered pages look contiguous to the device.
+- **NVMe path:** the driver calls the DMA API, gets an IOVA for each data page and for the SQ and CQ memory, and writes those into PRP1 and PRP2, the PRP lists and the Create I/O Queue commands. Interrupt writes go through a separate interrupt remapping table.
+- **The IOMMU is not in the PCIe spec:** it is a platform feature in the host bridge or root complex. PCIe supplies the interacting pieces: requester ID, the AT field, ATS, PASID and ACS.
+- **Validation consequences:**
+  - The device must only use addresses the host gave it. Over-fetching a PRP list beyond its end, prefetching queue entries past the queue end, or fetching more than the mapped length turns into a fault that is invisible without an IOMMU.
+  - Page boundaries matter. Mappings are usually 4 KB, and a read that crosses into an unmapped page faults.
+FOLLOW:
+- Where does the IOMMU sit relative to the switch and endpoints? => In or beside the root complex, so P2P traffic that stays under a switch does not pass through it unless ACS redirects it upstream.
+- Do the same rules apply on Arm? => Conceptually yes. The SMMU uses a stream ID derived from the requester ID and a substream ID that corresponds to the PASID.
+PITFALL: Believing the SSD "just uses physical addresses". Under an IOMMU it never does, and a firmware bug that invents or reuses addresses shows up as a fault or as corruption.
+VERIFY: Whether interrupt remapping is enabled together with DMA remapping on your platform, and how each vendor's IOMMU derives the domain from the requester ID.
+
+@@ 13.07 | Intermediate | Concept | tags=iommu,passthrough,iotlb,performance,strict,lazy
+Q: What is the difference between IOMMU passthrough and translated mode, and what does translation cost SSD throughput?
+SHORT: In translated mode each DMA goes through IOVA-to-physical page tables and the IOTLB, and every I/O pays for a map and an unmap in the driver. In passthrough (identity) mode, for example Linux iommu=pt, host-owned devices skip the mapping cost but also lose protection. The cost is IOTLB misses that add page-walk latency to DMA, and CPU time in map, unmap and invalidation. It shows up mostly with small random I/O at high IOPS.
+DEEP:
+- **Modes:** off, passthrough (identity domain, used for host devices while VFIO devices still get translated domains), and translated (strict, or lazy where invalidations are batched).
+- **Device-side cost:** an IOTLB miss makes the IOMMU walk multi-level tables in host memory. Each dependent read costs roughly a memory latency, so a miss can add on the order of hundreds of nanoseconds to that DMA. Nested translation for VMs adds more.
+- **Footprint effect:** with 4 KB pages, random 4 KB reads spread over a 1 GB buffer pool touch 262,144 distinct pages, far more than an IOTLB holds. Huge pages (2 MB mappings) cut the number of entries by 512 times.
+- **Software cost:** `dma_map_sg` and unmap per I/O, plus IOTLB invalidation on unmap in strict mode. At millions of IOPS across several SSDs this becomes CPU time and lock contention. Lazy mode batches invalidations but leaves a short window where a freed page is still reachable by the device.
+- **What to measure:** run the same fio job with IOMMU off, passthrough and translated, and compare IOPS, CPU utilization and p99 latency. Use the platform's IOMMU performance counters where they exist.
+- **Why both matter:** vendors often quote numbers with the IOMMU off or in passthrough, while cloud hosts run with it on. Validate both.
+FOLLOW:
+- Does passthrough hide DMA bugs? => Yes. Out-of-range or stale addresses are accepted silently instead of faulting.
+- Why does sequential large I/O barely notice translation? => Large contiguous mappings have few distinct pages and stay in the IOTLB, and per-I/O software cost is amortized over more data.
+PITFALL: Benchmarking only with the IOMMU off and shipping into hosts where it is on.
+VERIFY: Default IOMMU mode and option names (`iommu=pt`, `iommu.strict`, `intel_iommu`, `amd_iommu`) for your kernel version.
+
+@@ 13.08 | Intermediate | Debug | tags=iommu,fault,dmar,io-page-fault,completer-abort,unsupported-request
+Q: dmesg is flooded with DMAR (or IO_PAGE_FAULT) messages naming your NVMe SSD. What happened, what does the SSD see, and how do you triage it?
+SHORT: A DMA hit an IOVA that was unmapped or lacked permission. dmesg names the requester ID, direction, fault address and reason code. For a read the root complex typically returns a Completer Abort or Unsupported Request completion, and a posted write is dropped silently. NVMe shows this as command timeouts and controller resets. The address tells you which structure was touched: past a mapped page means an over-fetch, and a just-freed page means a late DMA after unmap.
+DEEP:
+```
+DMAR: DRHD: handling fault status reg 2
+DMAR: [DMA Read NO_PASID] Request device [3b:00.0] fault addr 0x7f2e3000 [fault reason 0x06] PTE Read access is not set
+AMD-Vi: Event logged [IO_PAGE_FAULT device=0000:3b:00.0 domain=0x0021 address=0x7f2e3000 flags=0x0020]
+```
+1. **Who:** the requester ID identifies the PF or the exact VF.
+2. **What:** compare the fault address with what the driver mapped. With `CONFIG_DMA_API_DEBUG` or trace events you can see map and unmap calls. An address just beyond a mapped range points to length or PRP list over-fetch. An address that was unmapped microseconds ago points to a late DMA, for instance after a timeout and abort, which is the dangerous case because the page may be reused.
+3. **When:** correlate with resets, aborts, FLR, hot-plug, ATS invalidation and firmware activation.
+4. **Device side:** a Completer Abort or UR completion received by the SSD can set Received Target Abort or Received Master Abort in its Status register (shown by `lspci -vv` as `<TAbort` and `<MAbort`), and the firmware may log its own error. A dropped write leaves no trace on the link.
+5. **Flood effects:** fault recording registers can overflow, the fault interrupt storm eats CPU, and repeated faults can look like a hang.
+6. **Isolation check:** booting with the IOMMU off makes the symptom go away. That only proves the IOMMU was reporting a real bad address.
+FOLLOW:
+- The fault is on a write. What does the SSD see? => Nothing on the link. It believes the write completed. For a host read command, that means the SSD posts a normal completion while the host buffer never received the data, so stale data can be accepted. Faults are found in dmesg, not in AER.
+- Why is a fault right after a command abort suspicious? => The abort and the device DMA raced. The driver unmapped the buffers while the firmware still had a transfer in flight.
+PITFALL: Treating a DMAR fault as an OS bug. The address is the device's or driver's, and the IOMMU is only reporting it.
+VERIFY: Exact dmesg formats, reason code numbering, whether your platform returns UR or CA for blocked reads, and whether the legacy Status bits are set on your device.
+
+@@ 13.09 | Advanced | Concept | tags=ats,atc,translation-request,invalidation,pri,at-field
+Q: How does Address Translation Services work, and what are the Translation Request, ATC, Invalidation and PRI?
+SHORT: ATS lets a device ask the IOMMU (the Translation Agent) to translate addresses ahead of time. It sends a Translation Request (a memory read with the AT field set), gets a Translation Completion with the physical address and permissions, caches it in its Address Translation Cache (ATC), and later issues DMA marked Translated. When a mapping changes, the IOMMU sends an Invalidation Request and waits for the device's Invalidation Completion. PRI lets the device ask the OS to page memory in.
+DEEP:
+- **AT field:** two bits in memory requests. Untranslated (IOVA, the IOMMU translates), Translation Request, and Translated (already physical). The value 11b is reserved.
+- **Flow:**
+  1. ATC miss: the device sends a Translation Request for an untranslated address.
+  2. The IOMMU walks the tables and returns a Translation Completion carrying the translated address, the range covered, and read and write permissions.
+  3. The device stores it in the ATC and later sends Translated requests using the physical address.
+  4. If the OS unmaps or changes the page, the IOMMU sends an Invalidate Request message. The device removes matching entries, makes sure earlier requests using them are done, and sends an Invalidate Completion message. The IOMMU may only reuse the page after that.
+- **Why:** it moves the translation work into the device, relieving the IOMMU's IOTLB, and it is the basis for shared virtual memory together with PASID.
+- **Trust:** a Translated request carries a physical address that the IOMMU does not walk again. It only checks that this device is allowed to send translated requests. So ATS is enabled for trusted devices only, and Linux offers `pci=noats`.
+- **PRI:** the device sends a Page Request message for a page that is not present, and the OS handles the fault and replies with a Page Response. This allows unpinned buffers. NVMe data buffers are normally pinned, so PRI is rare for SSDs.
+FOLLOW:
+- What stops a device from forging a Translated address to any physical page? => Nothing in the request itself. The IOMMU only accepts translated requests from devices with ATS enabled, so treat ATS-capable devices as trusted, and use ACS Translation Blocking where you do not.
+- Where does the ATC live and who sizes it? => In the endpoint, and it is an implementation choice. The ATS capability advertises properties such as the invalidate queue depth, and software programs the Smallest Translation Unit and ATS Enable in the ATS Control register.
+PITFALL: Assuming Translated requests bypass the IOMMU entirely. They skip the page walk, not the permission decision.
+VERIFY: AT encodings, Translation Completion data entry fields (size, permissions, untranslated-only and no-snoop bits), invalidate queue depth semantics, and PRI message names in the ATS and PRI sections of the Base Specification.
+
+@@ 13.10 | Intermediate | Concept | tags=pasid,svm,prefix,iommu
+Q: What is PASID and how does it relate to shared virtual memory?
+SHORT: PASID (Process Address Space ID) is a 20-bit value carried in an End-to-End TLP prefix. The IOMMU uses the requester ID plus the PASID to select a per-process address space, so a device can DMA using the same virtual addresses as a user process, which is shared virtual memory. It is usually combined with ATS and PRI. NVMe SSDs rarely use it, but accelerators and some future storage devices do.
+DEEP:
+- **Prefix:** the PASID prefix carries the ID and flag bits such as Execute Requested and Privileged Mode Requested.
+- **IOMMU side:** Intel scalable mode has PASID tables, AMD-Vi uses a guest CR3 table, and Arm uses a substream ID for the same job.
+- **SVA flow:** the driver binds a process to the device, obtaining a PASID. The device DMAs with process virtual addresses. Missing pages are faulted in through PRI, so nothing has to be pinned.
+- **Requirements:** the function needs the PASID capability and must have it enabled, and every switch and the root complex on the path must pass End-to-End TLP prefixes. If a component blocks prefixes, AER logs a TLP Prefix Blocked error.
+- **Flit mode:** the prefix encoding changes in FLIT mode.
+FOLLOW:
+- How is PASID different from a requester ID? => The requester ID says which function is asking. The PASID says which address space inside that function, so one function can serve many processes.
+- Is PASID needed for ATS? => No. ATS works with untranslated requests alone. PASID adds a per-process dimension.
+PITFALL: Treating PASID as something the PCIe fabric interprets. Only the IOMMU gives it meaning, and switches just forward the prefix.
+VERIFY: PASID prefix bit layout, capability fields (Max PASID Width), the E-E prefix limits, encoding in FLIT mode, and whether the NVMe Base Specification defines any PASID usage.
+
+@@ 13.11 | Advanced | Debug | tags=ats,invalidation,timeout,atc,stale-translation
+Q: The IOMMU reports an ATS invalidation timeout for an SSD. What is going on, and how do you debug it?
+SHORT: The IOMMU sent an Invalidate Request and did not get the Invalidate Completion in time, so it cannot know whether the device still holds a stale translation. Likely causes: the device is hung or resetting, the link is down, the upstream path is blocked so the completion message is stuck, or the ATC logic has a bug. The IOMMU logs an invalidation time-out (Intel: ITE), and the OS may stall or reset the device.
+DEEP:
+1. **Evidence:** dmesg lines from the IOMMU driver around the time of the timeout, whether the timeouts repeat, and whether the driver reset the device afterwards.
+2. **Is the device alive:** read Vendor ID and CSTS, and check link state. A hung controller or a link that went down cannot answer.
+3. **Is the response path blocked:** the completion is a message that travels upstream with posted-write ordering, and the device must not send it before earlier requests that used the entry have been sent. Any posted credit starvation, stuck upstream queue or heavy P2P congestion delays it. Check flow control state and upstream traffic.
+4. **Device firmware:** handling with a full invalidate queue, range decoding (the size field encodes how many pages), global versus non-global invalidates, and several outstanding invalidations at once.
+5. **The worse failure is silent:** the device answers but leaves a stale entry. Later Translated DMA goes to a freed and reused physical page, and no IOMMU fault appears. Test for it by unmapping and overwriting the page with a canary, then checking that no device write lands after the completion.
+6. **Isolate:** turn ATS off (`pci=noats` or the IOMMU option) and see whether the symptom vanishes. Then narrow to a command mix or a size pattern.
+- **Recovery rule:** while the device may still hold the translation, the page cannot safely be reused. The safe response is to reset the device so its ATC is cleared.
+FOLLOW:
+- Does a timeout imply the link is broken? => No. It is often the device side. Rule out link-down and credit stalls first, then read the firmware state.
+- Why can the IOMMU not just continue after the timeout? => Because reuse of the page while the device may still write to it risks memory corruption. The system must isolate or reset the device.
+PITFALL: Chasing the timeout and missing the stale-translation case, which produces no error at all.
+VERIFY: The invalidation completion time limit in the ATS section, the VT-d fault status bits for invalidation errors (ITE, ICE, IQE), and the Linux message text.
+
+@@ 13.12 | Advanced | Concept | tags=acs,isolation,p2p,redirect,iommu-groups
+Q: What is ACS, what does each control do, and why does it matter for isolation and for peer-to-peer?
+SHORT: Access Control Services sits in switch downstream ports, root ports and multi-function endpoints. Source Validation checks requester IDs, Translation Blocking blocks Translated requests, P2P Request and Completion Redirect send peer traffic upstream to the root complex, Upstream Forwarding and Egress Control tighten routing further, and Direct Translated P2P lets ATS-translated P2P go direct. Redirect forces DMA through the IOMMU, which isolates, but it blocks or slows P2P.
+DEEP:
+| ACS control | Effect |
+|---|---|
+| Source Validation | Drop requests whose requester ID is outside the bus range below that port (blocks spoofing) |
+| Translation Blocking | Block requests with the AT field set to Translated |
+| P2P Request Redirect | Route peer requests upstream instead of across the switch |
+| P2P Completion Redirect | Same for completions |
+| Upstream Forwarding | Forward eligible requests and completions upstream instead of routing them locally, used alongside the redirect bits |
+| P2P Egress Control | Per-port allow list for peer traffic |
+| Direct Translated P2P | Let Translated P2P bypass the redirect and go across directly |
+
+- **Why isolation needs it:** without ACS, two devices behind a switch can DMA to each other directly and the IOMMU never sees it. Linux therefore forms IOMMU groups from the ACS isolation of the path, and VFIO can only hand a whole group to a guest.
+- **Cost:** with redirect on, all P2P crosses the root port and root complex, sharing the uplink and depending on the platform's P2P support. Some root complexes drop or reject P2P requests, so P2P fails outright.
+- **Middle way:** ATS plus Direct Translated P2P. The IOMMU approves the translation, and the switch then forwards the translated request directly.
+- **On Linux:** `lspci -vvv | grep -E 'ACSCap|ACSCtl'` shows the state, for example `ACSCtl: SrcValid+ TransBlk- ReqRedir+ CmpltRedir+ UpstreamFwd+ EgressCtrl- DirectTrans-`. Kernel options such as `pci=disable_acs_redir=` can turn redirect off for chosen devices, at the cost of isolation.
+- **Multi-function devices:** ACS at function level controls whether functions of one device can reach each other. Without it, all functions land in one IOMMU group.
+FOLLOW:
+- Which control alone breaks P2P through a switch? => P2P Request Redirect on the downstream ports. Requests go upstream, and if the root complex does not forward them the transfer fails. Source Validation alone does not.
+- Why do multi-PF or SR-IOV SSDs care? => VFs need separate IOMMU groups to be assigned to separate VMs. If the device or path does not provide ACS, the group is bigger than the VF.
+PITFALL: Turning ACS off for GPUDirect or P2P performance and forgetting that it removes isolation between the endpoints.
+VERIFY: The full list and bit layout of ACS Capability and Control including the newer enhanced controls, and the kernel parameters for ACS handling.
+
+@@ 13.13 | Advanced | Cross-layer | tags=p2p,p2pdma,cmb,gpudirect,nvme,topology
+Q: How does peer-to-peer DMA between an NVMe SSD and a GPU or NIC work, and what topology conditions make it work or fail?
+SHORT: One endpoint reads or writes another endpoint's BAR directly. An SSD writes read data into GPU memory (GPUDirect Storage), or a NIC writes into an SSD's Controller Memory Buffer (CMB). Behind one switch the TLPs turn around in the switch and never touch the root complex. It needs a target memory in a BAR, bus addresses rather than host DRAM addresses, no ACS redirect on the path (or ATS with Direct Translated P2P), and a platform and driver that allow it.
+DEEP:
+- **CMB as target:** the NVMe Controller Memory Buffer exposes memory in a BAR, described by CMBLOC and CMBSZ. It can hold queues, PRP lists and data depending on the support bits. Linux registers a CMB that supports data as P2P memory when `CONFIG_PCI_P2PDMA` is on, and NVMe-oF targets can use it.
+- **GPUDirect Storage:** the NVIDIA cuFile path maps GPU memory so the SSD DMAs to it directly. If P2P is not possible it falls back to a bounce through host memory.
+- **Topology conditions:**
+  - Same switch is best. TLPs never leave it.
+  - Different root ports of one root complex works only if the platform forwards P2P between them. Linux keeps an allow list of known-good host bridges.
+  - Across sockets is usually slow or unsupported.
+  - ACS redirect on any switch port on the path forces traffic through the root complex. Check for it.
+  - The target BAR must be large enough and 64-bit, which is where Resizable BAR and Above 4G Decoding come in.
+  - The path runs at the slowest link, and the smallest MPS on it applies.
+- **Reads versus writes:** the SSD to GPU direction is posted writes that stream freely. The GPU to SSD direction needs non-posted reads to the GPU BAR, limited by outstanding tags and by how fast the GPU serves BAR reads, so it is often slower.
+- **With an IOMMU on:** the kernel maps peer BAR addresses for the initiator, or the traffic is redirected upstream and translated. Both need validating.
+FOLLOW:
+- Why use a CMB as a P2P target? => The NIC can write payload into SSD memory and the SSD can consume it with no host DRAM copy. CMB size and bandwidth limit it, and its contents are volatile unless backed by persistent memory.
+- What errors appear if the target BAR is disabled or the address is wrong? => The initiator gets UR or Completer Abort completions for reads, and posted writes are dropped, with any logging depending on the target.
+PITFALL: Assuming "P2P enabled" means the traffic stays under the switch. Check the routing before trusting a benchmark.
+VERIFY: CMBSZ support bits, the Linux P2PDMA allow list and mapping behavior, and NVIDIA's GPUDirect Storage platform requirements.
+
+@@ 13.14 | Principal | Debug | tags=p2p,acs,bounce,root-complex,throughput,triage
+Q: A P2P transfer between an SSD and a GPU is correct but very slow. How do you prove it is bouncing through the root complex, and what do you do about it?
+SHORT: A slow but correct P2P transfer is usually not staying local. ACS redirect or a common ancestor at the root complex pushes each TLP up to the root port and back. Prove it with the topology (lowest common ancestor of the two endpoints), the ACS state on each port between them, and traffic counters or an analyzer on the uplink. Then clear redirect (or use ATS with Direct Translated P2P), move the devices under one switch, or accept a host-memory bounce.
+DEEP:
+1. **Topology:** `lspci -tv` and identify the lowest common ancestor. If it is a root port or the root complex, the TLPs must cross it. Repeat for each candidate slot.
+2. **ACS state:** `lspci -vvv` on every port between the endpoints. Redirect bits set on a downstream port mean peer TLPs are sent upstream. On Linux, ACS is typically enabled when an IOMMU driver is active, so IOMMU on versus off can change P2P behavior.
+3. **Where the bytes go:** switch port counters or an analyzer on the uplink. If the transfer rate shows up on the uplink port in both directions, it bounces. If the uplink is quiet and the switch downstream ports carry the traffic, it is local.
+4. **Read versus write asymmetry:** if writes to the GPU are fast but reads from it are slow, look at outstanding non-posted reads (tags and MRRS at the SSD) and the read completion size the GPU returns. Bandwidth is roughly bytes in flight divided by round-trip time (see the outstanding-reads question in module 1).
+5. **The slowest link rule:** a Gen3 x8 leg or a downtrained link caps the path. Check the link state of every hop.
+6. **Fix options, cheapest first:** move the devices to slots under one switch; clear redirect bits for those ports only; ATS plus Direct Translated P2P; or accept the copy through DRAM and size the system for it.
+7. **Verify the fix:** repeat the measurement and show the uplink counters go quiet, and re-run the isolation tests because clearing redirect weakens them.
+FOLLOW:
+- Would disabling the IOMMU fix it? => Often yes, because the OS then leaves ACS redirect off. It removes DMA isolation, so it is a diagnostic step, not a fix for a multi-tenant host.
+- Bandwidth is fine at large transfers but poor at small ones. Why? => Per-TLP costs on a redirected path (IOMMU lookups, root complex handling) dominate small transfers, and fewer bytes are in flight per round trip.
+PITFALL: Tuning the endpoints when the routing is the problem. Look at the path before the devices.
+VERIFY: Which switch vendor tools expose per-port byte counters on your hardware, and how your kernel handles ACS enablement with the IOMMU active.
+
+@@ 13.15 | Intermediate | Concept | tags=resizable-bar,tph,atomicops,ptm,capabilities
+Q: What do Resizable BAR, TPH, AtomicOps and PTM each do, and what must the path support?
+SHORT: Resizable BAR lets software pick a BAR size from a menu the device advertises, so a large memory window such as a GPU frame buffer or CMB can be mapped whole. TPH adds processing hints and steering tags to TLPs so writes can be steered to a particular CPU cache. AtomicOps are non-posted read-modify-write TLPs (FetchAdd, Swap, CAS) that need a capable requester, a capable completer and a route through every hop. PTM lets devices synchronize their clocks to a PTM root.
+DEEP:
+- **Resizable BAR:** the capability lists supported sizes per BAR as a bitmap, and a control field holds the chosen size. Firmware or the OS sets it before assigning addresses, and it needs a 64-bit prefetchable BAR and Above 4G Decoding. Linux exposes `resource0_resize` in sysfs. For SSDs it matters for large CMB or PMR BARs.
+- **TPH:** a TH bit in the header, a 2-bit Processing Hint and an 8-bit Steering Tag (with an extended 16-bit form). Steering tags are looked up from a table in the TPH capability or in the MSI-X table. NVMe does not itself define how tags are chosen, so any use is vendor and platform specific.
+- **AtomicOps:** Device Capabilities 2 reports AtomicOp Routing Supported and the completer support for 32-bit, 64-bit and 128-bit CAS. Device Control 2 holds AtomicOp Requester Enable and AtomicOp Egress Blocking. Software should enable the requester only if the route supports it. A component that cannot handle it returns UR or blocks the TLP. NVMe's host interface does not use atomics, but GPUs and accelerators do.
+- **PTM:** Request and Response messages give a device the master time from a PTM root with nanosecond-scale resolution, useful for correlating traces and for time-sensitive systems. Every hop needs PTM support.
+FOLLOW:
+- An AtomicOp requester behind a switch gets UR. What is the cause? => A switch port lacks AtomicOp routing or has egress blocking set, or the completer does not support that operand size. Check Device Capabilities 2 and Device Control 2 at every hop.
+- Does Resizable BAR give a device more memory? => No. It changes how much the CPU can map at once. Without it, a driver may have to window into a large device memory through a small BAR.
+PITFALL: Enabling AtomicOp Requester because the endpoint supports it, without checking that the whole path can route and complete atomics.
+VERIFY: ReBAR size encoding (a size code of 0 means 1 MB), TPH mode names and tag widths, AtomicOp operand sizes, and PTM role definitions.
+
+@@ 13.16 | Principal | Scenario | tags=multi-tenant,isolation,sriov,nvme,qos,flr,validation
+Q: You are validating a multi-VF NVMe SSD sold for multi-tenant hosts. How do you prove tenant isolation?
+SHORT: Treat every VF as hostile and test five planes with negative tests, not just "each VF works": address isolation (per-VF IOMMU domain, no peer DMA, correct requester ID), resource isolation (private queues, interrupts and namespaces, admin commands PF-only), performance isolation (a noisy VF cannot wreck neighbors' tail latency), fault and reset isolation (a VF's FLR, errors and crashes stay local, and no data leaks on reuse), and management isolation. Define pass criteria for each.
+DEEP:
+1. **Address:** from a guest with a userspace driver on the VF, program PRPs and SGLs outside its mappings. Expect faults attributed to that VF's requester ID and neighbor canary buffers unchanged. Check on an analyzer that every DMA TLP carries the VF's own routing ID, never the PF's. Confirm ACS blocks VF to VF peer traffic and that each VF lands in its own IOMMU group.
+2. **Register and MMIO:** each VF BAR reaches only its own registers. Test doorbell offsets beyond the queue count, and writes across the VF BAR page boundary. Confirm MSI-X vectors cannot target another VF's addresses, with interrupt remapping on.
+3. **Resource:** namespaces attached to one VF must not appear in another's Identify. Format, firmware, security and other PF-only commands from a VF must be rejected. Over-allocation of queues and vectors must fail cleanly.
+4. **Performance:** run a noisy VF (large writes, garbage collection pressure) beside a latency-sensitive VF (4 KiB reads at low queue depth). Measure the victim's p99 and p99.9 against a solo baseline. Repeat with media partitioning features such as NVM Sets or Endurance Groups if the device offers them.
+5. **Fault and reset:** FLR one VF under neighbor load and record the neighbor's latency blip and the FLR time (the spec expects FLR to finish within a bounded time). After FLR or reassignment, check no old queue memory, CMB content or namespace data is visible. Malformed commands from one VF must not hang the controller. Disabling VFs or resetting the PF with VMs running must give defined behavior and no hangs.
+6. **Evidence and criteria:** zero cross-VF reads or writes, latency inflation under an agreed bound (for example p99 within 1.5x of solo), no controller resets, and every fault attributed to the offending VF.
+FOLLOW:
+- How do you show a VF cannot DMA into another VF's memory? => Fill the neighbor's buffers with a canary pattern, drive malicious PRPs from the first VF, and show dmesg faults with its requester ID and no canary changes.
+- The firmware uses the PF's requester ID for VF DMA as a shortcut. What breaks? => The IOMMU applies the PF's domain, so a VF's DMA can reach memory it should not, and per-VF faults and ACS checks become meaningless. Catch it by checking the requester ID on every DMA TLP.
+PITFALL: Testing only that each VF works. Isolation is proved by negative tests, and the noisy neighbor case belongs in the plan from the start.
+VERIFY: The FLR completion time bound in the Base Specification, which NVMe isolation features (NVM Sets, Endurance Groups, Predictable Latency) apply to VFs on the product, and IOMMU group behavior for your platform.
+
+@@ 13.17 | Principal | Cross-layer | tags=ats,iommu,validation,invalidation,race,pri,methodology
+Q: How would you validate an SSD's behavior under IOMMU with ATS, including translated and untranslated mixes, invalidation races and page faults?
+SHORT: Build a matrix over address mode (untranslated, translated, mixed), page size, invalidation timing and command type, then attack the races: invalidation during in-flight DMA, invalidation storms, and reset with translations outstanding. Use a controllable host mapper, a virtual IOMMU for coverage, real hardware for performance, and an analyzer for the AT field and message ordering. Pass means no faults, no writes to freed pages, bounded invalidation latency and no throughput loss.
+DEEP:
+- **Dimensions:**
+  - Address mode: untranslated only, translated only, mixed on the same queue.
+  - Page size: 4 KB, 2 MB and 1 GB mappings, and the size encoding of translated ranges.
+  - Commands: PRP and SGL, PRP lists crossing pages, metadata, read and write, and admin commands.
+  - Invalidation: idle, mid-command, storms, overlapping ranges, full invalidate queue, invalidation of a range partly in use.
+  - Page faults through PRI if the device supports it.
+  - Lifecycle: FLR, CC.EN reset, link retrain and hot removal with translations and invalidations pending.
+- **The key race:** the device must not use an entry after it has sent the Invalidate Completion, and must not send the completion before earlier requests using the entry have been issued. Test: unmap a page while DMAs to it are in flight, immediately overwrite or remap it with a canary, and detect any device write that lands after the completion.
+- **Harness:** a kernel module or userspace VFIO test that maps and unmaps at controlled instants, a virtual IOMMU with ATS for logic coverage, and hardware for timing. IOMMU trace events give the host view and an analyzer gives the wire view.
+- **Wire checks:** the AT field is correct on each request, Translated requests only follow a successful translation, writes are not sent when the translation lacks write permission, and the Invalidate Completion carries the right routing.
+- **Performance:** ATC hit rate, Translation Request latency, IOPS with ATS on versus off, and IOMMU counters.
+- **Criteria:** zero device-attributed faults, zero canary corruption, invalidation completion within the limit under storm, and IOPS at least equal to the untranslated case.
+FOLLOW:
+- Which findings are typically device firmware bugs? => Stale entries after a partial-range invalidate, completion sent before earlier requests drained, translation reuse across FLR, and misdecoded translation size.
+- How would you cover the page fault path if the device has no PRI? => You do not, but you cover the OS-side equivalent: pinned buffers and prove the device never touches a page outside them.
+PITFALL: Testing ATS only in steady state. The bugs are in races and lifecycle events.
+VERIFY: ATS and PRI message ordering rules and time limits, QEMU virtual IOMMU options for ATS, and the exact IOMMU trace events on your kernel.

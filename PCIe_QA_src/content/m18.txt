@@ -1,0 +1,427 @@
+# Module 18 — Scenarios & System Design
+
+@@ 18.01 | Principal | Cross-layer | fig=ltssm | tags=bring-up,power-on,enumeration,nvme,cc-en,admin-queue
+Q: Walk through everything that happens from power-on until the first NVMe read completes.
+SHORT: Power rails and REFCLK stabilize, then PERST# is released. The LTSSM trains Detect, Polling, Configuration to L0 at 2.5 GT/s, then changes speed to the maximum, and the Data Link Layer completes flow control initialization. Firmware enumerates and assigns BARs, the OS driver maps BAR0, programs the admin queues and sets CC.EN, waits for CSTS.RDY, identifies the controller, creates the I/O queues, and finally a read goes doorbell, SQE fetch, data DMA, CQE and MSI-X.
+DEEP:
+1. **Power and clock:** supply rails reach their limits, REFCLK runs stably, then the platform releases PERST#. The CEM allows roughly 100 ms from power valid to PERST# release and wants REFCLK stable before release (VERIFY).
+2. **Link training** (see the LTSSM module): Detect, Polling, Configuration, L0 at 2.5 GT/s. Then a speed change through Recovery, with equalization at Gen3 and above, up to the highest common rate. Training must start soon after PERST# release (about 20 ms, VERIFY).
+3. **Data Link Layer:** DL_Init sends InitFC1 and InitFC2 for VC0, then DL_Active, and TLPs can flow.
+4. **Enumeration** (see Config Space & Enumeration): firmware waits after reset, handles CRS while the SSD boots, reads the Vendor ID, assigns bus numbers, sizes and assigns BARs, and sets Memory Space and Bus Master Enable. Class code 010802h identifies an NVMe controller.
+5. **Driver bind:** the driver maps BAR0 and reads CAP (queue depth limit, doorbell stride, timeout CAP.TO in 500 ms units) and VS.
+6. **Controller enable:** allocate the admin SQ and CQ in host memory, write AQA, ASQ and ACQ, set CC (entry sizes, page size, command set) and CC.EN = 1, then poll CSTS.RDY = 1, within the CAP.TO limit.
+7. **Admin setup:** Identify Controller and Namespace, Set Features for the number of I/O queues, Create I/O Completion Queue then Create I/O Submission Queue (the SQ refers to its CQ), and configure MSI-X vectors.
+8. **First read:** the driver writes the SQE, writes the SQ tail doorbell (MWr to BAR0), the SSD fetches the SQE (MRd and completion), reads NAND, DMA writes the data (MWr TLPs), posts the CQE (MWr) and an MSI-X (MWr). The driver sees the CQE and writes the CQ head doorbell.
+- **Where each stage fails:** no L0 means steps 1 to 2, config reads returning all 1s means the link or CRS timing, RDY never set means firmware or CC settings, and a timeout on the first I/O means the queue, interrupt or data path.
+FOLLOW:
+- Which step has the longest and most variable time? => CC.EN to CSTS.RDY, which depends on firmware initialization and can approach the CAP.TO limit, followed by BIOS and OS enumeration.
+- Why create the CQ before the SQ? => The Create I/O SQ command names the CQ that receives its completions, so that CQ has to exist first.
+PITFALL: Treating "link up" as "device usable". Between L0 and the first I/O are DL_Active, enumeration, BAR programming, CC.EN and queue creation, each with its own failure signature.
+VERIFY: PERST# and REFCLK timing in the CEM, the 20 ms link-training start rule, CRS behavior, and the admin opcodes and field names in the NVMe Base Specification.
+
+@@ 18.02 | Advanced | Cross-layer | tags=read,tlp,mps,flow-control,ordering,latency
+Q: Trace a 4 KB read from the application down to NAND and back at every PCIe layer, with numbers.
+SHORT: The driver writes a 64-byte SQE and a 4-byte doorbell (a posted MWr). The SSD fetches the SQE (MRd and completion), reads NAND, then DMA-writes the 4 KB as sixteen 256-byte MWr TLPs, a 16-byte CQE and a 4-byte MSI-X write. That is 22 TLPs, about 4.6 KB upstream and about 150 B downstream. The data takes about 0.57 microseconds on Gen4 x4, negligible next to the NAND read.
+DEEP:
+Assumptions: Gen4 x4, MPS 256 B, a 4 KB aligned buffer (one PRP), and a fixed per-TLP cost of 10 B (2 sequence number, 4 LCRC, 4 framing) plus the header: 16 B for 4DW memory requests and 12 B for completions. So a memory TLP adds 26 B and a completion adds 22 B.
+1. **Application to driver:** `pread` with O_DIRECT or io_uring, the block layer, then the NVMe driver builds the SQE (opcode 02h Read, PRP1 = buffer address) in the host SQ.
+2. **Doorbell:** MWr, 4 B payload, posted, to BAR0 at 1000h plus the queue offset (stride from CAP.DSTRD). Wire size 30 B.
+3. **SQE fetch:** SSD issues an MRd for 64 B (non-posted, with a Tag), the Root Complex returns a CplD. Wire size 26 B up, about 86 B down.
+4. **NAND and FTL:** address translation, NAND read, ECC. Tens of microseconds for a typical TLC read (assumed 50 to 100 microseconds). This is where most of the latency is.
+5. **Data DMA:** 4096 / 256 = 16 MWr TLPs, each 256 + 26 = 282 B, so 4512 B. At 7.877 GB/s that is 573 ns (286 ns on Gen5 x4). Efficiency 4096 / 4512 = 90.8 percent. A memory TLP cannot cross a 4 KB boundary, so an aligned buffer needs no split beyond MPS.
+6. **Flow control:** the 16 MWr TLPs use 16 posted-header credits and 16 x 16 = 256 posted-data credits (one data credit is 16 B). The Root Complex returns them with UpdateFC as its memory controller drains.
+7. **Completion:** CQE is a 16 B MWr (42 B on the wire) with the phase bit, then MSI-X is a 4 B MWr (26 B, a 3DW header because the interrupt address is below 4 GB). The driver later writes the CQ head doorbell (30 B).
+8. **Ordering matters:** the CQE and MSI-X are posted writes behind the data writes on the same path, so posted ordering guarantees the host sees the data before it sees the completion (see Flow Control & Ordering).
+9. **Totals:** 22 TLPs. Upstream 26 + 4512 + 42 + 26 = 4606 B. Downstream 30 + 86 + 30 = 146 B, plus DLLPs.
+- **Latency budget:** PCIe round trips (doorbell to SQE fetch, then data, CQE and interrupt) add a few microseconds, while NAND adds tens. At QD1 the link speed barely matters, and at high QD it sets the ceiling.
+FOLLOW:
+- How does MPS 128 or 512 change this? => 128 B gives 32 TLPs and 83 percent efficiency, and 512 B gives 8 TLPs and 95 percent. The header cost is fixed per TLP.
+- What if the buffer is not 4 KB aligned? => The SSD needs two PRP entries, and the transfer splits at the page boundary into more, smaller TLPs.
+PITFALL: Assuming the completion can overtake the data. It cannot on the same path, because posted writes stay in order, and that is what NVMe relies on.
+VERIFY: Whether your platform's MPS is 128 B, 256 B or 512 B, the NAND read latency of your part, and the CQE and PRP field details in the NVMe Base Specification.
+
+@@ 18.03 | Principal | Scenario | tags=validation-plan,gen5,enterprise,exit-criteria,corner-matrix
+Q: Design the PCIe validation plan for a new Gen5 x4 enterprise SSD.
+SHORT: Define scope and risks, then cover link bring-up, electrical and margin, protocol and config, power management, resets and hot-plug, error injection, NVMe over PCIe, platform interoperability and long soak. Run each across a corner matrix (voltage, temperature, refclk, slots, speeds) on multiple units, automate with evidence capture on failure, and exit on quantified criteria: link-up yield bound, zero uncorrectable errors and miscompares, margin above limit, latency targets.
+DEEP:
+- **Scope:** form factor (U.2, U.3, E3.S, E1.S), speeds (Gen1 to Gen5), SR-IOV, hot-plug, IDE or DOE if offered, retimer topologies, and target platforms (CPU vendors, switches, backplanes).
+- **Test categories:**
+
+| Category | Examples |
+|---|---|
+| Link and LTSSM | Bring-up yield, speed and width changes, equalization, Recovery counts, downtrain and uptrain |
+| Electrical | Pre-compliance Tx and Rx, refclk tolerance, SSC, margin per lane |
+| Protocol and config | TLP variety and sizes, MPS and MRRS, 64-bit addresses, ordering, flow control, CRS, capabilities, BAR sizing |
+| Power | ASPM, L1.x, D-states, LTR, NVMe APST, exit latency |
+| Resets and hot-plug | PERST#, hot reset, FLR, CC.EN, subsystem reset, surprise removal |
+| Errors | AER, DPC, poison, UR, completion timeout, recovery and data verify |
+| NVMe over PCIe | Queue and interrupt scaling, doorbell handling, MSI-X, CMB or PMR if present |
+| Interop | Several root complexes and switches, BIOS versions, retimers, cable and backplane variety |
+| Soak | Long mixed load with data verify and thermal cycling |
+
+- **Corner matrix:** voltage low and high, temperature cold and hot, refclk SSC on and off with offsets, best and worst slot, and speed forced down.
+- **Automation:** every test scripted, reset loops, evidence capture on failure (see the Debug module), results database with firmware, BIOS and platform tags.
+- **Exit criteria:** link-up yield with a stated upper bound (3,000 clean trials gives 0.1 percent at 95 percent), zero uncorrectable errors and miscompares in soak, correctable rate under a throughput-impact threshold, worst-lane margin above characterization limits on all platforms in scope, latency and QoS targets met, and no open link-level issues above an agreed severity.
+- **Metrics reported:** yield per cell, correctable rate per GB, margin distribution, defect arrival and closure rate, platform coverage.
+FOLLOW:
+- What is the highest-risk area? => Interoperability and margin on real platforms, because compliance covers only reference conditions. Also resets and error recovery paths, which are the least exercised.
+- How do you decide when to stop? => When the exit criteria are met on the platforms in scope, the defect discovery rate has fallen, and there are no unexplained failures.
+PITFALL: Writing a plan as a list of test cases without pass criteria, statistics or platform coverage. An interviewer wants the exit criteria and the reasoning behind them.
+VERIFY: Which PCI-SIG and NVMe compliance programs apply to your form factor and generation.
+
+@@ 18.04 | Principal | Scenario | tags=field,interop,statistics,margin,population
+Q: A Gen5 drive works in the lab but fails in about 2 percent of a customer's servers. How do you find out why?
+SHORT: First explain why the lab missed it: with 2 percent, ten servers show nothing 82 percent of the time. Then treat it as a population problem. Collect a standard evidence bundle from failing and passing servers, build a table of platform attributes, find what separates them, and reproduce on a loaned failing server with swap tests. Measure margin on both populations, then fix by tuning, firmware or platform change and verify at the failure rate.
+DEEP:
+1. **Why the lab missed it:** the chance of seeing no failure in n servers is 0.98^n: 82 percent for 10, 36 percent for 50, 13 percent for 100. To have a 95 percent chance of catching one failing server needs about 148 servers (ln 0.05 / ln 0.98).
+2. **Define the failure:** link down, downtrain, timeouts, or drops? The signature drives everything else (see the Debug module's classification).
+3. **Evidence bundle from both groups:** `lspci -vvv` for the SSD and upstream ports, LnkSta and LnkSta2, AER counters, dmesg, `nvme smart-log`, error log, telemetry, BIOS, CPU and firmware versions, BMC logs, slot, backplane and cable.
+4. **Stratify:** find the attribute that separates failing from passing: platform generation, BIOS setting, backplane revision, retimer firmware, slot position, cable length, power supply, ambient temperature, drive firmware, unit lot.
+5. **Reproduce:** bring a failing server to the lab (or remote access). Swap tests: failing drive in a lab server, lab drive in the failing server, then swap slots and cables. The failure follows one item.
+6. **Measure margin:** run lane margining and equalization readouts in failing and passing servers. A population separated by low margin points to the tail of channel loss, connector tolerance, refclk or power noise, not a logic bug.
+7. **Fix and verify:** equalization or preset changes, firmware workaround, BIOS advice, or a platform change. Verify at the failing platform's rate with enough trials (150 or more for 2 percent).
+8. **Prevent:** add worst-channel screening and platform-diversity to the lab, and ship telemetry so margin and link events in the field are visible.
+FOLLOW:
+- The failing servers all share one BIOS version. Is that the cause? => It is a strong lead, not proof. Test by changing only the BIOS on a failing server, and check whether it also correlates with hardware batch.
+- What if failing servers show no PCIe errors at all? => Widen the search: firmware, host-side stalls, power events. Clean lower layers point up the stack (see the NVMe timeout question in this module).
+PITFALL: Declaring "cannot reproduce" after ten lab servers. Sample size, not luck, explains it.
+
+@@ 18.05 | Principal | Debug | tags=throughput,write,thermal,slc-cache,proving-link,bottleneck
+Q: Sequential write throughput is high for 10 minutes and then drops. What are the PCIe-side and non-PCIe causes, and how do you separate them and prove the link is or is not the bottleneck?
+SHORT: Look at the drop shape and what it correlates with. A drop after a fixed number of GB written points to an SLC cache or garbage collection, a drop after a fixed time points to thermal, and Bad TLP or Recovery counts rising point to the link. Prove the link is not the bottleneck by comparing throughput to the link ceiling, by lowering link speed or width and seeing no change, and by showing clean replay, credit and retrain evidence.
+DEEP:
+- **Non-PCIe causes:** SSD thermal throttling (composite temperature against the warning threshold), SLC write cache exhausted, steady-state garbage collection and write amplification, a power-state cap, host page cache write-back, CPU or memory throttling, and file system effects.
+- **PCIe causes:**
+  - Rising replays or retrains at higher temperature (Bad TLP rates, Recovery counts).
+  - A downtrain or width change (LnkSta).
+  - Write data is fetched by the SSD with MRd, so throughput depends on completion latency and outstanding reads. A slower host memory path (remote NUMA, IOMMU misses) can limit it without any error.
+  - Credit stalls and ASPM effects, less likely under sustained load.
+- **Separate with experiments:**
+  1. Plot throughput against time and against cumulative GB. GB-linked implies cache, time-linked implies thermal.
+  2. Log SSD temperature, throttle counters, LnkSta, AER rates and Recovery counts every few seconds beside throughput.
+  3. Repeat with a preconditioned drive, with a fan or heatsink change, and on another host.
+- **Prove the link is not the bottleneck:**
+  1. Ceiling: Gen5 x4 is about 15.75 GB/s per direction, about 14.3 GB/s at 256 B MPS. If you measure 3 GB/s, the link is at 20 percent.
+  2. Change the link: run at Gen4 (about 7.9 GB/s) or x2. If throughput does not move, the link is not limiting. If it drops proportionally, it is a co-limit.
+  3. Watch the link: zero replay, no Recovery, no credit stalls in an analyzer or PHY counters.
+  4. Use an SSD DMA loopback test (vendor tool) that moves data without NAND, to show the link and host can sustain the rate.
+  5. Queue depth: if throughput is flat as QD rises, the limit is the device, not the link.
+FOLLOW:
+- The drop happens at the same GB every time, at any temperature. What is it? => A finite fast region, most likely an SLC cache filling and the drive dropping to native write speed.
+- Throughput is 60 percent of the ceiling with no errors. Is the link the limit? => Not proven. Reduce link speed and see if it moves. Also check outstanding requests and completion latency (Little's law) and the host memory path.
+PITFALL: Concluding PCIe is the bottleneck because measured throughput is below line rate. Line rate is a ceiling, and most workloads are limited elsewhere.
+VERIFY: Your drive's thermal thresholds and throttle fields in the SMART log, and the effective TLP efficiency for your platform's MPS.
+
+@@ 18.06 | Principal | Numeric | tags=topology,switch,bifurcation,lanes,oversubscription,numa,hot-plug
+Q: Design a 24-drive Gen5 NVMe server: budget the lanes and bandwidth, choose between direct attach and switches, and say what you validate.
+SHORT: Twenty-four x4 drives need 96 lanes. Each Gen5 x4 is 15.75 GB/s per direction raw. Direct attach gives every drive its full lanes but consumes 96 of the host's lanes. Three switches with x16 uplinks use 48 host lanes but cap each 8-drive group near 57 GB/s, a 2:1 lane and about 1.7:1 bandwidth oversubscription at 12 GB/s per drive. Choose by the workload's real limit, such as network bandwidth.
+DEEP:
+Assumptions: Gen5 x4 drive = 32 GT/s x 4 x 128/130 = 15.75 GB/s per direction; 256 B MPS gives 256 / 282 = 90.8 percent TLP efficiency; each drive sustains 12 GB/s; the host has about 160 usable Gen5 lanes across two sockets (VERIFY per platform).
+1. **Lanes:** 24 x 4 = 96 lanes for drives.
+2. **Direct attach:** 96 host lanes, no oversubscription. Aggregate 24 x 12 = 288 GB/s. Leaves about 64 lanes for NICs and others.
+3. **Three switches, eight drives each, x16 uplink:** downstream 32 lanes and upstream 16, so 2:1 by lanes. Uplink 63.0 GB/s raw, x 0.908 = 57.2 GB/s usable. Demand 8 x 12 = 96 GB/s, so 1.7:1 oversubscription. Per drive about 7.2 GB/s when all are busy. Aggregate cap 3 x 57.2 = 172 GB/s. Uses 48 host lanes.
+4. **Compare with the consumer:** two 400 GbE NICs are about 100 GB/s per direction. Either option exceeds that, so a network-bound server does not need direct attach. A local analytics server that scans at 288 GB/s does.
+5. **Host memory:** each DMA byte lands in DRAM and is read again, so DRAM traffic is at least 2x. 12 channels of DDR5-4800 are about 461 GB/s peak per socket (assumed).
+6. **NUMA:** put 12 drives on each socket, keep the NIC and the application on the same node, and avoid cross-socket DMA.
+7. **Bifurcation and clocks:** an x16 slot must be set to x4x4x4x4 in BIOS, with a REFCLK and PERST# per drive, and retimers or short cables for Gen5.
+8. **Hot-plug:** native hot-plug per slot with power control, and DPC on switch ports so one drive fault does not take down its group.
+9. **Validate:**
+   - All 24 links train at Gen5 x4 on every boot (`lspci -tv`, LnkSta).
+   - Scaling test at 1, 4, 8, 12 and 24 concurrent drives, expecting linear scaling up to the limit.
+   - Error counters under full load, plus power and thermal with all drives busy.
+   - Hot-plug on each slot, DPC containment, NUMA placement, and staggered power-up to limit inrush.
+FOLLOW:
+- Why not x8 uplinks to save cost? => A Gen5 x8 uplink halves the cap to about 28.6 GB/s per switch, or 3.6 GB/s per drive at 8 per switch. Fine for cold storage, poor for hot NVMe.
+- What could make the measured number lower than 57.2 GB/s per uplink? => MPS smaller than 256 B, non-optimal completions, switch arbitration, and host DMA limits.
+PITFALL: Comparing lane counts instead of bandwidth to the real consumer. Oversubscription is acceptable when the downstream limit (network, CPU, DRAM) is below the uplink cap.
+VERIFY: The usable lane count per platform, switch part port counts and features (DPC, peer-to-peer), and any inter-socket bandwidth limit.
+
+@@ 18.07 | Advanced | Debug | tags=field,dmesg,logs,evidence,dropout
+Q: A drive drops out intermittently in the field and all you have is dmesg. What can you conclude, and what do you ask for?
+SHORT: You can conclude the time, the visible sequence, and whether the controller was unreachable or alive. A read of CSTS returning all 1s, with PCI_STATUS all 1s, means the device was not answering on the link. Timeouts with a readable, ready controller point to a stall. AER or DPC lines before the timeouts show the PCIe error first. You cannot conclude the layer, the direction, the LTSSM or the cause. Ask for config space, SMART, telemetry, versions and fleet correlation.
+DEEP:
+| Pattern in the log | Conclusion | Follow-up |
+|---|---|---|
+| "controller is down" with CSTS and PCI_STATUS all 1s | Reads returned all 1s: link down, device removed or unresponsive | AER, hot-plug or DPC lines before it, and whether a rescan brought it back |
+| I/O timeouts, abort, reset, CSTS readable | Device alive and not completing | SSD firmware, thermal, queue or interrupt |
+| AER uncorrected or fatal lines naming a port | A PCIe error came first, and the type says which layer | Decode the error and the reporting device |
+| Hot-plug "Link Down" or DPC containment | Port-level link loss or containment | What triggered it |
+| Rising corrected errors before the drop | Marginal link trending worse | Rate and load correlation |
+| No AER lines at all | Ambiguous: masked, firmware-owned, or no error reported | Check platform AER ownership |
+
+- **Cannot conclude:** the direction, the LTSSM path, whether it was the drive, slot or power, or the temperature. A single log is one sample.
+- **Ask for:**
+  1. Full dmesg from boot to the event, and the previous boot's log.
+  2. `lspci -vvv` for the SSD and upstream ports, before and after.
+  3. `nvme smart-log` and `error-log` (unsafe shutdown and power cycle counts), controller-initiated telemetry.
+  4. Kernel, BIOS, drive firmware, slot, backplane, rack and PSU details, plus BMC event log (power and thermal).
+  5. Whether the drive came back on a rescan or needed a power cycle.
+  6. How many drives, slots and servers show the same pattern.
+- **Shared cause versus single drive:** several drives dropping at the same moment on one backplane or switch points to power, the switch or the backplane. A single drive on a single slot points to the drive or slot.
+FOLLOW:
+- The drive returns after a rescan. What does that tell you? => The drive and slot are not dead. It was a link event, a reset, or a hung controller that was recovered, so look at DPC, hot-plug and AER handling.
+- No AER in the log. Does that mean no PCIe error? => No. AER may be masked, owned by firmware, or the failure never produced an error message, such as a sudden power loss to the slot.
+PITFALL: Naming a root cause from a dmesg excerpt. The log tells you what the host saw, not what happened on the link.
+VERIFY: The exact wording of nvme and AER messages on your kernel version, and platform AER ownership (firmware-first or native).
+
+@@ 18.08 | Principal | Numeric | tags=regression,link-up,statistics,rule-of-three,automation,confidence
+Q: Design an automated regression for link-up yield across resets, speeds and temperatures, with a statistical pass criterion.
+SHORT: Define a trial (reset, then check speed, width, DL active, config read, CSTS.RDY and one verified I/O). Run it over a matrix of reset types, target speeds and temperatures. With zero failures in n trials, the 95 percent upper bound on the failure rate is about 3 / n, so 3,000 clean trials of one unit in one cell bound the rate below about 0.1 percent. Screen every cell with about 300 trials and go deep on the worst cells.
+DEEP:
+1. **Trial definition:** reset type (cold power cycle, warm reboot, hot reset, secondary bus reset, FLR, link disable and enable), then pass only if LnkSta speed and width equal the expected values, Data Link Layer Link Active is set, config space is readable, CSTS.RDY = 1, one I/O verifies, and AER shows no uncorrectable error. A lower speed than expected is a failure, classified separately.
+2. **Matrix example:** 5 reset types x 3 target speeds (Gen3, Gen4, Gen5) x 3 temperatures (cold, ambient, hot) = 45 cells.
+3. **Rule of three:** with zero failures in n independent trials, the 95 percent upper bound on the rate is 1 - 0.05^(1/n), about 3 / n.
+
+| Target failure rate | Trials for 95 percent | For 99 percent |
+|---|---|---|
+| 1 percent | 299 | 459 |
+| 0.5 percent | 598 | 919 |
+| 0.1 percent | 2,995 | 4,604 |
+| 0.01 percent | 29,957 | 46,050 |
+
+4. **With failures:** 1 failure in n gives an upper bound of about 4.74 / n, 2 failures about 6.3 / n. Report the bound with the count, and use an exact interval, not just k / n.
+5. **Time budget:** at 45 s per trial, one cell of 3,000 trials takes 37.5 h on one rig. A tiered plan: tier 1 is 300 per cell x 45 cells = 13,500 trials (bound 1 percent per cell), tier 2 is 3,000 in the three worst cells = 9,000 trials. Total 22,500 trials = 281 h, or about 47 h on six rigs.
+6. **Independence traps:** failures cluster by unit, slot and temperature. Randomize order, power-cycle between trials, do not pool across units, and report per-unit and per-cell results. A failing trial can leave the rig in a bad state, so freeze it and capture evidence before continuing.
+7. **Gate:** release requires each cell's upper bound below its tier's target (300-trial cells are only bounded at about 1 percent, so state that limit), no unexplained failure, and any failure root-caused. Compare firmware versions by bounds, not by single counts.
+FOLLOW:
+- 1 failure in 3,000 trials. Does it pass a 0.1 percent target? => The bound is 4.74 / 3,000 = 0.16 percent, so not proven. Root-cause it, or extend to about 4,750 trials in total with no further failure.
+- Why not run all 45 cells at 3,000? => 135,000 trials at 45 s is 1,688 h. The tiered plan finds bad cells cheaply and spends time only where the risk is.
+PITFALL: Pooling all trials into one number. A cell that fails at 5 percent hides inside a pool of many that never fail.
+VERIFY: Reset methods your platform exposes and their real duration, and exact confidence-interval method your organization uses.
+
+@@ 18.09 | Advanced | Scenario | tags=hot-plug,surprise-removal,esd,inrush,dpc,pciehp
+Q: How do you validate hot-plug and surprise removal without damaging hardware?
+SHORT: Use hot-plug-rated slots and connectors, and do bulk cycling with a hot-plug emulator fixture that switches power, presence and PERST# electrically so the connector is not worn out. Test orderly removal, surprise removal under I/O load, hot-add, and neighbors during events. Check that the OS and drivers contain the failure with no hang or panic, and that data acknowledged before removal survives.
+DEEP:
+- **Hardware safety:**
+  - Use form factors and connectors designed for hot-plug (U.2, U.3, E1.S, E3.S). M.2 is generally not hot-plug rated.
+  - Rated mating cycles are limited, so put thousands of cycles on a fixture with relays or FETs on power, presence detect and PERST#, keep real mating to a small count, and use a robot or guide.
+  - Mating sequence: ground and precharge first, power next, signals last. Backplanes should have a hot-swap controller with inrush limiting, and you should measure inrush and neighbor rail dips on a scope.
+  - ESD control and orderly power-off before manual removal.
+- **Scenarios:**
+  1. Orderly removal: `echo 0 > /sys/bus/pci/slots/<slot>/power` or the attention button, and device removal in the OS.
+  2. Surprise removal at idle and under fio load: I/O errors reach the application, no hang, no panic, no leaked resources.
+  3. Hot-add: enumeration, BAR assignment and driver bind, with bus numbers and windows reserved (see the Resets, Hot-Plug module).
+  4. Repeat behind a switch, with DPC, and confirm the error does not spread to other ports.
+  5. Neighbors: run I/O on adjacent drives during insertion and removal, and check for errors caused by rail dips or crosstalk.
+- **Device side:** surprise removal is a power loss for the drive. Verify power-loss protection, that `unsafe_shutdowns` increments, and that data acknowledged with a flush survived.
+- **Pass criteria:** thousands of cycles, zero hangs, zero panics, all neighbor I/O uninterrupted, re-enumeration every time, no data loss for acknowledged writes.
+FOLLOW:
+- What does the host see on a surprise removal? => Surprise Down at the port (or a hot-plug event), pending requests never complete and time out, and the NVMe driver sees reads of all 1s. A hot-plug slot should treat it as a removal, not a fatal error.
+- Why an emulator fixture? => A connector is rated for a limited number of mating cycles, and manual insertion also varies. Electrical switching gives repeatable timing and unlimited cycles.
+PITFALL: Testing hot-plug on a slot or drive not designed for it. You can damage the connector, drive or backplane.
+VERIFY: Connector mating-cycle ratings, mating sequence and hot-plug requirements in the form-factor specification (SFF or OCP) for your drive.
+
+@@ 18.10 | Principal | Scenario | tags=backplane,retimer,redesign,gen4,channel-loss,decision
+Q: You inherit a flaky Gen4 backplane. How do you decide between adding retimers and redesigning it?
+SHORT: Measure before choosing. Quantify per-slot failure, lane margin and channel loss against the Gen4 budget of about 28 dB at 8 GHz, find whether failures track slot position, drive or connector, and try cheap fixes first (presets, BIOS, connector rework). If the worst slots are only slightly over budget, retimers are a fast fix. If margin is structurally short or Gen5 is coming, redesign.
+DEEP:
+1. **Stabilize and measure:** per-slot link-up yield, correctable rates and lane margin, at temperature, across several drives. Plot margin against slot channel loss (VNA or simulation) and trace length.
+2. **Read the pattern:**
+   - Only the far slots fail: length and loss, a budget problem.
+   - One or two slots: connector, via or assembly defect, fix locally.
+   - Fails with certain drives: drive-side issue, not the backplane.
+   - Fails with certain hosts: host board, BIOS equalization.
+3. **Cheap fixes first:** transmitter presets and receiver settings, BIOS equalization settings, refclk and power checks, connector rework or replacement.
+4. **Compare options:**
+
+| Option | Strength | Cost and risk |
+|---|---|---|
+| Retimer | Splits the channel into two budgets, restores margin quickly | Added part, power, latency (tens of ns), firmware and configuration, own failure modes, more validation |
+| Redriver | Cheap boost | Amplifies noise and jitter, does not fix jitter, can interfere with training |
+| Redesign | Removes the cause: lower-loss material, shorter routes, better connector and vias | Cost, schedule, respin risk |
+
+5. **Decide with data:** if the worst slot is over budget by a small margin and the rest are fine, a retimer is fast. If most slots have little margin, or the product must carry Gen5 later, redesign, because at Gen5 a board and backplane get a far smaller share of the loss budget (the overall channel budget is about 36 dB at 16 GHz, but each inch loses much more at that frequency and the package and silicon take their share), and the retimers would be needed anyway.
+6. **Verify the choice:** repeat the margin and yield tests, and update the plan with the retimer's firmware and temperature behavior (see the Equalization and Retimers module).
+FOLLOW:
+- Why not just use a redriver? => It does not reset jitter or noise and cannot recover a marginal link that is jitter limited. It can also interfere with equalization.
+- What would change your decision toward redesign? => Margin that is structurally short across many slots, no cost or schedule room for retimer validation, or a Gen5 roadmap for the same backplane.
+PITFALL: Choosing a retimer because it is the fastest fix without asking whether the loss is at one slot or across the backplane.
+VERIFY: The loss budgets per generation (28 dB at 8 GHz for Gen4, 36 dB at 16 GHz for Gen5) and what part of the total belongs to the host, backplane and drive.
+
+@@ 18.11 | Advanced | Scenario | tags=error-handling,injection,containment,recovery,data-integrity
+Q: How do you validate error handling end to end: inject, contain, log, recover, and verify data?
+SHORT: For each error class choose an injection method, define the expected containment, log entries and recovery, and then run I/O with data verification before, during and after. Check that the right error is logged at the right place, the fault stays contained, the system recovers without hang or panic, and no data is silently corrupted.
+DEEP:
+
+| Injection | Layer | Expected containment and log | Recovery and check |
+|---|---|---|---|
+| Corrupt LCRC or Nak | Data Link | Bad TLP counted, replay, no visible failure | No data error, throughput dip only |
+| Bad DLLP | Data Link | Bad DLLP counted | Later DLLPs recover |
+| Poisoned TLP | Transaction | Poisoned TLP logged at the receiver, data not consumed | Command error or defined driver action, no silent use |
+| UR from an unmapped address | Transaction | Completion with UR, IOMMU or AER log | Command fails cleanly |
+| Withheld completion | Transaction | Completion timeout logged | Command aborts or resets, no hang |
+| Surprise down | Link | DPC or hot-plug event | Driver error handling, other devices unaffected |
+| Controller fatal (CSTS.CFS) | NVMe | Driver detects the fault | Controller reset, I/O resumes |
+
+- **Injection tools:** analyzer or exerciser (LCRC, DLLP, poison, delay completions), OS AER injection (`aer-inject` on Linux), ACPI EINJ for platform errors, kernel fault injection for NVMe and block, and firmware test hooks in the SSD.
+- **Contain:** a downstream port with DPC should stop traffic and prevent poisoned or corrupt data being consumed (see the Errors, AER & DPC module). Check that neighbors keep running.
+- **Log:** the right AER bit, header log and first error pointer, on the correct device, plus a kernel message and a rasdaemon record.
+- **Recover:** the AER driver flow (error detected, slot reset, resume) and the NVMe driver's handlers, then confirm the link retrains and I/O resumes within a time budget.
+- **Verify data:** run fio with data verification or per-LBA patterns and end-to-end protection information, and compare with a reference model after each recovery. Confirm no torn or stale data and no silent acceptance of poison.
+- **Metrics:** recovery time, I/Os failed, false positives, missing logs, and zero silent corruption.
+FOLLOW:
+- Which is the most dangerous outcome? => Silent data corruption, where an error is not detected or is logged but data is still used. A hang is bad, corruption is worse.
+- How do you test that a correctable error stays invisible? => Inject at a rate and verify throughput and data. The only effect is the replay cost and the counter.
+PITFALL: Checking that the error is logged but not that the recovered data is correct. Inject, then verify content.
+VERIFY: Availability of aer-inject, EINJ and NVMe fault injection on your kernel and platform, and the exact AER bits that map to each injected error.
+
+@@ 18.12 | Advanced | Concept | tags=gen4,gen5,gen6,flit,pam4,validation-differences
+Q: Compare validating Gen4, Gen5 and Gen6 devices. What changes in the plan?
+SHORT: Gen4 and Gen5 are both NRZ with 128b/130b, so the protocol tests carry over, but Gen5 has a tighter channel budget, adds precoding, and leans on retimers, so margin and channel work grow. Gen6 changes the game: PAM4, FLIT mode with FEC and flit-level replay, so the error model, counters, analyzers and instruments change. NVMe and software layers stay the same.
+DEEP:
+
+| Area | Gen4 (16 GT/s) | Gen5 (32 GT/s) | Gen6 (64 GT/s) |
+|---|---|---|---|
+| Signaling | NRZ | NRZ | PAM4, 32 GBaud |
+| Encoding and framing | 128b/130b | 128b/130b | FLIT mode, FEC and CRC |
+| Channel budget | About 28 dB at 8 GHz | About 36 dB at 16 GHz | Similar Nyquist, far less SNR |
+| Error model | Raw BER near 1e-12, LCRC replay | Same, precoding to limit DFE bursts | Raw pre-FEC BER much higher, FEC corrects and flit replay catches the rest |
+| Typical debug counters | Bad TLP, replay, Recovery | Same, plus retimer statistics | FEC and flit error and replay counts (VERIFY names) |
+| Retimers | Sometimes | Often | More often |
+| Instruments | Analyzer, scope | Higher bandwidth | Flit-aware analyzer, much higher bandwidth |
+| New features to validate | Lane margining | Precoding, more margin | FLIT, FEC, L0p |
+
+- **What carries over:** config space, enumeration, NVMe queues, MSI-X, resets, error classes, most of the plan.
+- **Gen5 additions:** margin per lane becomes the primary health metric, retimer segments must be validated, and thermal and channel corners matter more.
+- **Gen6 additions:** validate FEC and CRC behavior and flit replay, measure pre-FEC error rates, verify L0p, check latency (FEC adds delay), and prove that DLLP-based debug assumptions (Ack, Nak, replay counters) are replaced by flit-level equivalents. BER-style claims move to pre-FEC and flit-level error rates.
+- **Plan effect:** keep the layered checklist, but add the new counters and decode, and revalidate the exit criteria. Do not reuse Gen4 error thresholds.
+FOLLOW:
+- Why do Gen5 drives more often need retimers than Gen4? => The channel budget at 16 GHz Nyquist is tighter for the same board and connector, so more topologies exceed it.
+- What do you keep from a Gen4 plan for Gen6? => The layered method, reset and enumeration tests, NVMe tests, corner matrix and statistics. Replace the electrical and error-model tests.
+PITFALL: Assuming a Gen5 test plan scales to Gen6 by changing the speed. PAM4, FEC and flits change what an error is.
+VERIFY: Flit size and field layout, FEC and replay behavior, L0p, Gen6 counter names and requirements in PCIe Base 6.x, and Gen6 compliance program status.
+
+@@ 18.13 | Advanced | Trap | tags=nvme,timeout,doorbell,msi-x,checkpoints,clean-counters
+Q: The NVMe driver logs an I/O timeout but every PCIe counter is clean. Where do you look next?
+SHORT: Clean error counters do not mean a healthy path. A lost doorbell, a stuck credit, a masked interrupt or a hung firmware produces no PCIe error. Walk the six checkpoints of a command: doorbell arrived, SQE fetched, SQE completion returned, data moved, CQE posted, MSI-X sent. The first missing step names the suspect. Without an analyzer, use CSTS, interrupt counts, MSI-X mask and PBA state, and SSD debug logs.
+DEEP:
+
+| Checkpoint | If it is missing | Suspect |
+|---|---|---|
+| 1. Doorbell MWr reaches the SSD | Nothing starts | Host driver, BAR or Memory Space Enable off, write not delivered, link |
+| 2. SQE fetch (MRd) issued | Doorbell seen, nothing happens | Bus Master Enable clear, SSD firmware stalled, queue disabled |
+| 3. SQE completion returned | MRd sent, no CplD | Host memory path, IOMMU, Root Complex (a completion timeout may follow) |
+| 4. Data transfer | Command fetched, no data | Firmware or NAND stall, garbage collection, thermal throttle |
+| 5. CQE posted | Data moved, no CQE | Firmware completion path |
+| 6. MSI-X sent | CQE present, host not woken | MSI-X or vector masked, wrong affinity, pending bit set, driver |
+
+- **Without an analyzer:** read CSTS (RDY, CFS), `/proc/interrupts` per queue, the MSI-X Function Mask and the PBA, whether polling the CQ finds the completion, `nvme get-feature` for APST and power state, block-layer traces (`blktrace`, ftrace nvme events), SSD debug logs and temperature.
+- **Extra suspects:** a power-state exit latency (APST plus L1.2) exceeding a tight timeout, a long firmware pause (garbage collection or a thermal event), and host stalls (soft lockup, interrupt storm).
+- **Scope of the timeout:** one queue, one namespace, one command type, or everything? All queues at once points to the controller or the link. One queue points to interrupt or driver state.
+- **Why counters are clean:** they count errors that a layer detects. A missing packet, an undelivered doorbell or a masked interrupt is not an error to any layer.
+FOLLOW:
+- What default timeouts should you keep in mind? => Linux uses about 30 s for I/O and 60 s for admin commands by default (nvme_core parameters). A short timeout in your test may only be exposing a long firmware pause.
+- PBA bit set but no interrupt: what does it mean? => The device sent the interrupt but the vector or function was masked, so it is pending. Look at the host's masking and the driver.
+PITFALL: Reading "no AER errors" as "not PCIe". Lost or delayed packets need an analyzer or a device-side log to show.
+VERIFY: Default nvme_core timeout parameter names and values on your kernel, and the MSI-X Function Mask and PBA layout in the Interrupts module and spec.
+
+@@ 18.14 | Advanced | Cross-layer | tags=l1.2,aspm,ltr,power,latency,clkreq
+Q: Explain L1.2 power-saving trade-offs and how you validate that latency targets are met.
+SHORT: L1.2 gates the reference clock and turns off the link's common-mode bias, so idle power drops, but the first I/O after idle pays an exit latency of tens of microseconds or more (the drive's T_POWER_ON plus common-mode restore plus Recovery). LTR tells the host how much latency the device tolerates. Validate by measuring idle power, state residency and the QD1 latency-versus-idle-gap curve, and require the tail latency to meet the target.
+DEEP:
+- **Mechanism (see the Power Management module):** the L1 PM Substates capability adds L1.1 and L1.2. L1.2 needs CLKREQ# to let the platform remove REFCLK, and LTR to decide when it is safe. The link enters L1.2 only when idle long enough and LTR allows.
+- **Trade-off:** saves the most idle power (the difference between L0 idle and L1.2 idle is large for a drive, on the order of hundreds of mW, VERIFY), costs exit latency on the first I/O, which lands in the p99 and p99.9 at low queue depth.
+- **Interplay with NVMe:** APST puts the controller in a deeper NVMe power state after idle, with its own entry and exit latencies. The two exit latencies can add.
+- **Validation steps:**
+  1. Confirm entry: read L1SS control bits and LTR values, watch CLKREQ# and REFCLK on a scope, use PHY residency counters, and measure the 3.3 V rail power.
+  2. Measure exit latency: from the first doorbell or CLKREQ# assertion to L0 and the first TLP, on an analyzer.
+  3. Latency curve: QD1 4 KB reads with idle gaps from 10 microseconds to 10 seconds (`fio --thinktime`, `--lat_percentiles=1`). The latency steps up at the L1 entry timer and again at L1.2 thresholds.
+  4. Compare p50, p99, p99.9 with substates enabled and disabled. Pass if the added tail latency is within the target.
+  5. Stress: millions of entry and exit cycles, at temperature, with retimers, checking for errors and link retrains.
+  6. Platform matrix: host support and LTR programming differ.
+- **Example:** if L1.2 exit is 70 microseconds (hypothetical) and the read takes 80, the first read after idle is 87 percent slower, which matters for a latency SLA and not for a cold archive.
+FOLLOW:
+- Why can LTR values make L1.2 never engage? => If the device reports a tolerance below the L1.2 exit latency (or the threshold), the platform will not allow L1.2.
+- Where do you look if the tail latency got worse after enabling substates? => The idle-gap curve, the exit latency, LTR values, and APST settings.
+PITFALL: Validating only that the link enters L1.2 and saves power. The requirement is the tail latency, so measure the first I/O after idle.
+VERIFY: L1.1 versus L1.2 clock and common-mode behavior, the T_POWER_ON and Common Mode Restore Time fields, typical exit latency, and LTR threshold rules in the Base Specification.
+
+@@ 18.15 | Advanced | Cross-layer | tags=rapid-fire,link,physical,ltssm,electrical
+Q: Rapid fire: link and physical. Answer ten one-liners.
+SHORT: This round checks fast recall across the physical layer, LTSSM, equalization and Data Link basics. Answer each in one sentence, then be ready to go one level deeper on any of them. The goal is precise, correct one-liners, and admitting VERIFY items instead of guessing.
+DEEP:
+- **Why does Polling run at 2.5 GT/s?** Every device supports it and it needs no equalization, so it is the common starting point.
+- **Which state handles a speed change and an L1 exit?** Recovery.
+- **What is the Gen4 Nyquist frequency?** 8 GHz, half of 16 GT/s for NRZ.
+- **What is the Gen3 and above encoding overhead?** 128b/130b, about 1.5 percent, versus 20 percent for 8b/10b.
+- **What does a retimer do that a redriver does not?** It recovers the clock and retransmits, splitting the channel into two budgets.
+- **What is a SKP ordered set for?** Absorbing clock differences between two reference clocks by adding or removing symbols.
+- **What does Receiver Error mean, versus Bad TLP, and who logs them?** Receiver Error is a PHY-level decode or framing failure and Bad TLP is an LCRC or sequence failure. The receiver logs both, so Bad TLP at the endpoint describes the inbound direction.
+- **What does Replay Number Rollover cause?** The Data Link Layer requests link retraining (Recovery).
+- **What does lane margining tell you?** The timing and voltage margin at a real receiver, per lane and direction, in system.
+- **What is the difference between an L0 link and a usable link?** The Data Link Layer must also reach DL_Active after flow control initialization.
+FOLLOW:
+- Which of these did you have to hedge on? => Say plainly which ones: the numbers that sit under VERIFY in this guide, such as budgets and timeouts. Say where you would look them up.
+- How would you extend one answer into a debug story? => Choose one, for example Rollover, and say what you would read (AER, LnkSta, LTSSM history) and what you would change.
+PITFALL: Padding one-liners with detail. Give the crisp answer first and let the interviewer pull the depth.
+VERIFY: The 36 dB and 28 dB budget figures, SKP interval, and encoding overheads in the Base Specification.
+
+@@ 18.16 | Advanced | Cross-layer | tags=rapid-fire,protocol,system,nvme,tlp,aer
+Q: Rapid fire: protocol and system. Answer ten one-liners.
+SHORT: This round covers TLPs, ordering, config space, interrupts, AER and NVMe over PCIe. Give one crisp sentence for each and expect a follow-up on any. Precision matters more than volume, and anything spec-sensitive should be flagged instead of guessed.
+DEEP:
+- **Which requests are posted?** Memory writes and messages. Reads, I/O and config requests are non-posted and get completions.
+- **What limits the payload size and the read request size?** MPS (the lowest of the two ends) limits payload, MRRS limits how much one read request can ask, and completions split at the RCB.
+- **Can a memory TLP cross a 4 KB boundary?** No. The address plus length must stay within a 4 KB region.
+- **What is CRS for?** Configuration Request Retry Status lets a device that is not ready delay enumeration without failing it.
+- **Why does the CQE not overtake the data?** Both are posted writes on the same path and posted writes stay in order.
+- **Where do NVMe doorbells live?** In BAR0 starting at offset 1000h, spaced by the stride in CAP.DSTRD.
+- **MSI versus MSI-X for NVMe?** MSI-X gives a per-vector table with masking and up to 2048 vectors, so each queue can have its own vector and CPU.
+- **What does a UR completion mean?** The completer does not support or cannot route the request. It is an error class. The completer detects and logs it, and the requester sees the status in the completion and may log it too.
+- **What does DPC do?** It contains an uncorrectable error by disabling the downstream port's link so bad data does not spread, and lets software recover.
+- **FLR versus CC.EN = 0?** FLR resets the whole function, including PCIe state, and CC.EN = 0 resets only the NVMe controller.
+FOLLOW:
+- Pick one answer you gave and describe a failure that violates it. => For example, a completion arriving before its data would break the producer-consumer model, which shows up as stale data with a good CQE.
+- Which answers depend on the platform? => MPS and RCB, completion timeout values, and DPC and AER ownership, so state them as defaults, not universal facts.
+PITFALL: Answering from memory of one platform. MPS, RCB and timeouts vary, so say "typically".
+VERIFY: The MSI-X table size limit, the doorbell offset and stride rules, and FLR and CC.EN behavior in the Base and NVMe specifications.
+
+@@ 18.17 | Principal | Scenario | tags=communication,leadership,root-cause,stakeholders,status
+Q: How do you communicate a root cause and fix status to stakeholders?
+SHORT: Lead with the conclusion and its status in one line, then give evidence, confidence, blast radius, workaround, next steps with dates, and the decision you need. Separate what is proven from what is suspected, quantify with rates and confidence, name the affected populations, and update on a fixed cadence. Do not mix root cause and fix status, and never let a hypothesis sound like a finding.
+DEEP:
+- **Structure of the update:**
+  1. **Status line:** what is known and where the fix stands, in one sentence.
+  2. **Impact and blast radius:** which products, platforms, firmware and customers, and what fraction. For example "about 2 percent of servers on platform X".
+  3. **Evidence:** the decisive observations (swap test result, margin data, trace), not the whole investigation.
+  4. **Confidence:** proven, likely or hypothesis, and what would change it.
+  5. **Workaround and mitigation:** what customers can do now.
+  6. **Plan:** next steps with owners and dates, and how the fix will be verified (rate and trials).
+  7. **Ask:** the decision, resource or approval needed.
+- **Principal-level habits:**
+  - Say what you do not know, and how you will find out.
+  - Give numbers with intervals (0 failures in 3,000 trials means under 0.1 percent at 95 percent), not "looks stable".
+  - Keep one source of truth and a fixed update time.
+  - Escalate early when the risk or timeline changes, not after.
+  - After the fix, publish the escape analysis: why the lab missed it and what regression now covers it.
+- **Audience:** engineering wants signatures and data, program managers want dates and risk, executives want impact and decisions. Same facts, different depth.
+FOLLOW:
+- Root cause is only 70 percent certain. What do you tell people? => State it as the leading hypothesis with the evidence for and against, name the test that will confirm it and when, and give the mitigation that holds in either case.
+- A customer wants a date. What do you say? => A range tied to milestones, such as "fix build in X days, verification needs about N trials, which is Y days", not a single optimistic date.
+PITFALL: Reporting activity ("we are investigating") instead of state: what is known, what is not, and what changes next.
+
+@@ 18.18 | Principal | Scenario | tags=mentoring,training,analyzer,trace-reading,team
+Q: How would you mentor a new validation engineer to read a protocol-analyzer trace in one week?
+SHORT: Start from a known-good capture and build up layer by layer: link-up anatomy on day 1, one NVMe command's TLPs on day 2, ACK/NAK and replay on day 3, LTSSM and Recovery on day 4, and a blind debug of unlabeled traces on day 5. Each day ends with an annotated deliverable. Teach the good-versus-bad diff, triggers and filters, and what a trace cannot show.
+DEEP:
+| Day | Focus | Exercise | Output |
+|---|---|---|---|
+| 1 | Anatomy of link-up | Mark every phase on a good capture from PERST# to L0: TS1 and TS2, EIEOS, SKP, InitFC1 and InitFC2, first config TLPs | Annotated timeline with timestamps |
+| 2 | Reading TLPs | Follow one NVMe read: doorbell, SQE fetch, data MWr TLPs, CQE, MSI-X. Match tags, lengths and addresses | Table of the 22 TLPs and the byte count and efficiency |
+| 3 | Data Link Layer | A capture with an injected LCRC error: sequence numbers, Nak, replay, Acks | Written explanation of the replay and the cost |
+| 4 | LTSSM and Recovery | Compare normal L1 exit, a speed change, a downtrain and Polling.Compliance snippets | State trail and cause for three snippets |
+| 5 | Blind debug | Three unlabeled traces, each with a different fault. Also set the trigger and filter for one | Ten-minute readout with confidence levels |
+
+- **Method to teach:**
+  - Always read a known-good trace first, then diff the failing one against it.
+  - Work in layers: framing, then DLL (sequence numbers, Ack and Nak), then TL (type, address, tag, length, status), then LTSSM and NVMe meaning.
+  - Use a checklist: who sent it, which direction, what came before, what should come next, and what is missing.
+  - Practice triggers, pre-trigger depth, filters and timestamp correlation (see the Debug module).
+- **Limits to teach early:** the analyzer sees the wire at its tap, not the receiver's view, and an interposer changes the channel.
+- **Assessment:** by Friday they can explain a trace to another engineer in two minutes, predict the next packet, say what the trace cannot show, and hand over an annotated file someone else can follow.
+- **Support:** pair on the first real failure, keep a reference library of annotated captures, and review their first three written findings for evidence and confidence wording.
+FOLLOW:
+- The new engineer freezes on raw symbols. What do you do? => Move up a level: use the decoded view with a short list of what to look for, and only drop to symbols to answer a specific question.
+- How do you know the week worked? => They correctly classify a blind trace, their annotations are usable by others, and they ask "what would I expect to see here" before opening a capture.
+PITFALL: Starting with a hard failing trace. With no baseline, everything looks abnormal, so start with known-good and change one thing at a time.

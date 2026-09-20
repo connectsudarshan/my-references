@@ -1,0 +1,20 @@
+[
+  {"id":1,"title":"Fundamentals, Topology & Bandwidth","desc":"Why PCIe exists, lanes and links, the RC/switch/endpoint tree, generations, encoding, and bandwidth math you can do on a whiteboard."},
+  {"id":2,"title":"Layered Architecture","desc":"Transaction, Data Link and Physical layers, what each owns, end-to-end versus per-hop fields, and where each kind of error is detected."},
+  {"id":3,"title":"Physical Layer & Electricals","desc":"Differential signaling, embedded clocks, scrambling, electrical idle, reference clocking, jitter, eye diagrams, PAM4 and lane margining."},
+  {"id":4,"title":"LTSSM & Link Training","desc":"Every LTSSM state and sub-state, TS1/TS2 contents, Recovery, speed and width changes, timeouts, and how to triage link-up failures."},
+  {"id":5,"title":"Equalization & Retimers","desc":"Why equalization exists, presets and coefficients, the four Gen3+ phases, status bits for debug, retimers versus redrivers."},
+  {"id":6,"title":"Data Link Layer","desc":"Sequence numbers, LCRC, ACK/NAK, replay buffer and timers, DLLP formats, DL states and reading correctable-error counters."},
+  {"id":7,"title":"TLP Anatomy & Transaction Types","desc":"Header fields, formats and types, addressing and routing, MPS/MRRS/RCB, completions and status, prefixes, atomics."},
+  {"id":8,"title":"Flow Control & Ordering","desc":"Credits, InitFC/UpdateFC, virtual channels, the ordering table, relaxed and ID-based ordering, deadlock avoidance."},
+  {"id":9,"title":"Config Space & Enumeration","desc":"Type 0/1 headers, BAR sizing, capability lists, ECAM, the enumeration algorithm and bus numbering."},
+  {"id":10,"title":"Interrupts (INTx / MSI / MSI-X)","desc":"Legacy INTx emulation, MSI and MSI-X structures, vector tables, PBA, masking and affinity."},
+  {"id":11,"title":"Power Management","desc":"D-states, L-states, ASPM, L1 substates, LTR, PME, and how NVMe power states interact with the link."},
+  {"id":12,"title":"Errors, AER & DPC","desc":"Error classes, AER registers and header logs, completion timeouts, poisoned TLPs, containment and recovery."},
+  {"id":13,"title":"Virtualization & I/O Services","desc":"SR-IOV, ATS/PRI/PASID, ACS, IOMMU interaction, peer-to-peer, TPH and AtomicOps."},
+  {"id":14,"title":"Gen5/6, FLIT, CXL & Security","desc":"Precoding, PAM4, FLIT mode and FEC, L0p, CXL on the PCIe PHY, IDE and DOE/SPDM."},
+  {"id":15,"title":"Resets, Hot-Plug & Form Factors","desc":"PERST#, hot reset, FLR, surprise removal, sideband signals, M.2, U.2/U.3, E1.S/E3.S, OCuLink."},
+  {"id":16,"title":"NVMe over PCIe (Cross-layer)","desc":"BAR0 registers, doorbells, queues and PRP/SGL as TLPs, MSI-X per queue, CC.EN resets, CMB/PMR and P2P."},
+  {"id":17,"title":"Debug, Analyzers & Compliance","desc":"Reading protocol-analyzer traces, link-up triage, lspci/setpci and Windows tooling, compliance, loopback, stress and error injection."},
+  {"id":18,"title":"Scenarios & System Design","desc":"Open-ended validation-plan and root-cause questions that cross every layer, the way a Principal loop tests them."}
+]

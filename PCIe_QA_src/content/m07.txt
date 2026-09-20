@@ -1,0 +1,389 @@
+# Module 7 — TLP Anatomy & Transaction Types
+
+@@ 7.01 | Basic | Concept | fig=tlphdr | tags=tlp,header,fmt,type,dw0
+Q: What does a TLP look like, and what do the Fmt and Type fields tell you?
+SHORT: A TLP is a header of 3 or 4 DW, an optional payload of up to 1024 DW, and an optional 1-DW ECRC. DW0 is common to every TLP: Fmt (3 bits) gives the header size and whether data follows, Type (5 bits) gives the kind of TLP, then come TC, Attr, TD, EP, AT and a 10-bit Length counted in DW. In a request, DW1 holds Requester ID, Tag and the byte enables, and DW2/DW3 hold the address.
+DEEP:
+- **Fmt[2:0]:** 000 = 3DW header, no data; 001 = 4DW, no data; 010 = 3DW with data; 011 = 4DW with data; 100 = TLP prefix. Bit 0 picks 3DW or 4DW and bit 1 says whether a payload follows.
+- **Type[4:0]:** together with Fmt it selects memory, I/O, configuration, message, completion or atomic (next question).
+- **TC[2:0]:** Traffic Class 0 to 7, mapped to a Virtual Channel (Module 8). **Attr** holds the Relaxed Ordering, No Snoop and ID-Based Ordering bits; those bits exist here but the ordering rules belong to Module 8.
+- **TD and EP:** TD says a 1-DW ECRC digest follows the payload. EP says the payload is poisoned. **AT[1:0]** is the address type used with ATS.
+- **Length[9:0]:** payload size in DW. The value 0 encodes 1024 DW, which is 4 KB. On a read request it is the amount requested.
+- **3DW versus 4DW:** a 3DW request carries a 32-bit address, a 4DW request a 64-bit address. A requester must use the 4DW form only for addresses above 4 GB.
+- **Requests, DW1:** Requester ID (16 bits), Tag (8 bits), Last DW BE and First DW BE (4 bits each). Address bits [1:0] are not sent because access is DW aligned; the byte enables give the byte level.
+FOLLOW:
+- Why does a doorbell write to an SSD look like a 4DW TLP on a server but a 3DW TLP on some other systems? => The header size follows the target address. BAR0 placed above 4 GB needs the 64-bit form, while one below 4 GB uses the 32-bit form.
+- Which fields change hop by hop? => In a normal memory or message TLP, none of DW0 to DW3. Sequence number, LCRC and framing are added per link outside the TLP. Exceptions: a bridge converts Type 1 config requests to Type 0, and a switch may set EP on a TLP it finds corrupted.
+PITFALL: Reading Length as bytes, or treating Length 0 as an empty transfer. It means 1024 DW, or 4096 bytes.
+VERIFY: Bit positions of the extra tag bits (T9, T8) and the LN bit in DW0 byte 1 in the spec revision you use, and the rule that addresses below 4 GB must use the 3DW format.
+
+@@ 7.02 | Basic | Concept | tags=types,mrd,mwr,cfg,msg,cpl,atomic
+Q: Which TLP types exist, and how are they encoded in Fmt and Type?
+SHORT: Memory read and write, I/O read and write, configuration read and write (Type 0 and Type 1), messages, completions with or without data, and three AtomicOps (FetchAdd, Swap, CAS). Memory read locked (MRdLk) is a legacy type. Fmt and Type together form byte 0 of the header, so an analyzer shows 20h for a 64-bit read, 60h for a 64-bit write and 4Ah for a completion with data.
+DEEP:
+| TLP | Byte 0 (Fmt+Type) | Posted or not | Response |
+|---|---|---|---|
+| MRd | 00h (3DW), 20h (4DW) | Non-posted | CplD |
+| MRdLk (legacy) | 01h, 21h | Non-posted | CplDLk |
+| MWr | 40h (3DW), 60h (4DW) | Posted | None |
+| IORd, IOWr | 02h, 42h | Non-posted | CplD, Cpl |
+| CfgRd0, CfgWr0 | 04h, 44h | Non-posted | CplD, Cpl |
+| CfgRd1, CfgWr1 | 05h, 45h | Non-posted | CplD, Cpl |
+| Cpl, CplD | 0Ah, 4Ah | n/a | n/a |
+| CplLk, CplDLk | 0Bh, 4Bh | n/a | n/a |
+| Msg, MsgD | 30h to 37h, 70h to 77h | Posted | None |
+| FetchAdd, Swap, CAS | 4Ch to 4Eh (3DW), 6Ch to 6Eh (4DW) | Non-posted | CplD |
+
+- **Messages:** always a 4DW header. The low 3 bits of Type are the routing subfield, so a message's byte 0 varies with how it is routed (see the routing question).
+- **Atomics:** the completer performs a read-modify-write and returns the original value in a CplD. Support is optional and advertised in Device Capabilities 2. NVMe SSDs rarely issue them.
+- **Locked reads:** only Root Complexes issue MRdLk and native endpoints are not required to support it.
+- **Analyzer habit:** memorize 00h, 20h, 40h, 60h, 4Ah and 0Ah. They cover almost all NVMe traffic.
+FOLLOW:
+- Which of these does an NVMe SSD generate as a requester, and which does it receive? => It sends MRd (SQE, PRP or SGL, write data) and MWr (read data, CQE, MSI-X), plus Cpl and CplD as a completer. It receives MWr (doorbells) and MRd, CfgRd and CfgWr from the host.
+- Why are I/O and configuration writes non-posted? => Software needs to know they took effect, and an error has to come back to the requester, so they return a Cpl without data.
+PITFALL: Assuming MSI-X is a Msg TLP. An MSI-X interrupt is an ordinary MWr to the address in the vector table. Msg types carry INTx emulation, power management, error signaling and vendor messages.
+VERIFY: Type encodings for messages, atomics and locked transactions, and the AtomicOp operand sizes, in the Base Specification.
+
+@@ 7.03 | Basic | Concept | tags=routing,address,id,implicit,switch
+Q: How are TLPs routed: address routing, ID routing and implicit routing?
+SHORT: Memory and I/O requests route by address: a switch compares it with each downstream port's windows and sends the TLP down on a match, or up otherwise. Configuration requests and completions route by ID (bus, device, function). Messages carry a 3-bit routing subfield in Type that picks address, ID, or implicit routing, such as to the Root Complex, broadcast from it, or terminate at the next receiver.
+DEEP:
+| Routing | Used by | How a switch decides |
+|---|---|---|
+| Address | MRd, MWr, IORd, IOWr, atomics, Msg with 001 | Address inside a downstream port's base and limit window goes down, else up |
+| ID | CfgRd/Wr, Cpl, CplD, Msg with 010 | Bus number inside a port's secondary to subordinate range goes down, else up |
+| Implicit | Msg with 000, 011, 100, 101 | To Root Complex, broadcast from Root Complex, local (terminate at receiver), gather to Root Complex |
+
+- **Completions:** the completer copies the request's Requester ID and Tag into the completion, which routes by ID back to the requester. The tag is never used for routing.
+- **Configuration:** a Type 1 request travels through bridges, and the bridge whose secondary bus matches converts it to Type 0 for the device on that bus.
+- **Peer to peer:** because memory requests route by address, an SSD can write to another endpoint's BAR through a switch if the address fits a downstream window. ACS can force such traffic up to the Root Complex instead.
+FOLLOW:
+- Which routing does an SSD's SQE fetch use in each direction? => The MRd routes by address (a host memory address) upstream, and the CplD routes by ID, using the SSD's own BDF, downstream.
+- Which routing does a Power Management PME message use? => Implicit routing to the Root Complex, so no address or ID is involved.
+PITFALL: Believing the tag helps route a completion. Routing uses the Requester ID only, and the tag matters only at the requester.
+VERIFY: Message routing subfield encodings and the Type 1 base and limit rules in the Base Specification.
+
+@@ 7.04 | Intermediate | Concept | tags=length,byte-enable,first-be,last-be,zero-length
+Q: How do Length and the First and Last DW byte enables express a byte-granular access?
+SHORT: Length counts whole DW. Byte-level precision comes from two 4-bit masks: First DW BE for the first DW and Last DW BE for the last, with every DW in between fully enabled. A 1-DW access uses only First DW BE and sets Last DW BE to 0000. A read of Length 1 with First BE 0000 is a zero-length read, used to flush earlier posted writes.
+DEEP:
+- **Mask meaning:** bit i of a BE field enables byte i of that DW, so 0001b is the lowest-addressed byte and 1100b is bytes 2 and 3.
+- **Byte count:** bytes moved = 4 x Length, minus the unused low bytes in the first DW, minus the unused high bytes in the last DW.
+- **Example, 6-byte write at address 0x...02:** DW0 holds bytes 2 and 3, DW1 holds four more, so Length = 2, First BE = 1100b, Last BE = 1111b, and the address field carries 0x...00.
+- **Example, unaligned 4-byte access at 0x...02:** it straddles two DW, so it becomes Length 2, First BE 1100b, Last BE 0011b.
+- **Length 0:** means 1024 DW. It is legal only when MPS (writes) or MRRS (reads) allow 4096 bytes.
+- **Zero-length read:** the completer must still return one DW of data, whose value is undefined. Software uses it as a cheap flush, because a read cannot pass earlier posted writes (Module 8).
+- **SSD flavor:** doorbells are 4-byte writes with BE 1111b. An 8-byte register such as CAP appears as one 2-DW read or as two 1-DW reads, depending on how the host accessed it.
+FOLLOW:
+- Where do byte enables appear in a completion? => They do not. Byte Count and Lower Address in the completion carry the same information (see the completion header question).
+- Can a memory write have First BE 0000? => Only as a 1-DW zero-length write, which is legal but useless for data. Both BE fields are normally non-zero when Length is greater than 1.
+PITFALL: Treating the BE as offsets into the payload. They are relative to the DW-aligned address, not to the start of the data.
+VERIFY: Legal BE patterns, including non-contiguous enables for 1-DW and 2-DW requests and the zero-length write rules.
+
+@@ 7.05 | Intermediate | Concept | tags=requester-id,tag,extended-tag,10-bit-tag,outstanding
+Q: What are the Requester ID and Tag, and why do tags limit the number of outstanding reads?
+SHORT: The Requester ID (bus, device, function) says who sent a request, and the Tag identifies each outstanding non-posted request from that requester. The completer copies both into the completion so the requester can match it. A requester can have only as many reads in flight as it has free tags: 32 with the original 5-bit tag, 256 with extended tags, up to 1024 with 10-bit tags. So bandwidth is capped at tags x read size / round-trip time.
+DEEP:
+- **Requester ID format:** Bus [15:8], Device [7:3], Function [2:0]. With ARI the device and function fields merge into an 8-bit function number.
+- **Tag scope:** unique among the non-posted requests outstanding from one Requester ID. A tag is allocated when a request is issued and freed when the last completion for it arrives. Split completions all carry the same tag.
+- **Widths:** the original tag field uses 5 bits. Extended Tag Field Enable (Device Control) makes it 8 bits. 10-bit tags need the Requester Enable in Device Control 2 and a completer that supports them.
+- **Bandwidth math:** the numeric worked out in Module 2 (about 31 reads of 256 B for Gen4 x4 at 1 microsecond). Here is the other direction: 32 tags x 256 B at a 2 microsecond round trip (through a switch and an IOMMU) caps at 4.1 GB/s, already below Gen4 x4.
+- **Buffer promise:** an endpoint that issues reads advertises infinite completion credits (Module 8), so it must own enough buffer for every outstanding tag times its read size.
+- **Ordering:** completions for different tags can come back in any order, so the requester places data by tag and address, never by arrival order.
+FOLLOW:
+- Can two outstanding requests from one requester share a tag? => No. Completions would be ambiguous, and a late completion could be applied to the wrong request.
+- Do posted writes need a tag? => The field exists but nothing matches on it, since no completion returns.
+PITFALL: Confusing tags with flow control credits. Tags are an end-to-end limit set by the requester. Credits are a per-link limit set by each receiver (Module 8).
+VERIFY: Bit positions of Extended Tag Field Enable and 10-bit Tag Requester Enable, and which capability bits show completer support for 10-bit tags.
+
+@@ 7.06 | Intermediate | Concept | tags=mps,mrrs,rcb,4kb-rule,device-control
+Q: What are MPS, MRRS and RCB, what is the 4 KB rule, and where are they set?
+SHORT: Max_Payload_Size (MPS) caps the data in any one TLP, from 128 B to 4096 B, and is set in Device Control. Max_Read_Request_Size (MRRS) caps how much one read request may ask for. The Read Completion Boundary (RCB, 64 or 128 B) is the address boundary where a completer may split a read's data. No request may cross a 4 KB address boundary.
+DEEP:
+| Parameter | Limits | Where | Values |
+|---|---|---|---|
+| MPS | Payload of one MWr, MsgD or CplD | Device Control, bits 7:5 | 128 B to 4096 B |
+| MRRS | Size of one read request | Device Control, bits 14:12 | 128 B to 4096 B |
+| RCB | Where a read's completions may split | Link Control, bit 3 | 64 B or 128 B |
+| 4 KB rule | Address plus length of any request | Fixed by the spec | 4096 B |
+
+- **MPS is per device:** each function is set to no more than its Device Capabilities limit, and the operating system normally programs the smallest value the path supports. A TLP whose payload exceeds the receiver's MPS is a Malformed TLP.
+- **MRRS is independent of MPS:** a larger MRRS means fewer request TLPs. The data returns as several completions, each at most MPS.
+- **RCB:** Root Complexes use 64 or 128 B. Other elements use 128 B. A completer may only split at RCB-aligned addresses.
+- **4 KB rule:** a 512 B DMA that starts at offset 0xF00 in a page becomes two TLPs of 256 B, because the first must stop at the 4 KB boundary. NVMe pages are at least 4 KB, so PRP boundaries never conflict.
+- **Where to look:** `lspci -vv` shows `MaxPayload` and `MaxReadReq` in DevCap and DevCtl for each device.
+FOLLOW:
+- Is MPS set per link or per device? => Per device, but the values along a path must be consistent, because a receiver rejects a TLP larger than its own MPS.
+- Does RCB apply to writes? => No. It applies only to how completions for a read are split.
+PITFALL: Expecting a larger MRRS to produce larger completions. Completion payload is bounded by MPS and by the completer's choice of split.
+VERIFY: RCB rules for endpoints versus Root Ports, and the Device Control and Link Control bit positions.
+
+@@ 7.07 | Intermediate | Concept | tags=completion,status,byte-count,lower-address,ur,ca,crs
+Q: What is in a completion header, and what do the status codes mean?
+SHORT: A completion always has a 3DW header. DW1 holds the Completer ID, a 3-bit Completion Status, the BCM bit and a 12-bit Byte Count. DW2 holds the Requester ID, the Tag and a 7-bit Lower Address. Status is SC (successful), UR (unsupported request), CRS (configuration retry) or CA (completer abort). Byte Count is the bytes still to come including this TLP, and Lower Address is the low 7 bits of the address of its first byte.
+DEEP:
+| Bits | Field | Meaning |
+|---|---|---|
+| DW1 [31:16] | Completer ID | BDF of the device that answered |
+| DW1 [15:13] | Completion Status | 000 SC, 001 UR, 010 CRS, 100 CA |
+| DW1 [12] | BCM | Byte Count Modified, used only by PCI-X bridges, 0 in native PCIe |
+| DW1 [11:0] | Byte Count | Remaining bytes for the whole request, 4096 encoded as 0 |
+| DW2 [31:16] | Requester ID | Routes the completion back |
+| DW2 [15:8] | Tag | Matches the outstanding request |
+| DW2 [6:0] | Lower Address | Low 7 bits of first byte address |
+
+- **Cpl versus CplD:** CplD carries data and Length is the DW in this completion. A Cpl without data answers writes to I/O or configuration space, and errors.
+- **CRS:** valid only for configuration requests. It tells the requester the device is not ready yet, for example just after reset. A Root Port retries, or with CRS Software Visibility returns a special Vendor ID value 0001h to software.
+- **Unexpected completion:** a completion whose Requester ID and Tag match nothing outstanding is logged as an Unexpected Completion error and dropped.
+FOLLOW:
+- Why does the completion repeat the Requester ID and Tag? => The completer holds no other state. The ID routes the completion and the tag selects the outstanding request.
+- Does a UR completion carry data? => No. It is a Cpl without data with status UR, and the requester treats the read as failed.
+PITFALL: Reading Byte Count as this TLP's payload size. It is what remains of the whole request, so it equals the payload only in the last completion.
+VERIFY: Completion Status encodings, and the values of Byte Count and Lower Address in error completions.
+
+@@ 7.08 | Intermediate | Concept | tags=poisoned,ep,ecrc,td,data-integrity
+Q: What is a poisoned TLP, and how does it differ from an ECRC error?
+SHORT: The EP bit is set by a device that knows the payload is already bad, for example after an uncorrectable ECC error, and forwards the TLP anyway. The TLP has a good LCRC and a good ECRC, so the link sees nothing wrong. An ECRC error means the TLP was changed in flight and is caught end to end when the TD bit says a digest is present. Poison says the data was bad at the source. ECRC says something corrupted it on the way.
+DEEP:
+- **Who sets EP:** a requester or completer with uncorrectable data (for example a Root Complex returning host memory that failed ECC), or a switch that detects an internal data fault while forwarding.
+- **Receiver action:** it logs Poisoned TLP Received and must not treat the data as good. AER register details are in Module 12.
+- **No replay:** LCRC is fine, so the Data Link Layer does nothing. Poison is a data-integrity signal, not a link error.
+- **ECRC:** TD=1 adds a 32-bit digest over the header (variant bits masked, EP among them) and payload, generated at the source and checked by the final receiver. Enabling it is an AER capability setting on both ends.
+- **Delivery differs:** a poisoned TLP is delivered with a flag. An ECRC failure means the TLP is not delivered, and a requester of a non-posted request usually learns through a completion timeout.
+- **SSD flavor:** if the SSD fetches write data and a CplD comes back poisoned, the controller must not program that data into NAND as good. The command should complete with an error such as Data Transfer Error. NVMe end-to-end protection information is a separate storage-level check.
+FOLLOW:
+- Why can the LCRC not catch what ECRC catches? => The LCRC is regenerated at each hop, so a fault inside a switch gets a fresh good LCRC (Module 6).
+- Can a poisoned TLP be sent on purpose in a test? => Yes, from a protocol exerciser or a device with an injection feature. It is the only clean way to test how a controller handles bad data from the host.
+PITFALL: Treating the EP bit as a link error indicator. It reports a data problem that was known at the source.
+VERIFY: Default severity and masking of Poisoned TLP Received and ECRC Error, the handling rules for poisoned writes to MMIO, and what a receiver does with an ECRC-failed request.
+
+@@ 7.09 | Intermediate | Trap | tags=ur,ca,unsupported-request,completer-abort,all-ones
+Q: A host read to an SSD returns all ones. Is that a UR or a CA, and how do you tell?
+SHORT: All ones alone tells you neither. UR means the completer does not support or decode the request: the address hits no BAR, the type or message is unsupported, or the function does not exist. CA means the completer decoded and supports the request but cannot complete it, because of an internal fault or a request it cannot service. A dead link also produces all ones. Check link state first, then the completion status on an analyzer and the error bits.
+DEEP:
+- **Non-posted:** the completer returns a Cpl with status UR (001) or CA (100), and a Root Complex turns it into all ones for the CPU. **Posted:** no completion exists, so the error is signaled by message or logged only.
+- **Typical UR causes with an SSD:** a read outside the BAR, a Type 1 or Type 0 configuration request to a function that is absent (this is how enumeration finds "no device"), an unsupported message, or a request with an unsupported type such as I/O.
+- **Typical CA causes:** the function is mid-reset or the controller logic faulted after decoding the address, or a design that aborts sizes and alignments it cannot handle instead of returning UR. Which one a device picks is a design decision.
+- **Where each is logged:** the completer logs Unsupported Request or Completer Abort in AER and sets Signaled Target Abort for CA. The requester's Status register shows Received Master Abort for UR and Received Target Abort for CA.
+- **Triage order:** first confirm the link is up and DL Active is set. Then look for the completion status on the analyzer, then AER and Status bits at both ends.
+- **IOMMU faults:** when an SSD's DMA hits an unmapped host address, the platform usually answers with UR or CA. Which one is platform specific.
+FOLLOW:
+- What does software see on a UR to a configuration read? => All ones, so Vendor ID reads as FFFFh, which is how enumeration detects an empty slot.
+- Is a UR always a bug? => No. Enumeration probes cause them deliberately, which is why platforms often mask or treat them as advisory.
+PITFALL: Calling every all-ones result a link failure, or every one a UR. Prove the link state and the completion status first.
+VERIFY: Bit positions of Signaled Target Abort, Received Target Abort and Received Master Abort in the Status register, and the default severity of UR and CA in AER.
+
+@@ 7.10 | Intermediate | Concept | tags=prefix,pasid,vdm,nvme-mi,mctp,message
+Q: What are TLP prefixes and vendor-defined messages, and where might you meet them on an SSD?
+SHORT: A TLP prefix is an extra DW placed before the header, marked by Fmt 100. Local prefixes are consumed by the next hop, and end-to-end prefixes travel to the destination, for example the PASID prefix used with address translation. A vendor-defined message (VDM) is a Msg TLP whose content is defined by a vendor. NVMe-MI can run over MCTP inside PCIe VDMs, giving a management controller an out-of-band path to the SSD.
+DEEP:
+- **Prefix format:** one DW, Fmt=100, with Type bit 4 selecting local (0) or end-to-end (1) and the rest naming the prefix. A TLP can carry a small, capability-limited number of end-to-end prefixes.
+- **Effect:** a prefix adds 4 bytes and extends the TLP with extra fields. It does not change routing or credits handling beyond the extra bytes. A switch that does not support end-to-end prefixes blocks them and reports an error.
+- **Examples:** PASID (end-to-end, tells the IOMMU which process address space), Extended TPH, and vendor-defined local or end-to-end prefixes. The details belong to Module 13.
+- **VDM basics:** a Msg or MsgD with message code 7Eh (Type 0) or 7Fh (Type 1) and a Vendor ID in the header. It can be routed to the Root Complex, by ID, or broadcast. A receiver that does not understand Type 0 returns UR, while Type 1 is silently discarded.
+- **NVMe-MI over VDM:** the baseboard management controller sends NVMe-MI commands (health, vendor log, firmware update) as MCTP over PCIe VDMs. On an analyzer they appear as MsgD TLPs. The alternative transport is MCTP over SMBus or I2C.
+- **Credits:** messages are posted TLPs, so they use posted credits like memory writes.
+FOLLOW:
+- Why is a Type 1 vendor message safer to broadcast? => Devices that do not recognize it drop it silently, while Type 0 makes them return UR and log an error.
+- Does NVMe-MI over VDM need the host NVMe driver? => No. It is a separate path, but it needs the link up and the controller's management logic alive.
+PITFALL: Assuming a prefix changes routing. Routing still follows the header that comes after the prefixes.
+VERIFY: Message codes for Vendor_Defined Type 0 and Type 1, the Max End-End TLP Prefixes limit, and the MCTP over PCIe binding used by NVMe-MI.
+
+@@ 7.11 | Advanced | Numeric | tags=completion-splitting,rcb,byte-count,lower-address,reassembly
+Q: How is a read split into completions, and how do Byte Count and Lower Address let the requester reassemble it?
+SHORT: The completer may split a read only at RCB-aligned addresses, with each completion at most MPS, and it must send them in address order. Every completion repeats the Requester ID and Tag, carries the bytes remaining in Byte Count, and gives the low 7 address bits in Lower Address. The requester knows a request is complete when a completion's Byte Count equals its own payload. A 200-byte read at 0x10000020 with RCB 64 B can return as four completions.
+DEEP:
+Assumptions: MRd at 0x1000_0020, Length 50 DW (200 B), full byte enables, MPS 256, completer splits at every 64 B boundary.
+
+| # | Address range | Payload | Byte Count | Lower Address |
+|---|---|---|---|---|
+| 1 | 0x10000020 to 0x1000003F | 32 B | 200 | 20h |
+| 2 | 0x10000040 to 0x1000007F | 64 B | 168 | 40h |
+| 3 | 0x10000080 to 0x100000BF | 64 B | 104 | 00h |
+| 4 | 0x100000C0 to 0x100000E7 | 40 B | 40 | 40h |
+
+1. Byte Count starts at the whole request (200) and drops by each payload: 200, 168, 104, 40.
+2. The last completion has Byte Count equal to its payload, so the requester frees the tag.
+3. Lower Address holds only 7 bits, so it wraps at 128 B. That is why completion 3 shows 00h.
+4. Offset into the buffer for any piece = request size minus its Byte Count, for example 200 - 168 = 32 for piece 2.
+
+- **RCB 128 B:** the same read returns as 96 B (Lower Address 20h, Byte Count 200) and 104 B (Lower Address 00h, Byte Count 104), two completions.
+- **No split:** a completer is also allowed to return all 200 B in one CplD, since it is below MPS.
+- **Cost of splitting:** assuming about 22 B of overhead per completion, four completions give 200 / 288 = 69% efficiency, one gives 200 / 222 = 90%.
+- **Lost piece:** if completion 3 is lost, completion 4 arrives with Byte Count 40 when 104 remains expected, so the requester can detect a gap instead of only timing out.
+FOLLOW:
+- Why is Lower Address only 7 bits? => RCB is at most 128 B, so the position within a 128 B block is enough to see alignment. Byte Count carries the rest.
+- What splits are legal for a 256 B aligned read with RCB 64 B? => Any split at 64 B multiples with each piece at most MPS: one 256, two 128, four 64, or uneven ones like 64 plus 192.
+PITFALL: Assuming the SSD decides how many completions come back. The completer, usually the host Root Complex, chooses the split within the rules.
+VERIFY: The Lower Address[1:0] rule for the first completion when First DW BE is partial, and the Byte Count calculation for partial byte enables.
+
+@@ 7.12 | Advanced | Debug | tags=hex-decode,header,mwr,4dw,aer-header-log
+Q: An analyzer or AER header log shows the bytes 60 00 00 40 3B 00 05 FF 00 00 00 02 4A 3C 10 00. Decode the TLP, and say whether it is legal at MPS 128.
+SHORT: Byte 0 is 60h: Fmt 011 and Type 00000, a 4DW memory write with data. Length is 040h, 64 DW or 256 B. The Requester ID is 3B00h (bus 3Bh, device 0, function 0), Tag 05h, both byte enables Fh. The address is 0x2_4A3C_1000. So it is a 256 B posted write from the SSD to host memory. It is fine at MPS 256 or larger, but Malformed at a receiver whose MPS is 128.
+DEEP:
+| DW | Byte(s) | Decode |
+|---|---|---|
+| DW0 | 60h | Fmt = 011b (4DW header, with data), Type = 00000b (memory request), so MWr |
+| DW0 | 00h | TC = 000, IDO = 0 (T9, T8, LN and TH are all 0) |
+| DW0 | 00h | TD = 0 (no ECRC), EP = 0, Attr = 00 (RO 0, NS 0), AT = 00, Length[9:8] = 00 |
+| DW0 | 40h | Length[7:0] = 40h, so 64 DW = 256 B |
+| DW1 | 3Bh 00h | Requester ID: bus 3Bh, device 00h, function 0 |
+| DW1 | 05h | Tag = 05h, not matched for a posted write |
+| DW1 | FFh | Last BE = Fh, First BE = Fh, all bytes valid |
+| DW2 | 00 00 00 02 | Address [63:32] = 0x00000002 |
+| DW3 | 4A 3C 10 00 | Address [31:2] = 0x4A3C1000, low bits zero |
+
+- **Address:** 0x2_4A3C_1000 is about 9.2 GiB, above 4 GB, so the 4DW form is correct. With upper bits zero it would have to be 3DW.
+- **4 KB rule:** 0x...1000 plus 256 B ends at 0x...1100, inside one page, so it is legal.
+- **MPS check:** 256 B payload exceeds 128 B, so a receiver at MPS 128 flags Malformed TLP. At 256 B or more it is fine.
+- **On the wire:** 16 B header + 256 B payload = 272 B, plus 4 B STP token, 2 B sequence number and 4 B LCRC = 282 B.
+- **Variants:** byte 0 = 20h would be a read with no payload. Byte 2 = 80h would set TD, 40h would set EP (poison), 20h would set RO. Byte 3 = 00h would mean 1024 DW.
+- **Tooling:** `lspci -vv` prints `HeaderLog:` as four DW in this same order (DW0 first) for the first uncorrectable error.
+FOLLOW:
+- How do you find which device is bus 3B? => `lspci -s 3b:00.0` or `lspci -tv`. The Requester ID is the device's BDF at the time.
+- Change the last byte of DW0 to 00h. What is the TLP? => Length 0 means 1024 DW, a 4096 B write. It is legal only if MPS is 4096, and at address 0x...1000 it exactly fills one page.
+PITFALL: Putting Length[9:8] in the wrong place. The two high Length bits sit in the low bits of byte 2, and Length[7:0] fills byte 3.
+VERIFY: T9, T8 and LN bit positions in byte 1 and the byte order used by the AER Header Log register on your platform.
+
+@@ 7.13 | Advanced | Cross-layer | tags=nvme,doorbell,sqe,cqe,prp,sgl,msix
+Q: Which TLPs does one NVMe command generate, from doorbell to interrupt?
+SHORT: The host rings the SQ tail doorbell with a 4-byte MWr to BAR0. The SSD fetches the 64 B submission entry with an MRd, and if needed the PRP list or SGL descriptors with more MRds. Read data goes to the host as MWr TLPs, while write data is fetched with MRd and returns in CplD. The SSD then posts a 16 B CQE with an MWr and raises MSI-X with a 4 B MWr, and the host writes the CQ head doorbell.
+DEEP:
+| Step | Direction | TLP | Size |
+|---|---|---|---|
+| SQ tail doorbell | host to SSD | MWr | 4 B |
+| Fetch SQE | SSD to host, CplD back | MRd, CplD | 64 B (often several entries at once) |
+| Fetch PRP list or SGL | SSD to host, CplD back | MRd, CplD | 8 B per PRP, 16 B per SGL descriptor |
+| Read data out | SSD to host | MWr | Up to MPS each |
+| Write data in | SSD to host, CplD back | MRd (up to MRRS), CplD (split at RCB) | Per request |
+| Post CQE | SSD to host | MWr | 16 B |
+| Interrupt | SSD to host | MWr to MSI-X address | 4 B |
+| CQ head doorbell | host to SSD | MWr | 4 B |
+
+- **Only three steps are non-posted:** the SQE fetch, the PRP or SGL fetch, and the write-data fetch. They need tags and cost a round trip. Everything else is posted.
+- **Doorbell placement:** SQ y tail is at 1000h + (2y) x (4 << CAP.DSTRD) and CQ y head at 1000h + (2y+1) x (4 << CAP.DSTRD).
+- **PRP list size:** a 128 KiB transfer with 4 KiB pages needs PRP1 plus a list of 31 PRPs, which is a single 248 B MRd.
+- **Order matters:** data MWr, then CQE MWr, then MSI-X MWr must stay in that order (Module 8). Complete NVMe register and queue behavior is in Module 16.
+- **CMB:** a controller memory buffer holds queues or data in the SSD, so the host writes them with MWr and the SSD skips some MRd round trips.
+FOLLOW:
+- Why can a controller fetch several SQEs with one MRd? => After a doorbell advances the tail by n entries they are contiguous, so one 64 x n B read saves round trips and header overhead.
+- Which of these go through the host IOMMU? => Every request the SSD issues to host memory, since it uses IOVAs. The doorbell is host-to-device MMIO and is not translated.
+PITFALL: Counting only data TLPs. At small I/O sizes the SQE fetch, CQE, MSI-X and doorbells are a large share of link and controller work.
+VERIFY: Doorbell offsets and stride, and CMB behavior, in the NVMe Base Specification.
+
+@@ 7.14 | Advanced | Numeric | tags=overhead,efficiency,iops,4k-read,mps
+Q: Why is a 4 KiB NVMe read many TLPs, and what does the overhead cost on Gen4 x4?
+SHORT: With MPS 256, the SSD sends the 4 KiB as 16 MWr TLPs, plus a CQE write, an MSI-X write and an SQE fetch request: 19 TLPs and about 4.6 KB on the wire upstream. Efficiency is about 89%, so a Gen4 x4 link (7.88 GB/s per direction) has a ceiling near 1.7 M IOPS for 4 KiB reads. At MPS 128 it drops to about 1.57 M, at MPS 512 it rises to about 1.79 M.
+DEEP:
+Assumptions: Gen4 x4 = 7.877 GB/s per direction. Per-TLP overhead = 4 B STP token + 2 B sequence + header + 4 B LCRC, so 26 B with a 4DW header and 22 B with a 3DW header. Buffer is page aligned with a 64-bit address. ACK DLLPs, UpdateFC and SKP ordered sets are ignored.
+
+| Upstream traffic | TLPs | Wire bytes |
+|---|---|---|
+| Data, 16 x (256 + 26) | 16 | 4512 |
+| CQE write (16 B, 4DW) | 1 | 42 |
+| MSI-X write (4 B, 3DW) | 1 | 26 |
+| SQE fetch request (MRd, 4DW) | 1 | 26 |
+| Total | 19 | 4606 |
+
+1. Efficiency = 4096 / 4606 = 88.9%.
+2. Ceiling = 7.877 GB/s / 4606 B = about 1.71 M IOPS.
+3. MPS 128: 32 x 154 + 94 = 5022 B, giving 1.57 M. MPS 512: 8 x 538 + 94 = 4398 B, giving 1.79 M.
+4. The opposite direction carries only the two doorbells (26 B each) and the 64 B SQE completion (86 B), about 138 B per I/O. It is nearly idle.
+
+- **Direction:** random reads load the device-to-host direction. Random writes load host-to-device, where data returns as completions.
+- **Misaligned buffers:** a PRP1 offset such as 0xF0 splits the 4 KiB across a page boundary and can add a TLP.
+- **Real drives sit below the ceiling** because of ACK and UpdateFC DLLPs, SKP ordered sets and controller limits.
+FOLLOW:
+- Would MPS 512 fix a link-bound drive? => It raises the ceiling by about 5 percent, but the smallest MPS on the path decides, and many platforms run 256.
+- Which direction limits a 4 KiB random write workload? => Host to device, where the SSD's write data arrives as CplD TLPs split at the completer's RCB.
+PITFALL: Modeling only the payload. Doorbells, queue entries and the interrupt are small TLPs, but each costs a whole header and framing.
+VERIFY: Framing overhead per generation (128b/130b STP token size) and FLIT-mode overhead for Gen6.
+
+@@ 7.15 | Advanced | Scenario | tags=mps,mrrs,malformed-tlp,mismatch,triage
+Q: An SSD passes small-I/O tests but hangs or resets under large transfers after a platform change. How do you check for an MPS or MRRS mismatch?
+SHORT: An MPS mismatch fails only bulk transfers: the sender uses a larger payload than a receiver on the path accepts, so that receiver logs Malformed TLP while doorbells, CQEs and small I/O keep working. An MRRS mistake gives no errors, only low throughput. Compare `lspci -vv` DevCap and DevCtl MaxPayload and MaxReadReq for every device on the path, and check AER for a Malformed TLP with a header log showing a large write.
+DEEP:
+1. **Read every device:** `lspci -vvv -s <BDF>` for the Root Port, each switch port and the SSD. Example: `DevCap: MaxPayload 512 bytes`, `DevCtl: MaxPayload 256 bytes, MaxReadReq 512 bytes`.
+2. **Compare along the path:** every receiver's MPS must be at least the payload its peer sends. A Root Port at 128 with an SSD at 256 breaks the SSD's data writes. The reverse direction (host completions to the SSD) may work. This asymmetry is a strong clue.
+3. **Confirm with evidence:** AER shows `MalfTLP+` in UESta at the receiver, and the header log decodes as in the previous decode question (Fmt/Type 60h, Length 040h). DPC, if enabled, contains the port and the host sees command timeouts and a controller reset.
+4. **Why it appears after a change:** a hot-plugged drive not re-tuned by the OS, firmware or BIOS that set a value the OS did not lower, or a new switch or riser with a lower MPS limit.
+5. **MRRS symptom:** MRRS 128 B means four times as many read requests as 512 B. Combined with a small tag pool, write throughput flattens while reads look normal. An analyzer shows many 128 B MRds.
+6. **Prove it:** with the device quiescent, lower MPS in Device Control on all devices (for example `setpci -s <BDF> CAP_EXP+8.w=0000:00e0` clears the MPS field to 128 B) and repeat. Changing MPS under traffic is unsafe.
+
+- **Not signal integrity:** the failure is deterministic with transfer size, has no correctable-error growth, and disappears at MPS 128.
+- **Fix:** set the path minimum in firmware or the OS, and add a boot-time check that reads and compares MPS along the path.
+FOLLOW:
+- Why do small I/Os still work? => CQEs, doorbells and SQE-sized TLPs are far below any MPS. Only bulk data TLPs exceed the smaller MPS.
+- Does a larger MPS at the receiver than at the sender break anything? => No. It is just less efficient, since the sender never exceeds its own setting.
+PITFALL: Chasing signal integrity because the errors appear only under load. Failure that depends on transfer size points to configuration.
+VERIFY: The default AER severity of Malformed TLP, and how your OS assigns MPS at enumeration and hot-plug.
+
+@@ 7.16 | Principal | Debug | tags=analyzer,completion-splitting,rcb,checker,automation
+Q: The same SSD write-data fetch shows 64 B completions on one platform and 256 B on another. Is either a bug, and how would you build a checker for split completions?
+SHORT: Neither is a bug by size alone. The completer picks the split, and any pattern is legal if each piece is at most MPS, splits fall on RCB-aligned addresses, pieces return in address order, and Byte Count and Lower Address are consistent. Build a checker per Requester ID and Tag that verifies those invariants, not a fixed size. Track the completion size distribution per platform separately as a performance baseline.
+DEEP:
+1. **Group** each MRd with its completions by Requester ID and Tag until the last piece arrives.
+2. **Invariants to check:**
+   - Sum of payloads equals the requested bytes, adjusted for byte enables.
+   - First Byte Count equals the request total, and each next one equals the previous Byte Count minus the previous payload.
+   - Lower Address of each piece equals the low 7 bits of (start address plus bytes so far).
+   - Every payload is at most MPS, and every internal split falls on a multiple of RCB.
+   - Pieces of one request arrive in ascending address order, and Completer ID stays constant.
+   - Status is SC on every piece. A UR or CA has no data and ends the request.
+   - No tag is reused before its request finishes.
+3. **Measure:** latency from the MRd to the first and to the last completion, and a completion size histogram. Compare platforms.
+4. **What the sizes cost:** overhead per completion is about 22 B, so pieces of 64, 128 and 256 B give about 74%, 85% and 92% efficiency. A 64 B completer means more TLPs and more DLLP work in the SSD's receive path.
+5. **Defects the checker catches:** payload above MPS (Malformed at the requester), split off an RCB boundary, out-of-order pieces, wrong Byte Count (the requester may hang or corrupt data), and duplicated tags.
+6. **SSD requester side:** its receive path must accept any legal split, including small pieces and interleaving across tags, and its reassembly must not depend on arrival order across requests.
+7. **Automation:** export traces from the analyzer scripting interface (CSV or JSON), run the checker as a script over every capture, and fail the run on any violation.
+FOLLOW:
+- Can a completer send the first piece before it has all the data? => Yes, in address order as data becomes available. So the first completion can arrive well before the last.
+- Would you fail a device that only copes with 128 B completions? => Yes. A requester has to accept any legal split.
+PITFALL: Writing a checker with fixed expected completion sizes. It flags legal platforms and misses real defects.
+VERIFY: The exact completion splitting rules for reads that cross RCB boundaries, and how unaligned or partial-BE reads are treated.
+
+@@ 7.17 | Principal | Scenario | tags=tags,mrrs,latency,plateau,write-iops,quantify
+Q: 4 KiB random write IOPS plateau at about 0.9 M on a Gen4 x4 SSD while reads reach 1.6 M and the NAND is idle. How do you find whether the PCIe request path is the limit?
+SHORT: Write data is fetched with MRd, so it is bound by tags x MRRS / round-trip time, not just by link rate. Measure the three inputs: MRRS from Device Control, the peak outstanding tags on the analyzer, and request-to-completion latency. If MRRS 128 B, 32 tags and 1.1 microseconds give 3.7 GB/s, that is 0.91 M IOPS and explains the plateau. Change one knob at a time and see whether the plateau moves in proportion.
+DEEP:
+1. **Model:** ceiling = min(link efficiency ceiling, tags x MRRS / latency, credit window / loop time from Module 8, controller internals).
+2. **Measure:**
+   - `lspci -vv`: `MaxReadReq` for the SSD, and whether Extended Tag is enabled (`ExtTag+`).
+   - Analyzer: maximum number of distinct outstanding tags, and time from each MRd to its first and last completion, under load, not idle.
+   - The completion size histogram (see the previous question).
+3. **Compute:** 32 tags x 128 B = 4096 B in flight. At 1.1 microseconds that is 4096 / 1.1e-6 = 3.72 GB/s, which is 0.91 M writes of 4096 B per second. This matches the plateau.
+4. **Controlled experiments:**
+   - Raise MRRS to 512 B. If the plateau scales, the request size was the limit.
+   - Enable extended tags or 10-bit tags where supported. If tags in use grow, the tag pool was the limit.
+   - Remove a hop (switch, retimer) to shorten latency.
+5. **Decision criteria:** the plateau follows the model and moves proportionally: fix MRRS and tags. It does not move: look at credits (Module 8), IOMMU translation misses, root complex read latency or SSD internals.
+6. **Latency under load:** queueing inside the host makes latency higher than idle, so the tags needed rise. Size the pool for the loaded value.
+
+- **Cautions:** a bigger MRRS raises the completion buffer the SSD must own, since it advertised infinite completion credits. Confirm its buffer covers tags x MRRS.
+FOLLOW:
+- Why is the read path unaffected? => Read data is sent as posted MWr, which needs no tags and no round trip. Only credits limit it.
+- How would you confirm the tag limit is in the controller firmware and not the OS setting? => If extended tags are enabled in DevCtl and the analyzer still shows at most 32 different tags, the device is not using them.
+PITFALL: Setting MRRS to 4096 to be safe. It can overrun the device's completion buffer, and some platforms handle huge reads poorly.
+VERIFY: The tag capability and enable bits and the maximum outstanding requests supported by the completer.
+
+@@ 7.18 | Principal | Cross-layer | tags=test-plan,negative-testing,malformed,poison,exerciser,nvme
+Q: How would you design a TLP-level negative and corner-case test plan for an NVMe SSD's PCIe interface?
+SHORT: Use a protocol exerciser as the link partner, because a real host only sends legal TLPs. Cover parametric legal traffic (MPS, MRRS, RCB, sizes, alignments, splits) and illegal traffic (malformed, poisoned, unsupported, ECRC, unexpected completions, timeouts). For each case define the expected PCIe behavior from the spec, then observe the analyzer trace, AER, NVMe status and log pages, and a data compare. Pass means no hang, no corruption, the right error class, and the controller recovers.
+DEEP:
+1. **Positive sweep:** MPS x MRRS x RCB x I/O size x buffer alignment. Check TLP sizes never exceed MPS or MRRS, the 4 KB rule holds, and data compares clean.
+2. **Malformed:** payload above MPS, Length inconsistent with byte enables, TLP crossing 4 KB, reserved Fmt or Type, TD with no digest. Expect Malformed TLP logged and no state corruption.
+3. **Unsupported and abort:** reads outside every BAR and unsupported types return UR, with no side effect. Check what completion status comes back.
+4. **Poison:** poisoned MWr to a doorbell, poisoned CplD returned to an SSD read. The command should fail with an error, and poisoned data must never reach NAND as good.
+5. **ECRC:** enable it, inject a bad digest inbound, and confirm the device drops and logs.
+6. **Completion handling:** unknown tag (Unexpected Completion), duplicate and late completions, UR or CA completions to the SSD's reads, odd splits down to 1 DW, interleaving across tags, and withheld completions until timeout. The device must not hang.
+7. **Register access sizes:** 1, 2, 4 and 8 byte and unaligned accesses to BAR0. Expect defined behavior, not a hang.
+8. **Observe:** analyzer trace, AER status, NVMe controller status and Error Information log, and a full read-back compare of data written before and after each injected fault.
+9. **Automate:** seeded random generation, coverage counters per case, run per firmware build with saved traces.
+
+- **Decision criteria:** a defect is any hang, any use of poisoned data as good, a wrong error class, state leaking from an earlier TLP, or a missing log.
+- **Safety:** negative tests can trigger fatal errors and DPC on a normal platform, so run on an isolated rig with the exerciser as the root, and clear AER status between cases.
+FOLLOW:
+- Why not use a normal host and a fault injection tool? => Host Root Ports and drivers emit only legal TLPs. Only an exerciser or modified fabric can build malformed, poisoned or oddly split ones.
+- What proves no residual state after a fault? => Register read-back, AER and NVMe status, and a data compare of I/O done before and after, plus a clean controller reset.
+PITFALL: Testing only legal traffic. Real platforms produce odd but legal splits and rare errors, and the corner cases are where firmware bugs live.
+VERIFY: Expected device behavior for each error in the Base Specification error handling tables, and the NVMe status codes and log page for failed transfers.
