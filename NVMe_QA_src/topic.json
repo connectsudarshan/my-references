@@ -1,0 +1,11 @@
+{
+ "title": "NVMe Q&amp;A — Study Guide",
+ "kicker": "NVMe · Q&amp;A STUDY GUIDE",
+ "crumb": "NVMe Q&A",
+ "lskey": "nvmeqa.v1",
+ "appid": "nvmeqa",
+ "exportpfx": "nvme-qa",
+ "out_file": "NVMe_QA_Study_Guide.html",
+ "hero_h": "NVMe Q&amp;A Study Guide",
+ "hero_p": "From NVMe fundamentals to Principal-level SSD firmware validation and debug scenarios, with the PCIe interactions called out where they matter."
+}

@@ -1,0 +1,406 @@
+# Module 19: Host Software Stack & Tools
+
+@@ 19.01 | Basic | Concept | fig=swstack | tags=linux,stack,blk-mq,nvme-core,tools
+Q: What are the layers of the Linux NVMe host stack, and where does each debug and validation tool tap in?
+SHORT: From the top: applications and filesystems, the block layer with blk-mq, the nvme-core module, the nvme PCIe transport module, and the PCI core, all above the SSD. nvme-cli and passthrough enter through character devices into nvme-core, sysfs shows core state, tracepoints sit inside nvme-core, blktrace sits above the driver, and SPDK bypasses the kernel path through VFIO.
+DEEP:
+- **Block layer and blk-mq:** turns bios into requests, applies an I/O scheduler (usually none for NVMe), and dispatches each request to a hardware context (hctx), which the PCIe driver maps to one NVMe queue.
+- **nvme-core (nvme_core.ko):** the controller state machine (new, live, resetting, connecting, deleting, dead), Identify and namespace scanning, retry and failover decisions, passthrough ioctls, sysfs and the multipath head devices.
+- **nvme PCIe transport (nvme.ko, pci.c):** maps BAR0, allocates the admin and I/O queues, builds PRP or SGL lists, rings doorbells, owns the MSI-X vectors, the timeout handler and the reset path. The fabrics modules (nvme-tcp, nvme-rdma, nvme-fc) replace this layer for NVMe-oF.
+- **PCI core:** enumeration, hot-plug, AER, DPC, ASPM and reset methods. See the PCIe page for those.
+
+| Tool | Taps in at | Sees | Blind to |
+|---|---|---|---|
+| fio, filesystem tests | Top: block device or file | End-to-end IOPS and latency | Which layer added the time |
+| nvme-cli | ioctl on /dev/nvmeX or /dev/nvmeXnY into nvme-core | Any admin command, logs, features, raw passthrough | Host queue state, timing |
+| sysfs, /proc/interrupts | nvme-core and blk-mq state | Controller state, queue and IRQ mapping | Per-command detail |
+| ftrace nvme events | Inside nvme-core, at setup and completion | Per-command qid, cid, opcode, status, retries | Wire timing, device internals |
+| blktrace, block tracepoints | Block layer, above the driver | Queue, issue and complete per request | NVMe command fields |
+| perf, bpftrace | kprobes and tracepoints anywhere | CPU cost, IRQ and softirq time, latency histograms | NVMe structures unless you probe them |
+| dmesg, journalctl -k | printk from nvme-core, nvme, PCI core | Timeouts, resets, AER | What the kernel does not log |
+| SPDK | User-space driver on VFIO, no kernel nvme | Full control of queues and commands | Kernel behavior (timeouts, retries, multipath) |
+
+- **Host timestamps are not wire timestamps:** the setup tracepoint fires before the SQE is written and the doorbell is rung (blk-mq can batch), and the completion tracepoint fires after the interrupt and softirq. Host latency is always at least the device latency.
+FOLLOW:
+- Does nvme-cli use the block layer and filesystem path? => No. It issues an ioctl on a character or block node, and nvme-core wraps the command in a passthrough request on the admin or I/O queue. There is no bio, page cache or filesystem involved.
+- Which host tool is closest to what the controller saw? => The nvme_setup_cmd and nvme_complete_rq tracepoints, since they carry the real SQE fields and status. An analyzer on the link is still the only true wire view.
+PITFALL: Reading host-side latency as device latency. Queueing, interrupt delivery and scheduler delays are all inside the number.
+
+@@ 19.02 | Basic | Concept | tags=dev-nodes,ng,naming,multipath,udev
+Q: What are /dev/nvme0, /dev/nvme0n1 and /dev/ng0n1, and how do you name a DUT reliably?
+SHORT: /dev/nvmeX is the controller character device for admin commands and resets. /dev/nvmeXnY is the namespace block device. /dev/ngXnY is a namespace character device for passthrough and io_uring commands. With native multipath, the block and ng nodes belong to the subsystem, and X can differ from the controller number. Identify DUTs by serial number, NGUID or EUI-64, never by the number.
+DEEP:
+| Node | Type | Used for |
+|---|---|---|
+| /dev/nvme0 | char, one per controller | Admin passthrough (id-ctrl, get-log, fw-download), reset, rescan |
+| /dev/nvme0n1 | block, one per namespace | Filesystems, fio, block I/O. nvme-cli ioctls also work and default the NSID to this namespace |
+| /dev/ng0n1 | char, one per namespace | I/O passthrough and io_uring commands, including namespaces the block layer does not support |
+| /sys/block/nvme0c0n1 | hidden per-path block device | Multipath only. Visible in sysfs, no /dev node |
+
+- **The numbering trap:** with multipath, the 0 in nvme0n1 is the subsystem instance. It is independent of the controller number in /dev/nvme0. The nvme-cli documentation for `format` warns that assuming a relationship can irrevocably erase the wrong device.
+- **Stable identities:** udev creates `/dev/disk/by-id/nvme-<model>_<serial>` and `nvme-eui.<hex>` links. sysfs has `serial`, `model`, `firmware_rev`, `wwid`, `nguid`, `eui` and `uuid` attributes. `nvme list` prints the serial number and NSID.
+- **Instance numbers are not stable:** they follow probe order and change across reboots, hot-plug and any reset that re-enumerates the device.
+- **Which node for which command:** to reach a specific controller in a multi-controller subsystem, use its /dev/nvmeX node. An ioctl on a multipath head node goes to whichever path the kernel selects at that moment.
+FOLLOW:
+- Can `nvme id-ns` run on /dev/nvme0? => Yes, but a character device has no namespace of its own, so pass `-n <nsid>`. On a namespace block node the NSID defaults to that namespace.
+- What does `nvme list` show under multipath? => One row per namespace, named by the head node. Use `nvme list-subsys` to see the controllers and paths behind it.
+PITFALL: Scripting against `nvme0n1` by number. After a re-enumeration the same SSD can become nvme1n1, and a destructive test can hit the boot drive or the wrong DUT.
+VERIFY: The kernel version that introduced the /dev/ng nodes (believed to be 5.13) and the exact by-id link formats on your udev version.
+
+@@ 19.03 | Basic | Concept | tags=nvme-cli,id-ctrl,smart-log,versions,2.x,3.x
+Q: Which nvme-cli commands do you start with, which of them change state, and what changed between nvme-cli 2.x and 3.x?
+SHORT: Read-only starters are list, list-subsys, id-ctrl, id-ns, smart-log, error-log, fw-log, get-feature and get-log. State-changing ones include set-feature, format, sanitize, fw-download, fw-commit, ns-create, reset, subsystem-reset and both passthru commands. The examples here use 2.x names. In 3.x commands are grouped (nvme id ctrl, nvme log smart, nvme fw commit) and the old flat names remain as deprecated aliases.
+DEEP:
+```
+nvme version                                 # record nvme-cli and libnvme versions with every result
+nvme list                                    # SN, model, FW revision, namespaces
+nvme list-subsys                             # subsystem, controllers, paths
+nvme id-ctrl /dev/nvme0                      # Identify Controller (CNS 01h)
+nvme id-ns /dev/nvme0n1                      # Identify Namespace (CNS 00h)
+nvme smart-log /dev/nvme0                    # log page 02h
+nvme error-log /dev/nvme0 -e 16              # log page 01h, 16 entries
+nvme get-feature /dev/nvme0 -f 0x07          # Number of Queues
+nvme get-log /dev/nvme0 -i 0x05 -l 4096 -b > effects.bin   # raw Commands Supported and Effects
+nvme id-ctrl /dev/nvme0 -o json              # machine-readable
+```
+- **2.x versus 3.x:** the master documentation lists the flat names as deprecated aliases that print a warning and may be removed in a future major version. The grouped names are `nvme id ctrl`, `nvme log smart`, `nvme log telemetry`, `nvme fw download` and `nvme fw commit`. The global options include `-o` (normal, tabular, json, binary), `--output-format-version` (version 2 uses more consistent field names), `--timeout=<ms>`, `--dry-run` and `-v`.
+- **Destructive set:** `format`, `sanitize`, `ns-delete` and `fw-commit` can lose data or brick a lab unit. Wrap them so they need an explicit serial-number confirmation.
+- **Log page requirements:** `get-log` needs `-l` (the length is mandatory). Use `-b` to archive raw bytes and decode later.
+FOLLOW:
+- How do you see what a command will send without sending it? => Use the global `--dry-run`, or `--show-command` on the passthru commands.
+- Which version do you record? => Both nvme-cli and libnvme from `nvme version`, plus the kernel version. JSON field names and command spellings depend on them.
+PITFALL: Parsing the human-readable text with regex. Layout and field names change between releases, so use JSON from a pinned version, or raw binary and your own decoder.
+VERIFY: In 3.x, the option names for human-readable decode (2.x used -H on several commands, the 3.x id ctrl synopsis does not list it), the default output-format-version, and which flat aliases your release still ships (run nvme id ctrl --help and nvme version).
+
+@@ 19.04 | Intermediate | Concept | tags=blk-mq,hctx,queues,msix,affinity,poll-queues
+Q: How does Linux map CPUs to NVMe queues, and what determines how many I/O queues you get?
+SHORT: The PCIe driver creates one I/O SQ/CQ pair per blk-mq hardware context. The count is capped by the CPU count plus any write and poll queues requested, by what the controller grants through Set Features Number of Queues, and by MSI-X vectors. Each non-polled queue has a managed IRQ affinity, and blk-mq maps every CPU to a queue near its interrupt. The dmesg line shows default/read/poll counts.
+DEEP:
+- **Request:** the driver asks for `possible CPUs + write_queues + poll_queues` I/O queues. The controller returns the count it grants (Set Features, Feature ID 07h), and the driver uses the smaller number.
+- **Vectors:** one for the admin queue (vector 0) plus one for each non-polled I/O queue, allocated with affinity spreading across CPUs. Poll queues have no interrupt at all.
+- **Three maps:** default, read (only exists when `write_queues` is set, and then default carries writes) and poll. `dmesg` prints `nvme nvme0: 28/0/4 default/read/poll queues`.
+- **CPU to hctx:** with more CPUs than queues, several CPUs share a queue and its lock. With more queues than CPUs, some queues are unused. The non-poll maps follow IRQ affinity, and the poll map uses the generic blk-mq spread.
+- **Where to look:** `/proc/interrupts` (nvme0q0 is admin, nvme0q1 and up are I/O), `/sys/block/nvme0n1/mq/<n>/cpu_list`, and `/sys/class/nvme/nvme0/numa_node`.
+- **Validation angles:** (1) run with fewer queues (a low grant, `nvme.write_queues`, fewer online CPUs) to exercise queue sharing. (2) offline CPUs during I/O, since a hardware context whose CPUs all go offline must drain. (3) confirm the SSD copes with the full granted count and with queue counts from 1 up to its maximum.
+FOLLOW:
+- The controller grants fewer queues than there are CPUs. What happens? => The driver builds fewer hardware contexts and several CPUs share each one. Everything works, contention rises, and the dmesg queue line shows the real numbers.
+- Why do poll queues need no MSI-X vector? => Completions are found by polling the CQ phase tag from the submitting thread (io_uring IOPOLL or hipri I/O), so no interrupt is ever raised. The interrupts module covers the polling mechanics.
+PITFALL: Assuming one queue per CPU. Read the dmesg line and `mq/*/cpu_list` before interpreting per-queue or per-CPU results.
+VERIFY: The exact clamp and rounding logic (it changes between kernel versions), and the 0-based encoding of the Number of Queues result.
+
+@@ 19.05 | Intermediate | Numeric | tags=queues,blk-mq,queue-depth,memory,poll-queues
+Q: A 64-CPU host uses an SSD that grants 32 I/O queue pairs, with nvme.poll_queues=4. How many queues of each type exist, how many CPUs share each, and how many commands can be in flight?
+SHORT: The request is 64 + 0 + 4 = 68 queues, the controller grants 32, so there are 32 I/O queues: 4 poll and 28 default (dmesg 28/0/4), with 29 MSI-X vectors including admin. Each default queue serves about 2.3 CPUs and each poll queue 16. With a 1024-entry queue the tag depth is 1023, so up to 32 x 1023 = 32,736 commands can be in flight, using about 2.5 MiB of queue memory.
+DEEP:
+Assumptions: 64 possible CPUs, `write_queues=0`, `poll_queues=4`, default `io_queue_depth=1024`, controller CAP.MQES = 4095 (4096 entries), granted queue pairs = 32.
+1. Requested I/O queues = 64 + 0 + 4 = 68. Granted = 32, so `nr_io_queues` = 32.
+2. Poll queues = min(4, 32 - 1) = 4 (at least one queue must stay interrupt-driven).
+3. Vectors = 1 admin + (32 - 4) = 29. Default queues = 28. Read queues = 0 (with `write_queues=0` reads and writes share the default map).
+4. CPUs per default queue = 64 / 28 = 2.29, so about 8 queues serve 3 CPUs and 20 serve 2 if spread evenly (real spread follows topology). CPUs per poll queue = 64 / 4 = 16.
+5. Queue size = min(MQES + 1, 1024) = 1024 entries. blk-mq tag depth = 1024 - 1 = 1023, because a full ring needs one unused slot.
+6. Commands in flight, all queues = 32 x 1023 = 32,736 (28 x 1023 = 28,644 default and 4 x 1023 = 4,092 poll).
+7. Queue memory = 32 x (1024 x 64 B SQ + 1024 x 16 B CQ) = 32 x 80 KiB = 2.5 MiB, before PRP and SGL pools.
+
+With `write_queues=8` instead: 28 vectors are left for I/O, 8 become default (writes), 20 read, and 4 poll, so dmesg shows 8/20/4.
+
+- **Why it matters:** a firmware validation run should include the largest depth and queue count a real host can produce. Reaching about 30 thousand outstanding commands needs every queue full, and fio with `iodepth=32 numjobs=64` reaches only 2,048.
+FOLLOW:
+- What limits in-flight commands if the SSD reports MQES = 255? => q_depth becomes 256, the tag depth 255, so 32 queues carry 8,160 commands. The driver takes the smaller of MQES + 1 and `io_queue_depth`.
+- Why is the tag depth one less than the queue size? => A ring with head equal to tail means empty, so a full ring must leave one slot unused or full and empty would look identical. The driver sizes the tag set to the 0-based queue size.
+PITFALL: Multiplying queue count by queue size without the minus one, or assuming fio iodepth alone fills the queues. The tag set is per queue, and each job's depth is spread over the queue its CPU maps to.
+VERIFY: Kernel-version differences in queue-count clamping, and whether your platform limits MSI-X vectors below the granted queue count.
+
+@@ 19.06 | Intermediate | Debug | tags=timeout,dmesg,nvme_timeout,abort,reset
+Q: dmesg shows "I/O tag 419 (b1a3) ... QID 5 timeout, aborting" followed by "Abort status: 0x0" and then "timeout, reset controller" for the same tag. What did the driver do at each step, and what does it tell you about the SSD?
+SHORT: The blk-mq timer fired, and nvme_timeout ran a fixed sequence: check CSTS, poll for a missed completion, then for a first timeout send an Abort and re-arm the timer. The Abort completed successfully (status 0x0) but the command still did not return, so the second timeout on the same tag reset the controller. The SSD lost or hung the command and did not honor the Abort, or the Abort itself reported not aborted.
+DEEP:
+```
+nvme nvme0: I/O tag 419 (b1a3) opcode 0x2 (Read) QID 5 timeout, aborting req_op:READ(0) size:131072
+nvme nvme0: Abort status: 0x0
+nvme nvme0: I/O tag 419 (b1a3) opcode 0x2 (Read) QID 5 timeout, reset controller
+nvme nvme0: 28/0/4 default/read/poll queues
+```
+The order of decisions in `nvme_timeout` (Linux 6.x pci.c; older kernels print shorter text):
+1. Read CSTS. If the PCI device is gone, the controller goes to deleting.
+2. If PCI error recovery is running, re-arm the timer and do nothing.
+3. If CSTS.CFS or NSSRO is set (an all-ones read counts), print `controller is down; will reset: CSTS=... PCI_STATUS=...` and reset.
+4. Poll the CQ once. A completion found there prints `timeout, completion polled`: the CQE was written but the interrupt was lost or delayed.
+5. If the request is on the admin queue, or was already aborted once, print `timeout, reset controller`.
+6. Otherwise, if the controller's Abort Command Limit (ACL) is not exhausted, send an Abort (opcode 08h) for this CID and SQID, mark the request aborted and re-arm (if the limit is exhausted the timer is simply re-armed).
+
+| Message | Branch | Points to |
+|---|---|---|
+| controller is down, CSTS=0x3 (or 0x2) | CFS set | Firmware declared a fatal error. Fetch logs, telemetry |
+| controller is down, CSTS=0xffffffff | MMIO all ones | Link down or device gone. Check AER and LnkSta. The driver adds a hint about power-saving modes |
+| timeout, completion polled | Missed interrupt | CQE was posted. MSI-X, coalescing or wake-up problem |
+| QID 0 timeout, reset controller | Admin command hung | Firmware or admin path wedged. No Abort is attempted |
+| timeout, aborting, then reset controller | Aborted once, still no CQE | Command lost or firmware hung |
+
+- **What Abort status 0x0 means:** the Abort command itself completed. Whether it aborted the target is in bit 0 of its completion dword 0 (1 means not aborted), which the driver does not print. A successful status does not prove the command was killed.
+FOLLOW:
+- The same log shows only the first line and then I/O resumes. What happened? => The Abort worked, or the command completed late. Check the I/O status on the CQE. Repeats at the same LBA or opcode point to a firmware path stuck on that command.
+- How do you split a wedged firmware from a lost interrupt? => Read CSTS first, then look at the CQ phase bits and head pointers in memory. A CQE present with the phase tag flipped means a lost interrupt. See the admin-queue triage question in the Admin Command Set module.
+PITFALL: Treating the abort message as the failure. The abort is only the first response, and the reset a full timeout later is the real event.
+VERIFY: Message wording (it changes across kernel versions, and with CONFIG_NVME_VERBOSE_ERRORS off the opcode text is (I/O Cmd) or (Admin Cmd) instead of a name such as Read), and the meaning of Abort CDW0 bit 0 in the NVMe Base Specification.
+
+@@ 19.07 | Intermediate | Numeric | tags=timeout,io_timeout,max_retries,budget,harness
+Q: With default Linux parameters, how long can one command that the firmware never completes keep an application waiting, and how do you set test timeouts around that?
+SHORT: One timeout cycle is about 60 s: 30 s before the Abort, then another 30 s before the reset. If the same command hangs again after each reset, the driver retries it up to nvme_core.max_retries = 5 times, so the application can wait about 6 x 60 s = 360 s plus six resets, roughly 6 to 7 minutes, before it sees an error. Lowering io_timeout to 5 s cuts that to about 1 minute.
+DEEP:
+Assumptions: defaults `nvme_core.io_timeout=30`, `admin_timeout=60`, `max_retries=5`; the SSD answers admin commands and resets but swallows the same read every time; CAP.TO = 0x14 (20 x 500 ms = 10 s) as the worst-case reset wait.
+1. t = 0: read submitted, blk-mq timer armed for 30 s.
+2. t = 30 s: first timeout. CSTS is fine, the CQ holds nothing, so the driver sends Abort and re-arms the timer for another 30 s. Abort is an admin command and completes quickly.
+3. t = 60 s: second timeout on an already-aborted request, so `timeout, reset controller`. The reset waits up to CAP.TO x 500 ms (10 s here) for CSTS.RDY to clear, and again to set on re-enable, so up to 20 s per reset. Typical resets take much less.
+4. The reset cancels all in-flight commands with a host-aborted status (0x371, no DNR). Retries are allowed until `max_retries`, so the request is resubmitted.
+5. Attempts = 1 + 5 = 6. Worst case = 6 x 60 s = 360 s, plus up to 6 x 20 s of reset wait = 480 s. Realistic total is 6 to 7 minutes.
+6. With `io_timeout=5` (it must be in force when the controller is probed, see the module parameter question): 6 x 10 s = 60 s.
+
+- **Budget rule:** harness timeout > (1 + max_retries) x 2 x io_timeout + reset time, or set the kernel values lower so the kernel gives up first. Both must be logged.
+- **Per-command override:** passthrough commands carry their own timeout. `nvme --timeout=<ms>` sets `timeout_ms` in the ioctl, and 0 means the kernel default (admin_timeout for admin commands).
+- **Timer rounding:** blk-mq rounds timeouts, so expect up to about a second of extra delay per step.
+- **If admin commands also hang:** teardown sends Delete SQ and Delete CQ for the I/O queues, and that step can wait up to about `admin_timeout` (60 s) inside each reset, so the worst case is longer than the arithmetic above.
+- **Trade-off:** a very short io_timeout gives false timeouts on legitimate long operations such as garbage-collection stalls, thermal throttling and firmware activation pauses.
+FOLLOW:
+- Does an aborted command carry DNR? => A host-aborted request from a reset has no DNR in the driver's status. The device's own DNR bit, if set, stops all retries.
+- What if the controller fails to come back after the reset? => The reset work gives up, marks the controller dead, removes it (the "Disabling device after reset failure" (older kernels: "Removing after probe failure") or "Device not ready; aborting reset" messages), and outstanding I/O fails.
+PITFALL: Setting the harness timeout to the driver's 30 s and blaming the SSD when the test is killed while the driver is still working through Abort, reset and retry.
+VERIFY: The retry behavior for requests cancelled by a reset on your kernel (confirm by injecting a hung command), and CAP.TO units in the NVMe Base Specification.
+
+@@ 19.08 | Intermediate | Cross-layer | tags=reset,hotplug,sysfs,pci,nssr,surprise-removal
+Q: How do you trigger controller resets, subsystem resets, namespace rescans and hot-plug from Linux software, and what does the kernel do in each case?
+SHORT: `nvme reset` or sysfs `reset_controller` runs a driver-level controller reset. `nvme subsystem-reset` writes the NSSR register. Writing 1 to the PCI device `reset` attribute does a PCI function reset. PCI `remove` followed by `rescan` emulates an orderly hot-remove and hot-add. None of these is a real surprise removal, which needs slot power or a physical pull. `nvme ns-rescan` re-reads the namespace list.
+DEEP:
+| Action | What happens |
+|---|---|
+| `nvme reset /dev/nvme0`, or `echo 1 > /sys/class/nvme/nvme0/reset_controller` | The driver disables the controller (CC.EN to 0), rebuilds queues and re-runs init. Namespace block devices stay. Requests in flight are cancelled and retried |
+| `nvme subsystem-reset /dev/nvme0` | Writes the NSSR register (needs CAP.NSSRS). Everything in the NVM subsystem resets. The driver sees CSTS.NSSRO and re-initializes. Fails if the controller lacks NSSR support |
+| `echo 1 > /sys/bus/pci/devices/<BDF>/reset` | PCI function reset (FLR if supported, otherwise another reset method). The driver's reset_prepare and reset_done callbacks bracket it |
+| `echo 1 > /sys/bus/pci/devices/<BDF>/remove`, then `echo 1 > /sys/bus/pci/rescan` | Orderly unbind: namespaces removed, normal shutdown sent while the device is present, /dev nodes vanish. Rescan probes it again, possibly under new instance numbers |
+| `nvme ns-rescan /dev/nvme0`, or `echo 1 > /sys/class/nvme/nvme0/rescan_controller` | Re-reads the namespace list after namespace management or attach |
+| `echo 0 > /sys/bus/pci/slots/<n>/power` | Software-directed slot power-off through pciehp, on slots that support it. Still an orderly removal |
+
+- **Surprise removal is different:** when the device is already gone, `nvme_remove` marks the controller dead and skips the shutdown handshake. Without pciehp, the first sign is a timeout with `CSTS=0xffffffff` after up to 30 s. With pciehp the link-down event removes the device quickly.
+- **What to check after removal:** I/O errors return promptly (not after tens of seconds), nodes disappear, no hung-task warnings and no oops.
+- **Unrelated attribute:** `delete_controller` exists only for transports that implement it (fabrics), not for PCIe.
+- **Reset scope ladder:** controller reset, then function-level reset, then subsystem reset, then link reset or power cycle. Each is a separate test, since each exercises different firmware state. The PCIe page covers the link and slot side.
+FOLLOW:
+- Which reset activates firmware after fw-commit with action 1? => A controller-level reset, such as `nvme reset`, is enough unless the commit status says a subsystem reset or conventional reset is required.
+- Why does a PCI reset test differ from an NVMe reset test? => FLR resets the function and the driver must re-probe state. CC.EN toggling resets only the controller. They hit different firmware paths.
+PITFALL: Using `remove` and `rescan` as a hot-plug test. The device stays powered and the link stays up, so the firmware sees a clean shutdown, not a power loss or link drop.
+VERIFY: Which reset methods your PCI device supports (`cat /sys/bus/pci/devices/<BDF>/reset_method`), the slot power attribute on your platform, and NSSR behavior on your controller.
+
+@@ 19.09 | Intermediate | Trap | tags=module-params,io_timeout,poll_queues,modprobe,multipath,apst
+Q: You set nvme_core.io_timeout or nvme.poll_queues through /sys/module and nothing changes. Which parameters matter for validation, and when does a change actually apply?
+SHORT: Most NVMe module parameters can be written at runtime through /sys/module, but the driver samples them when it builds a controller. Timeouts, queue depth and the write and poll queue maps are fixed at the first probe, so `nvme reset` does not apply them: unbind and rebind (or reload the module, or boot with the option). nvme_core.multipath is read-only at runtime. If nvme is in the initramfs, modprobe.d edits need an initramfs rebuild. Log values with results.
+DEEP:
+| Parameter | Default | Runtime write | Effect |
+|---|---|---|---|
+| nvme_core.io_timeout | 30 s | Yes | Per-command I/O timeout, sampled when the controller is created. A reset does not re-read it |
+| nvme_core.admin_timeout | 60 s | Yes | Admin command timeout, sampled when the controller is created |
+| nvme_core.max_retries | 5 | Yes | Retry limit, read at retry time |
+| nvme_core.default_ps_max_latency_us | 100000 | Yes | Ceiling for APST non-operational states. 0 disables APST. Sampled when the controller is created. On a live controller write `power/pm_qos_latency_tolerance_us` in its sysfs directory |
+| nvme.poll_queues | 0 | Yes | Number of polled queues. Re-read at each reset, but the tag set maps are built once, so going from 0 to N needs a rebind |
+| nvme.write_queues | 0 | Yes | Dedicated write queues. Same rule as poll_queues |
+| nvme.io_queue_depth | 1024 | Yes | Queue entries, 2 to 4095. The blk-mq tag depth is set at the first probe, so rebind rather than reset |
+| nvme_core.multipath | Y | No (0444) | Native multipath, boot or modprobe only |
+| nvme_core.iopolicy | numa | Yes | Default path policy for new subsystems |
+
+- **Setting them:** `nvme_core.io_timeout=10 nvme.poll_queues=4` on the kernel command line, or `options nvme_core io_timeout=10` in `/etc/modprobe.d/`. Runtime: write `/sys/module/nvme/parameters/poll_queues`, then unbind and rebind the device (`echo <BDF> > /sys/bus/pci/drivers/nvme/unbind`, then `bind`) so a controller is created again, and read the dmesg queue line to confirm.
+- **Newer kernels:** per-controller `io_timeout` and `admin_timeout` sysfs attributes exist in recent trees (values in milliseconds), which lets you change a live controller.
+- **Validation uses:** low `io_timeout` for fast fault-injection cycles, `default_ps_max_latency_us=0` to remove APST from a suspected power-state bug, `poll_queues` to test polled completion, small `io_queue_depth` to test full-queue and wrap paths, `multipath` off to test a single-path view.
+- **Log them:** dump `/sys/module/nvme*/parameters/*` into every result bundle.
+FOLLOW:
+- The driver hint after a dead-device timeout mentions default_ps_max_latency_us. Why? => When CSTS reads all ones the driver suspects a faulty power-saving state and suggests `nvme_core.default_ps_max_latency_us=0 pcie_aspm=off pcie_port_pm=off` to rule APST and link power management out.
+- Does changing poll_queues need a reboot? => No, but a reset is not enough when the controller was first probed without poll queues. Rebind the device or reload nvme. A reboot is only needed for read-only parameters.
+PITFALL: Writing a parameter and running `nvme reset`, then reading results as if it applied. Check the dmesg queue line or the sysfs timeout, and editing modprobe.d without rebuilding an initramfs that loads nvme leaves the old value in force.
+VERIFY: Which parameters your kernel exposes and their permissions (`ls -l /sys/module/nvme*/parameters`), when each is sampled on your kernel (read from Linux 6.x-era and newer source), plus the kernel version that added the per-controller timeout attributes.
+
+@@ 19.10 | Advanced | Concept | tags=multipath,ana,iopolicy,failover,head-node
+Q: How does native NVMe multipath work in the Linux host, and how do you validate failover with it?
+SHORT: When a subsystem reports multiple controllers, nvme-core creates one head namespace device per shared namespace, with hidden per-controller path devices behind it. I/O is routed by iopolicy (numa, round-robin, or queue-depth on newer kernels) to paths in usable ANA states. A path error or a host-aborted command is failed over to another path instead of surfacing. Validate with path loss and ANA changes under load, and check for zero errors and bounded latency.
+DEEP:
+- **When a head node exists:** the subsystem advertises multiple controllers (Identify Controller CMIC), `nvme_core.multipath=Y`, and the namespace identifiers are unique. `multipath_always_on` (newer kernels) forces a head node even for single-controller subsystems.
+- **Naming:** `/dev/nvme0n1` is the head, `/sys/block/nvme0c0n1` and `nvme0c1n1` are the paths. Per-path sysfs attributes include `ana_state` and `ana_grpid`, and `queue_depth` (used by the queue-depth policy).
+- **Path selection:** `iopolicy` under `/sys/class/nvme-subsystem/nvme-subsys0/`. numa prefers the path closest to the submitting node, round-robin alternates, queue-depth picks the path with the fewest outstanding commands. Only optimized paths are used while any exist, and non-optimized ones are the fallback.
+- **Failover rule:** in `nvme_decide_disposition`, a status of Path Related type (SCT 3, including host-aborted 0x371 and ANA inaccessible or transition states) on a multipath request fails over to another path. Other errors go to the caller. DNR or an exhausted retry count completes the request with an error.
+- **ANA changes:** an Asynchronous Event triggers a re-read of the ANA log page and updates path states.
+- **Validation plan:**
+  1. Sequential and random mixed load on the head node, verify data with a pattern checker.
+  2. Remove or disable one path (PCIe function reset, slot power, or change the ANA state through firmware or a target). Expect zero I/O errors and a bounded latency spike.
+  3. Restore it and confirm traffic returns to the optimized path.
+  4. Repeat with each iopolicy, and with all paths down. Requests are held while a path may still return and fail once none can, so record the actual behavior and its timing.
+- **Tools and traps:** `nvme list-subsys` shows paths and states. An ioctl on the head reaches one path only, so use `/dev/nvmeX` nodes to query each controller.
+FOLLOW:
+- Single-controller PCIe SSD: is there a head node? => Not by default. The block device is the plain namespace. Only `multipath_always_on` (newer kernels) creates a head anyway.
+- How is a host-aborted command treated under multipath? => It maps to a path error status, so the request is requeued to another path instead of failing to the application.
+PITFALL: Looking at the head node and calling it "the controller". The number in nvme0n1 is the subsystem instance, so query paths by controller node and confirm which one you hit.
+VERIFY: The kernel version that added the queue-depth policy (believed 6.11), the conditions that create a head node on your kernel, and the exact ANA status codes mapped to failover.
+
+@@ 19.11 | Advanced | Trap | tags=passthrough,ioctl,admin-passthru,io-passthru,effects,privileges
+Q: nvme admin-passthru and io-passthru let you send any command. What does the kernel do with it, and what can passthrough not do or leave in a wrong state?
+SHORT: Passthrough copies your command fields into an SQE, maps the user buffer, sets the timeout and returns the CQE result. The kernel assigns the command ID, queue and data pointers itself. The driver refreshes its view only when the Commands Supported and Effects log flags the command (it can freeze I/O and rescan), so a command with missing or wrong effects leaves the host stale. Unprivileged use is limited to safe commands, and recent kernels reject driver-managed Set Features even for root.
+DEEP:
+- **The interface:** `NVME_IOCTL_ADMIN_CMD`, `NVME_IOCTL_IO_CMD` and the 64-bit variants (`ADMIN64_CMD`, `IO64_CMD`) take `struct nvme_passthru_cmd64`: opcode, flags, nsid, cdw2, cdw3, cdw10 to cdw15, data and metadata buffers and lengths, `timeout_ms` and a 64-bit result.
+- **What the kernel controls:** command ID, PSDT and PRP or SGL fields, submission queue choice. You cannot force a specific CID, a bad PRP list, or ring behavior. Those need SPDK or a protocol emulator.
+- **Permissions:** without CAP_SYS_ADMIN only a small set of Identify variants is allowed on the admin path. On namespace nodes, a command is allowed only if the Commands Supported and Effects log marks it supported with harmless effects, and write commands need the node opened for write.
+- **Examples:**
+```
+nvme admin-passthru /dev/nvme0 -O 0x06 --cdw10=1 -l 4096 -r -b > idctrl.bin     # Identify Controller
+nvme io-passthru /dev/nvme0n1 -O 0x02 -n 1 --cdw10=0 --cdw11=0 --cdw12=7 -l 4096 -r -b > lba0.bin   # read 8 LBAs (512 B format)
+```
+  CDW10 and CDW11 hold the starting LBA and CDW12 bits 15:0 the 0-based block count, so 7 means 8 blocks. The buffer length must match.
+- **State it may not update:** the kernel reads the Commands Supported and Effects log. It freezes I/O around commands whose effects ask for it, rescans namespaces after commands flagged as namespace inventory or capability change, and only logs a message for controller capability change. Without those flags nothing is refreshed.
+  - Format NVM changes the LBA size and the block device geometry can stay stale until a rescan (nvme-cli's `format` issues BLKRRPART itself).
+  - Namespace attach and detach: use `ns-rescan` if the drive does not flag them in its effects log.
+  - Set Features that the driver manages (Number of Queues, APST, Host Memory Buffer, Host Behavior Support, and Keep Alive off fabrics) are rejected in recent kernels even for root, and changing them behind the driver's back is unsafe anyway.
+  - I/O passthrough bypasses the page cache, so a mounted filesystem is now inconsistent.
+- **Useful hooks:** `--dry-run`, `--show-command`, `--latency` to time a command.
+FOLLOW:
+- Can passthrough fake a bad CID or a broken PRP list? => No. The driver owns those fields. Use SPDK, a hardware analyzer with injection, or an emulated controller.
+- Why check the effects log before sending a vendor command? => Commands with unknown or intrusive effects (namespace inventory change, controller capability change, LBA content change) need host handling. Passthrough of unmarked commands is restricted for unprivileged users.
+PITFALL: Sending a destructive command with io-passthru or admin-passthru to a device holding a live filesystem or the boot volume, then wondering why the host is inconsistent.
+VERIFY: Which Set Features the running kernel blocks even for root, the unprivileged-passthrough behavior on your kernel, and errno values returned for oversized buffers.
+
+@@ 19.12 | Advanced | Scenario | tags=firmware-update,fw-download,fw-commit,automation,activation
+Q: Write the outline of an unattended firmware-update step for a lab that must be safe, verifiable and repeatable. Which commands, which checks, and which failures do you handle?
+SHORT: Snapshot identity and slot state, download in transfer-sized chunks with nvme fw-download, commit to a slot with an action, trigger the required reset, wait until the controller is live again, then verify the running revision, the Firmware Slot log and that data and namespaces are intact. Treat commit statuses that ask for a reset as expected, and time-box every step. Run the power-loss variant separately.
+DEEP:
+```
+DEV=/dev/nvme0; IMG=fw.bin; SLOT=2; SN=$(cat /sys/class/nvme/nvme0/serial)
+nvme id-ctrl $DEV -o json > pre_idctrl.json ; nvme fw-log $DEV > pre_fwlog.txt
+nvme fw-download $DEV --fw=$IMG --xfer=0x20000          # 128 KiB chunks, dword offsets are automatic
+nvme fw-commit  $DEV --slot=$SLOT --action=1            # 1 = replace and activate at next reset
+nvme reset $DEV                                         # controller-level reset activates it
+# wait: state == live, same serial, namespaces present
+nvme fw-log $DEV ; nvme id-ctrl $DEV -o json | jq -r .fr   # new revision, active slot = $SLOT
+```
+1. **Preconditions:** read Identify Controller FRMW (slot count, read-only slot 1, activation without reset), FWUG (download granularity), MDTS and MTFA. Refuse a slot that is read-only. Confirm the image length is a multiple of 4 bytes and of the granularity.
+2. **Download:** `--xfer` is the chunk size and defaults to 4 KiB, so raise it to a multiple of the granularity. Offsets advance automatically.
+3. **Commit:** actions 0 (replace), 1 (replace and activate at reset), 2 (activate at reset) and 3 (activate now, without reset, if supported). Statuses 0x10B, 0x110 and 0x111 mean the image is accepted but a conventional reset, subsystem reset or controller reset is needed. 0x112 is a maximum-time violation and 0x113 is activation prohibited.
+4. **Activate:** `nvme reset`, `nvme subsystem-reset`, or a power cycle, per the commit status. With action 3 the driver pauses I/O during the activation window (MTFA, in 100 ms units) through CSTS.PP handling.
+5. **Verify:** revision string, active slot in the Firmware Slot log, `serial` unchanged, all NSIDs and capacities present, a data pattern written earlier reads back, SMART and error logs sane, feature values (queues, APST, temperature thresholds) as expected.
+6. **Failures to inject:** bad image, truncated image, wrong slot, download without commit, commit of a slot never downloaded, reset during download, power loss between every step. The Admin Command Set module covers command semantics.
+FOLLOW:
+- Should the script use flat names or grouped names? => Use the flat names for nvme-cli 2.x, the grouped `nvme fw download` and `nvme fw commit` for 3.x, and pin the version. Detect it with `nvme version`.
+- How do you keep the DUT identity across a subsystem reset or power cycle? => Match by serial number or NGUID from sysfs after re-enumeration, never by the nvmeN number.
+PITFALL: Concluding success from the commit exit status. The commit only stages the image, and success is proved by the running revision after activation.
+VERIFY: FRMW and FWUG encodings, the status meanings above, and MTFA behavior with activation without reset in the NVMe Base Specification, plus the JSON key for the firmware revision in your nvme-cli version.
+
+@@ 19.13 | Advanced | Debug | tags=ftrace,blktrace,tracepoints,latency,trace-marker
+Q: You have host traces from fio at QD32 with the nvme tracepoints enabled. How do you turn them into per-command latency, spot retries and errors, and line them up with device logs?
+SHORT: Enable the nvme events, pair nvme_setup_cmd and nvme_complete_rq by controller, queue and command ID, and subtract the timestamps for host-observed latency. Read status, retries and flags on completion. Add block tracepoints or blktrace for the layer above, and write markers into trace_marker so the harness stages line up. Remember the CID contains a generation counter, so the same tag reappears with a different ID.
+DEEP:
+```
+echo 1 > /sys/kernel/tracing/events/nvme/enable
+echo 'status != 0' > /sys/kernel/tracing/events/nvme/nvme_complete_rq/filter
+echo "step 42 start" > /sys/kernel/tracing/trace_marker
+trace-cmd record -e nvme -e block:block_rq_issue -e block:block_rq_complete -- fio job.fio
+blktrace -d /dev/nvme0n1 -o - | blkparse -i -
+```
+Illustrative lines (times in seconds, format from the driver's trace.h):
+```
+fio-4121  [005] 2210.104301: nvme_setup_cmd: nvme0: disk=nvme0n1, qid=6, cmdid=8203, nsid=1, flags=0x0, meta=0x0, cmd=(nvme_cmd_read slba=1048576, len=31, ctrl=0x0, dsmgmt=0, reftag=0)
+<idle>-0  [005] 2210.104388: nvme_complete_rq: nvme0: disk=nvme0n1, qid=6, cmdid=8203, res=0x0, retries=0, flags=0x0, status=0x0
+fio-4121  [005] 2210.104420: nvme_setup_cmd: nvme0: disk=nvme0n1, qid=6, cmdid=8204, nsid=1, flags=0x0, meta=0x0, cmd=(nvme_cmd_read slba=1048608, len=31, ctrl=0x0, dsmgmt=0, reftag=0)
+<idle>-0  [005] 2213.104815: nvme_complete_rq: nvme0: disk=nvme0n1, qid=6, cmdid=8204, res=0x0, retries=0, flags=0x0, status=0x4281
+```
+1. **Latency:** command 8203: 2210.104388 - 2210.104301 = 87 us. Command 8204: 2213.104815 - 2210.104420 = 3.0004 s, far below the 30 s I/O timeout, so the host did not intervene. That is the SSD's own stall.
+2. **Status decode:** 0x4281 = DNR (0x4000) + SCT 2 (0x200, media and data integrity) + SC 0x81 (Unrecovered Read Error). DNR means no retry, and `retries=0` agrees. The kernel also prints `nvme0n1: Read(0x2) @ LBA 1048608, 32 blocks, Unrecovered Read Error (sct 0x2 / sc 0x81) DNR`.
+3. **Command ID:** `cmdid=8203` is 0x200B: generation 2 in bits 15:12 and tag 11 in bits 11:0. A retry reuses the tag with a new generation, so pair events by (controller, qid, cmdid), not by tag.
+4. **Length field:** `len=31` is the 0-based block count, so 32 blocks.
+5. **Layer split:** in blktrace, Q to D is block-layer queueing, D to C is driver plus device plus interrupt. A large D to C with a small nvme delta means the time is after completion delivery, such as IRQ or softirq delay.
+6. **Correlating with the SSD:** write markers at test-step boundaries, and use the command LBA or a unique pattern as the shared key with SSD-side logs, since clocks differ.
+FOLLOW:
+- What does tracing cost at high IOPS? => A lot. Use per-CPU buffers, filters, and short windows. At millions of IOPS unfiltered tracing changes the result, so validate with a control run without tracing.
+- Which fields identify a controller-internal error versus a host-side one? => Status SCT and SC on the completion for device errors. Host-caused ones appear as timeouts, abort statuses (0x371 host aborted) or retries in the same events.
+PITFALL: Trusting host timestamps for microsecond conclusions on a busy system. Scheduling and IRQ delay sit inside them.
+VERIFY: The exact event print format on your kernel (`cat /sys/kernel/tracing/events/nvme/nvme_setup_cmd/format`), and the tracefs mount point on your distribution.
+
+@@ 19.14 | Advanced | Cross-layer | tags=io_uring,passthrough,fio,ng,polling
+Q: How does io_uring NVMe passthrough work, what does it need, and when do you use it instead of block I/O or the ioctl passthrough?
+SHORT: io_uring passthrough submits raw NVMe commands asynchronously to a namespace character device such as /dev/ng0n1 through the io_uring_cmd opcode. The ring must be created with 128-byte SQEs and 32-byte CQEs. You get batching, deep queues and optional polling, with full control of opcode and CDWs, and no filesystem or bio layer. Use it for high-rate raw commands, PI tests and protocol-level checks the block path cannot express.
+DEEP:
+- **Command ops:** `NVME_URING_CMD_IO` and `NVME_URING_CMD_IO_VEC` on the namespace ng node, `NVME_URING_CMD_ADMIN` and `_ADMIN_VEC` on the controller node. The payload is `struct nvme_uring_cmd`: the same fields as the 64-bit ioctl, minus the result (which returns in the CQE).
+- **Requirements:** the ring needs `IORING_SETUP_SQE128` and `IORING_SETUP_CQE32`, or the driver returns `-EOPNOTSUPP`. The nsid in the command must match the node's namespace, or the command fails with `-EINVAL`. Privilege rules are the same as ioctl passthrough.
+- **Polling:** with `IORING_SETUP_IOPOLL` and poll queues (`nvme.poll_queues`), completions are polled from the submitting thread.
+- **fio:** `fio --name=raw --ioengine=io_uring_cmd --cmd_type=nvme --filename=/dev/ng0n1 --rw=randread --bs=4k --iodepth=64 --direct=1 --time_based --runtime=60` (add `--hipri` with poll queues). Newer fio adds metadata and PI options for this engine.
+- **Comparison:**
+
+| Path | Command control | Concurrency | Overhead | Typical use |
+|---|---|---|---|---|
+| Block I/O (fio libaio or io_uring on /dev/nvme0n1) | Read, write, trim, flush only | Deep | Filesystem and bio path | Workloads, performance |
+| ioctl passthru | Any opcode and CDW | One command per syscall, synchronous | Syscall per command | Admin commands, one-off tests |
+| io_uring passthru | Any opcode and CDW | Deep, batched, pollable | Lowest of the kernel paths | Raw command streams, PI and metadata tests, Write Zeroes or Verify at rate |
+| SPDK | Any command, queue geometry | Deepest | No kernel | Protocol-level and peak-rate tests |
+
+- **Limits:** the kernel still owns CID, PSDT and data pointers, and still applies its timeout and error handling to the request. The command flags byte must be zero, or the driver returns `-EINVAL`.
+FOLLOW:
+- The io_uring passthrough command fails with EOPNOTSUPP. What is the first check? => The ring flags. Without SQE128 and CQE32 the driver rejects the command. Then check that you opened the ng node, not the block node.
+- Can I use it for admin commands too? => Yes, on the controller character device with the admin command ops, subject to the same allow-list and privilege rules.
+PITFALL: Benchmarking raw passthrough against filesystem I/O and calling the difference a firmware speed-up. The paths do different work.
+VERIFY: The kernel version that added passthrough (believed 5.19), the fio version and options for the nvme engine, and PI and metadata support on your kernel and fio.
+
+@@ 19.15 | Principal | Cross-layer | tags=spdk,vfio,user-space,polled,raw-commands,bdev
+Q: When do you choose SPDK for firmware validation instead of the kernel driver, and what do you give up?
+SHORT: Choose SPDK when you need control the kernel never gives you: raw commands with your own fields, chosen queue counts and depths, polled completions with no interrupt in the path, and peak-rate load per core. It binds the SSD to VFIO in user space with hugepages. You give up the kernel's timeout, retry, reset and multipath behavior, the /dev nodes and nvme-cli on that device, and you must handle errors yourself.
+DEEP:
+- **Setup:** `scripts/setup.sh` allocates hugepages (`HUGEMEM`, `NRHUGE`) and rebinds the device from `nvme` to `vfio-pci` (or `uio_pci_generic`). `PCI_ALLOWED` restricts which devices are moved. `scripts/setup.sh reset` gives it back to the kernel.
+- **Programming model:** `spdk_nvme_probe` attaches controllers and does the CC/CSTS init. `spdk_nvme_ctrlr_alloc_io_qpair` creates queue pairs with chosen size. Each thread polls with `spdk_nvme_qpair_process_completions`, and the admin queue with `spdk_nvme_ctrlr_process_admin_completions`. There are no interrupts.
+- **Raw commands:** `spdk_nvme_ctrlr_cmd_admin_raw` and `spdk_nvme_ctrlr_cmd_io_raw` send a command with your own opcode and CDWs, and the library assigns the CID. `spdk_nvme_ctrlr_reset` and `spdk_nvme_ctrlr_reset_subsystem` exercise reset paths, and there is an AER callback and a command timeout callback.
+- **Decision table:**
+
+| Need | Kernel block | Kernel passthru | SPDK |
+|---|---|---|---|
+| Realistic host error handling | Yes | Partly | You write it |
+| Arbitrary opcodes and CDWs | No | Yes | Yes |
+| Choose queue count and depth | Limited (module params) | No | Yes |
+| Interrupt-free completion | Poll queues | Poll queues | Native |
+| Malformed PRP, CID reuse, ring abuse | No | No | Partial, custom driver or emulator for the rest |
+| Peak IOPS per core | Good | Good | Best |
+
+- **Costs:** needs root, an IOMMU (or no-IOMMU mode), pinned hugepages and a spinning core per poller. The device vanishes from `/dev`, so use SPDK's own tools (`identify`, `perf` examples, RPC) instead of nvme-cli.
+- **Method for a principal-level design:** keep the kernel path as the compatibility reference (what real hosts do) and use SPDK for stress and spec-edge cases. Run the same test against both to see if a failure depends on host behavior.
+FOLLOW:
+- How do you read CSTS or CAP under SPDK? => Through the controller register accessors in the library, since the kernel and `pcimem` are out of the picture on that device.
+- Can SPDK test what the kernel hides, such as queue counts near the maximum? => Yes for queue count and size within the controller's limits. CID values and PRP list contents are still chosen by the library.
+PITFALL: Reporting an SPDK-only failure as a firmware bug without checking that the test is legal under the specification and that a real host could trigger it.
+VERIFY: Names and paths of the example binaries in your SPDK tree, current setup.sh variables, and which raw-command variants support metadata and SGL payloads.
+
+@@ 19.16 | Principal | Cross-layer | tags=windows,stornvme,storport,deviceiocontrol,powershell,etw
+Q: How does the Windows NVMe stack differ from Linux, how do you reach the same information and commands from Windows, and how do you structure cross-OS validation?
+SHORT: Windows uses the inbox stornvme miniport under Storport (or a vendor driver). From user mode you query Identify, logs and features with IOCTL_STORAGE_QUERY_PROPERTY, send some commands with IOCTL_STORAGE_PROTOCOL_COMMAND, update firmware through the storage firmware IOCTLs or Update-StorageFirmware, and read health with Get-StorageReliabilityCounter. Passthrough is more restricted than on Linux, so isolate the OS-specific layer behind an interface.
+DEEP:
+- **Stack:** file system, volume and partition drivers, `disk.sys`, `storport.sys`, then `stornvme.sys` (inbox) or a vendor miniport. There is no blk-mq or sysfs, so queue counts, interrupt mapping and timeouts are Storport and driver internals.
+- **Information:** `Get-PhysicalDisk`, `Get-StorageReliabilityCounter`, `Get-StorageFirmwareInformation`, `Get-PnpDeviceProperty`, and in code `DeviceIoControl` with `IOCTL_STORAGE_QUERY_PROPERTY` using `StorageDeviceProtocolSpecificProperty` or `StorageAdapterProtocolSpecificProperty` and `STORAGE_PROTOCOL_SPECIFIC_DATA` with `ProtocolTypeNvme` and a data type for Identify, log page or feature.
+- **Commands:** `IOCTL_STORAGE_PROTOCOL_COMMAND` with `STORAGE_PROTOCOL_COMMAND` (protocol type NVMe) sends admin and vendor commands, and the inbox driver restricts which opcodes it accepts. Firmware goes through `IOCTL_STORAGE_FIRMWARE_GET_INFO`, `_DOWNLOAD` and `_ACTIVATE`. Arbitrary I/O commands are generally not available.
+- **Errors and timeouts:** command timeouts surface as Storport reset events (Event Viewer "Reset to device ... was issued"), and WHEA events cover PCIe errors when firmware hands AER to the OS. ETW (`wpr`, WPA, the Microsoft-Windows-StorPort provider) shows I/O latency and resets.
+- **Behaviors that differ from Linux:** the default power policy and APST tables the host programs, Modern Standby and hibernate, the crash-dump and hibernation paths (a simpler, polled mode with a different driver stack), write-cache and flush settings, TRIM through retrim, and different multipath support.
+- **Cross-OS design:**
+  1. One test interface (identify, get_log, send_admin, read, write, reset, wait_ready) with a Linux ioctl backend, a Windows DeviceIoControl backend and an SPDK backend.
+  2. Shared expected results (spec-derived), with per-OS expectations only where the OS legitimately differs.
+  3. Record driver name and version (inbox or vendor) with every result.
+  4. When a failure shows on one OS only, replay the same command sequence on the other OS on the same hardware or use a Linux live image, to split host behavior from firmware.
+FOLLOW:
+- Windows shows no PCIe errors while the drive drops. Is the link healthy? => Not proven. Firmware may own AER, and WHEA may be filtered. Use the SSD's own logs and an analyzer. See the PCIe debug module.
+- How do you reset the device stack from Windows software? => Disable and re-enable the device (PnP), or use a vendor tool. There is no equivalent of the sysfs controller reset attribute.
+PITFALL: Porting Linux passthrough tests to Windows one-to-one. Half of them cannot be expressed through the inbox driver, so the plan must say which tests are Linux-only and why.
+VERIFY: Which admin opcodes IOCTL_STORAGE_PROTOCOL_COMMAND accepts on your Windows build, the stornvme reset event ID and source (129 is commonly seen), the registry timeout values, the ETW provider event details, crash-dump and hibernation path behavior, multipath support for NVMe, and whether an nvme-cli build for Windows fits your needs.
+
+@@ 19.17 | Principal | Scenario | tags=automation,framework,nvme-cli,libnvme,identity,logging
+Q: Design the host-side automation layer for an SSD validation lab that must survive nvme-cli upgrades, device renumbering, kernel changes and failing DUTs, and produce evidence firmware teams trust.
+SHORT: Build a thin DUT abstraction that resolves devices by serial or NGUID, wraps commands behind a backend (libnvme or ioctl for structured results, nvme-cli JSON as fallback, SPDK for raw), records the full environment with every run, captures kernel log and traces on failure, and decodes statuses against expected sets rather than strings. Guard destructive operations with locks and identity checks. Pin tool versions and test the framework itself.
+DEEP:
+1. **Identity:** resolve the DUT from `/sys/class/nvme/*/serial` or NGUID, and re-resolve after every reset, hot-plug or power cycle. Never store `nvme0`. Provide `wait_ready()` (controller state is live, namespaces exist, udev settled) with a timeout.
+2. **Command backend:** prefer libnvme bindings or raw ioctl (`struct nvme_passthru_cmd64`) for structured, version-independent results. Use `nvme -o json` only with a pinned nvme-cli and `--output-format-version`. Archive raw binary log pages and decode with your own decoder tied to a spec revision.
+3. **Environment record:** kernel and nvme-cli versions, `/sys/module/nvme*/parameters/*`, CPU and NUMA layout, IRQ affinity, `lspci -vvv`, firmware revision, BIOS, link speed and width, and the harness commit.
+4. **Evidence on failure:** a kernel log cursor (`dmesg` or `journalctl -k` since the test start), nvme ftrace ring buffer with `trace_marker` step markers, SMART and error logs before and after, telemetry, PCIe AER counters. Snapshot before any reset, since reset destroys state.
+5. **Pass criteria:** compare status codes as decoded fields (SCT, SC, DNR) against expected sets per the spec. Fail a test on unexpected kernel signatures (timeout, controller is down, I/O error, AER), and allowlist expected ones for negative tests.
+6. **Safety:** per-DUT lock (flock), serial allowlist, refuse devices that are mounted, in use or holding the boot volume, and require an explicit `--force` in the wrapper for format, sanitize and namespace deletion.
+7. **Timeouts:** every call has a timeout larger than the driver's worst case (see the timeout budget question) or sets the kernel values lower first.
+8. **Quality of the framework:** unit tests against a fake backend, a self-test against an emulated controller, and a version matrix (kernel LTS and latest, nvme-cli 2.x and 3.x). No silent retry on failure. Record the retry count instead.
+- **Decision criteria:** subprocess nvme-cli costs a process launch per command (fine for admin sequences, wrong for tens of thousands of commands). ioctl or libnvme calls are cheap. io_uring passthrough or SPDK for rate.
+FOLLOW:
+- How do you detect that an nvme-cli upgrade changed your results? => Run a golden-DUT regression of the framework on every tool bump, comparing decoded fields from raw log pages against archived expected decodes.
+- How do you prevent a wrong-device disaster? => Identity by serial, a dry-run confirmation with the serial and model printed, locks, and a hard refusal if the device is mounted or is the boot device.
+PITFALL: Parsing text output and using device numbers. Both break silently (a renamed field, a renumbered SSD), and the test then passes or destroys the wrong thing.
+VERIFY: Which libnvme language bindings are maintained for your environment, and the JSON field names for your nvme-cli version and output-format-version.

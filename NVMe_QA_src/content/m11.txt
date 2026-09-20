@@ -1,0 +1,366 @@
+# Module 11: Power Management & Thermal
+
+@@ 11.01 | Basic | Concept | tags=overview,power-states,apst,hctm,thermal
+Q: Which separate mechanisms change an NVMe SSD's power draw and temperature behavior, and who controls each one?
+SHORT: Four mechanisms sit on top of the PCIe D-states and L-states. The host selects a power state with Set Features, Power Management (FID 02h). The controller enters idle states by itself through APST (FID 0Ch). The controller throttles on its own firmware policy as it heats up. The host tunes the alert and throttle trip points with Temperature Threshold (04h) and Host Controlled Thermal Management (10h).
+DEEP:
+| Mechanism | Decided by | What it changes | Where you see it |
+|---|---|---|---|
+| Set Features, Power Management (02h) | Host | Current power state PS0 to PSn: operational states cap power, non-operational states stop I/O | Get Features 02h, rail power |
+| APST (0Ch) | Controller, from a host-written table | Idle entry to a non-operational state, exit on the next I/O command | Rail power, first-I/O latency |
+| Thermal throttling | Controller firmware | Performance and power inside the operational states | Throughput versus temperature, SMART thermal fields |
+| Temperature Threshold (04h), HCTM (10h) | Host sets thresholds, controller acts | When alerts fire (04h) and when throttling starts (10h) | Async event, Critical Warning bit, SMART counters |
+
+- **Not a power state:** shutdown (CC.SHN) is an orderly stop of the controller. It is covered later in this module because power validation has to keep it separate from low-power idle.
+- **Layering:** these NVMe mechanisms are independent of PCIe D-states, ASPM, L1.2 and LTR. The deepest platform idle needs both stacks to agree (see the PCIe page, Power Management module, for the link side).
+- **What this module adds:** the descriptor fields and APST table, the thermal thresholds and counters, and how to validate each with evidence rather than configuration.
+- **Validation theme:** every mechanism has its own owner and its own observability. A test only counts when it observes the state that was reached, not the state that was requested.
+FOLLOW:
+- Is a thermal throttle a power state change? => Sometimes. The specification describes light throttling as moving toward lower-power operational states, so Get Features may or may not show it. Treat the reported state and the thermal state as separate signals.
+- Where does PCIe ASPM fit in? => It moves the link on its own idle rules. A laptop reaches its lowest idle only when a non-operational NVMe state, link L1.2 and a relaxed LTR all hold together.
+PITFALL: Assuming one knob controls power. Each mechanism has its own owner, and a test that only sets a policy proves nothing about the state actually reached.
+VERIFY: Feature IDs 02h, 04h, 0Ch and 10h and the statement about light throttling and operational power states in the thermal management section of the NVMe Base Specification.
+
+@@ 11.02 | Basic | Concept | tags=power-state-descriptor,mp,enlat,exlat,npss,nvme-cli
+Q: How do you read an NVMe power state descriptor, field by field?
+SHORT: Identify Controller carries NPSS, the highest state index (so it is zero-based), and up to 32 descriptors of 32 bytes starting at byte 2048. Each descriptor has MP (maximum power, scaled by MXPS), the NOPS flag (non-operational), ENLAT and EXLAT (maximum entry and exit time in microseconds), the relative performance ranks RRT, RRL, RWT and RWL, and idle and active power (IDLP, ACTP) with scale fields.
+DEEP:
+| Field | Location in descriptor | Meaning |
+|---|---|---|
+| MP | bytes 1:0 | Maximum power. Units of 0.01 W if MXPS = 0, 0.0001 W if MXPS = 1 |
+| MXPS, NOPS | byte 3, bits 0 and 1 | Scale of MP. NOPS = 1 means non-operational |
+| ENLAT | bytes 7:4 | Maximum microseconds to enter the state |
+| EXLAT | bytes 11:8 | Maximum microseconds to leave it for an operational state |
+| RRT, RRL, RWT, RWL | bytes 12 to 15, 5 bits each | Relative read and write throughput and latency rank, 0 is best |
+| IDLP, IPS | bytes 17:16, 18 | Idle power and its scale |
+| ACTP, APW, APS | bytes 21:20, 22 | Active power, workload code and scale |
+
+```
+$ nvme id-ctrl /dev/nvme0 -H          (excerpt, illustrative values)
+npss      : 4
+ps    0 : mp:6.20W operational enlat:0 exlat:0 rrt:0 rrl:0
+ps    3 : mp:0.0400W non-operational enlat:210 exlat:1200 rrt:3 rrl:3
+ps    4 : mp:0.0050W non-operational enlat:1000 exlat:9000 rrt:4 rrl:4
+```
+- **Decode:** PS0 raw MP is 620 with MXPS = 0 (0.01 W units). PS3 raw MP is 400 with MXPS = 1 (0.0001 W units), which is 0.04 W. Five descriptors exist because NPSS is 4.
+- **Everything is a bound:** MP is the most the state may draw, ENLAT and EXLAT are the most it may take. Typical figures are lower.
+- **Ordering:** PS0 is the highest-power state, and higher numbers use less power.
+FOLLOW:
+- How many descriptors does NPSS = 4 give? => Five, PS0 to PS4. NPSS is the highest index, and the largest possible value is 31 for 32 descriptors.
+- Which field tells the host how long a wake can take? => EXLAT for the controller part. The host adds the PCIe link exit and any platform wake to get the full figure.
+PITFALL: Treating MP as typical power. It is a ceiling, and average power in PS0 under a real workload is usually far below it.
+VERIFY: Scale encodings for IPS and APS, the APW workload codes, and the exact rank semantics of RRT, RRL, RWT and RWL in the power state descriptor table (Linux nvme.h and SPDK agree on the layout).
+
+@@ 11.03 | Basic | Concept | tags=temperature,wctemp,cctemp,smart,composite,hwmon
+Q: Where does an NVMe SSD report its temperature, and what do WCTEMP and CCTEMP mean?
+SHORT: The SMART/Health log (log page 02h) reports the Composite Temperature in Kelvin at bytes 2:1, plus up to eight sensor temperatures. Identify Controller gives WCTEMP (warning) and CCTEMP (critical) thresholds, also in Kelvin. The composite value is a vendor-defined blend of internal sensors. Critical Warning bit 1 flags a temperature condition, and the log counts minutes spent above each threshold.
+DEEP:
+- **Units:** all temperature fields are 16-bit Kelvin values. nvme-cli prints Celsius by subtracting 273. Linux hwmon subtracts 273.15 and reports millidegrees, so the same 315 K shows as 42 C and 41.85 C.
+- **Composite versus sensors:** the composite is a vendor-defined function of the sensors, and sensors 1 to 8 (0 means not implemented) may be the controller, NAND or the PCB. The controller or a die can be hotter than the composite.
+- **WCTEMP:** the composite level that indicates overheating while operation continues. **CCTEMP:** the level at which continued operation risks data loss, shutdown or damage. A value of 0 means the threshold is not reported.
+- **SMART fields:** Warning Composite Temperature Time (minutes at or above WCTEMP and below CCTEMP), Critical Composite Temperature Time (minutes above CCTEMP), and the Critical Warning byte.
+- **Linux hwmon:**
+```
+$ cat /sys/class/nvme/nvme0/hwmon*/temp1_input     # composite, millidegrees C
+41850
+$ cat /sys/class/nvme/nvme0/hwmon*/temp1_crit      # CCTEMP, hidden if CCTEMP = 0
+```
+  `temp1_max` and `temp1_min` are the over and under threshold (Feature 04h), `temp1_alarm` is the Critical Warning temperature bit, and `temp2` to `temp9` are sensors 1 to 8.
+FOLLOW:
+- Why can the composite differ from the hottest die? => It is a vendor-defined function of the sensors, so an internal hot spot can be above it, and firmware throttling often keys off internal points the host cannot see.
+- What does WCTEMP = 0 mean for tools? => No warning threshold is reported. The Linux driver then hides temp1_max, and the Warning Composite Temperature Time counter has nothing to count against.
+PITFALL: Treating the composite as the die temperature. It is a reported summary, and thresholds in a test must be set against it, not against a thermocouple reading.
+VERIFY: SMART log byte offsets for the temperature fields and time counters, whether the counters use at-or-above or above comparisons, and the exact WCTEMP and CCTEMP wording in the Base Specification.
+
+@@ 11.04 | Intermediate | Concept | tags=set-features,fid-02h,operational,non-operational,workload-hint
+Q: What does Set Features, Power Management actually do, and how should a validator read Get Features afterwards?
+SHORT: Feature 02h takes the power state in CDW11 bits 4:0 and a workload hint in bits 7:5. An operational state lets I/O continue at a capped power and usually reduced performance. A non-operational state parks the controller until the host selects an operational state again. Get Features returns what the controller reports, which need not track APST or throttling, so confirm the real state with a power measurement.
+DEEP:
+- **Operational states as caps:** a descriptor set such as PS0 8.25 W, PS1 6 W, PS2 4 W (illustrative) lets a host or rack manager bound SSD power. Lower states should rank lower in RRT and RWT.
+- **Non-operational states:** the idle-savings states. The host normally brings the controller back by selecting an operational state. Linux does exactly this in its host-managed suspend path, saving the current state, selecting NPSS, and restoring the saved state on resume.
+- **Workload hint:** a coarse hint about upcoming work (for example an idle period followed by random writes, or heavy sequential writes) so the controller can prepare.
+- **What to validate:**
+  1. Under the worst-case workload in state PSn, measured power stays at or below MP for PSn.
+  2. Throughput and latency rank in the same order as RRT, RRL, RWT and RWL.
+  3. Transition time from Set Features to the settled state and from the first I/O back to service stay within ENLAT and EXLAT.
+  4. A state above NPSS is rejected with an error status.
+```
+nvme set-feature /dev/nvme0 -f 2 -v 1     # select PS1
+nvme get-feature /dev/nvme0 -f 2          # reported state
+```
+FOLLOW:
+- Does Linux set a power state for runtime idle? => No. Runtime savings come from APST. The mainline driver sets a state through Feature 02h only in the host-managed suspend path.
+- Why measure instead of reading Get Features? => The reported value is a controller-defined register view. Only the rail power and the wake latency show what the silicon did.
+PITFALL: Treating a successful Set Features completion as proof the drive reached the state. Check power and latency.
+VERIFY: CDW11 layout (PS bits 4:0, workload hint bits 7:5) and hint encodings, whether Get Features reflects APST-driven states, whether the command completes before or after the transition, and the status code for a state above NPSS.
+
+@@ 11.05 | Intermediate | Concept | fig=nvmepower | tags=apst,itps,itpt,table,linux,idle-timeline
+Q: How is the APST table encoded, and what does the idle timeline look like for a real descriptor set?
+SHORT: Feature 0Ch takes a 256-byte table of 32 64-bit entries, and entry N applies while the controller is in state N. Each entry holds the target state ITPS (bits 7:3) and the idle time ITPT in milliseconds (bits 31:8). CDW11 bit 0 enables APST, and Identify Controller APSTA says whether it is supported. After ITPT with no I/O the controller enters ITPS, and an I/O command brings it back to an operational state.
+DEEP:
+- **Encoding (as the Linux driver builds it):** entry = (ITPS << 3) | (ITPT_ms << 8). ITPT has 24 bits, so the maximum is 16,777,215 ms. An all-zero entry means no transition from that state.
+- **Timeline for the PS4 example (ENLAT 1 ms, EXLAT 9 ms):**
+  1. t = 0: the last I/O completes and the idle timer starts in PS0.
+  2. t = 100 ms: the timer expires and the controller enters PS4, taking up to ENLAT.
+  3. PS4 dwell: power falls to the PS4 level, and the link may drop to L1.2.
+  4. A doorbell write arrives: the exit takes up to EXLAT, and the I/O completes after exit plus normal service time.
+- **Two Linux algorithms** (PS3: ENLAT 210 us and EXLAT 1,200 us. PS4: 1,000 us and 9,000 us):
+
+| Current state | Recent mainline (100 ms if total latency is 15 ms or less) | Older 50 x (ENLAT + EXLAT) rule |
+|---|---|---|
+| PS0 to PS2 | PS4 after 100 ms | PS3 after 71 ms |
+| PS3 | PS4 after 100 ms | PS4 after 500 ms |
+| PS4 | none | none |
+
+- **Why PS3 is skipped in the new scheme:** both states fall within the 15 ms primary tolerance, so only the deepest one is used. A state with total latency between 15 ms and 100 ms would form a second tier with a 2,000 ms timeout.
+- **What wakes it:** conformance tests expect I/O commands to end the non-operational state, and admin commands to leave it alone.
+FOLLOW:
+- How do you see what the host programmed? => `nvme get-feature /dev/nvme0 -f 0x0c -H` decodes the entries. Setting `nvme_core.default_ps_max_latency_us=0` (or the pm_qos sysfs value to 0) turns APST off.
+- What counts as idle for the timer? => Command activity. Whether admin commands or internal background work restart the timer is implementation specific, so measure it.
+PITFALL: Comparing APST behavior across kernels without the algorithm. The same drive gets different targets and timers under the 50 x rule and the primary and secondary scheme.
+VERIFY: ITPS and ITPT bit positions and the meaning of a zero ITPT, which operational state the controller returns to, whether admin commands leave the state, and which kernel release introduced the apst_primary and apst_secondary parameters.
+
+@@ 11.06 | Intermediate | Concept | tags=temperature-threshold,fid-04h,async-event,critical-warning,tmpsel,thsel
+Q: How does the Temperature Threshold feature work, and when does the controller raise an over-temperature or under-temperature event?
+SHORT: Feature 04h takes a threshold in Kelvin (CDW11 bits 15:0), a sensor select TMPSEL (bits 19:16, 0 is the composite and 1 to 8 are sensors) and a type THSEL (bits 21:20, 0 over and 1 under). When the selected temperature crosses the threshold, the controller sets the temperature bit in Critical Warning and, if enabled, completes an Async Event Request with type SMART/Health and info 01h. The composite over-threshold defaults to WCTEMP.
+DEEP:
+- **Example values:** over threshold 80 C is 353 K, so CDW11 = 0x00000161. Under threshold 5 C is 278 K with THSEL = 1, so CDW11 = 0x00100116.
+- **Event completion:** Dword 0 of the Async Event Request completion holds the type in bits 2:0, the info in bits 15:8 and the log page in bits 23:16. A temperature event reads 0x00020101: type 1 (SMART/Health), info 01h (temperature threshold), log page 02h.
+- **Prerequisites:** an Async Event Request must be outstanding and the event must be enabled in Async Event Configuration (FID 0Bh). After an event is reported, the controller does not repeat that type until the log page is read with Retain Asynchronous Event cleared.
+- **Linux mapping:** `temp1_max` reads and writes the over threshold, `temp1_min` the under threshold, `temp1_alarm` shows the Critical Warning bit.
+- **Validation cases:**
+  1. Read defaults and check the composite over threshold equals WCTEMP.
+  2. Set and get each TMPSEL, and confirm a missing sensor is rejected.
+  3. Trigger without heating: set the over threshold just below the current composite and expect the event.
+  4. Read the log to re-arm, then trigger again.
+  5. Repeat with an under threshold.
+FOLLOW:
+- How do you trigger an over-temperature event without heating the drive? => Set the composite over-threshold just below the current reading. The pending Async Event Request should complete and Critical Warning bit 1 should set.
+- Why did the second crossing raise no event? => An event type is not repeated until its log page has been read with RAE cleared. A test that skips the log read sees only the first event.
+PITFALL: Writing the threshold in Celsius. 80 instead of 353 sets a threshold far below any real temperature and fires immediately.
+VERIFY: TMPSEL value for all sensors, default sensor thresholds, Async Event Configuration bit positions, RAE re-arm rules, and the Critical Warning bit 1 definition in the Base Specification.
+
+@@ 11.07 | Intermediate | Concept | tags=hctm,fid-10h,tmt1,tmt2,mntmt,mxtmt
+Q: What is Host Controlled Thermal Management, and how do TMT1 and TMT2 differ from WCTEMP and CCTEMP?
+SHORT: HCTM (Feature 10h, supported when the HCTMA bit is set) lets the host program two thermal management temperatures in Kelvin, TMT1 (bits 31:16) and TMT2 (bits 15:0), within the controller's MNTMT and MXTMT limits. Above TMT1 the controller should throttle lightly, and above TMT2 heavily. The host sets the trip points and the controller chooses the actions. WCTEMP and CCTEMP are warning and critical limits, not throttle controls.
+DEEP:
+- **Identify fields:** HCTMA (support), MNTMT (lowest allowed setting) and MXTMT (highest). A Set Features outside that range fails with an invalid field status.
+- **Example:** TMT1 = 80 C (353 K = 0x161), TMT2 = 84 C (357 K = 0x165), so CDW11 = 0x01610165.
+```
+nvme set-feature /dev/nvme0 -f 0x10 -v 0x01610165
+nvme get-feature /dev/nvme0 -f 0x10 -H
+```
+- **Behavior:** light throttling starts moving toward lower-power operation while limiting the performance impact. Heavy throttling reduces temperature regardless of performance. Actions, recovery and hysteresis are vendor-defined.
+- **Reporting:** the SMART log carries a transition count and a total time for each of TMT1 and TMT2 (nvme-cli labels them Thermal Management T1 and T2).
+- **Where it is used:** enclosures without heatsinks, embedded and USB-powered designs where the host wants to cap power.
+- **Persistence:** check whether the value survives a controller reset and a power cycle, and reprogram it at every initialization if it does not.
+FOLLOW:
+- What happens if TMT1 is set below MNTMT? => The command is rejected with an invalid field status. MNTMT and MXTMT bound what the host may program.
+- How do you prove the drive throttled at TMT1? => Compare the TMT1 transition count and total time before and after a hot run, and match them to the composite trace and the throughput drop. Use the counters and the throughput curve together.
+PITFALL: Assuming HCTM lets the host throttle the drive. The host only moves the trip points.
+VERIFY: HCTMA, MNTMT and MXTMT field positions, TMT1 versus TMT2 ordering and zero-value rules, persistence across resets, and the byte offsets and units of the thermal management counters in the SMART log.
+
+@@ 11.08 | Intermediate | Trap | tags=trap,throttle,wctemp,counters,smart
+Q: Throughput halves at a composite temperature of 75 C, yet the SMART log shows zero Warning Composite Temperature Time and no temperature event. Is the SSD's thermal reporting broken?
+SHORT: Not necessarily. Vendor throttling uses its own trip points, often keyed to internal sensors and set below WCTEMP, so it can act long before the composite reaches WCTEMP (say 85 C). The warning counter, the Critical Warning bit and the default over-temperature event all key off WCTEMP or a host-set threshold. Check the thermal management counters, the sensor readings and the vendor log before filing a bug.
+DEEP:
+| Signal | Keyed to | Fires at 75 C composite with WCTEMP = 85 C? |
+|---|---|---|
+| Vendor throttle | Firmware trip points, often on the hottest internal sensor | Yes, if the trip is at or below 75 C or a sensor is hotter than the composite |
+| TMT1 and TMT2 counters | Host-programmed (or default) TMT1 and TMT2 | Only if TMT1 is at or below 75 C |
+| Warning Composite Temperature Time | Composite at or above WCTEMP | No |
+| Critical Warning bit and event | Over threshold, default WCTEMP | No, unless the host lowered the threshold |
+
+- **The design intent:** WCTEMP is a warning limit and CCTEMP a critical one. Throttling is meant to keep the drive from ever reaching them.
+- **A real bug looks like this:** HCTM is advertised, TMT1 is set at or below the running temperature, the drive throttles, and the TMT1 counters do not move.
+- **Evidence to collect:** composite and sensors 1 to 8 every second, throughput, current power state, link speed, the SMART log before and after, and the vendor log if one exists.
+- **Correlation check:** a thermocouple on the controller and NAND shows whether the composite under-reads a hot spot.
+FOLLOW:
+- When are missing counters a firmware bug? => When HCTM is supported, TMT1 is at or below the running temperature, throttling is observed, and the TMT1 transition count and total time stay flat.
+- Does a temperature event mean the drive throttled? => No. The event says a threshold was crossed. Throttling is a separate firmware action.
+PITFALL: Treating WCTEMP as the throttle point. It is a warning level, and throttling normally starts earlier.
+VERIFY: Which counters the specification ties to HCTM versus vendor-defined throttling, and whether the Warning Composite Temperature Time comparison is at-or-above or above.
+
+@@ 11.09 | Advanced | Numeric | tags=numeric,average-power,duty-cycle,transition-energy,break-even,apst
+Q: A laptop SSD idles between short I/O bursts. Compute its average power with and without APST, the energy of one transition, and the break-even idle gap.
+SHORT: Assume a 0.2 s burst at 3.5 W every 60 s, 0.8 W idle in PS0, 5 mW in PS4, a 100 ms APST timer, and 2 W during the 10 ms of entry plus exit. Without APST the average is about 809 mW. With APST it is about 18 mW, a reduction of about 44 times. One entry and exit costs 20 mJ, and the idle gap must exceed roughly 125 ms for APST to win.
+DEEP:
+Assumptions (illustrative): burst 3.5 W for 0.2 s, idle in PS0 0.8 W, PS4 5 mW, ENLAT 1 ms and EXLAT 9 ms taken at their maxima, 2 W while transitioning, APST idle timer 100 ms.
+
+1. Without APST, one 60 s cycle: 0.2 x 3.5 + 59.8 x 0.8 = 0.70 + 47.84 = 48.54 J. Average = 48.54 / 60 = 0.809 W.
+2. With APST: burst 0.70 J, timer wait 0.1 x 0.8 = 0.080 J, transitions 0.010 x 2 = 0.020 J, PS4 dwell (60 - 0.2 - 0.1 - 0.01) x 0.005 = 59.69 x 0.005 = 0.298 J. Total = 1.099 J. Average = 18.3 mW.
+3. Break-even: transition energy 20 mJ divided by the saving rate (0.8 - 0.005) = 0.795 W gives 25 ms. Add the 100 ms timer, so the gap must exceed about 125 ms.
+
+| Period (0.2 s burst) | Average, no APST | Average, APST |
+|---|---|---|
+| 1 s | 1,340 mW | 803 mW |
+| 10 s | 854 mW | 85 mW |
+| 60 s | 809 mW | 18.3 mW |
+| 600 s | 801 mW | 6.3 mW |
+
+- **Battery view:** over 8 hours of idle-like use, 0.809 W is 6.5 Wh and 0.0183 W is 0.15 Wh for the drive alone.
+- **Caveats:** the descriptor MP (for example 8.25 W) never enters an average, since it is a ceiling. ENLAT and EXLAT are maxima, so 10 ms is a worst case. Link PHY power, host CPU and platform effects are excluded. The first I/O after idle pays up to EXLAT 9 ms plus link exit.
+FOLLOW:
+- What changes if the burst repeats every 1 s? => The idle gap is 0.8 s, above the 125 ms break-even, but the PS4 dwell is only 0.69 s, so the average falls from 1,340 mW to 803 mW, about 40 percent.
+- Why is a timer of 50 x (ENLAT + EXLAT) considered safe? => For PS4 that is 500 ms against a 10 ms transition, so the drive spends at most about 2 percent of time transitioning, which is the bound the Linux driver comments cite.
+PITFALL: Using MP as the active power in the average. It is a ceiling, and using it overstates the energy of every burst.
+VERIFY: How the Base Specification defines the averaging window and workload for MP and ACTP, and whether ENLAT and EXLAT cover only the controller or also platform effects.
+
+@@ 11.10 | Advanced | Cross-layer | tags=shutdown,cc-shn,csts-shst,rtd3e,rtd3r,unsafe-shutdown,d3
+Q: How do CC.SHN, RTD3E and RTD3R relate to NVMe power states and PCIe D3, and how do you validate a clean shutdown?
+SHORT: Shutdown is an orderly stop, not a power state. The host writes CC.SHN (01b normal, 10b abrupt) and polls CSTS.SHST until it reads 10b, complete. RTD3E is the controller's advertised time to finish that, and RTD3R its time to resume after a D3-style power removal, both in microseconds. Reaching PS4 or D3hot does no shutdown work. Power removed without the notification increments Unsafe Shutdowns in the SMART log.
+DEEP:
+- **Sequence:** stop new I/O and let commands drain, write CC.SHN, poll CSTS.SHST (00b normal operation, 01b processing, 10b complete), then the host may move the link to D3 and the platform may remove power. The register mechanics are in the Controller Registers module.
+- **Timeouts in practice:** Linux waits at least 5 s and takes RTD3E in seconds when it is larger, capped at 60 s, so an RTD3E of 2 s still waits 5 s and 90 s waits 60 s. Microsoft documents a 5 s default for Windows when RTD3E is not reported.
+- **Not equivalent:** PS4 and D3hot keep power, so there is nothing to lose, but they do no shutdown work either. The PCIe PME_Turn_Off handshake quiesces only the link.
+- **Validation loop:**
+  1. Write known data with a dirty write cache and GC active, issue SHN, measure SHST completion time, and require the p99.9 to be at or below RTD3E.
+  2. Remove power, restore it, and verify all data. Unsafe Shutdowns must not increase.
+  3. Repeat with power cut and no SHN: the counter must rise by one, and data acknowledged as flushed must survive (depends on power-loss protection).
+  4. Measure power-on to ready against RTD3R.
+  5. After SHST = 10b, confirm no I/O is serviced until the controller is reset.
+- **Newer revisions:** later NVMe revisions add an NVM Subsystem Shutdown (CAP.NSSS, NSSD register) that applies to the whole subsystem.
+FOLLOW:
+- What must the host do before writing CC.SHN? => Stop new submissions and let outstanding commands complete, so the controller can flush its write cache and mapping journal and report SHST 10b.
+- Is D3hot without SHN safe if power stays on? => For data, yes, since the device stays powered. It is unsafe whenever the platform may remove power without warning.
+PITFALL: Treating D3hot or PS4 as a safe point to remove power. Only the shutdown notification finishes the controller's internal work.
+VERIFY: RTD3R and RTD3E offsets and semantics, abrupt-shutdown guarantees, and the NVM Subsystem Shutdown fields and the revision that introduced them.
+
+@@ 11.11 | Advanced | Cross-layer | tags=client,modern-standby,s0ix,linux,windows,suspend,storaged3enable
+Q: On a client laptop, how do Linux and Windows decide what the SSD does in idle and standby, and what must the firmware get right?
+SHORT: The host uses one of three paths. Runtime idle uses APST. Suspend-to-idle on Linux either keeps the SSD powered in its deepest non-operational state with the link in L1.x, or does a full shutdown and D3. Windows Modern Standby uses non-operational states as driver-managed idle states and does not support APST there. The SSD must report truthful ENLAT, EXLAT and RTD3 values and stay stable on all three paths.
+DEEP:
+| Path | Chosen when | NVMe action | Resume cost |
+|---|---|---|---|
+| Runtime idle (Linux, Windows) | APST supported (Linux) or driver idle timers (Windows), latency within host tolerance | APST table, or driver-selected non-operational state | EXLAT plus link exit |
+| Linux s2idle, host-managed | Non-default states exist (NPSS above 0), ASPM enabled on the device, no simple-suspend quirk | Save current state, Set Features to NPSS, restore on resume | EXLAT scale, power stays on |
+| Linux s2idle, simple suspend | ASPM off, NPSS = 0, a quirk, or the ACPI StorageD3Enable property allows D3 | CC.SHN normal, wait SHST, then D3 | RTD3R scale plus controller re-init |
+| Windows Modern Standby | Platform declares it | Driver-selected non-operational state, or D3 with RTD3 | RTD3R scale |
+
+- **Host tolerances filter states:** a state is used only if its ENLAT plus EXLAT fits. Recent Linux uses 15 ms and 100 ms tolerances, and Windows uses per-power-plan tolerances (Microsoft lists 500 ms and a 50 ms idle timeout as Modern Standby defaults). On recent Linux, a deepest state with a 120 ms exit is never used.
+- **Windows and APST:** Microsoft's NVMe guidance says the StorNVMe driver does not support devices with APST enabled when Modern Standby is required, and asks for RTD3 support with a short resume latency.
+- **S0ix dependency:** the SoC only reaches deep idle when the link is in L1.2 (or down in D3) and the SSD's LTR is relaxed. See the PCIe page, Power Management module.
+- **Firmware duties:** truthful descriptors, accurate RTD3E and RTD3R, no background wake-ups in idle, clean resume from each path, and no APST interaction bugs with the deepest state.
+FOLLOW:
+- Why can the same SSD idle at 3 mW on one laptop and 500 mW on another? => The platforms take different paths. One reaches PS4 with L1.2 or D3, the other has ASPM off, no CLKREQ# routing, or a quirk that forces a shallower state.
+- How do you tell which Linux path was taken? => The driver logs "platform quirk: setting simple suspend" on the StorageD3Enable route. Check `/sys/power/mem_sleep`, the ASPM state and the rail power across a suspend.
+PITFALL: Validating only the APST runtime path. Suspend and Modern Standby use different code in both the host and the firmware.
+VERIFY: Current Windows Modern Standby storage requirements and default values, the Linux suspend conditions on your kernel, and how StorageD3Enable is interpreted on your platform.
+
+@@ 11.12 | Advanced | Debug | tags=debug,apst,ps4,rail-power,nvme-cli,sysfs
+Q: The rail power of an idle laptop SSD sits near 0.8 W and never falls to the 5 mW the descriptor promises for PS4. How do you find out why?
+SHORT: Work from the top. Is APST supported and enabled, does the programmed table reach PS4 (eligible descriptor, latency limit, quirks), is the drive really idle for longer than ITPT, and is the link in a low power state? Read the APST feature with nvme-cli, the driver's latency limit and the command traffic, then plot rail power against time since the last I/O. A first-I/O latency that is bimodal shows whether the drive ever gets there.
+DEEP:
+```
+nvme id-ctrl /dev/nvme0 -H | grep -E "apsta|npss|^ps "
+nvme get-feature /dev/nvme0 -f 0x0c -H
+cat /sys/class/nvme/nvme0/power/pm_qos_latency_tolerance_us
+cat /sys/module/nvme_core/parameters/default_ps_max_latency_us
+```
+| Observation | Meaning | Next step |
+|---|---|---|
+| APST feature shows disabled | Driver or quirk turned it off, APSTA is 0, or the latency limit is 0 | Check the limit, quirk list and Identify APSTA |
+| Entries for PS0 to PS3 target PS3, none reach PS4 | PS4 filtered out: exit latency above the limit, or a "deepest state" quirk | Compare EXLAT 9,000 us with the limit |
+| Table is right, power stays flat | Not idle: a command lands inside ITPT, or the controller has background work | Trace block I/O and admin traffic, then sweep idle time |
+| PS4 is reached but rail power stays high | The link is not in L1.2, so the PHY burns power, or other loads share the rail | Read LnkCtl and L1SubCtl, ASPM policy, CLKREQ# |
+
+1. Confirm the descriptor and table with the commands above.
+2. Remove candidate wake sources: journald, smartd, udisks, fstrim, monitoring agents that call `nvme smart-log`. Then trace with `iostat -x 1` or blktrace at zero I/O.
+3. Sweep idle times (0.05 s, 0.5 s, 5 s, 60 s) and record first-I/O latency. A step near ITPT plus EXLAT proves entry.
+4. Repeat on a second unit and firmware to separate a unit issue from firmware.
+5. If a permissive-mode feature is enabled (Non-Operational Power State Config, FID 11h), background work may run inside the state and raise power above the descriptor.
+FOLLOW:
+- Does polling `nvme smart-log` keep the drive awake? => It is an admin command, and conformance tests expect admin commands to leave a non-operational state alone, but firmware may still restart its idle timer. Run with and without polling.
+- The table is correct and the system is idle, but power stays high. What next? => Suspect firmware: background work blocking entry, or an optimistic MP for PS4. Compare rail power on another firmware build and another unit.
+PITFALL: Forcing APST on or raising the latency limit before reading the table. You may enable a deepest state that a quirk disabled for a reason.
+VERIFY: sysfs and module parameter names on your kernel, nvme-cli output format on your version, and the effect of Feature 11h on entry into non-operational states.
+
+@@ 11.13 | Advanced | Debug | tags=debug,wake-latency,ltr,exlat,analyzer,first-io
+Q: The first read after an idle period takes 14 ms, the host tolerates 10 ms, and the SSD advertises EXLAT 9 ms. Where does the extra time come from, and how does LTR relate to it?
+SHORT: Split the 14 ms with an analyzer: doorbell write, controller wake before the SQE fetch, the platform's answer to that fetch, data service, CQE write and the interrupt reaching the application. EXLAT covers only the controller. The link L1.2 exit, a platform wake that depends on the LTR the SSD reported, CPU idle exit, and firmware exceeding its own EXLAT all add. LTR is what the SSD tells the platform, not what the host tolerates from the SSD.
+DEEP:
+| Component | Expected | How to measure |
+|---|---|---|
+| Link exit from L1.2 | about 0.1 ms | Analyzer, L1SubCtl values |
+| Controller wake (EXLAT) | up to 9 ms | Doorbell MWr to SQE MRd |
+| Platform wake for the SQE fetch | 0.1 ms to a few ms | SQE MRd to its CplD |
+| Normal 4 KiB read at QD1 | about 0.08 ms | Steady-state baseline |
+| CQE to application: interrupt, CPU C-state exit, scheduler | 0.05 to 2 ms | MSI-X MWr to fio completion |
+
+Assumptions are illustrative. Expected total is about 9.2 ms plus the platform and host legs. Measured 14 ms minus (9 + 0.11 + 0.08) leaves about 4.8 ms unexplained.
+
+- **Two different tolerances:** LTR runs from device to platform (how long the SSD can wait for memory). The APST latency tolerance in Linux or Windows runs from host to device (how long the host accepts for the SSD to wake). Raising the host tolerance never lowers a wake time. It lets deeper states in.
+- **Decision rule:**
+  1. Doorbell to SQE fetch above EXLAT plus link exit: the firmware exceeds its descriptor, so file it against the SSD.
+  2. SQE fetch to completion large: the platform is in a deep package state that the reported LTR allowed. It is a platform and LTR policy issue.
+  3. Interrupt to application large: host CPU idle and scheduling.
+- **Firmware angle:** an SSD may send a tighter LTR as soon as it wakes. That helps later requests, and it costs package power, so it is a platform-validated trade.
+FOLLOW:
+- The doorbell to SQE fetch gap is 12 ms. Is that a specification violation? => It exceeds the advertised EXLAT, so it is a defect against the descriptor. Check how the specification defines exit latency when a command arrives during entry.
+- Would a tighter LTR fix the whole 14 ms? => Only the platform leg, and it keeps the SoC shallow, which costs power. The controller wake and host legs are unaffected.
+PITFALL: Confusing LTR with the host's APST latency tolerance. They point in opposite directions and gate different states.
+VERIFY: The definition of ENLAT and EXLAT when a command arrives during entry, LTR message behavior on your platform, and which analyzer view timestamps the doorbell.
+
+@@ 11.14 | Principal | Debug | tags=debug,throttle,slc-cache,gc,link,fio,discriminate
+Q: Sequential write throughput falls from 3.2 GB/s to 1.1 GB/s after about eight minutes of a sustained fio run. How do you decide between thermal throttling, SLC cache exhaustion, garbage collection, a power-state cap and a PCIe link change?
+SHORT: Separate them with experiments. Log composite and sensor temperature, SMART thermal counters, LnkSta, the reported power state and throughput every second. Then change one variable at a time: airflow or preheat moves a thermal drop, write rate or fill level moves a cache or GC drop, and a link or power state change shows in LnkSta and Get Features. A drop at a fixed amount written is not thermal.
+DEEP:
+| Cause | Signature | Discriminating test |
+|---|---|---|
+| Thermal throttling | Drop follows temperature reaching a trip point, recovers when it cools, counters rise | Preheat or reduce airflow: drop comes earlier. More airflow: later or never |
+| SLC cache exhaustion | Drop at a fixed number of bytes written, independent of temperature | Halve the rate with fio rate limit: drop at the same GB, twice the time |
+| Garbage collection | Drop once the drive is filled, latency spikes | Fresh versus preconditioned drive, vary fill |
+| Power-state cap | Constant lower level after a state change | Get Features 02h, host power policy |
+| PCIe downtrain | Step to a fraction of throughput | LnkSta speed and width, AER, Recovery counts |
+
+- **Use arithmetic first:** at 3.2 GB/s, 8 minutes is 480 x 3.2 = 1,536 GB written. That is more than a 1 TB drive holds, so on a 1 TB device the first fill ends at 1,000 / 3.2 = 312 s (5.2 minutes). A cache that is a fraction of capacity would have run out well before 8 minutes, and steady-state GC after the first pass is as likely as thermal.
+- **Thermal is confirmed when:** the composite or a sensor crosses the trip within seconds of the drop, the TMT counters or vendor counters increment, more cooling shifts or removes the drop, and throughput returns after cooling.
+- **Run hygiene:** wait until the drive returns to its idle temperature, restore the same drive state, and run each variant at least three times. Record the fill state, since it changes GC.
+- **Report:** a plot of throughput, composite, sensor maximum and link state on one time axis, with the variant that moved the drop.
+FOLLOW:
+- Throttling is confirmed but the composite stays below every declared threshold. What now? => Plot sensors 1 to 8 and vendor logs against the drop. The trip may be on a sensor that the composite averages out. Use a thermocouple and file with the data.
+- How long between runs? => Until temperature and drive state match the start of the previous run. Thermal time constants are minutes, so back-to-back runs compare different starting states.
+PITFALL: Changing two variables at once, such as fan speed and write rate, which makes the cause unattributable.
+VERIFY: The drive's SLC cache size and policy from vendor documentation, and the SMART thermal counter fields on your product.
+
+@@ 11.15 | Principal | Scenario | tags=scenario,thermal,validation,chamber,fault-injection,throttle
+Q: How would you design the thermal validation of an SSD firmware release, from threshold programming to throttle behavior and safe operation at the critical temperature?
+SHORT: Define what must be true, then build a controllable thermal environment and observe every signal together. Check thresholds and features (defaults, Set and Get, out-of-range), reporting (SMART fields, Critical Warning, async events), throttle behavior (trip point, throughput floor, hysteresis, no oscillation), safety (never above CCTEMP, data intact) and recovery, across ambient and airflow corners with long soaks and fault injection.
+DEEP:
+1. **Environment:** thermal chamber sweep (for example 0, 25, 40, 55 and 70 C ambient), a fixture with controlled airflow, a heater or a vendor command that biases the sensor for fast tests, and thermocouples on controller, NAND and case for correlation.
+2. **Workloads:** worst-case power (large sequential writes at high queue depth), mixed random, idle bursts, and each operational state.
+3. **Observation at 1 Hz:** composite and sensors, throughput and latency percentiles, reported power state, LnkSta, SMART counters, and async event timestamps.
+4. **Predict, then measure:** steady state T = Ta + P x Rth. With P = 7 W and an assumed Rth = 6 C/W: at 25 C ambient the drive settles at 67 C (no throttle). At 40 C it would reach 82 C, above TMT1 = 80 C, so allowed power is (80 - 40) / 6 = 6.7 W (95 percent). At 55 C it would reach 97 C, and allowed power falls to (80 - 55) / 6 = 4.2 W (60 percent). A measured floor far from the prediction points at a policy bug.
+5. **Checks:**
+   - Threshold API: defaults, round trip per sensor, out-of-range HCTM rejected, persistence across resets.
+   - Reporting: Critical Warning and event on crossing, re-arm, counters, under-temperature.
+   - Throttle: onset near the trip, heavy stage at TMT2, hysteresis and limit-cycle amplitude, throughput floor, no command timeouts.
+   - Safety: composite never above CCTEMP, defined behavior if it is reached, hot power-up, data verify (fio `verify`) throughout.
+6. **Fault injection:** stuck or failed sensor, fan failure, fast cold-to-hot ramp. The drive must fail safe.
+FOLLOW:
+- How do you speed the tests up? => Bias the temperature (heater or vendor command) for coverage, then confirm the release gate with real soaks, since thermal time constants are minutes.
+- What do you gate on? => Zero miscompares, composite never above CCTEMP, throttle onset within tolerance of the documented trip, a throughput floor with no timeouts, and correct counters and events.
+PITFALL: Testing only in an open chamber. The customer enclosure, heat-soaked neighbors and airflow direction produce different profiles, so include a worst-case enclosure.
+VERIFY: What the specification requires at CCTEMP, persistence rules for HCTM and threshold settings, and whether a vendor command exists to bias the temperature.
+
+@@ 11.16 | Principal | Scenario | tags=scenario,descriptor-audit,mp,enlat,exlat,automation,statistics
+Q: How would you prove that a firmware release's power state descriptors (MP, ENLAT, EXLAT, RRT and RWT) are true, and what would the automation and pass criteria look like?
+SHORT: Treat each field as a specification to measure. MP is a ceiling on power under the worst-case workload, ENLAT and EXLAT are ceilings on transition time, and the RRT and RWT ranks must match the measured performance order. Measure every state at temperature corners with an instrumented rail and analyzer, over enough transitions to bound the tail, and gate the release on the maximum, not the average.
+DEEP:
+| Field | Measurement | Pass criterion |
+|---|---|---|
+| MP, operational | Rail power analyzer, worst-case workload mix, temperature corners, over the specification's window | Maximum at or below MP, with an instrument guard band |
+| MP, non-operational | Settled idle after entry, link in its intended L-state, background work included | Steady power at or below MP |
+| ENLAT | Time from the request to the controller settling in the state | p99.99 at or below ENLAT |
+| EXLAT | Analyzer: doorbell TLP to CQE minus baseline service and link exit, from each non-operational state, various dwells, commands arriving mid-entry | Maximum at or below EXLAT |
+| RRT, RRL, RWT, RWL | fio in each operational state | Ranks match measured order, no inversion |
+
+- **Sample size:** zero exceedances in N samples bounds the exceedance probability near 3 / N at 95 percent confidence. N = 3,000 gives 0.1 percent. APST cycles cannot be shorter than the timer, so drive volume with direct Set Features transitions and run a smaller APST-driven set.
+- **Corners:** temperature, supply voltage, link speed, capacity and fill level, and worst-case pre-state (write in flight, GC active), since entry can be delayed.
+- **Automation:** a state-machine driver (nvme-cli or SPDK), an analyzer API, a power meter, raw per-cycle records, and a CI dashboard of max and tail per field per firmware build.
+- **Instrument traps:** sample rate and bandwidth of the power analyzer (a 1 kS/s meter misses 50 us spikes), analyzer timestamp resolution, and calibration against a known load.
+FOLLOW:
+- Measured EXLAT is 5 percent above the advertised value. What do you do? => Log a defect. Either fix the firmware or raise the descriptor deliberately, knowing the host may then stop using that state because it crosses a latency tolerance.
+- How do you handle measurement noise on power? => Report mean and maximum with the instrument's accuracy, apply a guard band, repeat with a second instrument, and calibrate against a known load.
+PITFALL: Auditing averages. Hosts use the stated maxima to choose states, so a rare overshoot silently breaks the host's latency budget.
+VERIFY: The specification's definition of the MP measurement window and workload, and the reference points for ENLAT and EXLAT.

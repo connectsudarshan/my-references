@@ -1,0 +1,339 @@
+# Module 11: ZRWA, Simple Copy & Related Features
+
+@@ 11.01 | Basic | Concept | tags=zrwa,overwrite,motivation,zns-1.1
+Q: What is the Zone Random Write Area (ZRWA), and why was it added to ZNS?
+SHORT: ZRWA is an optional per-zone window just above the write pointer where the host may write in any order and overwrite the same LBAs before they are committed. Committing advances the write pointer, so everything behind it is sequential-only again. It exists because strict write-at-the-pointer is awkward for small, unaligned, out-of-order or repeatedly updated data such as metadata, parity and log tails. It is a recent addition, so treat its exact rules as revision-specific.
+DEEP:
+- **The problem:** plain ZNS requires every write to start exactly at the write pointer, one command at a time per zone. Anything that is rewritten (a journal tail, a superblock, a RAID parity block, a small record that grows) must either be appended again as a new copy, or padded out to a full write unit.
+- **What ZRWA adds:** a window of ZRWASZ blocks starting at the write pointer. Inside it the host writes at any offset, in any order, and may overwrite. The device holds the data in a buffer and commits it to media in units of ZRWAFG blocks, either when the host asks (explicit flush) or when writes run past the window (implicit flush).
+- **Typical uses:** small metadata and journal updates, parity updates for RAID or erasure coding across zones, rewriting the tail of a log record, and keeping several writes in flight to one zone without strict ordering.
+- **What it costs:** a buffer in the controller, a new resource (a limited number of zones can hold a ZRWA at once), and new state to validate.
+- **Where it comes from:** ZRWA arrived after the first ZNS release, as part of a later revision of the Zoned Namespace Command Set (my recollection is 1.1, 2021). A drive that does not report ZRWA support behaves as plain ZNS.
+FOLLOW:
+- Does ZRWA turn a zone into a conventional random-write zone? => No. Only the window above the write pointer is rewritable. Committed data behind the pointer is still sequential-only and needs a Reset to reuse.
+- Is ZRWA mandatory in a ZNS SSD? => No. It is optional and advertised in the ZNS Identify Namespace data, so a host must check before using it.
+PITFALL: Calling ZRWA "random writes to a zone". It is random writes to a small, bounded window that is then flushed forward.
+VERIFY: The ZNS Command Set revision that introduced ZRWA (1.1 by my recollection, with the ratified TP believed to be TP 4076) in the ZNS Command Set Specification and its revision history.
+
+@@ 11.02 | Basic | Concept | tags=zrwa,identify,zrwasz,zrwafg,zrwacap,numzrwa,ozcs
+Q: Which Identify and zone descriptor fields describe ZRWA, and how does a host discover support?
+SHORT: Support is announced by a bit in OZCS. The ZNS Identify Namespace data then gives ZRWASZ (window size), ZRWAFG (flush granularity), ZRWACAP (capabilities, including whether explicit flush is supported) and NUMZRWA (how many zones can hold a ZRWA at once). A zone that currently has a ZRWA allocated shows a ZRWA-valid bit in its zone attributes.
+DEEP:
+| Field | Where | Meaning |
+|---|---|---|
+| OZCS bit 1 | ZNS Identify NS, bytes 3:2 | ZRWA supported (bit 0 is Read Across Zone Boundaries) |
+| NUMZRWA | bytes 47:44 | Number of ZRWA resources: zones that can have a ZRWA at the same time |
+| ZRWAFG | bytes 49:48 | Flush granularity, in logical blocks |
+| ZRWASZ | bytes 51:50 | ZRWA size, in logical blocks |
+| ZRWACAP | byte 52 | Bit 0: explicit flush operations supported |
+| ZRWAV | zone attributes, bit 3 | This zone currently has a ZRWA |
+
+- **Units:** ZRWASZ and ZRWAFG are in logical blocks, not bytes, and both are 16-bit, so multiply by the LBA size. ZRWASZ is normally a multiple of ZRWAFG.
+- **Why two sizes:** ZRWAFG is the unit in which the window is committed. A sensible firmware picks it to match a NAND program unit or a flush-friendly multiple of one.
+- **Host check order:** read OZCS, then the fields, then confirm that ZRWACAP bit 0 is set before ever issuing an explicit flush.
+- **Tooling:** libnvme and SPDK define the structure. Do not rely on nvme-cli's `zns id-ns` text output showing these fields, and parse the raw structure (`--output-format=binary`) when in doubt.
+- **Namespace creation:** with Namespace Management, a host can request ZRWA resources for a new zoned namespace (a create option plus a requested-number field, next to the requested active and open resources).
+FOLLOW:
+- Is NUMZRWA related to MAR and MOR? => It is a separate budget. A ZRWA is bound to an open zone (see the lifecycle question), so in practice it competes for the same zones. A test model needs all three limits.
+- Where do you see ZRWAV from the host? => In the zone attributes byte of a normal Report Zones descriptor, bit 3.
+PITFALL: Reading ZRWASZ as bytes. A ZRWASZ of 1024 with 4 KiB blocks is 4 MiB, not 1 KiB.
+VERIFY: Byte offsets (from the libnvme structure layout), the OZCS and ZRWACAP bit positions, ZRWAV bit 3, the encoding of NUMZRWA (in particular any no-limit value) and whether ZRWASZ must be a multiple of ZRWAFG, in the ZNS Command Set Specification revision you target.
+
+@@ 11.03 | Basic | Concept | tags=conventional-zones,zone-type,namespaces,metadata,f2fs
+Q: Does ZNS have conventional (random-write) zones, and where does a host keep data that needs in-place update?
+SHORT: No. The Zoned Namespace Command Set defines only the Sequential Write Required zone type, so every zone in a ZNS namespace is sequential. Conventional zones belong to SMR drives. In NVMe the answer is a second namespace on the same controller that uses the normal NVM command set, plus ZRWA for small bounded in-place updates. Filesystems such as f2fs use a separate conventional device for their metadata.
+DEEP:
+- **Zone type:** the zone descriptor has a type field. In the ZNS command set the only defined value is 2h, Sequential Write Required. There is no conventional type to reserve, and no ZOC bit to ask for one. The zonedstorage.io ZNS page says the same: NVMe can expose a separate namespace for conventional access instead.
+- **SMR contrast:** ZBC and ZAC drives can expose conventional zones for metadata, and Linux zoned filesystems were built around that. Module 1 covers the heritage.
+- **Option 1, second namespace:** create an NVM-command-set namespace next to the zoned one, and use it for superblocks, the mapping table checkpoint, or a journal. It has its own FTL and OP, so it costs capacity and reintroduces GC, but for a tiny metadata volume that is fine.
+- **Option 2, ZRWA:** covers small updates, but only inside the window, and only until they are committed.
+- **Option 3, log-structured metadata:** write metadata as a log across zones and reset old ones. As I recall, btrfs in zoned mode keeps its superblock this way, in a log over two zones.
+- **Validation angle:** a mixed device needs both command sets to work independently. Confirm that heavy GC in the conventional namespace does not starve the zoned one.
+FOLLOW:
+- Can a firmware simply make the first N zones behave as random-write zones? => Not as a legal ZNS zone type. A validator that finds a zone with a type other than 2h should treat it as a spec violation.
+- Why does ZNS have no conventional zones? => The zonedstorage.io explanation is that NVMe supports multiple namespaces, so a separate conventional namespace serves the purpose.
+PITFALL: Assuming ZNS SSDs behave like SMR drives with a conventional zone region. They do not.
+VERIFY: That no additional zone type is defined in the newest ZNS Command Set revision (libnvme lists only Sequential Write Required), and the exact wording of the ZOC bits.
+
+@@ 11.04 | Intermediate | Concept | fig=zrwa | tags=zrwa,window,implicit-flush,write-pointer,ifr
+Q: How does the ZRWA window work: where can the host write, when does the write pointer move, and what is an implicit flush?
+SHORT: With a ZRWA allocated, writes may start anywhere from the write pointer up to just below WP + ZRWASZ, and may extend into a second region above it (another ZRWASZ blocks in the QEMU model). Data inside the window is uncommitted and can be overwritten. A write that reaches into the second region forces an implicit flush: the controller commits the oldest blocks, in multiples of ZRWAFG, and the write pointer advances until the write fits. Anything beyond that fails.
+DEEP:
+Layout for one zone (offsets from ZSLBA, WP = committed write pointer):
+
+| Region | Range | Rule |
+|---|---|---|
+| Committed | ZSLBA up to WP | Sequential-only, readable, no overwrite |
+| ZRWA | WP to WP + ZRWASZ - 1 | Random writes and overwrites, in any order |
+| Implicit flush region | WP + ZRWASZ to WP + 2 x ZRWASZ - 1 | A write ending here commits data and moves WP |
+| Beyond | WP + 2 x ZRWASZ and above | Zone Invalid Write |
+
+- **Reporting:** the WP in Report Zones is the committed pointer. Data sitting in the window is invisible to Report Zones, so the zone looks emptier than the host has written.
+- **Implicit flush size:** the pointer advances by the excess, rounded up to a multiple of ZRWAFG. The host does not choose it, so a test must recompute the expected WP after every write that touches the second region.
+- **Order freedom:** because writes need not land at WP, several writes to one zone may be in flight in any order, as long as they stay inside the window and do not conflict.
+- **Capacity limit:** writes still cannot go past the zone capacity.
+- **Reference model:** QEMU's NVMe device implements this with these exact parameters (`zoned.zrwas`, `zoned.zrwafg`, `zoned.numzrwa`), which makes it a useful cross-check for a host model.
+FOLLOW:
+- Does an implicit flush need any host command? => No. It happens as a side effect of a write, which is why the WP can move without a flush.
+- Are overlapping in-flight writes ordered? => Not by the protocol. If two commands overwrite the same LBAs, the host must serialize them, exactly as it would for any NVMe writes.
+PITFALL: Modelling only the explicit flush. Any write ending past WP + ZRWASZ moves the write pointer as a side effect.
+VERIFY: The size of the region above the window (2 x ZRWASZ total in the QEMU model), the exact rounding rule for implicit flush, alignment rules for writes and for the WP at allocation, and the behavior near zone capacity in the ZNS Command Set Specification.
+
+@@ 11.05 | Intermediate | Concept | tags=zrwa,explicit-flush,zsa-11h,zrwafg,zrwacap
+Q: How does the Flush Explicit ZRWA action work, and what rules does the range have to obey?
+SHORT: Flush Explicit ZRWA is Zone Send Action 11h in Zone Management Send. Its SLBA field names the last LBA to commit rather than a zone start. The controller commits everything from the write pointer through that LBA and sets the pointer to the next LBA. The committed range must be a whole number of ZRWAFG units and must lie inside the window. It only works if ZRWACAP says explicit flush is supported.
+DEEP:
+- **Command:** Zone Management Send, ZSA 11h. The SLBA (CDW10-11) is the exception to the "SLBA must be a zone start" rule, and it means "flush up to and including this LBA". nvme-cli exposes this as `nvme zns zrwa-flush-zone <dev> --lba=<last-lba>`.
+- **Effect:** the range [WP, SLBA] becomes committed, the write pointer moves to SLBA + 1, and the window slides up by the same amount. The zone is not closed or finished.
+- **Range rules (as modelled):** the number of blocks flushed is a multiple of ZRWAFG, the end LBA is not beyond the window, and the zone has a ZRWA allocated. Anything else is rejected.
+- **Support bit:** ZRWACAP bit 0 says explicit flush exists. A device without it relies on implicit flush only, and the host learns nothing about commit points except from Report Zones.
+- **Errors:** the libnvme description of Invalid Zone Operation Request covers an invalid flush range. The QEMU model uses Zone Boundary Error for a range beyond the window and Invalid Field in Command for an unaligned count, so accept any of these in a test and pin them down against the spec.
+- **When to flush:** at natural commit points, such as a transaction boundary or a full parity stripe, so the drive programs full units rather than partial ones.
+FOLLOW:
+- Is Flush Explicit ZRWA the same as the NVM Flush command? => No. The NVM Flush command asks for volatile cache to be made durable. This action moves the ZRWA commit boundary. How the two interact is device- and spec-defined and has to be tested.
+- Can I flush a zone that has no ZRWA? => No. The controller rejects it.
+PITFALL: Passing the zone start LBA to a flush out of habit. The field means the last LBA to commit, so a zone start below the write pointer is rejected.
+VERIFY: SLBA meaning for ZSA 11h (last LBA, inclusive) and the ZRWAFG alignment rule, the exact status for each invalid case, and whether the NVM Flush command has any effect on ZRWA contents, in the ZNS Command Set Specification.
+
+@@ 11.06 | Intermediate | Concept | tags=zrwa,lifecycle,open,close,finish,reset,resources
+Q: How is a ZRWA allocated and released, and how does it interact with zone states and resources?
+SHORT: A host allocates a ZRWA by opening an Empty zone with the ZRWA-allocate option in Zone Management Send, and a limited pool of ZRWA resources (NUMZRWA) bounds how many zones can hold one. The ZRWA lives while the zone holds it. Finish and Reset release it (the QEMU model does this), and Reset discards uncommitted data. What Close does to a ZRWA and its data is a point to read in the spec and test. A device that has run out of ZRWA resources returns ZRWA Resources Unavailable.
+DEEP:
+- **Allocate:** Open Zone (ZSA 03h) with CDW13 bit 9 set (the action-specific option, `--zrwaa` or `-r` in nvme-cli). The libnvme text says that trying to allocate a ZRWA when the zone is not Empty fails with Invalid Zone Operation Request.
+- **Resource check:** if no ZRWA resource is free, Zone Management Send fails with ZRWA Resources Unavailable (status code type 1, code B7h in libnvme). This is separate from Too Many Open Zones (BEh) and Too Many Active Zones.
+- **State:** the zone becomes Explicitly Open and the ZRWAV attribute bit is set. Implicit open never allocates a ZRWA, so the host must explicitly open.
+- **Release:** in the QEMU model, Finish and Reset clear ZRWAV and return the resource, while Close leaves the ZRWA allocated. I would not assume either for real firmware. What happens to uncommitted data on Close and Finish (committed first, or dropped) has to be read from the spec and tested, because host recovery depends on it.
+- **Interaction with limits:** each ZRWA zone is also an open zone and an active zone, so the budget from module 6 tightens: a host with MOR of 4 and NUMZRWA of 2 can have at most two ZRWA zones among its four open ones.
+- **Controller-driven changes:** if the controller moves a ZRWA zone to Read Only, Offline or Full by itself, check what happens to ZRWAV, the resource count and the uncommitted data. The spec is the oracle.
+FOLLOW:
+- Can I allocate a ZRWA to a zone that already has data? => Not through this path in the libnvme description: it says a non-Empty zone gets Invalid Zone Operation Request.
+- Does a ZRWA zone hold resources until the host acts? => Yes. It was explicitly opened, so it keeps an open slot and a ZRWA slot until the host finishes or resets it (or the spec says Close releases it). A host that abandons such zones exhausts NUMZRWA quickly.
+PITFALL: Assuming a ZRWA zone behaves like any explicitly open zone for Close. Check whether Close releases the ZRWA and commits or drops its data.
+VERIFY: The Empty-only rule, ZRWA release and data-commit behavior on Close, Finish and Reset (QEMU releases on Finish and Reset only), whether the controller may release a ZRWA on its own, and the exact status precedence (ZRWA Resources Unavailable versus Too Many Open Zones) in the ZNS Command Set Specification.
+
+@@ 11.07 | Intermediate | Concept | tags=simple-copy,copy,opcode-19h,source-range,mssrl,mcl,msrc
+Q: What is the Simple Copy (Copy) command, and how is it built?
+SHORT: Copy (opcode 19h, an NVM command set I/O command) copies data from one or more source LBA ranges to one contiguous destination range, entirely inside the controller, so the data never crosses PCIe. The command carries the destination start LBA (SDLBA) and a range count, and points to a list of 32-byte source range entries. Limits come from MSSRL, MCL and MSRC in the NVM Identify Namespace data and support from ONCS bit 8.
+DEEP:
+- **Command:** opcode 19h. SDLBA in CDW10-11, number of ranges NR in CDW12 bits 7:0 (zeroes-based), descriptor format in CDW12 bits 11:8. The data buffer holds NR + 1 source range entries.
+- **Source range entry (format 0h):** 32 bytes: SLBA at bytes 15:8, NLB at bytes 17:16 (zeroes-based), and fields for the expected reference tag and application tag when protection information is used.
+- **Result:** the source ranges are concatenated in order and written at SDLBA. Sources and destination must not overlap, or the command fails with Overlapping I/O Range (87h in libnvme).
+- **Limits:** MSSRL (maximum blocks in one range), MCL (maximum blocks in the whole command), MSRC (maximum number of ranges, zeroes-based). Exceeding them gives Command Size Limit Exceeded (83h).
+- **Support and options:** ONCS bit 8 says Copy is supported. Bit 9 says the write part is single-atomic, and bit 10 says all copies are fast copies. A per-range option can demand a fast copy and fail with Fast Copy Not Possible (86h) otherwise.
+- **Newer formats:** later revisions add descriptor formats with a source namespace per range (nvme-cli has `--snsids`). The original "simple" form copies inside one namespace.
+- **Host tooling:** `nvme copy` in nvme-cli sends it. As far as I checked, the mainline Linux `nvme.h` has no Copy opcode, and block-layer copy offload is still a patch series under review, so use passthrough, SPDK (which defines the opcode and range structure) or xNVMe.
+FOLLOW:
+- Does Simple Copy reduce NAND traffic? => No. The controller still reads the source and programs the destination. It saves host memory, host CPU and PCIe bandwidth.
+- Is Copy a ZNS command? => It is an NVM command set command that a zoned namespace also accepts, with the write pointer rules applied to the destination (next question).
+PITFALL: Treating Copy as a data-free metadata remap. It moves real data unless the controller implements some internal shortcut.
+VERIFY: Opcode 19h, the CDW12 field positions, range entry layout, MSSRL, MCL and MSRC fields, ONCS bits 8 to 10, status values and the descriptor formats available in the NVM Command Set Specification revision you target (TP believed to be TP 4065).
+
+@@ 11.08 | Intermediate | Concept | tags=comparison,zns,fdp,conventional,smr,tradeoffs
+Q: Compare conventional NVMe, FDP, ZNS and host-managed SMR on host burden, write amplification, over-provisioning and ecosystem.
+SHORT: Conventional SSDs ask nothing of the host and pay in OP and write amplification. FDP keeps that interface and lets the host tag data with placement hints, so the drive still runs GC but with less amplification. ZNS moves placement and GC to the host for near-1 write amplification and little OP. Host-managed SMR has the same sequential rule as ZNS, on a hard drive, with a far older software stack.
+DEEP:
+| Aspect | Conventional | FDP | ZNS | Host-managed SMR |
+|---|---|---|---|---|
+| Write rule | Random | Random, with placement tag | Sequential per zone (or ZRWA window) | Sequential per zone, plus conventional zones |
+| Who does GC | Drive | Drive | Host | Host (rewrite zones) |
+| Write amplification | Workload dependent, often 2 to 5 at high fill | Lower with good grouping | Near 1 from the drive side | Host rewriting only |
+| Over-provisioning | 7 to 28 percent typical | Still needed | Small | None as such |
+| Drive DRAM for mapping | Full L2P | Full L2P | Coarse zone mapping | Not a concern |
+| Legacy software | Works | Works | Needs zone-aware stack | Needs zone-aware stack |
+| Host burden | None | Lifetime classifier | Log-structured design, GC, resources | Same as ZNS |
+| Ecosystem | Universal | Growing | Narrower, Linux zoned block layer | Mature in HDD |
+
+- **Placement is a hint in FDP:** the drive may ignore or reinterpret it, so WAF is reduced, not guaranteed.
+- **ZNS gives a guarantee, at a price:** no in-place update except inside a ZRWA, and every failure mode moves to the host.
+- **Numbers are indicative:** WAF and OP figures depend on workload and fill level. Quote them as ranges, and never as datasheet facts.
+- **Validation weight:** conventional needs performance and reliability testing. FDP adds placement and statistics tests. ZNS adds the whole zone state machine, resources and Append. See module 1 and the NVMe page for detail.
+FOLLOW:
+- Can one drive offer both ZNS and conventional namespaces? => Yes as separate namespaces with different command sets. FDP and ZNS combined in one namespace is not something to assume.
+- Which of the four has the lowest DRAM cost? => ZNS and SMR, since mapping is per zone rather than per page.
+PITFALL: Presenting ZNS as strictly better. Its gains are real only if the application already writes in a log-structured way.
+VERIFY: FDP and ZNS interaction rules in the current NVMe Base Specification and command set specifications, and any quoted WAF or OP figures against the workload you are comparing.
+
+@@ 11.09 | Advanced | Numeric | tags=zrwa,numeric,implicit-flush,explicit-flush,wp,alignment
+Q: A ZRWA has ZRWASZ = 1024 and ZRWAFG = 64 blocks on 4 KiB LBAs, and the zone starts empty with a ZRWA allocated. Work out the sizes, then the write pointer after each step of the sequence below.
+SHORT: ZRWASZ is 4 MiB and ZRWAFG is 256 KiB, so the window plus the implicit flush region spans 8 MiB. Writes at offsets 0 and 0 again leave WP at 0. A 16-block write at offset 1020 ends at 1035, 12 blocks past the window, so implicit flush advances WP by one ZRWAFG to 64. Flushing to offset 511 commits 448 blocks and moves WP to 512, while flushing to 500 would commit 437 blocks and be rejected.
+DEEP:
+Assumptions: offsets are relative to ZSLBA, WP starts at 0, the window is [WP, WP + 1023], writes up to WP + 2047 are accepted, and implicit flush rounds the excess up to a multiple of ZRWAFG (QEMU model).
+
+1. **Sizes:** 1024 x 4 KiB = 4 MiB. ZRWAFG = 64 x 4 KiB = 256 KiB. 2 x 1024 blocks = 2048 blocks = 8 MiB reachable.
+2. **Write 8 blocks at 0, then again at 0:** both inside the window, so WP stays 0. The second write overwrites the first.
+3. **Write 16 blocks at 1020:** last block is 1035. The window ends at 1023, so the excess is 1035 - 1023 = 12 blocks. Round up to a multiple of 64: one unit, 64 blocks. **WP = 64.** The window is now [64, 1087].
+4. **Flush Explicit to LBA 511:** blocks to commit = 511 - 64 + 1 = 448. 448 / 64 = 7, so it is aligned. **WP = 512.**
+5. **Flush Explicit to LBA 500 instead:** 500 - 64 + 1 = 437 blocks. 437 mod 64 = 53, so it is not a multiple of ZRWAFG and is rejected.
+6. **Write at offset 3000 when WP = 64:** the limit is 64 + 2048 - 1 = 2111, so 3000 fails with Zone Invalid Write.
+
+Why bother: if a filesystem updates one 4 KiB bitmap block 1000 times before committing, plain ZNS needs 1000 x 4 KiB = 3.9 MiB of zone space (each update appended), while ZRWA needs one 256 KiB commit, about 15.6 times less zone space and a matching drop in later host GC.
+FOLLOW:
+- What if step 3 wrote 80 blocks at 1000 instead? => The last block is 1079, the excess is 56, still one unit of 64, so WP = 64. At 1000 with 100 blocks the end is 1099, excess 76, two units, WP = 128.
+- Why does the reported WP in step 2 not show 8? => It is the committed pointer. The window contents are not committed.
+PITFALL: Rounding the implicit flush down. The rule must push the pointer forward far enough that the write fits.
+VERIFY: The size of the accepted region above the window, the rounding rule for implicit flush and alignment requirements at the start of a ZRWA, from the ZNS Command Set Specification. The numbers here follow the QEMU model.
+
+@@ 11.10 | Advanced | Trap | tags=zrwa,zone-append,trap,persistence,conventional,ordering
+Q: Trap: a teammate says "ZRWA gives us random writes to a zone, Zone Append still works there, and whatever we wrote is already on the media". Which of the three claims are wrong?
+SHORT: All three should be challenged. ZRWA is random writes only inside a bounded window above the write pointer. Zone Append is not supported into a zone with a ZRWA in the reference model, and the spec rule should be checked. Data in the window is not committed until it is flushed, so it must not be assumed durable or even visible in the reported write pointer.
+DEEP:
+- **"Random writes to a zone":** wrong in scope. The rewritable area is ZRWASZ blocks (plus the flush region) above WP. Behind WP the zone is sequential-only.
+- **"Zone Append still works":** doubtful. Append lets the device choose where data lands, and ZRWA lets the host choose. QEMU rejects Append to a ZRWA zone with Invalid Zone Operation Request. Treat it as an error path to test, and read the exact rule in the spec.
+- **"It is already on the media":** wrong to assume. Committed means behind WP. Report Zones shows only committed data. What survives a power loss for uncommitted window data is device specific, and the host should not depend on it without a documented guarantee.
+- **Other traps in the same area:**
+  - Overlapping writes in flight have no protocol ordering, so two overwrites of one LBA racing in different queues leave undefined content.
+  - The write pointer can move on its own through implicit flush.
+  - A ZRWA occupies an open resource for as long as it exists.
+- **Host rule of thumb:** treat the window as a scratch buffer with a commit operation. Recovery logic should look only at data behind the write pointer.
+FOLLOW:
+- Can I mix Write and Zone Append to the same ZRWA zone at different times? => Not while a ZRWA is allocated in the QEMU model. After a Close or Finish releases it, the normal rules apply again. VERIFY.
+- Is a Read of an uncommitted window LBA legal? => The device is expected to return the latest data written to the window, but confirm the exact read rule in the spec and test it.
+PITFALL: Adding ZRWA to a Zone Append based design without checking. The two placement models are mutually exclusive in the reference implementation.
+VERIFY: Zone Append to a zone with ZRWA allocated (status and legality), read behavior inside the window, and any power-loss guarantee for uncommitted ZRWA data in the ZNS Command Set Specification and the device datasheet.
+
+@@ 11.11 | Advanced | Debug | tags=zrwa,debug,status,cqe,nvme-cli,invalid-write
+Q: You run the ZRWA script below on a drive reporting ZRWASZ = 1024, ZRWAFG = 64, NUMZRWA = 2, 4 KiB LBAs. Decode each result and say which ones, if any, are firmware defects.
+SHORT: None of these is a defect on its face. Step 4 moved WP to 0x40 by implicit flush, which the host did not ask for. Step 5 is Zone Invalid Write because 0x900 is beyond WP + 2 x ZRWASZ. Step 7 is ZRWA Resources Unavailable because both ZRWA resources are in use. Steps 8 and 9 are Invalid Zone Operation Request for an unsupported Append and a non-Empty allocation. A defect would be a different status or a pointer that is not FG-aligned.
+DEEP:
+```
+ 1 open   zone0 (slba 0x0)   zrwaa=1          -> success
+ 2 write  slba 0x0   nlb 8                    -> success
+ 3 write  slba 0x0   nlb 8   (same data area) -> success
+ 4 write  slba 0x3F0 nlb 32                    -> success  (report: wp=0x40 za=0x08 zs=0x30)
+ 5 write  slba 0x900 nlb 8                    -> SCT 1 SC 0xBC
+ 6 open   zone1 (slba 0x10000) zrwaa=1        -> success
+ 7 open   zone2 (slba 0x20000) zrwaa=1        -> SCT 1 SC 0xB7
+ 8 append zone0                               -> SCT 1 SC 0xB6
+ 9 write zone3 nlb 8, then open zone3 zrwaa=1 -> SCT 1 SC 0xB6
+```
+Decode: status word (DW3 bits 31:16) is DNR << 15, SCT << 9, SC << 1, plus the phase bit. With DNR set and P = 1, SC 0xBC is 0x8379, SC 0xB7 is 0x836F and SC 0xB6 is 0x836D. nvme-cli shows the same as SCT and SC values.
+
+1. Steps 2 and 3 are in the window, so success, and Report Zones still shows WP 0.
+2. Step 4 ends at 0x3F0 + 31 = 0x40F = 1039, past the window end 1023, so the excess of 16 rounds to one 64-block unit and WP = 0x40. The zone state byte 0x30 is Explicitly Open (state 3h in bits 7:4), and attribute 0x08 is ZRWAV.
+3. Step 5: 0x900 is 2304, beyond 0x40 + 2047 = 0x83F, so Zone Invalid Write (BCh).
+4. Step 7: NUMZRWA = 2 and zones 0 and 1 hold them. ZRWA Resources Unavailable (B7h), not Too Many Open Zones, so check MOR too.
+5. Step 8: Append into a ZRWA zone (QEMU model). Step 9: allocation on a non-Empty zone, per the libnvme description.
+
+Defect signs: WP not a multiple of ZRWAFG after an implicit flush, B7h missing so a third ZRWA opens, or the ZRWAV bit stuck after Close.
+FOLLOW:
+- Step 4 succeeded but Report Zones showed WP 0x40. Is the host wrong to expect WP 0? => Yes. The write ended in the flush region, so the controller advanced the pointer. A host model must derive WP from the write, not from the flush commands alone.
+- How would you tell B7h from a host bug in the zone list? => Count zones with ZRWAV set from Report Zones. If it equals NUMZRWA, the error is correct. If fewer, suspect a leaked resource.
+PITFALL: Comparing the whole status word in a test. DNR, retry and phase bits differ between devices, so mask to SCT and SC.
+VERIFY: SC values B6h, B7h, B8h and BCh in the ZNS Command Set Specification, and which status the spec assigns to Append on a ZRWA zone and to a ZRWA request on a non-Empty zone.
+
+@@ 11.12 | Advanced | Concept | tags=simple-copy,zns,write-pointer,destination,resources,host-gc
+Q: How does Simple Copy behave on a zoned namespace: what rules apply to the destination and the sources, and what does it change for host garbage collection?
+SHORT: The destination of a Copy in a zoned namespace behaves like a write: it must land at the write pointer of one zone (or in the ZRWA window), respect zone state and capacity, and it advances the write pointer and can implicitly open the zone. Sources are read like normal reads, so zone state, boundary and read-above-WP rules apply. For host GC it removes the host read and write data movement for relocation, but the NAND work stays.
+DEEP:
+- **Destination rules (as modelled in QEMU):** SDLBA selects the destination zone. The zone is implicitly opened if needed, so open and active limits and their errors can appear on a Copy. Every range then goes through the same write check as a Write: write pointer position, zone state (Full, Read Only, Offline), and zone capacity. The write pointer advances as data is committed. The result must not cross a zone boundary.
+- **Source rules:** a source range needs the same checks as a Read, including zone state (an Offline source fails), and the read-across-boundary rule if a range spans zones. The spec must be the oracle for reading above the write pointer.
+- **Overlap:** source and destination ranges must not overlap. In host GC they are in different zones, so this only matters for tests that copy inside one zone.
+- **Ordering and completion:** a single Copy is one command with NR + 1 ranges. Partial failure semantics (which ranges were written, what the write pointer is afterwards, and what the completion reports) are spec-defined, so a validator must read the write pointer after a failed Copy and not assume all-or-nothing.
+- **Concurrency:** a Copy to a zone competes with Writes and Appends to the same zone. Treat it as another writer that must follow the single-writer or ZRWA rule.
+- **Host GC changes:** the victim-zone valid ranges become a batch of source ranges for one Copy into the target zone. The host still needs its own map update, reset of the victim, and crash handling, and PI can be used to check source data during the copy.
+FOLLOW:
+- Can a Copy be used to fill a zone that has a ZRWA? => Possibly, with window rules for the destination. This combination is not well documented publicly, so test it and read the spec.
+- Does Copy consume open resources? => Yes when it implicitly opens the destination zone, so an over-budget host can see Too Many Open Zones from a Copy.
+PITFALL: Assuming Copy is atomic or all-or-nothing. It is one command, but the state after a failure or power loss is spec- and device-defined.
+VERIFY: Whether SDLBA must equal the write pointer, whether the destination may be in more than one zone, source range read rules across zones, status codes, partial-completion reporting and ONCS atomicity behavior in the ZNS and NVM Command Set Specifications. The rules above follow the QEMU model and are unverified against the specification text.
+
+@@ 11.13 | Advanced | Concept | tags=zde,descriptor-extension,use-cases,recovery,filesystem,design
+Q: What are practical uses of the Zone Descriptor Extension, and what design rules keep it from causing trouble?
+SHORT: The extension is a small host-defined blob stored with a zone descriptor, set on an Empty zone and returned by an extended Report Zones. It is useful for per-zone metadata that recovery needs quickly: owner, generation, lifetime class or a checksum. A host can rebuild its map from one report instead of scanning zone contents. The rules are that the extension is set before data, uses an active resource, and is cleared by Reset.
+DEEP:
+Mechanics live in modules 4 and 6. This answer is about how to use it.
+- **Recovery map:** after a crash, one extended Report Zones returns every zone's state, write pointer and extension. A filesystem that stores "zone owner = file group 17, generation 42" can rebuild its zone table without reading data from hundreds of zones.
+- **Lifetime and placement tags:** a database can keep a lifetime class or level number per zone, so GC decides victims from the report alone.
+- **Integrity anchor:** a checksum of a small header written at the zone start can live in the extension, so a torn header is detectable.
+- **Fencing and epochs:** a generation number per zone helps a restarted writer detect that a zone was reset and reused by a newer writer.
+- **Design rules:**
+  - Set it while the zone is Empty, and expect the zone to become Closed and to hold an active resource from that moment (see the budget in module 6).
+  - Size is fixed by ZDES, up to 255 x 64 bytes, so design a compact layout with a version byte and a checksum.
+  - Do not use it as a log: it cannot be updated in place, so changing it means a Reset first.
+  - Test what survives Reset, power loss and controller reset, since the host will depend on that.
+- **Availability:** support is per LBA format (ZDES nonzero). Mainline Linux has no block-layer interface that I know of, so users are SPDK, xNVMe or passthrough.
+FOLLOW:
+- Why not keep the same data in a separate metadata zone? => That costs an extra zone and a read, and it needs its own consistency between zone contents and the metadata. The extension travels with the descriptor.
+- Should the extension hold a copy of user data? => No. It is meant for a few bytes to a few KiB of metadata, and it costs report size for every zone.
+PITFALL: Filling extensions for every zone at format time. Each set zone is Closed and takes an active slot.
+VERIFY: ZDES units and limits, persistence across power loss and controller reset, clearing on Reset and interaction with Read Only or Offline zones in the ZNS Command Set Specification.
+
+@@ 11.14 | Principal | Numeric | tags=simple-copy,numeric,host-gc,pcie,offload,quantify
+Q: A host GC relocates 4 GiB of valid data per victim batch from 4 KiB LBAs. Quantify what Simple Copy saves over read-then-write, and what it does not.
+SHORT: With the host in the path, relocating 4 GiB moves 4 GiB up and 4 GiB down over PCIe, 8 GiB in total, plus 4 GiB of host DRAM buffers. With Copy, if valid data averages 256 KiB fragments, that is 16,384 source ranges. At 128 ranges per command that is 128 commands and 512 KiB of range descriptors, roughly 16,000 times less PCIe traffic. NAND read and program work is unchanged.
+DEEP:
+Assumptions: valid data 4 GiB = 1,048,576 blocks. Average fragment 64 blocks (256 KiB). MSRC = 128 ranges per command (a hypothetical device limit). Source range entry = 32 bytes. Full-duplex PCIe with about 6 GB/s usable per direction.
+
+1. **Host-path traffic:** 4 GiB read + 4 GiB write = 8 GiB across the link, and 4 GiB of DRAM as a bounce buffer per batch.
+2. **Ranges:** 1,048,576 / 64 = 16,384 ranges.
+3. **Commands:** 16,384 / 128 = 128 Copy commands, each with a 128 x 32 = 4096 byte descriptor list.
+4. **Descriptor traffic:** 128 x 4096 = 512 KiB, plus command and completion overhead. Ratio: 8 GiB / 512 KiB = 16,384.
+5. **PCIe time saved:** 4 GiB at 6 GB/s is about 0.72 s per direction. With reads and writes overlapping, the link is busy for about 0.7 s per batch on the host path and close to nothing on the Copy path.
+6. **Fragment size sensitivity:** with 8-block fragments there are 131,072 ranges and 1024 commands, and the descriptors are 4 MiB, still trivial. Very small fragments make the command count (and MCL and MSSRL limits) the constraint.
+7. **What stays the same:** NAND reads and programs, the L2P or zone map updates, the victim Reset, and the time to program the destination. If the device is NAND-bound, Copy does not speed up GC, it frees the host CPU and the link for foreground I/O. A test should measure foreground p99 latency during GC, not GC time alone.
+
+Method to defend the claim: run the same GC batch with and without Copy at fixed foreground load, record link bytes (a PCIe analyzer or device counters), host CPU, GC batch time and foreground p99.9.
+FOLLOW:
+- What limits how big one Copy can be? => MSRC, MSSRL, MCL and the controller's internal queue depth. Also long single commands risk host command timeouts.
+- What does Copy lose relative to a host-side copy? => The host cannot inspect or recompress the data, and integrity checking depends on PI in the copy.
+PITFALL: Claiming a GC speedup. The saving is on the host and link, and the media time is unchanged.
+VERIFY: The MSSRL, MCL and MSRC values of the target device and their units in Identify Namespace, and any ZNS-specific limit on the destination size per command.
+
+@@ 11.15 | Principal | Scenario | tags=interview,tradeoffs,market,zns,fdp,direction
+Q: An interviewer asks: "What are ZNS's tradeoffs, and where is this going?" How do you answer as a validation principal, and what do you hedge?
+SHORT: Give the trade in one sentence: ZNS removes the drive's mapping, GC and most OP in exchange for a host that writes sequentially, resets zones and budgets resources. Then say where it wins (log-structured stores, controlled stacks), where it struggles (legacy software, mixed workloads), how FDP and ZRWA and Copy try to ease adoption, and that adoption trends should be checked against current sources. Close with what you would validate.
+DEEP:
+A structure that works in 90 seconds:
+1. **The trade:** less DRAM, OP and write amplification and better tail latency, against zone-aware software, host GC and new failure modes. See module 1.
+2. **Where it fits:** RocksDB with ZenFS or similar LSM stores, log-structured filesystems (f2fs, btrfs zoned), object stores with append-only segments.
+3. **Where it does not:** unmodified filesystems, block-device consumers, mixed random workloads, third-party software you cannot change.
+4. **The features that ease it:** ZRWA for small in-place updates, Zone Append for concurrency, Simple Copy for GC offload. All later additions, none removing the host burden.
+5. **The alternative:** FDP keeps the block interface and reduces WAF through placement hints. Public write-ups I have seen describe FDP as having broad commercial traction and hyperscaler backing, and describe ZNS as needing invasive application changes (check the source and date before quoting any). That is a reasonable reading, not a fact I would quote as market share.
+6. **The other signal:** the ZNS Command Set Specification kept getting revisions after 1.1 in 2021 (my recollection is 1.2 and later in 2024 and 2025, unverified), and the zoned block layer is well maintained in Linux because SMR needs it. So zoned interfaces are not going away, even if ZNS-specific SSD demand is narrower.
+7. **Validation view:** either way, the zone model, resource limits and durability rules need tests, and much of that reuses the SMR and ZBC tooling.
+
+What to hedge aloud: market numbers, vendor roadmaps, and TP-level details you have not read.
+FOLLOW:
+- Would you recommend ZNS for a general-purpose fleet? => Only where the software is under the team's control and lifetimes cluster naturally. Otherwise FDP or better OP tuning is lower risk.
+- What is your single biggest validation concern? => Recovery after power loss, because host and device must agree on write pointers and uncommitted data.
+PITFALL: Dismissing ZNS as dead, or promoting it as the future. Say what the evidence supports and label the rest as opinion.
+VERIFY: Current ZNS and FDP deployment status, the latest ZNS Command Set Specification revision and date, and any claim about hyperscaler adoption, against current public sources.
+
+@@ 11.16 | Principal | Scenario | tags=validation-plan,zrwa,simple-copy,fault-injection,oracle,automation
+Q: Design a validation plan for a ZNS SSD that claims ZRWA and Simple Copy. What do you test, what is the oracle, and how do you decide it is enough?
+SHORT: Extend the zone-state model from module 10 with ZRWA state (allocated, committed WP, window contents) and a Copy model, then drive it with directed boundary tests, constrained-random command streams and power-loss injection. The oracle is the model plus a data pattern that encodes LBA and generation. Pass criteria are exact statuses, exact WP after every command, and no loss of committed data. Coverage means every window boundary, every resource limit and every abort point.
+DEEP:
+1. **Capability consistency:** OZCS, ZRWACAP, ZRWASZ, ZRWAFG, NUMZRWA, ONCS, MSSRL, MCL and MSRC all agree with behavior. Reject devices whose limits are not enforced.
+2. **ZRWA directed tests:** write at WP - 1, WP, WP + ZRWASZ - 1, WP + ZRWASZ, WP + 2 x ZRWASZ - 1 and WP + 2 x ZRWASZ; overwrites with read-back; implicit flush amounts; explicit flush aligned, unaligned, empty, too large; at zone capacity.
+3. **ZRWA lifecycle:** allocate on Empty, on non-Empty, past NUMZRWA; Close, Finish, Reset with uncommitted data; controller-driven Read Only or Offline; ZRWAV in Report Zones after each.
+4. **Copy directed tests:** one range, MSRC ranges, MSRC + 1, MSSRL and MSSRL + 1, MCL and MCL + 1, overlap, source in Offline zone, destination wrong WP, full zone, resource limit, PI mismatch. Verify data content and WP.
+5. **Random and concurrent:** mix Write, Append, Copy, flush and zone management across zones at several queue depths. Serialize overlapping window writes in the host, as the protocol does not order them.
+6. **Fault injection:** power loss during window writes, during explicit flush and mid-Copy; controller reset with a ZRWA allocated; command abort and timeout on a long Copy. After each, rebuild the model from Report Zones and check the invariants.
+7. **Oracle:** for each block a record of (LBA, generation, source). A model of committed WP and window. Differential run against QEMU's ZRWA and Copy implementation for the logic, and hardware only for timing and power.
+8. **Exit criteria:** all status and WP cells reached, no unexplained model divergence, repeated power-loss runs clean at a target count, and any documented device-specific behavior captured as an explicit waiver.
+FOLLOW:
+- How do you keep spec-version drift from breaking the suite? => Read support bits from Identify, gate each test on them, and put revision-specific expectations in a table you can update.
+- Which test finds the most bugs in practice? => Usually power loss around the window and flush, and resource exhaustion paths, because they combine state.
+PITFALL: Trusting QEMU as the specification. It is a reference model and can be wrong, so every divergence needs a spec citation.
+VERIFY: Each expected status, the effect of Close, Finish and Reset on uncommitted ZRWA data, Copy partial-failure behavior and power-loss guarantees in the ZNS and NVM Command Set Specifications and vendor documents.
+
+@@ 11.17 | Principal | Cross-layer | tags=power-loss,zrwa,durability,root-cause,copy,recovery
+Q: After sudden power loss, a filesystem finds that data it had flushed with an explicit ZRWA flush is missing, while unflushed window data is present. How do you root-cause it and decide whether it is a device bug?
+SHORT: Separate what the host was told from what the media holds. A successful explicit flush means the range is behind the write pointer, so losing it is a defect unless the host reused the zone or the device promised nothing beyond a separate durability command. Unflushed window data being present is allowed, not a bug. Capture the last completions, the Report Zones state before and after, and the read-back of every block.
+DEEP:
+1. **Timeline:** from host logs or a trace, list for the last N commands: completion status, the WP the device reported, whether a Flush or Flush Explicit ZRWA was acknowledged, and the queue. The oracle is the last acknowledged flush.
+2. **Post-power-cycle state:** Report Zones for the zone (state, WP, ZRWAV). Read every block below the old WP and in the window.
+3. **Classify:**
+   - Data below the acknowledged flush point missing, and WP lower: device defect, since the flush was acknowledged.
+   - WP lower than the acknowledged flush but data before it good: the pointer was not persisted. Check whether the device makes the write pointer durable only on a separate NVM Flush.
+   - Window data present above WP: allowed. Its survival is device-defined unless documented.
+   - WP higher than acknowledged: allowed, for example an implicit flush that landed just before the cut.
+4. **Layers:** check whether the host relies on the NVM Flush command for durability. Check volatile write cache settings (Feature 06h) and whether the SSD has power-loss protection capacitors. A drive that acknowledges commit before it is programmed needs PLP to keep the promise.
+5. **Repeat under control:** use a programmable power switch or the firmware's own injection at a controlled point (mid-flush, mid-program, mid-implicit flush) and run hundreds of cycles. Correlate loss with the point of injection.
+6. **Firmware evidence:** ask for the log of the flush path: when the WP was updated in the persistent map, and whether it is written before or after the NAND program completes.
+7. **Same method for Copy:** a Copy acknowledged before the destination is programmed has the same failure shape.
+FOLLOW:
+- The device documents that window data is lost on power loss, and the host lost committed data anyway. Is that a bug? => Yes, unless the host skipped a durability command the device requires. Documented volatility of the window does not cover data already committed behind the write pointer.
+- How would you prove it is the host's fault instead? => Show a reset or reuse of the zone in the trace, or find an out-of-order overwrite of a committed LBA that the host issued.
+PITFALL: Judging by data presence alone. The verdict depends on what the device acknowledged and what it documented.
+VERIFY: What the specification says about persistence of ZRWA contents, of a committed write pointer after Flush Explicit ZRWA, and of the NVM Flush command on zoned namespaces, and the vendor's own guarantees.

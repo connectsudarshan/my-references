@@ -1,0 +1,128 @@
+[
+ {
+  "id": 1,
+  "title": "NVMe Fundamentals & Architecture",
+  "scope": "Why NVMe (vs AHCI/SATA/SAS); NVM subsystem, controller, namespace, port; host vs device roles; the NVMe spec family (Base 2.x, command set specs, transport specs, NVMe-MI) and how the 2.0 restructuring works; queue-pair concept and parallelism intro; form factors and protocols overview (U.2/U.3/E1.S/E3.S/M.2 belong to the PCIe module 15, only mention). Keep queue mechanics for module 3.",
+  "figs": "nvmearch: block diagram host software -> NVMe driver -> PCIe -> NVM subsystem (controller with admin + I/O queues, namespaces, NAND) "
+ },
+ {
+  "id": 2,
+  "title": "Controller Registers & Initialization",
+  "scope": "Controller register map (CAP, VS, INTMS/INTMC, CC, CSTS, NSSR, AQA, ASQ, ACQ, CMBLOC/CMBSZ, PMR registers, doorbell region and DSTRD, Boot Partition registers only briefly); CAP fields (MQES, CQR, AMS, TO, DSTRD, NSSRS, CSS, MPSMIN/MPSMAX); the init sequence (wait CSTS.RDY=0, program AQA/ASQ/ACQ, CC fields IOSQES/IOCQES/MPS/CSS/AMS, set EN, wait RDY, Identify, set queues), shutdown (CC.SHN, CSTS.SHST), CC.EN reset semantics, NSSR, CSTS.CFS, timeouts from CAP.TO in 500 ms units, CMB/PMR basics. Register offsets and bit positions go under VERIFY unless certain.",
+  "figs": "ctrlinit: the enable/initialization flow chart; regmap: BAR0 layout with offsets"
+ },
+ {
+  "id": 3,
+  "title": "Queues, Doorbells & Command Flow",
+  "scope": "SQ/CQ ring mechanics (head/tail, wrap, full/empty, queue size 0-based QSIZE, MQES), doorbell writes and stride, SQE 64 B layout (CDW0 opcode/FUSE/PSDT/CID, NSID, MPTR, PRP/SGL, CDW10-15), CQE 16 B layout (DW0 result, SQ Head Pointer, SQ ID, CID, phase tag, status), phase-tag consumption logic, why CID must be unique per SQ, arbitration (round robin, weighted round robin with urgent priority, vendor specific), the full command lifecycle host and device, fused commands, queue creation ordering (CQ before SQ), max queues (Number of Queues feature). Do NOT cover PRP/SGL detail (module 4) or status code tables (module 9).",
+  "figs": "sqcq: ring buffer diagram with head/tail/phase; sqecqe: SQE and CQE dword layouts"
+ },
+ {
+  "id": 4,
+  "title": "PRPs, SGLs & Data Transfer",
+  "scope": "PRP1/PRP2 semantics, PRP lists, chaining last entry, page size CC.MPS, offset in first page, worked entry-count math, MDTS (units of MPSMIN), SGL descriptors (Data Block, Bit Bucket, Segment, Last Segment, Keyed for fabrics), SGL vs PRP capability (Identify Controller SGLS), metadata pointer (MPTR) and SGL for metadata, host bugs (misaligned PRP, list crossing pages, wrong PRP2 use) and their status codes (Invalid Field, PRP Offset Invalid), PCIe consequences (TLP splitting by MPS/RCB, read completions), what a validator checks.",
+  "figs": "prp: PRP1/PRP2/PRP list chaining diagram"
+ },
+ {
+  "id": 5,
+  "title": "Admin Command Set",
+  "scope": "Admin opcodes overview; Identify CNS values and what they return (controller, namespace, active NS list, NS descriptor list, CSI-specific variants); Create/Delete I/O CQ and SQ (fields, ordering, QPRIO, PC, IEN, IV); Get/Set Features (FID list, Save bit, select field, Number of Queues, Arbitration, Power Management, Temperature Threshold, Async Event Config, Timestamp, Host Behavior); Get Log Page basics (LID, NUMD, LPO, RAE) - detail of logs in module 13; Abort semantics and ACL; Async Event Request lifecycle and outstanding limit (AERL); Firmware Download/Commit/Activation (FRMW, slots, CA values, reset requirement, NVM subsystem reset); Keep Alive and Doorbell Buffer Config at a glance; Device Self-test, Sanitize and Format only pointers (modules 12,13). Include what happens when the admin queue misbehaves.",
+  "figs": "fwslots: firmware download / commit / activate slot flow"
+ },
+ {
+  "id": 6,
+  "title": "NVM Command Set (I/O Commands)",
+  "scope": "I/O opcodes and fields: SLBA, NLB (0-based), FUA, LR, PRINFO (pointer only, PI in module 8), DSM (deallocate/trim, context attributes, range format, DLFEAT and read-after-deallocate behavior), Write Zeroes with DEAC, Flush and volatile write cache (Get/Set Features VWC), Compare, Verify, Write Uncorrectable, Copy command (simple copy, source ranges), atomicity (AWUN, AWUPF, NAWUN, NAWUPF, NABO/NABSPF, atomic boundary), write ordering and the fact that NVMe does not order commands across queues, reservations (Reservation Register/Acquire/Release/Report only briefly). Firmware-validation angle: what a test must assume about persistence, torn writes after power loss, and read-after-write across queues.",
+  "figs": "(no diagram)"
+ },
+ {
+  "id": 7,
+  "title": "Namespaces & Identify Structures",
+  "scope": "Namespace concept vs LUN; NSID rules (broadcast FFFFFFFFh, active vs allocated NSIDs); Identify Namespace fields (NSZE, NCAP, NUSE, NSFEAT thin provisioning, FLBAS, LBAF table with MS/LBADS/RP, NMIC shared, DLFEAT, NGUID/EUI64, UUID list); Namespace Management (create/delete) and Namespace Attachment (attach/detach), TNVMCAP/UNVMCAP, granularity (NVM sets, Endurance groups pointer), ANA groups pointer (module 14), command-set-independent namespace identification (CSI), changing a namespace's LBA format via Format NVM (pointer), namespace capacity math (Numeric), what happens to I/O to inactive NSID (Invalid Namespace or Format).",
+  "figs": "nsmodel: subsystem, controllers, private/shared namespaces, attach lines"
+ },
+ {
+  "id": 8,
+  "title": "End-to-End Data Protection & Metadata",
+  "scope": "Metadata concept (MS bytes per LBA), extended LBA (DIF-style interleaved) vs separate metadata buffer (MPTR/SGL), PI formats (8-byte tuple: guard CRC16, application tag, reference tag; newer 64-bit guard formats are VERIFY), PI types 1/2/3 and reference tag increment rules, PRACT and PRCHK bit semantics on read/write, PI location (first or last 8 bytes of metadata, DPS), what the controller checks vs what the host checks, error status (Guard Check Error, Application Tag Check Error, Reference Tag Check Error), end-to-end protection in the SSD data path (firmware keeps PI through the internal pipeline), how to build data-integrity tests using PI, Numeric example (bytes per 4 KiB + 8 B LBA and extended LBA size), Debug example (reading a PI error).",
+  "figs": "pifmt: 8-byte PI tuple and where it is generated/checked"
+ },
+ {
+  "id": 9,
+  "title": "Status Codes, Errors & Recovery",
+  "scope": "CQE status field layout (P, SC, SCT, CRD, M, DNR), status code types (generic, command specific, media and data integrity, path related, vendor), the common codes and when each is returned (Invalid Opcode, Invalid Field, Command ID Conflict, Data Transfer Error, Abort Requested, LBA Out of Range, Capacity Exceeded, Namespace Not Ready, Media errors, Internal Error), retry policy (DNR, CRD, Command Retry Delay), Error Information log page, CSTS.CFS and fatal status, command timeout handling in host (abort, then controller reset), reset hierarchy (CC.EN toggle = controller reset; NSSR = NVM subsystem reset; PCIe FLR, hot reset, fundamental reset) and what each preserves (pointer to PCIe resets module 15), Async Event handling, behavior on queue delete with outstanding commands, aborted commands and SQ deletion. Exact code values under VERIFY unless certain.",
+  "figs": "cqestatus: DW3 status field layout; nvmereset: reset scope matrix"
+ },
+ {
+  "id": 10,
+  "title": "Interrupts, Coalescing & Polling",
+  "scope": "Interrupt Vector (IV) in Create I/O CQ, mapping many CQs to one vector, vector 0 for admin CQ, pin-based/MSI/MSI-X support for NVMe (PCIe module 10 covers MSI-X mechanics; do not re-teach), interrupt coalescing feature (aggregation threshold, aggregation time in 100 us units), Interrupt Vector Configuration feature (coalescing disable per vector), INTMS/INTMC masking for pin/MSI, phase-tag polling, Linux poll queues / io_uring hipri, SPDK polled mode, interrupt-per-core affinity, IRQ storms/lost interrupts debug, latency vs CPU tradeoff numbers (Numeric), how a validator detects missing or spurious interrupts.",
+  "figs": "intpath: SQ->CQ->MSI-X vector -> CPU path, with coalescing timeline"
+ },
+ {
+  "id": 11,
+  "title": "Power Management & Thermal",
+  "scope": "Power state descriptors (MP, ENLAT, EXLAT, RRT/RRL/RWT/RWL, IDLP, NOPS), NPSS, Power Management feature, APST feature and the transition table, host-controlled thermal management (HCTM, TMT1/TMT2), Temperature Threshold feature, WCTEMP/CCTEMP, over/under temperature async events, thermal throttling behavior and validation, relation to PCIe D3hot/L1.2 and RTD3 (pointer to PCIe module 11), shutdown and CC.SHN, Modern Standby/S0ix on client SSDs, Numeric example (average power at duty cycle, energy of transition), Debug: SSD does not enter PS4, wake latency exceeding host tolerance (LTR).",
+  "figs": "nvmepower: power states table plus APST idle timeline"
+ },
+ {
+  "id": 12,
+  "title": "Security & Data Sanitization",
+  "scope": "Security Send/Receive and TCG Opal/Pyrite/Enterprise at a high level, Format NVM (SES: none/user data erase/crypto erase; PI and LBA format change; timing; effect on namespaces), Sanitize (block erase, overwrite, crypto erase; sanitize status log, no-deallocate-after-sanitize, behaviour across power cycle, restrictions while sanitize in progress), Namespace Write Protection states, RPMB (replay-protected memory block), Boot Partitions, Self-encrypting drives and key management concepts, SPDM/DOE/secure boot for firmware (concepts only, VERIFY), firmware signing, validation: verifying data is unrecoverable, testing sanitize under power loss.",
+  "figs": "eraseops: what Format, Sanitize and crypto-erase touch (scope comparison)"
+ },
+ {
+  "id": 13,
+  "title": "Reliability, Logs & Telemetry",
+  "scope": "Get Log Page mechanics (LID, NUMD split, LPO, RAE), SMART / Health Information log fields (critical warning bits, composite temperature, available spare and threshold, percentage used, data units read/written = 1000 x 512 B, host read/write commands, controller busy time, power cycles, power on hours, unsafe shutdowns, media and data integrity errors), Error Information log, Firmware Slot Info, Changed Namespace List, Telemetry Host-Initiated and Controller-Initiated logs, Persistent Event Log, Endurance Group log, Device Self-test command and log, Commands Supported and Effects log, vendor logs and OCP datacenter SMART additions (VERIFY), Numeric: convert data units to TB written and WAF-style estimates, percentage used to remaining life, Debug: reading a log dump after an unexpected shutdown.",
+  "figs": "(no diagram)"
+ },
+ {
+  "id": 14,
+  "title": "Multi-Controller, Multipath & Virtualization",
+  "scope": "NVM subsystem with multiple controllers (private vs shared namespaces, controller IDs, CNTLID), dual-port and dual-host designs, ANA (Asymmetric Namespace Access) states and log page, host multipath (native NVMe multipath in Linux), Reservations for shared access (types and registrants), Virtualization Enhancements: primary/secondary controllers, Virtualization Management command, flexible resources (VQ/VI), SR-IOV mapping (PCIe module 13 covers SR-IOV mechanics), NVMe-MI (out-of-band via SMBus/I2C/MCTP, VPD, health polling, basic management command set) concepts, failure scenarios and validation of path failover.",
+  "figs": "multictrl: dual-port SSD with two hosts, controllers, shared namespace and ANA"
+ },
+ {
+  "id": 15,
+  "title": "NVMe over Fabrics",
+  "scope": "Why fabrics, transport-independent architecture, capsule format (command capsule, response capsule, in-capsule data), Fabrics commands (Connect, Property Get/Set, Authentication), Discovery controller and discovery log, NQN, queue model over RDMA/TCP/FC, keyed SGL and RDMA memory registration vs TCP PDUs (ICReq/ICResp, H2CData, C2HData, R2T), keep-alive timeout, controller loss timeout, boot from fabrics, Linux nvme-tcp/nvme-rdma and nvmet targets, how performance and error behavior differ from PCIe, what an SSD validation engineer needs from fabrics (JBOF/EBOF, NVMe-oF targets). Keep it shorter and at a level right for a PCIe SSD validation interview.",
+  "figs": "fabrics: host -> fabric transports -> discovery/subsystem, capsule format"
+ },
+ {
+  "id": 16,
+  "title": "Advanced NVMe Features",
+  "scope": "Host Memory Buffer (DRAM-less SSDs, HMPRE/HMMIN, HMB descriptor list, what breaks when host memory is lost), Controller Memory Buffer and Persistent Memory Region, Streams/Directives (write-lifetime hints), Flexible Data Placement (Reclaim Groups, Reclaim Units, placement identifiers, FDP configurations, events; VERIFY details), how FDP compares with ZNS (details in the separate ZNS page), Key Value command set, Copy command, Computational Storage concepts, Command Set Identifier and I/O Command Set Profile feature, Host managed features like Timestamp, Live Migration and Namespace management extensions (pointers, VERIFY). Say which items are recent (post 2.0) and put revision specifics under VERIFY.",
+  "figs": "fdp: reclaim groups / reclaim units and placement identifiers, versus conventional mixed writes"
+ },
+ {
+  "id": 17,
+  "title": "SSD Internals Behind NVMe",
+  "scope": "Firmware pipeline from command fetch to NAND program, page/block/die/plane/channel hierarchy, L2P mapping and journal, write buffer/cache, GC and WAF (WAF = NAND writes / host writes; derive), over-provisioning and spare factor math (Numeric), wear leveling, read disturb, retention and read-retry, LDPC ECC, bad-block management, power-loss protection (capacitors, flush of in-flight data, FTL journal replay), TRIM/deallocate effects, SLC cache behaviour and performance cliffs, how DRAM-less designs differ, and how these appear to the host as latency spikes, capacity numbers (NCAP vs raw), endurance (percentage used), and unsafe-shutdown counters. Validation angle: what to test and what evidence to gather.",
+  "figs": "ftl: logical-to-physical mapping, blocks, GC flow; gc: valid/invalid pages and WAF example"
+ },
+ {
+  "id": 18,
+  "title": "Performance & QoS",
+  "scope": "IOPS x block size = bandwidth, Little's law (QD = IOPS x latency), scaling with queues and threads, PCIe bandwidth ceiling vs NAND/FW limits, steady-state vs fresh-out-of-box (SNIA PTS ideas: purge, precondition, measure window), latency percentiles and tail (p99, p99.99), coordinated omission caveat, fio job design for validation (ioengine, iodepth, numjobs, direct, rate limiting, verify), read/write mix, sequential vs random, alignment and 4K, effects of GC/thermal throttling/SLC cache, QoS reporting (OCP latency monitoring, VERIFY), Numeric: bandwidth ceilings, QD needed for a target IOPS, latency budget, Debug: read a fio output with a tail-latency problem.",
+  "figs": "latstack: latency budget stack (host SW, PCIe, controller FW, NAND) for a 4K random read"
+ },
+ {
+  "id": 19,
+  "title": "Host Software Stack & Tools",
+  "scope": "Linux stack: nvme-core, nvme-pci, blk-mq hardware queues and CPU mapping, native multipath, nvme-cli commands (id-ctrl, id-ns, list, smart-log, get-feature, set-feature, format, sanitize, fw-download, fw-commit, admin-passthru, io-passthru, telemetry-log, get-log), sysfs and /dev/nvme*n*, dmesg messages for timeouts and resets (nvme_timeout, controller reset, I/O queue timeout), module parameters (io_timeout, admin_timeout, default_ps_max_latency_us, poll_queues), Windows stornvme/StorNVMe and tools (PowerShell Get-StorageReliabilityCounter, nvme.exe vendors, DeviceIoControl IOCTL_STORAGE_PROTOCOL_COMMAND, VERIFY), SPDK user-space driver, io_uring NVMe passthrough, ftrace/blktrace/perf, hot-plug in software, firmware update flow from host tools, and building automation on these.",
+  "figs": "swstack: Linux NVMe software stack layers, and where each tool taps in"
+ },
+ {
+  "id": 20,
+  "title": "Validation Methodology & Test Design",
+  "scope": "Test strategy pyramid (unit/FW simulation/emulation/FPGA/silicon), spec-to-test traceability, conformance suites (UNH-IOL, vendor suites, OCP datacenter NVMe SSD spec compliance, VERIFY names), positive/negative/boundary testing of commands and registers, fuzzing, fault injection (link errors, power fail SPOR/SPO, NAND errors, command aborts, resets during I/O), data integrity methodology (deterministic pattern, hash/verify, PI, write-read-compare with LBA-encoded content, atomicity tests), stress and soak, protocol analyzers and how they fit, power-cycle and reset matrix, regression triage, flaky test handling, metrics (coverage, escape rate, MTBF), automation framework design (YAML-driven, plugins, logging, artifacts) and CI. Include a Principal-style question on designing a test plan for a new feature.",
+  "figs": "valpyramid: validation layers from unit test to system test, with what each catches"
+ },
+ {
+  "id": 21,
+  "title": "Debug & Triage Scenarios",
+  "scope": "A set of realistic scenarios each with symptoms, first three actions, evidence to collect, likely causes ranked, and the discriminating experiment: CSTS.CFS after a Format, I/O timeouts under queue depth, admin command hang after power cycle, data miscompare after SPOR, sudden performance drop after N hours (thermal, GC, SLC), namespace disappears after reset, link downgrade and NVMe timeout correlation, unexpected zero-filled reads after deallocate, firmware update failures, host vs device fault isolation. Also the meta-skills: reproducibility, bisecting firmware builds, minimum repro, writing a good bug report, communicating with firmware and hardware teams. Cross-layer means NVMe plus PCIe plus NAND plus host.",
+  "figs": "triage: fault-isolation decision tree (host / link / controller / media)"
+ }
+]

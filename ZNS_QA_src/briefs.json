@@ -1,0 +1,74 @@
+[
+ {
+  "id": 1,
+  "title": "Why Zoned Storage",
+  "scope": "Conventional SSD pain (FTL random-write handling, GC WAF, OP cost, latency spikes, DRAM for L2P), zoned model idea (sequential write within zones, host takes over placement/GC), heritage: SMR HDDs with ZAC/ZBC, host-aware vs host-managed vs drive-managed, ZNS as the NVMe zoned command set, what the host gains (lower WAF, less OP, lower DRAM, predictable latency, ties to log-structured software) and what it takes on (must write sequentially, must do GC, resource limits), who ships it and where it fits (ZNS vs FDP vs conventional; use a hedged tone, VERIFY market statements). Numeric: DRAM for a page-level L2P table on a 4 TB SSD versus zone-level mapping, and OP saved.",
+  "figs": "conv_vs_zns: conventional mixed-placement SSD with GC vs zoned placement"
+ },
+ {
+  "id": 2,
+  "title": "ZNS Architecture & Command Set Basics",
+  "scope": "NVMe 2.x command set architecture recap (Base + NVM CS + ZNS CS, CSI values: NVM 00h, KV 01h, ZNS 02h; VERIFY), I/O Command Set Profile / CSS bits in CC, Identify Namespace data structure for the ZNS command set (ZOC, OZCS, MAR, MOR, RRL, FRL, ZAMDS/ZASL, LBAF extension ZDES), Identify Controller ZASL, zone size ZSZE vs zone capacity ZCAP, zone start LBA alignment, which NVM commands remain valid (Read, Write, Flush, Write Zeroes, Verify, Compare, DSM), which commands are ZNS-specific (Zone Append, Zone Management Send/Receive), namespaces of ZNS type appear how in nvme-cli/Linux. Field names and offsets under VERIFY where unsure.",
+  "figs": "zonemodel: LBA space divided into zones with zone size vs zone capacity, write pointer per zone"
+ },
+ {
+  "id": 3,
+  "title": "Zones, States & the Write Pointer",
+  "scope": "Sequential Write Required zones, ZSLBA, ZCAP, write pointer (WP) and what it means in each state, zone descriptor fields (zone type, zone state, zone attributes, ZSLBA, ZCAP, WP, zone descriptor extension), the states: Empty, Implicitly Opened, Explicitly Opened, Closed, Full, Read Only, Offline; transitions caused by writes, Open/Close/Finish/Reset/Offline, reaching capacity, and by the controller (to Read Only or Offline); what a Read returns in each state and beyond WP (VERIFY: ZOC read-across-boundary and read-above-WP behaviour, DLFEAT), invariants a validator can assert (WP monotonic, WP within [ZSLBA, ZSLBA+ZCAP], Full means WP at end). Numeric: zones per namespace and WP after N writes. Debug: interpret a report-zones dump.",
+  "figs": "zstates: zone state machine with transitions labeled by command/event"
+ },
+ {
+  "id": 4,
+  "title": "Zone Management Commands",
+  "scope": "Zone Management Send: ZSA values and per-action rules (legal source states, what the WP becomes), Select All bit, Zone Send Action Specific field, Reset semantics vs erase (data becomes unreadable/zeros, latency of reset, cost on NAND), Finish semantics (WP moves to end; data between old WP and end read as? VERIFY), Zone Management Receive: Report Zones (ZRA, ZRASF filters, Partial Report bit, number of descriptors, returned buffer format, reporting large namespaces in batches), status codes for illegal transitions (Invalid Zone State Transition), and how nvme-cli exposes them (nvme zns commands; VERIFY exact subcommand names). Debug: given command sequence and starting states, predict outcomes.",
+  "figs": "(no diagram)"
+ },
+ {
+  "id": 5,
+  "title": "Zone Append",
+  "scope": "Why append exists (queue depth > 1 per zone without host-side ordering), command fields (SLBA = ZSLBA of the zone, NLB, ZASL/ZAMDS limits), result LBA in CQE DW0 (64-bit; VERIFY), atomicity/ordering guarantees (device serializes appends per zone; completions can return out of order; host must use the returned LBA), Zone Append vs Write: Write requires exact WP match (why QD=1 per zone or host ordering; failure of reordered writes), boundary rules (append cannot cross zone capacity; Zone Boundary Error), append to non-open zones (implicit open), interaction with PI (reference tag, VERIFY), Linux status (zone append emulation via zone write plugging for devices without append; native REQ_OP_ZONE_APPEND), host data structure needs (map user block to returned LBA), Numeric: throughput with QD in one zone using append vs write. Debug: duplicate/lost appended data.",
+  "figs": "append: N concurrent appends to one zone with device-assigned LBAs returned in CQE"
+ },
+ {
+  "id": 6,
+  "title": "Zone Resources: Active, Open & Excursions",
+  "scope": "Active zones (Implicitly/Explicitly Opened, Closed) vs Open zones (Implicitly/Explicitly Opened), MAR/MOR encoded as 0-based values with FFFFFFFFh meaning no limit (VERIFY), what happens when a Write or Open would exceed the limit (Too Many Active Zones / Too Many Open Zones; VERIFY names), implicit close of an implicitly opened zone by the controller, Zone Active Excursion (ZAE) and Finish Zone Recommended (FZR) attributes with FRL/RRL (Finish Recommended Limit, Reset Recommended Limit), Zone Descriptor Changed log page and asynchronous event, resource-accounting strategies in host software (RocksDB/ZenFS style), Numeric: resource budget across many writers, Debug: writes fail after N zones - find why. Also Zone Descriptor Extension (ZDE) usage.",
+  "figs": "zoneres: active vs open sets with a zone moving between states and limits marked"
+ },
+ {
+  "id": 7,
+  "title": "Errors, Status Codes & Read Rules",
+  "scope": "Zone-specific command status codes and when each is returned (Zone Boundary Error, Zone Is Full, Zone Is Read Only, Zone Is Offline, Zone Invalid Write, Too Many Active/Open Zones, Invalid Zone State Transition; VERIFY exact values), Write not at write pointer -> Zone Invalid Write, write crossing capacity, Read behaviour by state and region (below WP, at/above WP up to ZCAP, between ZCAP and ZSZE; ZOC 'read across zone boundaries' bit, DLFEAT fill values; VERIFY), zone going Read Only (why: media issues) and Offline (data lost), host recovery decisions, retry (DNR) policy, Zone Descriptor Changed events, reporting of failed zones, error handling for Zone Append, what to do when a write times out mid-zone and the WP is unknown (query Report Zones, then re-sync), and checking WP after power loss. Debug: read a sequence of statuses and identify the host bug.",
+  "figs": "(no diagram)"
+ },
+ {
+  "id": 8,
+  "title": "ZNS Firmware & FTL Design",
+  "scope": "Zone-to-flash mapping (zone = superblock or set of erase blocks across dies/channels; parallelism vs zone size vs capacity, ZSZE power-of-two vs ZCAP), why zone capacity is smaller than zone size, write buffer and flush, partially written pages at Finish (padding), zone reset = block erase and its latency/impact, bad-block handling and how it changes ZCAP or moves zones to Offline/Read Only, wear leveling across zones (host controls placement, controller still wears), L2P simplification (zone-level or coarse), power-loss handling of the write pointer and buffered data (PLP or write-through; unsafe shutdown behaviour; what the device may promise about WP after power loss; VERIFY), read disturb/retention at zone level, background scanning, SLC cache for zones, error paths (program fail while writing a zone), firmware state machine per zone, metadata persistence. Numeric: zone size from NAND geometry, and reset time impact. Validation angle: what must be tested.",
+  "figs": "zns_ftl: zone mapped over dies/channels as a stripe of erase blocks; reset erases the set"
+ },
+ {
+  "id": 9,
+  "title": "Host Software Stack for Zoned Storage",
+  "scope": "Linux: zoned block device model (blk-zoned), sysfs attributes (zoned, chunk_sectors, nr_zones, max_open_zones, max_active_zones, zone_append_max_bytes), ioctls (BLKREPORTZONE, BLKRESETZONE, BLKOPENZONE, BLKCLOSEZONE, BLKFINISHZONE; VERIFY), nvme driver ZNS support, how sequential write ordering is ensured (mq-deadline zone write locking historically; zone write plugging in newer kernels, VERIFY version), filesystems (f2fs, btrfs zoned mode, zonefs, dm-zoned legacy), ZenFS/RocksDB, libzbd/zbc-utils, nvme-cli zns subcommands (id-ns, zone-mgmt-send, zone-mgmt-recv, report-zones, zone-append), fio zonemode=zbd and options (max_open_zones, zone_reset_threshold; VERIFY), SPDK zns bdev, xNVMe, Windows support status (VERIFY), lessons: host must implement GC. Debug: a 'write error at wrong LBA' log from a host.",
+  "figs": "(no diagram)"
+ },
+ {
+  "id": 10,
+  "title": "ZNS Validation & Test Design",
+  "scope": "Test plan structure for ZNS (Identify field consistency, zone descriptor invariants, state transitions matrix with all legal/illegal actions, Report Zones filters and pagination, boundary tests at ZCAP/ZSZE/namespace end, open/active limit enforcement, Zone Append concurrency and returned-LBA validation, ZAE/FZR/RRL attribute behaviour, Read Only/Offline injection, zone reset under load, reset during I/O, controller reset/power-cycle WP persistence, SPOR at every point of a zone's life, data integrity with per-zone models, host model (reference model of zone state and WP updated per completion), fuzzing, performance tests (zone-sequential bandwidth, append QD scaling, reset latency impact on neighbors), automation (nvme-cli, libzbd, Python model), analyzers/trace checks of CQE DW0), triage of ZNS-specific bugs, and reporting. Include a Principal-style 'design the test plan/reference model' question.",
+  "figs": "(no diagram)"
+ },
+ {
+  "id": 11,
+  "title": "ZRWA, Simple Copy & Related Features",
+  "scope": "ZRWA (Zone Random Write Area): why (in-place overwrite window for small/unaligned writes), ZRWASZ, ZRWAFG (flush granularity), ZRWACAP/ZRWAS fields, explicit vs implicit flush (Flush Explicit ZRWA), what ZRWA changes for write pointer and Zone Append (VERIFY), Simple Copy command in ZNS (source ranges, destination WP rules, offload for host GC, VERIFY), Zone Descriptor Extension use cases, conventional zones in ZNS (ZOC / zone type; VERIFY), comparison table ZNS vs FDP vs conventional vs SMR (host burden, WAF, OP, compatibility, ecosystem), where the industry seems to be heading (hedge, VERIFY), and what to say in an interview about ZNS tradeoffs. Mark all TP-derived details as VERIFY since they are recent additions.",
+  "figs": "zrwa: ZRWA window over a zone with the write pointer, explicit flush moving it"
+ },
+ {
+  "id": 12,
+  "title": "ZNS Scenarios & System Design",
+  "scope": "Design a log-structured store on ZNS (zone allocation, GC policy, WP tracking, append vs write choice, resource budgeting), capacity planning (ZCAP vs ZSZE, OP-free math, bad zone provisioning), migrating from conventional namespaces (what breaks: random-write assumptions, TRIM semantics), recovery after crash and power loss (rebuild zone map from Report Zones), debug scenarios (WP mismatch, zones stuck Open, append returning unexpected LBA, Too Many Open Zones under load, reset stalls, performance cliff, Read Only zones appearing), validation-team scenarios (what evidence to collect from host, firmware logs, analyzer), interview-style 'walk me through' questions. Mostly Scenario, Debug, Cross-layer, Principal.",
+  "figs": "(no diagram)"
+ }
+]

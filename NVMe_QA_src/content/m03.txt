@@ -1,0 +1,350 @@
+# Module 3: Queues, Doorbells & Command Flow
+
+@@ 3.01 | Basic | Concept | fig=sqcq | tags=sq,cq,ring,head,tail,ownership
+Q: How do NVMe submission and completion queues work as rings, and who owns which pointer?
+SHORT: Each queue is a fixed-size circular array in memory. For an SQ the host produces at the tail and the controller consumes at the head. For a CQ the controller produces at the tail and the host consumes at the head. Doorbell writes tell the controller the SQ tail and CQ head. The controller reports the SQ head in every CQE, and signals new CQEs with the phase tag. Neither side ever reads the other's pointer register.
+DEEP:
+Every controller has one admin queue pair (QID 0) plus I/O queue pairs created by the host. Queues normally live in host memory, and with a CMB they can live on the device. All traffic is DMA except the doorbell writes.
+
+| Pointer | Written by | How the other side learns it |
+|---|---|---|
+| SQ tail | Host | SQ tail doorbell write (MMIO) |
+| SQ head | Controller | SQ Head Pointer (SQHD) field in each CQE |
+| CQ tail | Controller | Phase tag in the new CQE, plus an interrupt if enabled |
+| CQ head | Host | CQ head doorbell write (MMIO) |
+
+- **Wrap:** pointers count entries, not bytes, and wrap modulo the queue size. SQ entries are 64 B and CQ entries are 16 B.
+- **Empty and full:** head equal to tail means empty. Tail plus one equal to head (modulo size) means full (question 3.04).
+- **Pairing:** each SQ is bound to exactly one CQ at creation, but several SQs may share one CQ. The SQID field in the CQE says which SQ a completion belongs to. Linux uses one SQ and one CQ per hardware queue.
+- **Direction of data:** the controller pulls SQEs with memory reads and pushes CQEs with memory writes. See the PCIe page, NVMe over PCIe module, for the TLP view.
+FOLLOW:
+- Why does the host not read the SQ head register? => There is no such register. The head is reported in CQEs, so the host learns free SQ space only by consuming completions.
+- Can a CQ be shared by SQs of different sizes? => Yes. The host must then size the CQ for the worst case of all outstanding commands across those SQs.
+PITFALL: Saying the controller "reads the tail from the doorbell register." The doorbell is a write-only notification. The controller keeps its own copy of the written value.
+
+@@ 3.02 | Basic | Concept | tags=doorbell,stride,mmio,batching,posted-write
+Q: What is a doorbell, where does it live, and what are the rules for writing one?
+SHORT: A doorbell is a 32-bit write-only register in BAR0, starting at offset 1000h. Each queue pair has an SQ tail doorbell and a CQ head doorbell, spaced by a stride of 4 << CAP.DSTRD bytes. Writing the SQ tail tells the controller that new SQEs exist up to that index. Writing the CQ head tells it the host has consumed CQEs up to that index. The value is an entry index below the queue size, not a count or byte offset.
+DEEP:
+- **Addresses:** SQ y tail is at 1000h + (2y) x stride, and CQ y head is at 1000h + (2y+1) x stride. Question 3.07 works an example.
+- **Value:** the new tail or head index, with only the low 16 bits meaningful. One tail write can publish many SQEs, which is how batching works.
+- **Posted write:** a doorbell is a posted MWr, so the host gets no acknowledgment. A doorbell that is lost, mis-addressed or ignored shows up only as an NVMe timeout.
+- **Ordering:** the SQE stores to host memory must be visible before the doorbell MMIO. Drivers rely on a write barrier (in Linux the `writel` used for the doorbell orders earlier memory writes).
+- **Write-only:** the host must not read doorbells, and keeps its own copy of the last value it wrote.
+- **Illegal writes:** a write to a doorbell of a queue that does not exist, or a value at or above the queue size, is a host error. The controller may report it as an Error-type asynchronous event (Write to Invalid Doorbell Register, Invalid Doorbell Register Write Value), and afterward the queue's behavior is not guaranteed.
+- **Shadow doorbells:** virtual controllers can use the Doorbell Buffer Config admin command so the host updates memory instead of MMIO. Physical SSDs mostly use real doorbells.
+FOLLOW:
+- Is a doorbell write needed for every command? => No. The host may queue several SQEs and write the tail once. The controller fetches everything between its head and the new tail.
+- What happens if the doorbell write beats the SQE stores to memory? => The controller can fetch a stale or partly written SQE. That is a host ordering bug and shows up as random invalid opcodes or CID mismatches.
+PITFALL: Treating the doorbell value as a byte offset or a count of new commands. It is the new tail or head index.
+VERIFY: Async event codes for invalid doorbell writes (Error Status, 00h and 01h), and the required behavior after an invalid write, in the NVMe Base Specification.
+
+@@ 3.03 | Basic | Concept | fig=sqecqe | tags=sqe,cqe,layout,cdw0,psdt,sqhd,phase
+Q: What is in the 64-byte SQE and the 16-byte CQE?
+SHORT: The SQE has command dword 0 (opcode, FUSE, PSDT, 16-bit command identifier), then NSID, two reserved dwords, the metadata pointer, a 16-byte data pointer (two PRPs or one SGL descriptor) and command dwords 10 to 15. The CQE has a command-specific DW0 result, a reserved DW1, DW2 with SQ head pointer and SQ ID, and DW3 with the command identifier, the phase tag and the 15-bit status field.
+DEEP:
+| SQE dword | Content |
+|---|---|
+| 0 | Bits 7:0 opcode, 9:8 FUSE, 15:14 PSDT, 31:16 CID |
+| 1 | NSID |
+| 2-3 | Reserved by the base layout (some commands use them) |
+| 4-5 | MPTR, metadata pointer |
+| 6-9 | DPTR: PRP1 and PRP2, or one 16-byte SGL descriptor |
+| 10-15 | Command-specific (CDW10 to CDW15) |
+
+| CQE dword | Content |
+|---|---|
+| 0 | Command-specific result (for example the granted queue counts from Set Features) |
+| 1 | Reserved, though some commands return a 64-bit result across DW0 and DW1 (Zone Append returns the LBA) |
+| 2 | Bits 15:0 SQ Head Pointer, 31:16 SQ Identifier |
+| 3 | Bits 15:0 CID, bit 16 phase tag, 24:17 SC, 27:25 SCT, 29:28 CRD, 30 M, 31 DNR |
+
+- **PSDT:** 00b means the data pointer holds PRPs. 01b and 10b mean SGL, with the metadata pointer either a contiguous buffer or an SGL segment. Detail is in the PRP and SGL module.
+- **Status field:** bits 31:17 of DW3 are the 15-bit status. Status code tables are in the Status Codes module.
+FOLLOW:
+- Where is the opcode's function decided, in the SQE or by the queue? => By the opcode plus which queue: admin opcodes only work on the admin SQ, and I/O opcodes only on I/O SQs.
+- Which CQE fields identify the command? => The pair SQID (DW2) and CID (DW3). CID alone is not enough when a CQ is shared.
+PITFALL: Reading the phase tag as part of the status code. It shares the same 16-bit halfword, but it is bit 0 of that halfword and the status code starts at bit 1.
+VERIFY: CDW0 reserved bits 13:10, CDW2-3 usage per command, and the DW1 usage for 64-bit results, in the NVMe Base and command set specifications.
+
+@@ 3.04 | Intermediate | Concept | tags=qsize,mqes,full,empty,outstanding,cq-overflow
+Q: How is queue size defined, when is a queue full, and what really limits the number of commands in flight?
+SHORT: Queue size fields are 0-based: Create I/O SQ and CQ carry QSIZE as entries minus one, and CAP.MQES is the maximum entries minus one. A queue has at least 2 entries. Empty means head equals tail, and full means tail plus one equals head modulo size, so an N-entry ring holds N-1. The SQ head moves when a command is fetched, not completed, so in-flight commands are limited by CQ space and CID space, not SQ depth.
+DEEP:
+- **Occupancy:** (tail - head) mod N, and free space is N - 1 - occupancy. For N = 16, head 3 and tail 14, occupancy is 11 and 4 slots are free. With head 14 and tail 2 it wraps: (2 - 14) mod 16 = 4.
+- **Limits:** the admin queue holds up to 4096 entries. I/O queues are bounded by CAP.MQES + 1, up to 65,536. Linux clamps its own I/O queue depth (the `io_queue_depth` parameter, default 1024, range 2 to 4095) and sets QSIZE to depth minus one.
+- **Why SQ depth is not the limit:** the controller consumes SQEs as it fetches them. A drive that fetches 200 commands from a 64-entry SQ over time can have 200 commands in flight, provided the host reaps or tracks them.
+- **What is the limit:** each in-flight command will eventually need one CQ slot, and one unique CID on its SQ. The controller must not overwrite a CQE the host has not consumed, so the host sizes the CQ for all commands that can be outstanding on the SQs mapped to it.
+- **Linux's rule:** the block layer tag depth is set to queue depth minus one, with one CQ per SQ. So it can never overfill the SQ or the CQ, and it never needs the SQHD value for flow control.
+FOLLOW:
+- What does QSIZE = 0 mean? => One entry, which is below the 2-entry minimum, so a controller should reject it with an Invalid Queue Size status.
+- Does a full SQ mean the SSD is slow? => Not necessarily. It means the host ran out of known free slots, and the host only learns of free slots by consuming CQEs, so a stalled CQ path can make a healthy drive look full.
+PITFALL: Forgetting the minus-one twice: QSIZE is 0-based, and usable slots are one fewer than entries. A 1024-entry ring is QSIZE 1023 on the wire and holds at most 1023 commands.
+VERIFY: The maximum I/O queue size (64K entries) and the exact rule on CQ-full behavior (the controller must hold completions rather than overwrite) in the NVMe Base Specification queue chapter.
+
+@@ 3.05 | Intermediate | Concept | tags=phase-tag,cq,consume,wrap,barrier
+Q: Explain the phase tag and give the loop a host uses to consume completions.
+SHORT: The phase tag is bit 0 of the CQE status halfword. The host zeroes the CQ memory before creating the queue and expects phase 1 on the first pass. The controller writes 1 on the first pass through the CQ and inverts the value each time its tail wraps. The host treats an entry as new only when its phase equals the expected phase, and it inverts the expected phase each time its own head wraps. No tail register is read.
+DEEP:
+```
+while (((cq[head].dw3 >> 16) & 1) == expected_phase) {
+    dma_rmb();                 /* phase first, then the rest of the entry */
+    handle(cq[head]);          /* match SQID and CID, complete the request */
+    if (++head == q_depth) { head = 0; expected_phase ^= 1; }
+    consumed++;
+}
+if (consumed) mmio_write32(cq_head_doorbell, head);
+```
+- **Why not test for a nonzero entry?** A successful completion on the second pass has phase 0, so its DW3 can be all zero when the CID is 0. Zeroed memory and a valid completion would look the same. Toggling gives an unambiguous "is this from the current pass" test without the controller having to erase anything.
+- **Initialization:** the host zeroes the CQ before Create I/O CQ. After a controller reset or queue re-creation both sides restart at phase 1 and the host must zero the memory again (Linux does a memset in its queue init). A missed re-zero makes old entries with phase 1 look new.
+- **The barrier:** the host must not read the CID or status before it has seen the phase bit change. On weakly ordered CPUs the loads can be reordered, so the driver uses a read barrier after the phase check.
+- **One doorbell per batch:** the CQ head doorbell is written after the loop, not per entry.
+FOLLOW:
+- What happens if the host does not write the CQ head doorbell? => The controller thinks the CQ is filling. Eventually it stops posting, and commands look hung even though the drive is healthy.
+- Can the host detect a torn CQE? => Not from the phase alone. A controller writing the phase word last, or the whole CQE as one 16-byte write, prevents it.
+PITFALL: Initializing expected_phase to 0. The first valid pass carries phase 1.
+VERIFY: The initial phase value and CQ-zeroing requirement text in the Create I/O Completion Queue section of the NVMe Base Specification.
+
+@@ 3.06 | Intermediate | Cross-layer | tags=lifecycle,command-flow,doorbell,fetch,completion,interrupt
+Q: Walk through the life of one command from the host driver to completion, and where can a validator observe each step?
+SHORT: The host allocates a unique CID, writes the SQE at the tail, advances its tail and writes the SQ doorbell. The controller notices the doorbell, arbitrates, fetches the SQE, and decodes and executes it, moving data by DMA. It then writes a CQE at its CQ tail with the new phase, raises an MSI-X interrupt, and the host matches CID, completes the request, and writes the CQ head doorbell.
+DEEP:
+1. **Build:** the host takes a free CID, writes the 64-byte SQE at `sq[tail]` including the PRP or SGL, and advances its shadow tail (wrapping at the queue size).
+2. **Ring:** it issues a barrier, then writes the new tail to the SQ tail doorbell (a posted MWr to BAR0).
+3. **Fetch:** the controller notices the doorbell, arbitration picks this SQ, and it issues a memory read for one or more SQEs. Its internal SQ head advances.
+4. **Decode and validate:** opcode, NSID, fields and CID are checked. Many errors complete here, without touching media.
+5. **Execute:** for a read, the firmware maps the LBA, reads NAND and DMAs data to host memory. For a write, it DMAs data from host memory first, then writes the media or the cache.
+6. **Complete:** it builds the CQE (result, SQHD, SQID, CID, status, phase) and writes it at its CQ tail. Data writes must be visible before the CQE.
+7. **Signal:** if interrupts are enabled it sends the MSI-X message for the CQ's vector, unless masked or coalesced. A polled queue skips this.
+8. **Reap:** the host checks the phase, finds the request by CID, frees the CID, records SQHD, and finally writes the CQ head doorbell.
+
+- **Timestamps to collect:** doorbell write to SQE fetch (arbitration and fetch latency), SQE fetch to CQE write (device service time), CQE write to interrupt, interrupt to CQ head doorbell (host latency).
+- **Why order matters:** on the PCIe side data MWr, then CQE MWr, then MSI-X MWr travel as one posted stream, so the host sees data before the CQE. See the PCIe page, NVMe over PCIe module.
+FOLLOW:
+- At which step is a write "complete" for the host? => When the CQE is posted, which for a cached write may be before NAND programming. Durability needs FUA or Flush.
+- Which step is invisible on a link analyzer? => Step 1, the SQE store into host memory. It appears only as the later fetch.
+PITFALL: Measuring latency from the host's submit call to its completion call and calling that the drive's latency. It includes queueing, doorbell and interrupt costs.
+VERIFY: Whether your controller fetches one SQE or several per read request, and the order of its CQE and MSI-X writes.
+
+@@ 3.07 | Intermediate | Numeric | tags=doorbell,dstrd,stride,bar0,offset
+Q: CAP.DSTRD is 2. Where are the SQ 5 tail and CQ 5 head doorbells, and how large is the doorbell region for an admin plus 128 I/O queue pairs?
+SHORT: The stride is 4 << 2 = 16 bytes. SQ 5 tail is at 1000h + 10 x 16 = 10A0h, and CQ 5 head is at 1000h + 11 x 16 = 10B0h. With 129 queue pairs (admin plus 128) the region is 2 x 129 x 16 = 4128 bytes and ends at 2020h. With DSTRD 0 the same doorbells are at 1028h and 102Ch, and the whole region is 1032 bytes.
+DEEP:
+1. Stride = 4 << DSTRD bytes. DSTRD 2 gives 4 << 2 = 16 B.
+2. SQ y tail = 1000h + (2y) x stride. For y = 5: 1000h + 10 x 16 = 1000h + 160 = 10A0h.
+3. CQ y head = 1000h + (2y + 1) x stride. For y = 5: 1000h + 11 x 16 = 10B0h.
+4. Region size = 2 x (number of queue pairs) x stride. Queue pairs = 1 admin + 128 = 129. So 2 x 129 x 16 = 4128 B = 1020h, ending at 1000h + 1020h = 2020h. The last doorbell (CQ 128 head) is at 2010h.
+5. Same layout at DSTRD 0 (stride 4): SQ 5 tail 1028h, CQ 5 head 102Ch, region 2 x 129 x 4 = 1032 B, ending at 1408h.
+
+- **Upper bound:** 65,536 queue pairs (admin plus 65,535 I/O) at DSTRD 0 is 2 x 65,536 x 4 = 512 KiB of doorbells, which is why BAR0 size varies between drives. Linux computes the needed size as the doorbell base plus (I/O queues + 1) x 8 x stride in dwords.
+- **Debug use:** a host that assumes DSTRD 0 on this drive writes SQ 5's tail to 1028h. That is 40 bytes into the region, inside the 16-byte slot of SQ 1 (offset 32 to 47) and not at the start of any slot. The write is ignored or misdirected, no command is fetched, and the command times out with a clean PCIe link.
+FOLLOW:
+- How does an analyzer trace tell you the queue ID of a doorbell write? => Subtract 1000h and divide by the stride to get an index. The QID is index / 2, and odd indexes are CQ head doorbells while even indexes are SQ tail doorbells.
+- Is the doorbell region always at 1000h? => Yes, it starts there, regardless of stride.
+PITFALL: Hard-coding a 4-byte stride in a validation tool. Read CAP.DSTRD every time.
+VERIFY: The doorbell base offset (1000h) and the DSTRD field position (CAP bits 35:32) in the NVMe Base Specification register map.
+
+@@ 3.08 | Intermediate | Trap | tags=cid,uniqueness,command-identifier,out-of-order,genctr
+Q: Command Identifiers are 16 bits. Must a CID be unique across the whole controller, and what breaks if the host reuses one too early?
+SHORT: No. A CID only has to be unique among commands outstanding on the same SQ. Two SQs may use the same CID, and a CID may be reused once its completion has been consumed. Completions carry SQID and CID, and the host uses that pair to find the request, so reusing a CID while it is still outstanding makes completions ambiguous. The spec has a Command ID Conflict status (generic 03h) for it, but controllers are not required to catch it.
+DEEP:
+- **Identity is the pair:** (SQID, CID). Abort also names a command by SQID (CDW10 bits 15:0) and CID (bits 31:16).
+- **Completions come out of order:** the CID is the host's lookup key. Linux uses the blk-mq tag as an index, and puts a 4-bit generation counter in the top nibble of the CID (`genctr << 12 | tag`). A CQE whose tag matches but whose generation is old is rejected with a genctr mismatch message.
+- **Early reuse, host side:** two live commands share a CID. The first CQE completes one of them, possibly the wrong one, and the second CQE finds nothing (or the wrong thing). A read may be completed with a write's status, data lands in the wrong buffer, or the host logs an unknown-tag message.
+- **Late duplicate CQE, firmware side:** a firmware bug that completes a command twice is harmless until the CID has been reused. Then the stale CQE completes a live command. The generation counter exists to catch exactly this.
+- **Validation angle:** a tester that hands out CIDs sequentially or as slot indexes will not find a controller that keeps a fixed-size context table indexed by 8 or 12 bits of CID. Randomize CIDs over the full 16-bit space and interleave the same CID across SQs.
+FOLLOW:
+- Can two commands on different SQs with the same CID be outstanding? => Yes. The controller must keep them apart, and Abort and CQEs carry SQID to disambiguate.
+- Does the CID have to match the slot index in the SQ? => No. It is an opaque host token that the controller echoes.
+PITFALL: Assuming CID is unique per controller. It is per SQ, and only among outstanding commands.
+VERIFY: Whether any CID value is reserved on PCIe queues, and whether your controller implements Command ID Conflict detection.
+
+@@ 3.09 | Advanced | Concept | tags=arbitration,round-robin,wrr,urgent,burst,qprio
+Q: How does command arbitration work, and what do round robin, weighted round robin and urgent priority each do?
+SHORT: Arbitration chooses which SQ the controller fetches the next command from. It does not order completion. Round robin is mandatory: every SQ, including the admin SQ, gets equal turns of up to the arbitration burst. Optional weighted round robin with urgent priority class serves the admin SQ and Urgent SQs strictly first, then High, Medium and Low classes in proportion to their weights. Vendor-specific arbitration is a third option.
+DEEP:
+- **Discover and select:** CAP.AMS bit 17 says WRR is supported, bit 18 says vendor specific. Round robin needs no bit. The host selects with CC.AMS (000b RR, 001b WRR, 111b vendor specific) while the controller is disabled.
+- **Burst:** the Arbitration feature (Feature ID 01h) has an Arbitration Burst field. The burst is 2^AB commands per SQ per round, and 111b means no limit. Identify Controller reports a recommended burst (RAB).
+- **Weights:** LPW, MPW and HPW in the same feature (bits 15:8, 23:16, 31:24) set how many commands each class may start per round. They are 0-based, so a value of 0 still means one.
+- **Priority per SQ:** the QPRIO field in Create I/O SQ (CDW11 bits 2:1) gives 00b Urgent, 01b High, 10b Medium and 11b Low. It matters only when WRR is selected.
+- **Ordering of classes:** Admin, then Urgent, then the weighted High, Medium and Low set. Urgent traffic can starve the weighted classes, and the spec gives no latency guarantee.
+- **What it does not do:** arbitration governs fetch only. Commands from one SQ are not guaranteed to execute or complete in order, and firmware scheduling deeper down (NAND queues, GC) can blunt the priority effect.
+- **In the field:** mainline Linux runs round robin (it sets CC.AMS to RR), and on drives with a known quirk (some auto-enable WRR when the queue priority is left at zero, which is Urgent) it creates SQs with Medium priority. Testing WRR needs SPDK or a custom host.
+FOLLOW:
+- Does CC.AMS take effect while the controller is enabled? => No. Set it before CC.EN is written to 1, since it may not change while enabled.
+- Where does the admin queue rank? => Above everything in WRR, and it takes part as an ordinary queue in round robin.
+PITFALL: Expecting a High-priority SQ to complete first. It is fetched first, but completion depends on the work and the firmware's back end.
+VERIFY: Weight encoding (0-based), the admin versus Urgent ordering, the CC.AMS change rule, and the RAB meaning (Identify Controller byte 72) in the NVMe Base Specification.
+
+@@ 3.10 | Advanced | Debug | tags=cq,dump,phase,cid,sqhd,decode
+Q: Below is a raw dump of an 8-entry CQ for SQ 1. The host head is 2 and the expected phase is 0. Which entries are new, what does each say, and where is the controller's tail?
+SHORT: Slots 2 and 3 are new, because their phase bit is 0. Slot 2 is CID 001Ah with status 0000h (success). Slot 3 is CID 001Bh with status 8004h: phase 0, SC 02h (Invalid Field in Command), DNR set. Slot 4 has phase 1, the old pass, so the host stops there. The controller's tail is slot 4, the host writes head 4, and the latest SQHD is 12, so SQ slots up to 11 are free.
+DEEP:
+Entries listed by slot, showing DW2 (SQID:SQHD) and DW3 (status:CID). The host is on pass 2 of the ring.
+
+| Slot | DW2 | DW3 | Phase (DW3 bit 16) | Reading |
+|---|---|---|---|---|
+| 0 | 0001 0009 | 0000 0018 | 0 | Pass 2, already consumed |
+| 1 | 0001 000A | 0000 0019 | 0 | Pass 2, already consumed |
+| 2 | 0001 000B | 0000 001A | 0 | New, CID 1Ah, success |
+| 3 | 0001 000C | 8004 001B | 0 | New, CID 1Bh, failed |
+| 4 | 0001 0005 | 0001 0014 | 1 | Old (pass 1), not yet overwritten |
+| 5 | 0001 0006 | 0001 0015 | 1 | Old |
+| 6 | 0001 0007 | 0001 0016 | 1 | Old |
+| 7 | 0001 0008 | 0001 0017 | 1 | Old |
+
+1. Expected phase is 0 and slot 2 has phase 0, so consume it. Slot 3 has phase 0, so consume it. Slot 4 has phase 1, so stop.
+2. Decode DW3 of slot 3: the upper halfword is 8004h = 1000 0000 0000 0100b. Bit 0 (phase) is 0. Bits 8:1 hold 02h. Bits 11:9 are 0, so SCT is generic. Bit 15 (DNR) is set. So status is Invalid Field in Command, do not retry.
+3. Head becomes 4. Write 4 to the CQ head doorbell. The controller tail is also 4, since it wrote slots 0 to 3 in this pass.
+4. SQHD in the last consumed CQE is 000Ch, so the controller has fetched through SQ slot 11 (its head is 12), and the host may reuse slots up to 11.
+5. The failed command is CID 001Bh on SQ 1. Correlate with the SQE you submitted for that CID to find which field was invalid.
+
+- **What the wrong logic does:** a host that consumed "anything nonzero" would also take slots 4 to 7, completing CIDs 14h to 17h a second time. That produces unknown-tag errors or completes the wrong requests.
+FOLLOW:
+- If the host expected phase 1 at head 2, what would it do? => See no new entry (slots 2 and 3 have phase 0), so CIDs 1Ah and 1Bh look lost and time out. The stale-entry symptom (consuming 14h to 17h twice) needs the host to reach slot 4 with the wrong expected phase.
+- Why is SQHD 5 in slot 4 a clue? => It is lower than the 12 in slot 3. SQHD normally increases (modulo the SQ size) in posting order, so a drop with no SQ wrap means an older entry.
+PITFALL: Comparing the whole DW3 to zero instead of extracting bit 16. A phase-0 success with CID 0 is indistinguishable from empty memory otherwise.
+
+@@ 3.11 | Advanced | Concept | tags=fused,compare-and-write,atomic,adjacent,ordering
+Q: What are fused commands, what must the host do to submit one, and what happens when one half fails?
+SHORT: A fused operation is two commands the controller treats as one atomic unit, the first with FUSE 01b and the second with FUSE 10b. The only defined pair is Compare followed by Write (a compare-and-swap on the same LBA range). They must sit in adjacent SQ slots with the same NSID, and the host must publish both with one tail update. If the first fails, the second is aborted with Command Aborted due to Failed Fused Command.
+DEEP:
+- **Support:** Identify Controller FUSES bit 0 says Compare and Write is supported. Linux does not issue fused commands for normal I/O, so a validator has to build them (SPDK, nvme-cli passthrough or a custom host).
+- **Rules for the host:** first command FUSE 01b, second FUSE 10b, both in consecutive SQ slots, same SQ, same NSID, same LBA range, and each with its own CID. The second must not be visible without the first.
+- **Semantics:** the write executes only if the compare succeeds, and no other command may modify the range in between. The controller returns two CQEs, one per command.
+- **Failure cases:**
+  - Compare miscompares: Compare completes with Compare Failure (media and data integrity status 85h), and the Write is aborted with Failed Fused Command (generic 09h).
+  - Only one half arrives or the pair is split: the controller completes the lone command with Command Aborted due to Missing Fused Command (generic 0Ah).
+  - Compare succeeds but Write fails: the Compare stays successful.
+- **Not ordering:** fusion applies to just this pair. Unfused commands, even in the same SQ, carry no ordering guarantee unless the host waits for completion.
+FOLLOW:
+- Does NVMe guarantee that commands in one SQ execute in order? => No. Fetch is in order, but execution and completion are not. A host needing order must wait for completions, or use a Flush or FUA.
+- Can the pair wrap around the end of the SQ? => Check the spec before relying on it. A safe test avoids it first, then adds the wrap case as a boundary test.
+PITFALL: Ringing the doorbell between the two halves. The controller can fetch the first alone and fail it as a missing fused command.
+VERIFY: Compare Failure status code (SCT 2, SC 85h), whether a fused pair may wrap the SQ, and exactly which errors abort the second command, in the NVMe Base and NVM Command Set specifications.
+
+@@ 3.12 | Advanced | Concept | tags=queue-creation,create-cq,create-sq,number-of-queues,feature-07h,delete
+Q: In what order does the host create and delete I/O queues, why, and how does the Number of Queues feature fit in?
+SHORT: The host first uses Set Features, Feature ID 07h (Number of Queues) to ask for a queue count, then creates each I/O CQ with Create I/O Completion Queue and only then the I/O SQ that names it, because the SQ's CDW11 carries the CQ ID. Delete runs in reverse, SQ before CQ. Counts in the feature are 0-based in both request and reply, and the controller can grant fewer queues than requested.
+DEEP:
+1. **Number of Queues:** CDW11 bits 15:0 request SQs and bits 31:16 request CQs, both minus one. The completion DW0 returns the granted counts in the same layout. Linux takes the minimum of the two granted counts.
+2. **Create I/O CQ (opcode 05h):** CDW10 QID (15:0) and QSIZE (31:16). CDW11 has PC bit 0, interrupts enabled bit 1 and interrupt vector bits 31:16. PRP1 is the queue base. Errors include an invalid vector and an invalid queue size.
+3. **Create I/O SQ (opcode 01h):** CDW10 QID and QSIZE. CDW11 has PC, QPRIO (bits 2:1) and CQID (bits 31:16). If that CQ does not exist the controller returns Completion Queue Invalid (command-specific status 00h).
+4. **Delete:** Delete I/O SQ (opcode 00h) first. Delete I/O CQ (opcode 04h) with an SQ still attached is rejected with Invalid Queue Deletion (0Ch).
+5. **Timing rule:** Number of Queues is meant for initialization, before any I/O queue exists. Setting it later returns Command Sequence Error (generic 0Ch).
+
+- **Queue IDs:** QID 0 is the admin queue. I/O QIDs start at 1. The spec allows up to 65,535 I/O queues of each type, though a real drive may offer 8, 32, 128 or so.
+- **Linux behavior:** it requests one queue per CPU (bounded by configured read, write and poll queues), takes the minimum of the reply counts, and creates CQ then SQ for each queue. If the feature fails, it still brings the admin queue up.
+- **Validator hooks:** try to create an SQ before its CQ, an SQ with an unknown QID, a queue size of 0 and above MQES + 1, a duplicate QID, and an interrupt vector beyond the MSI-X table.
+FOLLOW:
+- What happens to queues after a controller reset? => They are all gone. The host must run the create sequence again, and must zero CQ memory.
+- Can SQ and CQ counts differ? => Yes, the reply has separate fields, and the host uses the smaller for paired queues.
+PITFALL: Requesting one queue per CPU on a 256-thread host and assuming the drive granted it. Always use the returned counts.
+VERIFY: The Number of Queues reply layout, the Command Sequence Error rule, the maximum queue count and any reserved value such as FFFFh, and CAP.CQR (contiguous queues required) handling in the NVMe Base Specification.
+
+@@ 3.13 | Advanced | Scenario | tags=cq-full,shared-cq,overflow,fault-injection,stall
+Q: A test host maps 8 SQs of 256 entries onto one CQ of 256 entries. What can go wrong, and how do you test how the firmware behaves when the CQ fills?
+SHORT: Up to 8 x 255 = 2040 commands can be outstanding but the CQ holds 255 entries. If the host reaps slowly, the CQ fills. A correct controller holds completions until the host advances the CQ head. A faulty one overwrites unconsumed CQEs (lost completions and timeouts), deadlocks with all command contexts waiting on the CQ, or stalls unrelated queues. Test it by holding the CQ head doorbell and checking every CID completes exactly once.
+DEEP:
+- **Why it is risky rather than plainly illegal:** the CQ is a shared resource. The host is responsible for CQ space, and if it is short the controller has to hold completions. Many hosts avoid the issue by sizing the CQ at least equal to the sum of the SQs.
+- **Method:**
+  1. Use an SPDK or custom host (Linux keeps depth safe by design and will not do this).
+  2. Submit 2040 commands across the 8 SQs. Hold the CQ head doorbell at its initial value.
+  3. Watch the CQ: after 255 entries the controller should stop posting. Record what the trace shows next.
+  4. Release the doorbell in steps (1, 8, all) and reap.
+  5. Check the scoreboard: each (SQID, CID) completed exactly once, no CQE overwritten, SQHD monotonic per SQ, phase flips at the wrap.
+- **Extra checks:** while the data CQ is full, an admin command (on its own CQ) should still complete. Check that the stalled data queue does not starve it, even though the spec only requires that nothing is overwritten.
+- **Look for:** firmware that keeps a count of "free CQ slots" and lets it go negative, a CQ full flag that clears on any doorbell write (even one that does not free space), and timeouts on unrelated SQs while one CQ is stuck.
+- **Pass criteria:** zero lost or duplicated completions, controller recovers within your stated bound after the head is released, and no controller fatal status.
+FOLLOW:
+- Would you expect Linux to trip this? => Not with its default layout, which keeps one SQ per CQ and tag depth below queue depth. Custom hosts or shared CQs are where it shows up.
+- How do you tell a controller stall from a lost doorbell? => The stall clears when the head is advanced in a controlled way. A lost doorbell stays stuck even after another doorbell write on the same queue.
+PITFALL: Judging "controller stopped completing" as a firmware hang. If the host never advanced the CQ head, the controller is behaving correctly.
+VERIFY: The exact wording on CQ-full behavior (may the controller stop fetching, or only stop posting) in the NVMe Base Specification.
+
+@@ 3.14 | Principal | Numeric | tags=doorbell-rate,batching,mmio,cost,iops,overhead
+Q: At 1M IOPS, how much doorbell traffic and CPU cost do you get with one doorbell per command versus batching, and how would you measure it on a real drive?
+SHORT: With one SQ and one CQ doorbell per command, 1M IOPS makes 2M doorbell writes per second. At about 30 wire bytes each that is 60 MB/s, under 1 percent of a Gen4 x4 link, so the cost is CPU and firmware time. At an assumed 200 ns per uncached write it is 40 percent of a core. Batching 8 SQEs per tail write and 4 CQEs per head write gives 375K writes per second, 7.5 percent of a core.
+DEEP:
+Assumptions: 4 KiB random reads at 1M IOPS total, doorbell MWr of 4 B payload plus 16 B header plus 10 B link framing and DLLP overhead (30 B, as in the PCIe page 4 KB TLP-count question), Gen4 x4 at 7.88 GB/s per direction, and 200 ns of CPU time per uncached MMIO write (an assumption to measure on your platform).
+1. Unbatched: 1 SQ tail + 1 CQ head per command = 2 x 1M = 2M writes per second.
+2. Wire: 2M x 30 B = 60 MB/s, which is 60 / 7880 = 0.76 percent of host-to-device bandwidth.
+3. CPU: 2M x 200 ns = 0.4 core-seconds per second, so 40 percent of one core.
+4. Batched (8 SQEs per SQ doorbell, 4 CQEs per CQ doorbell): 1M / 8 = 125K SQ writes, plus 1M / 4 = 250K CQ writes = 375K per second, which is 18.75 percent of the unbatched count.
+5. Batched wire: 375K x 30 B = 11.25 MB/s. Batched CPU: 375K x 200 ns = 7.5 percent of a core.
+
+- **Where the win is:** CPU time and firmware doorbell handling, not link bandwidth. The controller also fetches several SQEs per read request (up to a 512 B request at MRRS 512).
+- **Batching is opportunistic:** at 1M IOPS over 16 queues each queue sees about 62.5K IOPS. Waiting to fill a batch of 8 would cost about 128 microseconds, so drivers batch only what is already queued (blk-mq plugging) and never wait. At QD1 the batch size is 1.
+- **Measure it:** capture BAR0 writes in the 1000h range on an analyzer over a fixed window, compute doorbells per command (2.0 unbatched, lower with batching) and the distribution of tail jumps per doorbell. A doorbell count above two per command signals spurious or redundant doorbell writes.
+FOLLOW:
+- Do shadow doorbells change this? => For virtual controllers yes. The host writes memory and only rings when the controller's EventIdx says it must, so most MMIO disappears.
+- What would a firmware doorbell-rate limit look like in a test? => IOPS that plateau at a fixed doorbell rate, while raising batch size (deeper queue, plug) lifts IOPS.
+PITFALL: Assuming doorbells cost link bandwidth. They cost host CPU cycles and firmware attention.
+VERIFY: The per-MMIO-write CPU cost on your platform (measure it), and your controller's SQE fetch size per read.
+
+@@ 3.15 | Principal | Cross-layer | tags=validation,test-design,wrap,scoreboard,negative,stress
+Q: How would you design a validation suite for SQ/CQ mechanics, doorbells and CIDs on a new SSD firmware, and what would you use as the oracle?
+SHORT: I would build a host model in SPDK or a custom driver that tracks tail, head, phase, outstanding CIDs and per-CQ occupancy, with a scoreboard checking every command completes exactly once with sane SQHD and phase. Test axes are queue depth (including 2, non-power-of-two and MQES+1), wrap position, doorbell batching, CID patterns, CQ pressure, invalid doorbells and queue create errors. An analyzer trace cross-checks the model against the wire.
+DEEP:
+- **Oracle:** the scoreboard checks per queue: each (SQID, CID) completed once, no CQE for an unissued CID, SQHD advances within range in posting order, phase flips exactly at the CQ wrap, and CQE count equals submitted count.
+- **Axes to sweep:**
+  - **Depth:** 2, 3, 5, 64, 1000, 1024, MQES + 1. Non-power-of-two depths expose masks used for modulo.
+  - **Wrap:** run past 3 wraps of both rings, with batches that straddle the wrap.
+  - **Doorbells:** single, batched, repeated same value, tail jump equal to N-1, and CQ head doorbell delayed.
+  - **CIDs:** random over the full 16-bit space, immediate reuse, identical CIDs across SQs.
+  - **CQ pressure:** shared CQ, delayed head, sudden release (question 3.13).
+  - **Negative queue commands:** bad QID, oversize, duplicate QID, SQ before CQ, delete CQ with SQ (question 3.12).
+  - **Arbitration:** RR fairness and WRR ratios (question 3.17).
+  - **Reset:** reset mid-traffic, recreate queues, check no stale CQE reaches the host.
+- **Cross-layer evidence:** capture with a PCIe analyzer: doorbell writes, SQE fetch address and size, CQE write address and size, data write ordering, MSI-X after CQE. Compare the wire order to what the model saw.
+- **Automation:** seeded random sequences, log the seed, shrink to the smallest failing depth. Small depths (2 and 3) make wrap and full frequent, so a bug reproduces in seconds rather than hours.
+- **Rig limits:** most kernel drivers keep depth safe by design, so a kernel-only test rig never drives many of these cases. Passing them on Linux says little about the firmware.
+FOLLOW:
+- What is your exit criterion? => Zero scoreboard violations over long randomized soaks at each depth class, plus every negative case returning the documented status.
+- How do you separate host-model bugs from firmware bugs? => Reproduce on a second controller or a reference model, and check the trace: if the wire is correct and the model wrong, the bug is in your model.
+PITFALL: Testing only power-of-two depths with round numbers of commands, which never hits a wrap in the middle of a batch.
+VERIFY: Status codes expected for each negative case, and the SQHD ordering rule for multiple SQs sharing one CQ.
+
+@@ 3.16 | Principal | Debug | tags=rca,wrap,duplicate-completion,unknown-tag,analyzer,phase
+Q: After hours of QD128 traffic on a 1000-entry queue, the host logs occasional "invalid id" completions, and later a timeout. The problem clusters around CQ wraps. How do you root-cause it?
+SHORT: Capture a PCIe trace around the event and check the CQE write addresses against the CQ base and 16-byte stride, the phase value on each pass, and each CID's fetch and completion counts. That separates firmware faults (wrong wrap point, wrong phase, duplicate or missing CQE) from host faults (missed barrier, stale CQ memory) and PCIe faults. Reproduce at depth 2 or 3 to make wraps frequent.
+DEEP:
+- **Hypotheses, firmware:**
+  - The CQ tail wraps at the wrong place. With 1000 entries a mask or compare written for a power of two would wrap at 1024 or skip a slot.
+  - The phase flips at the wrong point, one entry early or late.
+  - A duplicate completion (abort or retry path) posts a second CQE for the same CID.
+  - CQ-full check overwrites an unconsumed entry.
+- **Hypotheses, host:** stale CQ memory after a reset (phase 1 leftovers), missing read barrier after the phase check, CQ head doorbell written before entries were consumed, or a CID reused too soon.
+- **Evidence, step by step:**
+  1. Capture with a trigger on the first host error (or a doorbell to the CQ head near the wrap). Keep pre-trigger history.
+  2. List every CQE write: address, phase bit, CID. The address should advance by 16 B and return to the base after 1000 entries. A jump or an extra slot proves a wrap bug.
+  3. Verify phase alternates exactly at the wrap.
+  4. Map SQE fetches to CIDs, then count CQEs per (SQID, CID). Two means duplicate, zero means lost.
+  5. If the wire is clean, the host is at fault. Dump the CQ and host state, and check the barrier and doorbell order.
+- **Repro:** run the same stimulus at depths 2, 3, 5 and 1000 with a fixed seed. If only 1000-entry (non-power-of-two) queues fail, it is the modulo.
+- **Decision:** wire wrong means firmware. Wire right and host wrong means driver or model. Wire right but the host memory holds different CQE data is rare, and points at the platform (IOMMU, coherency).
+FOLLOW:
+- Why does the timeout come later? => A lost or misattributed completion leaves a command that the host still believes is outstanding. The timeout fires only when its timer expires.
+- What would you file with the firmware team? => Trace file, offsets of the bad CQE write, queue base and depth, seed, and the minimal reproducing depth.
+PITFALL: Blaming the host on the first "invalid id". A single stale CQE and a wrap bug produce identical host symptoms. Only the wire trace distinguishes them.
+VERIFY: The exact host message text on your kernel (the mainline driver logs "invalid id ... completed on queue ..."), and how your analyzer decodes CQE fields.
+
+@@ 3.17 | Principal | Scenario | tags=wrr,arbitration,validation,qprio,fairness,starvation
+Q: Design an experiment to verify that a drive's weighted round robin arbitration honors urgent priority and class weights, and explain what result would count as a bug.
+SHORT: Enable WRR (CAP.AMS bit 17, then CC.AMS = 001b), create one SQ per class with QPRIO Urgent, High, Medium and Low, and saturate them with a workload that bottlenecks at the controller front end, not NAND. Measure SQE fetches per SQ on a link analyzer. Under equal saturation the fetch ratio of High, Medium and Low should track HPW, MPW and LPW (each plus one), and Urgent should take precedence.
+DEEP:
+- **Setup:** an SPDK-based host (its controller options expose the arbitration mechanism, burst and weights, and its I/O qpair options expose the queue priority). Mainline Linux uses round robin and cannot do this. Set weights such as HPW 8, MPW 4, LPW 2 and burst 1 (AB = 0).
+- **Workload:** identical 4 KiB reads at high depth on each SQ, aimed at a range that does not stress NAND (reads of deallocated or cached LBAs), so the arbitration point, and not the back end, limits throughput.
+- **Measure at the fetch:** count SQE fetch reads per SQ per window on the analyzer. Completion counts also work but include firmware scheduling below arbitration.
+- **Expected:**
+  - High : Medium : Low fetch ratio close to (HPW+1) : (MPW+1) : (LPW+1) at saturation, with error set by the burst granularity.
+  - Urgent, if saturating, takes almost everything else. That is not a bug.
+  - Admin commands (Get Log Page, Identify) still complete under full I/O load.
+- **Bug candidates:** ratios equal (WRR ignored, plain round robin), weights applied as 1-based when 0-based (or reverse), priority of an SQ changing when another SQ is deleted and recreated, Urgent not preempting, Low fully starved while High is not saturating.
+- **Controls:** rerun with CC.AMS = RR and check fairness (equal shares). Rerun with different bursts. Record firmware and settings per run.
+- **Decision:** the spec defines the mechanism but no numeric tolerance, so set pass bands from the datasheet or from a reference drive, and treat repeated large deviations as the bug.
+FOLLOW:
+- Why not measure with fio on Linux? => The kernel driver does not select WRR or set per-queue priority, so every SQ would look the same.
+- What if firmware honors priority only at fetch, not in NAND scheduling? => That is legal. Report the gap as a product limitation and quantify latency by class.
+PITFALL: Running the test with a NAND-bound workload. Back-end scheduling then hides the arbitration effect, and every class shows nearly identical throughput.
+VERIFY: WRR weight encoding (0-based), burst encoding, whether the class weights apply per round per SQ or per class, and how the admin SQ interacts with Urgent, in the NVMe Base Specification.

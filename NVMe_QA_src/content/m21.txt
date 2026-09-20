@@ -1,0 +1,392 @@
+# Module 21: Debug & Triage Scenarios
+
+@@ 21.01 | Basic | Concept | fig=triage | tags=triage,fault-isolation,decision-tree,layers,method
+Q: Every failure report starts as "the SSD is broken". What decision tree puts it in the host, link, controller or media bucket?
+SHORT: Ask in order and stop at the first question that answers. Does config space still return a valid Vendor ID? Does CSTS read sanely with CFS clear? Do commands complete, and with which status type? If they hang, is the CQE already in host memory, and was the SQE fetched? If Success came back, is the data right? Each answer names a bucket: link, controller, media or host.
+DEEP:
+| Step | Evidence | Verdict | Bucket |
+|---|---|---|---|
+| 1. Function present? | Vendor ID in config space, LnkSta | All ones | Link, slot power or device gone |
+| 2. Controller alive? | CSTS and CC, read only after step 1 passes | CFS = 1, or RDY fell unexpectedly | Controller firmware |
+| 3. Status SCT 2 | CQE, error log, SMART media errors | Media and data integrity failure | Media or FTL |
+| 3. Status 04h Data Transfer Error | AER, IOMMU fault log | A DMA to or from host memory failed | Link or host memory path |
+| 3. Status 01h, 02h, 0Bh | Error log Parameter Error Location | The command was wrong | Host, unless a legal command was rejected |
+| 4. Timeout, CQE in host memory | CQ dump, MSI-X mask and PBA | Completion posted, host not woken | Host interrupt path, or firmware signaling |
+| 4. Timeout, no SQE fetch | Analyzer, or SSD log | Doorbell lost or queue not polled | Link, host BAR access or firmware |
+| 4. Timeout, SQE fetched, no CQE | Analyzer, or SSD log | Command stuck inside the controller | Firmware, or NAND stall |
+| 5. Success, wrong data | Raw reread, PI check, stamped pattern | Same bad data on every read, or data that varies | Media or FTL, or transport and host buffer |
+
+- **Cheapest first:** a config read and a CSTS read cost nothing and run in the failing system. The analyzer comes last.
+- **Stop at the lowest anomalous layer**, as the PCIe page method says. The exception: a firmware hang leaves every layer below it clean, so clean link plus readable CSTS plus no CQE is a positive controller finding.
+- **Buckets chain:** a link event can end as a timeout, then a reset, then CFS. Use the earliest timestamp to find the cause.
+- **Each bucket has an owner:** host software, platform or hardware, firmware, or NAND and FTL. The verdict decides who receives the evidence.
+FOLLOW:
+- Step 1 passes, CSTS reads 0x1 and there is no error status, yet I/O hangs. Which bucket? => Not yet known. Go to step 4 and check whether the CQE is in host memory, since a lost interrupt and a stuck controller look the same to the driver.
+- Why check for all ones before decoding CSTS? => A read of FFFFFFFFh has RDY, CFS and SHST all set, so a naive decode reports a fatal controller when the link is simply down.
+PITFALL: Starting at the layer you know best. The tree is ordered by cost and by dependency, so a controller theory is worthless until step 1 proves the function is even reachable.
+VERIFY: Which Linux log strings and sysfs entries your kernel provides for each step, since names change between releases.
+
+@@ 21.02 | Basic | Debug | tags=dmesg,linux,signatures,csts,timeout,nvme-cli
+Q: Which Linux NVMe log lines map to which failure class, and what is the first action for each?
+SHORT: Read the log top-down, because the first odd line is the cause and the rest is the driver's escalation ladder of timeout, abort, reset and disable. An all-ones CSTS with all-ones PCI_STATUS is a dead link. CSTS 0x3 is a controller fatal. A timeout with a readable CSTS is a stall. "Completion polled" is a lost wake-up. "Invalid id" is a CQE the host does not recognize.
+DEEP:
+| Log line (abbreviated, Linux) | Reading | First action |
+|---|---|---|
+| `controller is down; will reset: CSTS=0xffffffff, PCI_STATUS=0xffff` | Config and MMIO reads fail: link down, device off the bus | Save AER, LnkSta, hot-plug and DPC lines above it, then PCIe triage |
+| `controller is down; will reset: CSTS=0x3` | RDY and CFS set: firmware reported a fatal | Save the controller-initiated telemetry and vendor log before it is lost |
+| `I/O tag N (cid) opcode 0x2 (I/O Cmd) QID Q timeout, aborting` | The controller is alive and the command did not finish | Read CSTS, check the CQ for the CID, then trace the command |
+| `... timeout, completion polled` | The CQE was in the queue and the interrupt never came | Interrupt path and firmware signaling, not the data path |
+| `invalid id N completed on queue Q` | A CQE whose CID is not outstanding | Firmware duplicate or wrong CID, or stale CQ memory |
+| `Device not ready; aborting initialisation, CSTS=0x0` | CC.EN set and RDY never rose | Measure time to ready against CAP.TO |
+| `critical medium error, dev nvme0n1, sector S` | A media status (SCT 2) was returned | Error log and SMART media counters |
+| `Disabling device after reset failure` | Reset did not bring the controller back, namespaces removed | Everything before it: why the reset failed |
+
+- **Order matters:** an `AER:` or `pciehp: Link Down` line before the timeout means the PCIe side broke first. A `nvme ... timeout` with nothing else above it needs the controller-side evidence.
+- **Repeats:** the same CID timing out again after the reset points at the command, and a different one each time points at the device or path.
+- **Linux stores the status shifted right by one and folds DNR to bit 14**, so `0x4281` in a tool is SCT 2, SC 81h, DNR set (see the Status Codes module).
+FOLLOW:
+- The log ends at "controller is down" and the machine froze. What did you lose? => Everything after the last flush of the log. Persist the journal and use a serial or network console, since the interesting lines are the last ones.
+- One drive logs timeouts, others on the same backplane log nothing. What does that suggest? => A problem local to that drive or slot, not shared power or the switch. Several drives at once points upstream of them.
+PITFALL: Grepping for "timeout" only. The line that explains it is usually a few lines above.
+VERIFY: The exact message wording on your kernel version (with CONFIG_NVME_VERBOSE_ERRORS the opcode shows a name such as Read, without it (I/O Cmd) or (Admin Cmd)), and the meaning of each field in the timeout line.
+
+@@ 21.03 | Basic | Concept | tags=evidence,capture,volatility,nvme-cli,before-reset
+Q: A drive has just failed in the lab. What do you capture, in what order, and why before any reset?
+SHORT: Capture in order of volatility: the kernel log, then PCIe config space and CSTS, then the controller's own logs and telemetry, then the test's records. Each step is read-only. Reset, driver reload, counter clearing and reformat destroy evidence, so they come last, after everything is saved with a timestamp and a build identifier.
+DEEP:
+```
+dmesg -T > dmesg.txt ; journalctl -k -b -1 > prev_boot.txt
+lspci -vvv -s 01:00.0 > lspci.txt ; lspci -xxxx -s 01:00.0 > cfg.txt   # also the upstream ports
+timeout 10 nvme smart-log /dev/nvme0 -o json > smart.json
+timeout 10 nvme error-log /dev/nvme0 -e 64 > errlog.txt
+timeout 10 nvme fw-log /dev/nvme0 > fwlog.txt
+timeout 30 nvme telemetry-log /dev/nvme0 --controller-init --output-file=tel_ci.bin
+timeout 10 nvme id-ctrl /dev/nvme0 -H > idctrl.txt
+timeout 10 nvme get-feature /dev/nvme0 -f 0x02 -H     # also 0x0c APST, 0x04 temperature threshold
+```
+- **Why this order:** the kernel ring buffer wraps, AER status bits are sticky until cleared, and volatile controller state (telemetry, an assert dump) can vanish with the next reset or power cycle.
+- **Wrap every admin command in a timeout.** A wedged controller will hang the tool as well, and a hung capture script loses the rest of the bundle. If the first admin command hangs, stop and go to hardware access.
+- **Read logs without clearing events.** A Get Log Page without the retain-asynchronous-event option re-arms the event, so a later read no longer shows what the first one saw.
+- **Also record:** kernel, BIOS and drive firmware versions, slot, temperature, the fio command line and seed, and the wall-clock time, so the failure can be lined up with other logs.
+- **Then and only then:** reset, rescan or power cycle, noting which one you used and how the drive came back.
+FOLLOW:
+- The drive is unreachable and admin commands hang. What can you still capture? => Config space, the sysfs link state, the kernel log, the host-side test records, and via UART or JTAG the firmware's own state if the rig has them.
+- Should a capture script include a Format or a self-test? => No. It must be read-only. Anything that changes drive state belongs to a separate stage that runs after the bundle is saved.
+PITFALL: Rebooting first because the drive "needs" it. The unsafe-shutdown count, the sticky bits and the assert context are gone after that.
+VERIFY: nvme-cli option names (telemetry-log flags, --rae, output format) on your version, and which log page IDs your product supports.
+
+@@ 21.04 | Intermediate | Concept | tags=minimum-repro,bug-report,reproducibility,determinism,amplification
+Q: What makes a minimum repro and a good NVMe bug report, and why do firmware teams reject weak ones?
+SHORT: A minimum repro is the smallest, most deterministic configuration that still fails at a known rate, with one passing variant that differs in a single variable. A good report states the symptom with a rate (k failures in n trials), the exact builds, the repro script and seed, the evidence with timestamps, and what has been ruled out. Weak reports say "fails sometimes under load" and nothing a developer can act on.
+DEEP:
+1. **Fix the failure definition** in one sentence with a rate: "stale read, 3 in 1e8 reads, 8 queues, QD1".
+2. **Reduce:** raw device with O_DIRECT, no filesystem, one namespace, fewest queues and threads, smallest block size, narrowest LBA range, fixed seed. After each cut, re-run to confirm it still fails at a similar rate.
+3. **Amplify:** shrink the LBA range so collisions are constant, raise the reset or cut frequency, add thermal or power corners. Confirm the amplified failure has the same signature, since a new failure mode is a different bug.
+4. **Make it deterministic where possible:** replayable script, logged submission order, seed and timestamps.
+5. **Keep a control:** the same test with one variable changed that passes, for example one queue instead of eight.
+
+A report checklist:
+- **Title:** symptom plus signature, not a guess at the cause.
+- **Where:** drive firmware, hardware revision, host, kernel, driver, BIOS, slot and the lot or serial number.
+- **What:** expected against actual, the CQE or data pattern, and the rate with the number of trials.
+- **How:** the script, fio job file or SPDK command, the seed, the drive state before the test (fill, preconditioning, format).
+- **Evidence:** logs and traces with their clock domains, first-seen and last-known-good builds.
+- **Ruled out:** what you tested and excluded, so nobody repeats it.
+- **State:** whether the failing unit is preserved, and how to reach the rig.
+FOLLOW:
+- The repro only works on the full rig after six hours. What do you hand over? => The rig access or a shipped unit, the exact script, and the evidence. Then keep working on amplification in parallel, because a six-hour repro will stall the fix.
+- How do you show a repro is minimal? => Removing any remaining element (one queue, one thread, the LBA range) makes the failure rate drop or vanish, measured with enough trials.
+PITFALL: Trimming the repro while watching for a single failure. A rate that changes from 1 in 50 to 1 in 5000 after a cut needs a longer run to notice, so measure rates, not occurrences.
+
+@@ 21.05 | Intermediate | Debug | tags=format,cfs,csts,admin-timeout,fatal,reset
+Q: A namespace Format NVM ends with CSTS.CFS set and the drive does not come back. What are your first actions, what evidence do you collect, and how do you rank the causes?
+SHORT: First decide whether CFS came before or after the host reset. Do not reset or reissue the format. Read CSTS, config space and the logs, and keep the console output. The cause is firmware until proven otherwise, most likely an assert in the erase, remap or mapping-table rebuild path. The discriminating experiment is to rerun the format with a long timeout so the host cannot reset, while logging CSTS every 100 ms.
+DEEP:
+- **Symptoms:** `nvme format` returns an error or a timeout. dmesg shows an admin timeout on the Format opcode (80h) followed by a controller reset, or `controller is down; will reset: CSTS=0x3`. After the reset the controller may never reach RDY.
+- **First three actions:**
+  1. Read config space, then CSTS and CC. All ones means a link problem, CSTS = 3 means a fatal, CSTS = 0 means the reset left it not ready.
+  2. Save the kernel log with timestamps, then the error log, SMART, firmware log, and any controller-initiated telemetry or vendor log, and check for a pending Persistent Internal Error event.
+  3. Record the command: LBA format index, secure erase setting, metadata and PI options, the namespace, and the host timeout. Note whether Identify Namespace shows a format still in progress.
+- **Evidence and timeline:** was CFS set before the host timeout fired, or only after the host reset the controller mid-format? That single fact separates a firmware fatal from a recovery bug.
+
+| Rank | Cause | Signature |
+|---|---|---|
+| 1 | Firmware assert in the erase, remap or table rebuild path | CFS set while the host was still waiting, assert dump on UART |
+| 2 | Long admin command starving the firmware's watchdog or heartbeat | Fatal at a repeatable time after start, scales with capacity |
+| 3 | Host reset interrupted the format and recovery from a half-formatted state failed | CFS or not-ready only after the host timeout reset |
+| 4 | Erase or program failures on aged or bad blocks | Only on drives with high wear or many grown bad blocks |
+| 5 | Power or thermal event under the erase load | Rail droop or temperature spike at the fatal moment |
+
+- **Discriminating experiment:** run the format with a long command timeout and no host reset (nvme-cli sets its own timeout, so check it), polling CSTS every 100 ms into a log. If CFS rises by itself, it is rank 1 or 2. If the format completes and only a reset breaks it, it is rank 3. Then vary: a format to the same LBA format (no size change) against a different one, a fresh drive against an aged one, and a second unit.
+FOLLOW:
+- The failure happens only when the LBA size changes from 512 B to 4096 B. What does that suggest? => The namespace size and mapping tables are rebuilt for the new format, so suspect sizing or table initialization for the new geometry. Compare with a same-format run.
+- Is a long Format a hang? => Not necessarily. Compare the run time with the host timeout and the Format Progress Indicator in Identify Namespace before calling it stuck.
+PITFALL: Resetting the drive to "see if it comes back" before saving the assert context. The reset destroys exactly what the firmware team needs.
+VERIFY: The nvme-cli default timeout for format (600000 ms in the 2.x source), the Format Progress Indicator location, and the CFS clearing rules in the NVMe Base Specification.
+
+@@ 21.06 | Intermediate | Scenario | tags=timeout,queue-depth,resources,cq-full,lost-completion,sweep
+Q: fio runs clean up to a moderate queue depth, but at high depth on many queues some I/Os time out. How do you triage it?
+SHORT: A 30 second timeout is not congestion. At 1 million IOPS and depth 128, Little's law gives about 128 microseconds per command, so a timeout means a command was lost or stuck, not queued. Check whether the CQE was in host memory, then sweep queues and depth to find the smallest failing configuration. A threshold at a round number points to a firmware resource pool, and a failure that appears at any depth points to a race.
+DEEP:
+- **Symptoms:** `I/O tag N ... QID Q timeout, aborting` only above some depth, on some queues, possibly followed by `completion polled` or a reset.
+- **First three actions:**
+  1. Read CSTS and note `completion polled` versus a real stall. Polled means the CQE existed and the wake-up was lost.
+  2. Look at scope: one queue, several, or all? Which CIDs, which opcode, which block size?
+  3. Save per-queue submitted and completed counts and the latency histogram before the timeout, from a block trace with SQID and CID.
+- **Latency arithmetic:** W = L / lambda = 128 / 1,000,000 s = 128 microseconds. A 30 s timeout is about 234,000 times that. A drive that is merely overloaded shows a long tail, not a missing command.
+
+| Rank | Cause | Signature |
+|---|---|---|
+| 1 | Firmware resource exhaustion: command contexts, DMA descriptors, PRP list buffers, CID tracking | Fails above a fixed total of outstanding commands, the same number every run |
+| 2 | CQ backpressure with a shared or small CQ, or a wrong full test | Fails when the CQ is shared or smaller than the sum of SQs (see the Queues module) |
+| 3 | Wake-up race at low occupancy or at wrap | Fails at any depth, worse at low depth, `completion polled` |
+| 4 | Long internal stall from GC or thermal action | Timeout only after a long latency growth, correlates with load duration |
+| 5 | Host limits: IOMMU mapping space, tag depth beyond MQES, driver bug | Reproduces only on one host or kernel |
+
+- **Discriminating experiment:** sweep queues x depth x block size in a grid and record the smallest failing point. A boundary at a constant total (256 or 1024, for instance) is a pool. A boundary that scales with queue count is per-queue state. If it fails everywhere, run with an SPDK host that holds the CQ head doorbell, so you control queue occupancy directly and can tell a stall from a lost doorbell.
+FOLLOW:
+- Depth 127 passes and depth 128 fails on every run. What do you tell firmware? => The exact count and the smallest repro, and ask which pool has that size. A constant limit is a strong lead.
+- Failure appears only with 8 jobs, not 1 job at the same total depth. What next? => Suspect per-queue or cross-queue state, such as shared CQ, arbitration or per-core structures, and compare a single-queue run at the same depth.
+PITFALL: Raising the host timeout to "give it time". A command that is lost stays lost, and the test then hides a defect that a real host would hit.
+VERIFY: Whether your controller may stop fetching or only stop posting when the CQ is full, and the Linux timeout and tag-depth defaults on your kernel.
+
+@@ 21.07 | Intermediate | Debug | tags=power-cycle,admin-timeout,ready,recovery,power-loss,first-boot
+Q: After abrupt power cuts the first admin command sometimes hangs or the controller never becomes ready. How do you find the cause?
+SHORT: Time the whole bring-up after a cut: power good, PERST# release, first config read, CC.EN write, CSTS.RDY, first admin CQE. If RDY never rises, the controller misses its own CAP.TO promise or is hung. If RDY rises and an admin command still hangs, the ready promise was broken. Vary the off time, the dirty state at the cut and a clean shutdown, and see whether ready time scales with the recovery work.
+DEEP:
+- **Symptoms:** `Device not ready; aborting initialisation, CSTS=0x0`, or `opcode 0x6 (Admin Cmd) QID 0 timeout, reset controller` on the first Identify. It happens after abrupt cuts and not after clean shutdown, and not on every cut.
+- **First three actions:** read config space and CSTS to see that the link is up and what state the controller is in. Confirm the cut was really abrupt (SMART unsafe shutdowns rose by one). Poll CSTS with the driver unbound for many times CAP.TO, and record when, or whether, RDY rises.
+- **Evidence:** the bring-up timeline for four cases: clean shutdown then cold boot, abrupt cut then cold boot, warm reboot, and FLR. Also the amount of dirty data and the drive's fill at the cut, and the log from the previous boot.
+
+| Rank | Cause | Signature |
+|---|---|---|
+| 1 | Power-loss recovery (journal replay, mapping table rebuild, NAND scan) takes longer than CAP.TO or the driver's wait | Ready time grows with fill or dirty data, RDY rises late |
+| 2 | RDY asserted before the admin path is usable | RDY = 1, CFS = 0, admin command hangs until recovery ends |
+| 3 | Firmware assert or hang on damaged metadata from the cut | CFS set, or hang forever, only on some cuts, data dependent |
+| 4 | Rig timing: power reapplied before the rails and capacitors have discharged | Failure rate depends on off time |
+| 5 | Host or BIOS enumeration timing | Config reads fail or CRS, also on warm boots |
+
+- **Discriminating experiment:** repeat with off times of about 0.1 s, 1 s and 10 s, with an idle drive and with the drive under a 60 s random-write load at the cut, and with a normal shutdown followed by a cut. Plot time to ready for each. If it follows dirty state, it is recovery time (rank 1) and CAP.TO must cover the worst case. If RDY is 1 and the admin command still hangs, the ready promise is broken (rank 2).
+FOLLOW:
+- RDY rises at 14 s and CAP.TO says 10 s. Fix the host? => Fix the drive. CAP.TO is the device's promise, so it must advertise at least the worst case. A longer host wait is only a diagnostic.
+- How do you know the cut was hard enough? => The SMART unsafe shutdown count should increase by one per cut. If it does not, the rig is not cutting power hard enough.
+PITFALL: Testing after a clean shutdown or after a very long off time only. The interesting recovery path runs only after a real unclean cut with data in flight.
+VERIFY: Whether a controller may legally exceed CAP.TO after an unsafe shutdown, the CRTO fields in NVMe 2.x, and the Unsafe Shutdowns field in the SMART log.
+
+@@ 21.08 | Intermediate | Trap | tags=deallocate,trim,dlfeat,zeros,dsm,granularity
+Q: A filesystem check finds blocks that read as zeros where data was expected, and the workload issues trims. How do you decide between a legal deallocate, a host bug and a firmware bug?
+SHORT: First decide whether zeros are legal for that LBA. Read DLFEAT, then trace every Dataset Management command and check whether the failing LBA falls inside a trimmed range. Zeros inside a range are legal, though the test may be wrong. Zeros just outside a trimmed range are a bug, in the host's range math or in the firmware's rounding. Zeros in a block written after the trim are a lost-write bug.
+DEEP:
+- **Symptoms:** reads of some LBAs return zeros with Success, so no status and no error log entry.
+- **First three actions:** read DLFEAT from Identify Namespace (which value does a deallocated block return?). Collect every Dataset Management deallocate the host sent, from `blktrace`, `nvme` tracepoints or an analyzer. Map the zero spans to LBAs.
+- **Evidence:** the trimmed ranges (start LBA, length), the failing LBAs, time of the last write and of the trim for each, and the drive's granularity (NPDG, NPDA).
+- **Worked example.** 4 KiB LBAs and an assumed 16 KiB mapping unit (4 LBAs). The host trims LBA 1001 and 1002.
+  - Legal reads: LBA 1001 and 1002 return the old data or zeros, and must stay stable.
+  - LBA 1000 and 1003 are outside the range and must be unchanged. Zeros there mean the firmware deallocated the whole unit (rounding outward), which is a bug.
+
+| Rank | Cause | Signature |
+|---|---|---|
+| 1 | Legal: the host or test trimmed it (fstrim, discard mount, LVM, the harness itself) | Zeros fall inside a trimmed range, DLFEAT says zeros |
+| 2 | Host range error: the zero-based NR, or 512 B sector units mixed with 4 KiB LBAs | Trimmed range 8 times larger, or shifted, against what was intended |
+| 3 | Firmware rounds the range outward | Zeros just outside the range, aligned to the mapping unit |
+| 4 | Trim races with GC or a write buffer, so a newer write is dropped | Zeros in an LBA written after the trim, or old data comes back |
+| 5 | Never-written LBA read before any write, or after Format | No write to that LBA in the log |
+
+- **Discriminating experiment:** with a seeded pattern, trim one 4 KiB LBA at each alignment within a mapping unit and read the neighbors. Damage outside the range is rank 3. Then write after the trim under GC load and check the new data survives (rank 4).
+FOLLOW:
+- The drive returns FFh in trimmed blocks and the checker expects zeros. Bug? => Not if DLFEAT reports FFh. The oracle must use the reported value.
+- Trimmed data comes back as the old data after a reboot. Bug? => It is legal only if the drive never deallocated it, and it must then be stable. Zeros before the reboot and old data after is a resurrection bug.
+PITFALL: Calling every zero read a firmware bug. Deallocate is meant to produce zeros or the old data, so prove the LBA was outside every range first.
+VERIFY: DLFEAT value meanings, NPDG and NPDA semantics, that Dataset Management NR is zero-based while the range length is not, and whether data outside a range must be unaffected in the NVM Command Set Specification.
+
+@@ 21.09 | Advanced | Scenario | tags=namespace,reset,attach,identify,rescan,persistence
+Q: After a controller reset a namespace disappears from the host. How do you find out whether the host lost it or the drive did?
+SHORT: Compare the kernel's view with the controller's own answers. Issue Identify with the Active Namespace ID list and the Allocated list through raw passthrough. If the controller still lists it and Identify Namespace is intact, the host lost it, through a failed reset, a scan racing recovery, or a changed identifier. If the controller no longer lists it, firmware lost or detached it, and the reset type decides where.
+DEEP:
+- **Symptoms:** `/dev/nvme0n1` gone after `nvme reset`, an FLR, a hot reset or a power cycle. Other tools show the controller.
+- **First three actions:** check dmesg for `Disabling device after reset failure` or a failed scan. Run `nvme list-ns /dev/nvme0` and `nvme list-ns /dev/nvme0 -a`. Run `nvme id-ns /dev/nvme0 -n 1` and compare NSZE, NCAP, NGUID and EUI64 with the values before the reset.
+- **Evidence:** the reset type, before and after copies of the lists and Identify Namespace, the Changed Namespace List log, and timestamps of the scan against controller ready.
+
+| Rank | Cause | Signature |
+|---|---|---|
+| 1 | Host marked the namespaces dead because the reset failed | dmesg reset failure, controller lists them |
+| 2 | Scan raced controller recovery: Identify or first I/O got Namespace Not Ready or timed out | Rescan later finds it, controller answers normally |
+| 3 | Firmware did not persist creation or attachment state, for one reset type or after an unsafe shutdown | Active list empty or shorter, only after PERST#, NSSR or a cut |
+| 4 | Identifiers changed across the reset, so udev, multipath or LVM see a new device | Same NSID, different NGUID or EUI64 |
+| 5 | Another host detached or reformatted a shared namespace | Multi-host setup, Changed Namespace event unseen |
+
+- **Discriminating experiment:** build a matrix of reset type (CC.EN, FLR, NSSR, hot reset, PERST#, power cycle) by state (idle, mid-write, after clean shutdown, after unsafe cut). For each cell, record the controller's raw lists and Identify data before and after, and the kernel's view. Rank 1 and 2 show correct controller data. Rank 3 and 4 show changed controller data, and the cell names the reset path with the bug.
+FOLLOW:
+- Rescan brings the namespace back. What was it? => The controller had it, so the host lost or skipped it. Check whether the scan raced controller readiness, and how long the drive needed after reset.
+- Only the NGUID changed after a power cycle. What breaks? => Anything keyed on it, such as multipath grouping, udev by-id names and fleet inventory. Identifiers should be stable across resets.
+PITFALL: Looking at `nvme list` only. It shows the kernel's view, so a host problem and a firmware problem look identical.
+VERIFY: Which resets a created and attached namespace must survive, and what Identify Namespace returns for a not-active NSID, in the NVMe Base Specification.
+
+@@ 21.10 | Principal | Cross-layer | tags=spor,power-loss,miscompare,nand,paired-page,oracle,firmware
+Q: After sudden power loss cycles, verification finds miscompares. How do you classify them and separate a test bug, a firmware ordering bug and a NAND-level effect?
+SHORT: Classify each bad LBA by its stamp: an older version of the same LBA, another LBA's data, a torn mix, or an uncorrectable read. Apply the committed and in-doubt model to decide if it is a failure at all. Then check where the failing LBAs sit: bad LBAs that were not being written at the cut point to NAND-level damage, such as an interrupted upper-page program corrupting data on the same wordline.
+DEEP:
+- **Symptoms:** after power-up some LBAs return a value that is neither the committed one nor any in-doubt one, or an uncorrectable read status (SCT 2, 81h).
+- **First three actions:** confirm the cut was real (unsafe shutdowns rose) and that the host log survived off the drive under test. Wait for CSTS.RDY and read everything twice. Apply the state model from the NVM Command Set module: committed value plus in-doubt writes.
+- **Classify each failing LBA using its stamp (LBA, write ID, sequence, CRC):**
+
+| Observation | Meaning | Likely owner |
+|---|---|---|
+| Committed value missing, older version returned, LBA was flushed | Flush or FUA completed before the data and mapping were durable | Firmware ordering (journal, checkpoint, cache drain) |
+| Another LBA's stamp | Mapping or journal replay error | Firmware FTL |
+| Part new and part old inside the atomic unit | Torn write beyond AWUPF or NAWUPF | Firmware write path |
+| Old, committed LBA not being written near the cut now bad or 81h | Collateral damage from an interrupted program in the same block or wordline | NAND and power-loss design |
+| Reads differ between two reads | Rig or read-retry effect, or the value has not settled | Test, then media |
+| Only an in-doubt value, no failure | Legal outcome | Test model was too strict |
+
+- **The NAND cue:** on multi-bit-per-cell NAND, cutting power while programming an upper page can corrupt the lower page of the same wordline, which may hold data that was acknowledged long before. A firmware that does not protect it (a parity or an SLC staging buffer, energy from power-loss capacitors to finish the program) loses previously committed data that has no relation to the cut-time write. The failing LBAs are logically unrelated to the in-flight ones but physically colocated.
+- **Discriminating experiments:** (1) cut only when idle: zero failures expected, so failures with idle cuts blame the recovery path. (2) Cut with only sequential, one-stream writes, so physical neighbors are known. (3) Map failing LBAs to physical location with a vendor tool and see if they share a wordline or block with the in-flight writes. (4) Repeat with power-loss protection enabled and disabled, if the product allows it.
+- **Rate:** with zero failures in N effective cuts the 95 percent upper bound is about 3/N, so 3,000 effective cuts for 0.1 percent.
+FOLLOW:
+- The failing LBAs were all written 20 minutes before the cut. What does that suggest? => Not the cut-time write itself. Look for collateral damage to old data, or a checkpoint or garbage-collection ordering problem in recovery.
+- Data is wrong only after the first read and fine after the second. What now? => The value changed after settling, so suspect read-retry or a media state that recovers, and record it against block age and temperature.
+PITFALL: Judging the read-back against the last acknowledged write. That flags legal outcomes and misses the difference between lost writes, torn writes and collateral damage.
+VERIFY: The Flush and FUA rules for what "durable" requires, the atomic write parameters, and the NAND paired-page behavior for your part from the vendor.
+
+@@ 21.11 | Advanced | Debug | tags=firmware-update,commit,fw-download,activation,slot,cqe
+Q: Firmware updates fail intermittently: sometimes the commit errors, sometimes the drive keeps running the old image after a reset. How do you triage it?
+SHORT: Separate command errors from behavior. A deterministic error status (Invalid Field, Invalid Firmware Image, wrong slot) points at the tool or the image. A commit that succeeds but leaves the old image points at reset scope or a failed boot that fell back. Verify from the drive, never from the commit status: read the Firmware Slot log and Identify's firmware revision after the reset, and replay the same image with a second tool.
+DEEP:
+- **Symptoms:** `nvme fw-commit` returns an error, or Success followed by a reset and the old revision.
+- **First three actions:** save each CQE, not just the tool's summary. Read the Firmware Slot log (03h) and the firmware revision before and after. Hash the image and record the download parameters (chunk size, offsets, slot, commit action).
+- **Evidence:** the CQE of every Download and Commit, the slot log before and after each step, the reset type used, and the log from the boot after activation.
+- **Decode example.** A Firmware Image Download with an offset that is not a multiple of the granularity: DW3 = 0x8005000A. Phase 1, SC 02h (Invalid Field), SCT 0, DNR set, CID 0Ah. Deterministic, so it is a tool error.
+
+| Rank | Cause | Signature |
+|---|---|---|
+| 1 | Tool or parameters: chunk above MDTS, offset not a multiple of FWUG, NUMD off by one, wrong slot, commit issued before download finished | Deterministic Invalid Field or Invalid Firmware Slot, fails the same way each time |
+| 2 | Image rejected: signature, product or version check, downgrade prevention, truncation | Invalid Firmware Image (SCT 1, SC 07h) |
+| 3 | Commit succeeded but a higher-scope reset was needed and the host did a lesser one | Status 10Bh, 110h or 111h treated as an error, or the wrong reset used |
+| 4 | New image failed to boot and the controller fell back to the old one | Reset ok, slot log shows old active slot, a firmware image load event or vendor log entry |
+| 5 | Live activation exceeded the time allowed or commands stalled | Timeouts during activation, CSTS.PP set for too long |
+
+- **Discriminating experiment:** replay the identical image with two independent tools (nvme-cli, a vendor tool, SPDK) and compare the CQEs. Then repeat the commit with each reset scope in turn (controller reset, NSSR, PCIe reset, power cycle) and read the slot log after each. Rank 1 disappears with another tool, rank 3 disappears with the named reset.
+FOLLOW:
+- Commit returns Success and the slot log shows the new image as next but the revision is old. Is it a bug? => Not yet. The image takes effect only after the right reset. Do that reset and read the revision again.
+- The revision is old after the right reset and the slot log shows the old slot active. What do you capture? => The vendor boot log and the error log, and repeat with a known-good image to prove the process works.
+PITFALL: Trusting the commit status as proof of activation, or treating a "committed, reset needed" status as a failed update.
+VERIFY: The CQE status values for commit and their names, FWUG units, the meaning of commit actions 1 and 2, and nvme-cli flag names on your version.
+
+@@ 21.12 | Advanced | Cross-layer | tags=link-downtrain,timeout,lnksta,correlation,pcie,retrain,timeline
+Q: Some servers show a link that trained below the SSD's capability and also NVMe timeouts. How do you tell whether the downtrain caused the timeouts, followed them, or is unrelated?
+SHORT: Build one timeline and see what came first. A retrain lasts microseconds to milliseconds, so it alone cannot cause a 30 second timeout. A timeout means something was lost or stuck. Then pin the link speed lower and rerun: timeouts that disappear at the lower speed mean lost margin at the higher one. Timeouts that persist mean the link is not the cause. A downtrain that follows a reset is often a consequence.
+DEEP:
+- **Symptoms:** LnkSta shows 8 GT/s on a 16 GT/s device, or a width below x4. Throughput is below rating. dmesg has NVMe timeouts.
+- **First three actions:** read LnkSta, LnkCap, LnkSta2 and the Link Bandwidth Management and Link Autonomous Bandwidth Status bits on both ends before any reset. Collect timestamped events: AER and `pcieport` lines, NVMe timeout and reset lines, SSD-side LTSSM and Recovery counters. Compare against the same model in a healthy slot.
+- **Ceiling arithmetic (Gen4 x4, 128b/130b):** 16 GT/s x 4 x 128/130 / 8 = 7.88 GB/s. Gen3 x4 is 3.94 GB/s, and Gen4 x1 is 1.97 GB/s. At about 91 percent TLP efficiency (256 B payload, 24 B overhead) Gen3 x4 gives about 3.6 GB/s, so a drive rated near 7 GB/s reads at half speed.
+
+| Order of events | Reading |
+|---|---|
+| Errors and Recovery first, then timeouts, then downtrain | Margin problem, downtrain was the hardware's answer |
+| Timeout first, reset, then retrain lands at lower speed | Something else hung the drive. The reset's retrain exposed marginal equalization |
+| Downtrain with no NVMe events | Slow but not failing, check margin and policy |
+| LBMS or ABMS set with no errors | Speed change happened, by hardware or software, find the initiator |
+
+- **Ranked causes:** (1) marginal channel or equalization, failing at the higher rate under temperature or load. (2) A reset or hot-plug retrain that did not reach the higher speed. (3) Platform policy or a Target Link Speed setting. (4) The SSD requesting a lower speed on its own.
+- **Reset scope note:** a controller reset (CC.EN) does not retrain the link. A retrain at that moment came from a different event. See the PCIe page (Reset module).
+- **Discriminating experiment:** force the link to the lower speed and run the same workload for the same time. Timeouts gone means margin at the higher speed, so measure lane margin at both ends. Timeouts unchanged means they are not speed-related, so follow the NVMe path (module 9).
+FOLLOW:
+- Timeouts stop after the drive downtrained. Fixed? => No. It is a workaround that hides lost margin and halves throughput. Find the cause and record the yield at the intended speed.
+- The downtrain appears only after `nvme reset`. Why? => The reset alone leaves the link. Look for a hot reset, FLR-triggered retraining, or the host's error recovery, and read what triggered the retrain.
+PITFALL: Assuming the downtrain is the cause because it is the visible anomaly. The timestamps decide which came first.
+VERIFY: The conditions that set Link Bandwidth Management Status and Link Autonomous Bandwidth Status, and how the platform's Target Link Speed and hardware autonomous speed change behave.
+
+@@ 21.13 | Advanced | Numeric | tags=performance,steady-state,gc,waf,slc-cache,thermal,hours
+Q: A random-write test holds 400K IOPS and then falls to 90K IOPS after 55 minutes. Use the numbers to decide between GC, SLC cache exhaustion and thermal throttling, and say what SMART data confirms it.
+SHORT: Convert time to bytes written. At 400K IOPS x 4 KiB that is 1.64 GB/s, so 55 minutes is about 5.4 TB, or 1.4 fills of a 3.84 TB drive. A drop after more than one full overwrite is the signature of garbage collection reaching steady state. The fall from 400K to 90K implies a write amplification near 4.4, which host and NAND write counters (SMART host data units, plus vendor, OCP or Endurance Group logs for NAND writes) can confirm.
+DEEP:
+Assumptions: 3.84 TB (3.84e12 B) drive, 4 KiB random writes, NAND write bandwidth constant, WAF close to 1 at the start.
+1. Fresh rate: 400,000 x 4096 = 1.638 GB/s.
+2. Time to write the capacity once: 3.84e12 / 1.638e9 = 2,344 s = 39 minutes.
+3. At the drop: 55 x 60 x 1.638e9 = 5.41 TB = 1.41 x capacity.
+4. After the drop: 90,000 x 4096 = 0.369 GB/s. If NAND program bandwidth is the limit, the host rate falls by WAF: 1.638 / 0.369 = 4.4.
+5. Confirm from counters: WAF = NAND bytes written / host bytes written, from deltas over the run (host writes and NAND or media units written in vendor or OCP logs, or the Endurance Group log where supported).
+
+| Cause | Where the drop lands | Test |
+|---|---|---|
+| GC steady state | After 1 or more overwrites, tracks bytes written, WAF rises | Halve the rate with `--rate_iops`: drop at the same 5.4 TB, twice the time (about 110 min) |
+| SLC cache exhaustion | After a fixed number of GB, well before one fill, recovers after idle | Drop at the same GB regardless of rate. Time changes |
+| Thermal throttling | Follows temperature reaching a trip point, independent of bytes | Preheat or cool. Drop earlier or later, TMT or vendor counters rise |
+
+- **Halved-rate check:** at 200K IOPS the fill time is 78 minutes and the drop at 1.41 fills is at about 110 minutes. Thermal behavior would not track that.
+- **Fits this data:** more than one fill and a 4.4x fall favor GC. An SLC cache would run out far below 1.4 fills, so it does not explain this timing on a 3.84 TB drive.
+- **Reproducibility:** each run needs the same starting state (secure erase, then the same precondition), or the fill state changes the answer.
+FOLLOW:
+- The drop is at 5.4 TB with cooling and also with a lower rate. Which cause? => GC. Bytes written, not time or temperature, set the drop.
+- How would trim or over-provisioning change it? => More free space lowers WAF, so the drop comes later and is smaller. A full-range trim should restore fresh-out-of-box behavior for a while.
+PITFALL: Comparing a fresh drive with a preconditioned one, or two runs from different starting states. GC behavior depends on fill and history.
+VERIFY: Which log page and field names your drive uses for host and NAND writes, the size of a Data Unit in the SMART log (1000 x 512 B), and the SLC cache size and policy from vendor documentation.
+
+@@ 21.14 | Principal | Scenario | tags=swap-test,statistics,host-vs-device,interaction,design-of-experiments
+Q: A failure happens about once in 200 reboots on one host with one drive. Design the experiment that shows whether the fault follows the drive, the host, or the combination, and say how many trials it takes.
+SHORT: Run a 2 x 2 swap: two drives across two hosts, and keep the original combination as a control. To see a 0.5 percent failure with 95 percent confidence, a cell with no failures needs about 600 cycles. Four cells is 2,400 cycles, so first find a stress amplifier that raises the rate to about 5 percent and confirm it has the same signature. Then 60 cycles per cell suffice.
+DEEP:
+- **Symptoms:** a low-rate failure with a known signature (for example, drive absent at enumeration), seen in one setup.
+- **First three actions:** define the failure and its rate from the logs. Fix everything else: firmware, BIOS, kernel, slot, cable, thermal state. Prepare an unattended cycle rig with power control and evidence capture.
+- **The design:** drives A (failing) and B (known good), hosts X (failing) and Y (known good). Cells: A on X, B on X, A on Y, B on Y. Interleave the cells in time rather than running them one after another, so drift from temperature, time of day or firmware state does not line up with a cell. Move the slot and cable with the host.
+- **Trials:** P(no failure in n cycles) = 0.995^n. For 5 percent, n = ln(0.05) / ln(0.995) = about 600. Four cells need 2,400 cycles, at 3 minutes each 120 hours. With two rigs, 60 hours.
+- **Amplify:** a stress that raises the rate to 5 percent (shorter off time, lower temperature, faster reset cadence) cuts n to ln(0.05) / ln(0.95) = 58 to 60 per cell. 60 cycles at 5 percent give at least one failure with probability 1 - 0.95^60 = 95 percent. Check the same signature, or it is a different bug.
+
+| Result | Reading |
+|---|---|
+| Fails on A in both hosts | The drive |
+| Fails on X with both drives | The host or platform, including its slot and cable |
+| Fails only on A with X | An interaction. Each is within spec, the combination is marginal, look at timing and margin |
+| Fails on none | Environment, drift or the amplifier changed the mode. Re-run the control |
+| Fails on all | The stress dominates, back it off |
+
+- **Discipline:** re-run the control cell at the end to detect drift, do not change two things at a time, and pool nothing across cells.
+FOLLOW:
+- The failure appears only in A on X, at 2 in 300. Whose bug is it? => Neither yet. It is a combination, so measure margin, timing and reset sequencing on that pair. Fix whichever side has room to change and keep the other in the regression.
+- Two rigs give different rates for the same cell. What now? => Rig differences are a variable. Compare their power and reset timing, and only compare rates measured on the same rig.
+PITFALL: Concluding "follows the drive" from one failure in one cell. At low rates the absence of a failure in a cell proves little without the trial count.
+VERIFY: Nothing spec-specific here. Check the confidence arithmetic with your own rates and cell counts.
+
+@@ 21.15 | Principal | Numeric | tags=bisect,firmware-builds,statistics,rule-of-three,amplification,regression
+Q: A failure that shows about 2 percent of the time appeared somewhere in 128 firmware builds. How do you bisect it, and what does it cost in trials?
+SHORT: Bisect as usual, but treat the verdicts asymmetrically. One failure proves a build bad, and a good verdict needs enough clean trials: about 149 at a 2 percent rate for 95 percent confidence. Seven steps at roughly half good and half bad cost about 690 trials, or 115 hours at 10 minutes each. Amplify the rate to about 10 percent and it becomes about 135 trials, 22 hours. Then confirm the culprit and its predecessor separately.
+DEEP:
+Assumptions: monotonic regression (later builds are also bad), 128 candidate builds, rate p = 2 percent, 10 minutes per trial.
+1. Steps: log2(128) = 7.
+2. Good verdict needs n with 0.98^n < 0.05: n = ln(0.05) / ln(0.98) = 148.3, so 149 trials (0.98^149 = 0.049).
+3. Bad verdict stops at the first failure. Expected trials on a bad build are about (1 - 0.98^149) / 0.02 = 47.5.
+4. About 3.5 good steps and 3.5 bad steps: 3.5 x 149 + 3.5 x 47.5 = 688 trials = about 115 hours at 10 minutes.
+5. Amplify to p = 10 percent: good needs ln(0.05) / ln(0.9) = 28.4, so 29 trials, and bad costs about 9.5. Total 3.5 x 29 + 3.5 x 9.5 = 135 trials = 22.5 hours.
+6. False-good risk: each good verdict of a truly bad build has a 5 percent chance of being wrong. Across 3.5 such steps the chance that at least one is wrong is up to about 16 percent. A wrong good verdict sends the search to the wrong half.
+7. Confirm: retest the suspect build and its predecessor with three times the trials. The culprit must fail at the expected rate and the predecessor stay clean for the same count.
+
+- **Keep the state identical:** same drive, same rig, same test script, and the same drive state per trial (secure erase and the same fill), because builds may change the on-NAND layout. If downgrade is blocked, use separate units or a fresh drive per build.
+- **Handle non-monotonic bugs:** if a build near the boundary fails and a later one passes, the bug may be latent or masked. Widen the bracket and test the neighbors before trusting the result.
+- **Then narrow inside the build:** once one commit range remains, bisect commits or feature flags, not just nightly builds.
+FOLLOW:
+- The amplifier changes the rate to 10 percent but the failure looks different. What now? => It is not the same bug, so it cannot be used to bisect. Keep the original stress for the confirmation stage, and find a different amplifier.
+- What is the cheaper way to cut trials? => Run rigs in parallel, and test several builds at once on separate rigs, but only if the rigs are identical and are cross-checked.
+PITFALL: Calling a build good after 10 clean trials of a 2 percent failure. That leaves a 82 percent chance of missing it.
+VERIFY: Nothing spec-specific. Recompute the trial counts with your own failure rate and confidence.
+
+@@ 21.16 | Principal | Scenario | tags=communication,firmware-team,hardware-team,escalation,handoff,disagreement
+Q: The firmware team says "cannot reproduce, it is your host". How do you move the bug forward without an argument?
+SHORT: Replace the argument with an experiment. Hand over a repro package they can run, or the rig, and propose a test both sides agree would settle it: run their build on your rig, your unit on a reference host, and add an independent observer such as an analyzer or an SPDK host. State what evidence would change your mind. Keep to facts, the rate and the ruled-out list, and name the owner of each next step.
+DEEP:
+- **Symptoms:** a real failure, a triage record that points at the drive, and a developer who cannot see it on their bench.
+- **First three actions:** check why they cannot reproduce it (their setup differs in host, BIOS, temperature, drive state, timing or firmware build). Re-run your repro on their reference host or theirs on yours, with logs. Preserve the failing unit and the rig state.
+- **The handoff package:**
+  - Minimum repro script, seed, drive state before the test, and the rate with the trial count.
+  - The passing control and the failing case, one variable apart.
+  - Evidence from an independent observer: analyzer trace or a second host stack.
+  - Timestamps and clock domains, and a shared marker to correlate (CID, LBA pattern, GPIO).
+  - The list of what you ruled out.
+- **Ask for instrumentation, not for effort.** "Please add a counter for X and a log of the last N commands at the timeout" is actionable. "Please look at it" is not. Agree on a debug build and confirm it still fails, since instrumentation can change timing.
+- **Agree on a decisive test up front.** "If the CQE is in the queue at the timeout the bug is in the host interrupt path, and if not, it is in the firmware. Let us capture that." Then whoever's hypothesis fails updates.
+- **Two sides, two audiences:** firmware wants the command sequence, state and reproduction. Hardware wants scope captures, rails, temperature and unit serials. Give each what it acts on.
+- **Escalate on facts:** rate, customer or program impact, time lost, and the decision needed. Record what was agreed and by when.
+- **Close the loop:** verify the fix at the failure rate, add the repro to the regression suite, and write down how the lab missed it.
+FOLLOW:
+- They say the spec allows what you saw. What do you do? => Quote the section and check it together. If it is truly legal, the test expectation was wrong and you fix it. If the spec is unclear, ask for a written interpretation and a conformance test.
+- You cannot share the rig. What is the fallback? => Ship a unit with the script and evidence, or capture the failure with a debug build on their side, so the first run they see is the failing one.
+PITFALL: Arguing about who is at fault. Show the rate, the control and the observer that neither side owns, and let the data assign the owner.

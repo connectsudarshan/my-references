@@ -1,0 +1,346 @@
+# Module 6: Zone Resources: Active, Open & Excursions
+
+@@ 6.01 | Basic | Concept | fig=zoneres | tags=active,open,resources,states
+Q: What is the difference between an active zone and an open zone in ZNS?
+SHORT: An open zone is one in the Implicitly Opened or Explicitly Opened state. An active zone is any open zone plus any zone in the Closed state. So open is a subset of active. The namespace enforces two independent budgets, Maximum Active Resources and Maximum Open Resources. Empty, Full, Read Only and Offline zones consume neither.
+DEEP:
+| Zone state | Counts as active | Counts as open |
+|---|---|---|
+| Empty | no | no |
+| Implicitly Opened | yes | yes |
+| Explicitly Opened | yes | yes |
+| Closed | yes | no |
+| Full | no | no |
+| Read Only | no | no |
+| Offline | no | no |
+
+- **Active means "the controller must keep partial state for this zone".** A Closed zone has a write pointer that is neither at the start nor at the end, so the device has already committed NAND and mapping resources to it.
+- **Open means "the zone can accept a write right now".** Only open zones can be written. A write to a Closed zone first moves it to Implicitly Opened, which needs a free open resource.
+- **Two limits, two failure modes.** Running out of active resources blocks new zones from being started. Running out of open resources blocks new writers, even when active resources are still free.
+- **Where the states come from:** see module 3 for the state machine. This module is about the counting.
+FOLLOW:
+- Does a Full zone hold any resource? => No. Reaching capacity (or a Finish) releases both the active and the open resource. This is why finishing a zone is a way to free an active slot.
+- Are limits per controller or per namespace? => They are reported in the namespace's ZNS Identify data, so treat them as per namespace. VERIFY sharing rules if a subsystem has several zoned namespaces.
+PITFALL: Treating "open" and "active" as the same number. A host that only tracks writers can still hit Too Many Active Zones because Closed zones keep counting.
+VERIFY: The Active and Open Resources definitions and the per-namespace scope of MAR and MOR in the NVMe Zoned Namespace Command Set Specification.
+
+@@ 6.02 | Basic | Concept | tags=mar,mor,identify,encoding,nvme-cli
+Q: Where do you read the zone resource limits, and how are MAR and MOR encoded?
+SHORT: They are in the Zoned Namespace Command Set specific Identify Namespace data (Identify with CNS 05h and CSI 02h): MAR at byte offset 4 and MOR at offset 8, each 4 bytes. Both are 0-based, so the limit is the field value plus 1, and FFFFFFFFh means no limit. Linux exposes them as max_active_zones and max_open_zones, where 0 means no limit.
+DEEP:
+```
+nvme zns id-ns /dev/nvme0n1                  # zoc, ozcs, mar, mor, rrl, frl, lbafe zsze/zdes
+cat /sys/block/nvme0n1/queue/max_active_zones
+cat /sys/block/nvme0n1/queue/max_open_zones
+```
+- **Layout of the start of the structure:** ZOC (2 bytes at 0), OZCS (2 at 2), MAR (4 at 4), MOR (4 at 8), RRL (4 at 12), FRL (4 at 16).
+- **Decode:** mar = 0xD means 14 active zones. mar = 0xFFFFFFFF means unlimited.
+- **Linux does the arithmetic in 32 bits:** it stores mor + 1 and mar + 1. FFFFFFFFh plus 1 wraps to 0, which the block layer reads as no limit. The same trick appears in the SPDK API, where a returned 0 means no limit.
+- **Zone size and descriptor extension size** sit in the per-LBA-format extension at the end of the same structure. See module 2 for the layout.
+- **What a validator checks first:** MAR is at least MOR, and the values match the datasheet. A device that reports mar smaller than mor is a firmware bug.
+FOLLOW:
+- A device reports mar = 0 and mor = 0. What does that mean? => One active zone and one open zone, not unlimited. Only FFFFFFFFh means no limit.
+- Can the limits change at runtime? => They belong to the namespace, so expect a change only through a format or namespace management operation. Re-read Identify after any namespace change.
+PITFALL: Reading the raw field as the count. The off-by-one is why a "14 zone" drive shows 0xD.
+VERIFY: Byte offsets of MAR and MOR, the FFFFFFFFh no-limit encoding, and CNS 05h for the command-set specific Identify Namespace, in the ZNS Command Set Specification and NVMe Base Specification.
+
+@@ 6.03 | Basic | Concept | tags=limits,firmware,plp,buffers,design
+Q: Why does a ZNS SSD limit active and open zones at all, and why must MAR be at least MOR?
+SHORT: Each active zone pins partly written NAND state and each open zone pins write buffering and open program units, so the controller sizes those for a bounded count. Open is a subset of active, so the active limit can never be below the open limit. The limits are what let a ZNS drive need much less DRAM and power-loss capacitance than one that could have every zone open.
+DEEP:
+- **What an open zone typically costs (firmware view):** a write buffer slice, an open NAND block or superblock stripe, partially filled program pages that are not yet safe on NAND, and mapping state. The exact recipe is vendor specific.
+- **What an active (Closed) zone typically costs:** the partially programmed NAND block must be kept, and the device must be able to resume programming at the write pointer later. It still owns NAND that cannot be reclaimed.
+- **Power-loss sizing:** the data that must be flushed on power loss grows with the number of open zones. The limit bounds the capacitor energy the design needs.
+- **Why MAR >= MOR:** every open zone is also active, so a device cannot allow more open zones than active zones. Equal values are common, and are legal.
+- **What the host pays:** it must schedule its writers against the budget. That is the price for removing the drive's internal garbage collection.
+FOLLOW:
+- Why not just make MOR huge? => More open zones means more buffer RAM, more open NAND blocks with worse program interference management, and more energy to flush on power loss. The limit is a cost decision.
+- Do conventional NVMe SSDs have an equivalent? => Not as a visible limit. They have hidden open blocks per stream, and the controller hides the cost behind its FTL. With ZNS it surfaces in the interface.
+PITFALL: Assuming a larger MOR is always better for the host. If the firmware degrades latency or write amplification at high open counts, the host wants a lower operating point than the limit.
+VERIFY: The per-zone resource costs above are typical designs, not spec text. Confirm against the actual product architecture document.
+
+@@ 6.04 | Intermediate | Concept | tags=transitions,accounting,resources,state-machine
+Q: Which zone state transitions consume or release active and open resources?
+SHORT: Leaving Empty for an open state consumes one active and one open resource. Moving from Closed to an open state consumes one open. Closing an open zone releases an open resource but keeps the active one. Reaching Full, a Finish, a Reset or a controller-forced Read Only or Offline releases everything the zone held. Open-to-open (implicit to explicit) is free.
+DEEP:
+| Transition (trigger) | Active | Open |
+|---|---|---|
+| Empty to Implicitly Opened (Write, Append) | +1 | +1 |
+| Empty to Explicitly Opened (Open Zone) | +1 | +1 |
+| Closed to Implicitly or Explicitly Opened | 0 | +1 |
+| Implicitly Opened to Explicitly Opened (Open Zone) | 0 | 0 |
+| Opened to Closed (Close Zone, or controller implicit close) | 0 | -1 |
+| Opened to Full (write reaches capacity, or Finish) | -1 | -1 |
+| Closed to Full (Finish) | -1 | 0 |
+| Opened to Empty (Reset) | -1 | -1 |
+| Closed to Empty (Reset) | -1 | 0 |
+| Empty to Closed (Set Zone Descriptor Extension) | +1 | 0 |
+| Opened or Closed to Read Only or Offline (controller) | -1 | -1 if it was open |
+
+- **The host commands that free an active slot are Finish and Reset:** Finish gives up the unwritten capacity and Reset destroys the data. Close does not free one.
+- **The last write** to a zone that reaches its capacity moves it to Full and frees both resources with no host command.
+- **Set Zone Descriptor Extension** is easy to forget: it turns an Empty zone into a Closed one, so it is an active-resource allocation.
+- **Validation use:** this table is the oracle for a resource model in a test harness. Every row is a test.
+FOLLOW:
+- Does reading a zone consume a resource? => No. Reads work in any state that has valid data and do not change zone state or resource counts.
+- Does Open Zone on an already Explicitly Opened zone change anything? => It is a valid no-op for resources. See module 4 for the exact transition rules and Select All behaviour.
+PITFALL: Assuming Close gives back an active slot. It only gives back an open slot, so parking zones in Closed does not help against the active limit.
+VERIFY: The Set Zone Descriptor Extension row (Empty to Closed consuming an active resource and its failure status) and the Read Only or Offline release behaviour in the ZNS Command Set Specification.
+
+@@ 6.05 | Intermediate | Concept | tags=status-codes,too-many-active,too-many-open,errno
+Q: What happens when a write or an Open Zone would exceed the limits, and which status codes come back?
+SHORT: If no active resource is free, the command fails with Too Many Active Zones. If an active resource is free but no open resource is, the controller may implicitly close an Implicitly Opened zone to make room. If it does not or cannot (for example all open zones are Explicit), the command fails with Too Many Open Zones. Both are Command Specific status codes: SC BDh and BEh in status code type 1.
+DEEP:
+| Status | SCT | SC | Combined (Linux nvme.h) | Linux errno |
+|---|---|---|---|---|
+| Too Many Active Zones | 1 | BDh | 0x1BD | EOVERFLOW ("active zones exceeded") |
+| Too Many Open Zones | 1 | BEh | 0x1BE | ETOOMANYREFS ("open zones exceeded") |
+
+- **Order of checks for a write to an Empty zone:** active resource first, then open resource. The command needs both.
+- **Write to a Closed zone** needs only an open resource, so it can fail with Too Many Open Zones but never with Too Many Active Zones.
+- **Consequence of Open being a subset of Active:** when MAR equals MOR, the open limit can never be hit first, so a test sees only Too Many Active Zones. Reasoning: open zones are a subset of active zones, so with MAR equal to MOR the active limit is reached no later than the open limit.
+- **A failed command changes nothing:** the zone state and the resource counts must be identical before and after. That is an easy negative test.
+- **Retry policy:** these errors are not transient. A blind retry fails again until the host closes, finishes or resets something.
+FOLLOW:
+- Is the status the same for Zone Append? => Append follows the same resource rules as a write, because it also opens the zone. See module 5.
+- What other zone status codes sit next to these? => B8h Zone Boundary Error through BFh Invalid Zone State Transition. Module 7 covers them all.
+PITFALL: Reading the errno as a media error. EOVERFLOW and ETOOMANYREFS from a zoned block device are resource errors, not defects.
+VERIFY: Whether the DNR bit is set on these statuses, and the precedence when both limits are exceeded at once, in the ZNS Command Set Specification.
+
+@@ 6.06 | Intermediate | Concept | tags=implicit-close,eviction,latency
+Q: What is implicit close, and what does it mean for the host and for a validator?
+SHORT: When a command needs an open resource and none is free, the controller may transition one Implicitly Opened zone to Closed to make room, and then process the command. It never closes an Explicitly Opened zone. The host gets no error and no choice of victim, so the visible effects are a zone that quietly became Closed and an occasional latency spike.
+DEEP:
+- **Trigger:** a write, append or Open Zone that would push open zones past MOR while some zone is Implicitly Opened.
+- **Victim choice** is up to the controller. A controller might pick the least recently written zone, but the spec does not say, so do not build on it.
+- **Cost:** closing a zone forces the firmware to make its buffered data safe (pad or flush partial program units). That work lands on the command that triggered it, so p99 latency on writes can spike when the host runs above MOR implicit writers.
+- **State after:** the victim is Closed, still active, write pointer unchanged. The next write to it moves it back to Implicitly Opened and may evict another zone. Round-robin writing over more than MOR zones evicts on every write.
+- **Explicit open is the opt-out:** an Explicitly Opened zone cannot be evicted, and that is why Open Zone is the tool for reserving resources.
+- **What to check in a test:** with MOR + 1 implicit writers and MAR at least MOR + 1, no error occurs, Report Zones shows exactly MOR open zones and at least one Closed zone, and no data is lost or reordered.
+FOLLOW:
+- Does the host get a notification of an implicit close? => Not from the command itself. Check the zone state with Report Zones, and see module 6.11 for the Zone Descriptor Changed notice.
+- Can a device refuse to implicitly close? => The text says the controller may, so a controller can choose to fail with Too Many Open Zones instead. A robust host handles both.
+PITFALL: Writing to more than MOR zones and calling it fine because no error was returned. It runs, but with a hidden close and reopen on many writes.
+VERIFY: Whether the controller shall or may implicitly close and any ordering rule in the ZNS Command Set Specification, and whether a zone descriptor changed notice is generated for it.
+
+@@ 6.07 | Intermediate | Concept | tags=explicit-open,implicit-open,reservation,strategy
+Q: Should a host open zones explicitly or rely on implicit open, and how does that change failures?
+SHORT: Explicit open reserves the resources at Open Zone time, so a shortage shows up as a clean, early error before any data is written and the zone cannot be evicted. Implicit open takes the resources at the first write, so a shortage may appear mid-stream, or be hidden by an eviction. Choose explicit for long-lived writers with latency targets and implicit for many short-lived ones.
+DEEP:
+| | Explicit Open | Implicit Open |
+|---|---|---|
+| When resources are taken | At the Open Zone command | At the first write or append |
+| Failure point | The Open command, no data at risk | The first write, which the host may have already queued |
+| Eviction by controller | Never | Possible when open resources are short |
+| Extra commands | One per zone | None |
+| Cleans up by | Close or Finish from the host | Also the controller (implicit close) |
+
+- **Explicit open** is a pre-flight check. A writer thread opens its zone, and only then accepts work. Resource exhaustion becomes back-pressure at the resource manager rather than an I/O error on the data path.
+- **Explicit open on an empty zone still costs an active slot,** even if nothing is ever written. A leaked explicit open is a leaked active zone.
+- **Implicit open** saves a command and lets the device optimise, but the host loses control of what is open.
+- **Mixed use** works: implicit open moves to explicit with Open Zone at no resource cost.
+FOLLOW:
+- Which does ZenFS-style software use? => ZenFS keeps its own open and active token counters. In the current source it does not send Open Zone: zones are opened implicitly by writes, and it issues explicit Close, Finish and Reset. VERIFY against the version you use.
+- Does explicit open change data placement? => Not by spec. It is a resource statement only. Any placement effect is firmware specific.
+PITFALL: Explicitly opening a spare zone "just in case" and forgetting it. That is a permanent active and open resource with no data.
+VERIFY: The ZenFS open policy in the ZenFS source (zbd_zenfs.cc calls only close, finish and reset on zones).
+
+@@ 6.08 | Intermediate | Trap | tags=trap,closed,crash,recovery,power-cycle
+Q: After a host crash or power cycle a restarted application gets Too Many Active Zones on its first write. Why?
+SHORT: Zone state is persistent device state, not host state. Open zones are returned to Closed at a power cycle or NVM subsystem reset (whether a controller-level reset alone does so is unconfirmed), and Closed zones stay active. The restarted host starts counting from zero, but the device still holds every zone the previous instance left partly written. Recovery must reconcile with Report Zones, then finish, reset or resume those zones.
+DEEP:
+- **What happens at a reset or power cycle:** zones that were Implicitly or Explicitly Opened become Closed (or Empty if nothing was written), and their write pointers are kept. Open resources are freed but active resources are not.
+- **What the host believes:** its in-memory table is gone, so it thinks zero zones are active.
+- **What the device believes:** up to MAR zones are active. The first write to an Empty zone is refused.
+- **Recovery procedure:**
+  1. Identify to read MAR and MOR.
+  2. Report Zones over the whole namespace, or filter by state (one state value per report) for Implicitly Opened, Explicitly Opened and Closed if you want only active zones.
+  3. For each: resume it (it is a valid append point), Finish it, or Reset it if its data is no longer needed.
+  4. Only then start new writers.
+- **Validation angle:** power cycle in the middle of a many-zone workload and check every zone's state and write pointer against the model. A zone that lost data past the acknowledged write pointer is a data-integrity bug. A zone that changed active status unexpectedly is a state bug.
+FOLLOW:
+- Should the host reset all zones at startup? => Only if the data is disposable. Otherwise reconcile: resume or finish partly written zones according to the application's own log.
+- Does a controller reset alone (not a power cycle) do the same? => Open zones close on any reset that clears open state. VERIFY which resets in the specification do it.
+PITFALL: Tracking resource use only in RAM. After a crash, that model is wrong, and the device is the only source of truth.
+VERIFY: The initial state of zones after an NVM subsystem reset, controller reset and shutdown, including the Empty rule for zones with no data, in the ZNS Command Set Specification.
+
+@@ 6.09 | Advanced | Concept | tags=zde,descriptor-extension,zdes,set-zone-descriptor
+Q: What is the Zone Descriptor Extension, how big can it be, and how is it used?
+SHORT: The Zone Descriptor Extension (ZDE) is optional host-defined metadata attached to a zone and returned with its zone descriptor by an extended Report Zones. Its size, ZDES, is per LBA format, in units of 64 bytes, and it is set with the Set Zone Descriptor Extension action, which moves an Empty zone to Closed and sets the ZDEV bit in the zone attributes.
+DEEP:
+- **Size:** ZDES is an 8-bit field in the LBA format extension of the ZNS Identify Namespace data. Bytes equals ZDES times 64, at most 255 x 64 = 16,320 bytes. A value of 0 means the format has no extension.
+- **Set:** Zone Management Send with action 10h and a data buffer of exactly ZDES x 64 bytes. It is valid on an Empty zone, and it moves that zone to Closed.
+- **Resource impact:** Closed is active. Setting an extension on many empty zones can hit MAR, and it should be planned in the budget of module 6.12. It does not use an open resource.
+- **Valid bit:** the ZDEV bit (bit 7 of the zone attributes byte in the descriptor) says an extension is present.
+- **Read:** Zone Management Receive with the extended report action returns each descriptor followed by ZDES x 64 bytes. Reports get bigger, so size the buffer for it.
+- **Use cases:** a filesystem stores a zone owner, generation number, lifetime class or checksum of a zone header, so a scan after a crash reads it in one command rather than reading data from every zone.
+- **nvme-cli:** `nvme zns set-zone-desc`, and `nvme zns report-zones` with the extended option.
+FOLLOW:
+- What happens to the extension on Reset Zone? => It should be cleared with the zone going to Empty (ZDEV cleared). Test it explicitly. VERIFY.
+- Is it supported by Linux block layer? => The mainline block layer has no interface I know of for it, so use passthrough or a user-space stack such as SPDK or xNVMe.
+PITFALL: Setting the extension on a zone that then sits Closed and empty for a long time. It permanently holds an active resource.
+VERIFY: ZDES units, the Set Zone Descriptor Extension transition and resource effect, ZDEV bit position, extension clearing on Reset, and persistence across power loss in the ZNS Command Set Specification.
+
+@@ 6.10 | Advanced | Concept | tags=zae,fzr,rzr,zfc,frl,rrl,excursion
+Q: What are FZR, RZR, FRL, RRL and a Zone Active Excursion, and why would a device do that?
+SHORT: A device may want zones not to stay active or Full indefinitely. It advertises time limits (FRL and RRL) and sets Finish Zone Recommended or Reset Zone Recommended in the zone attributes. If the host ignores a recommendation, a device that supports Zone Active Excursions may itself Finish the zone: the zone goes to Full, the Zone Finished by Controller bit is set, and the host is notified.
+DEEP:
+- **Capability:** ZOC bit 1 in Identify says the namespace may perform Zone Active Excursions. ZOC bit 0 is Variable Zone Capacity.
+- **Zone attributes byte in the descriptor:** bit 0 ZFC (Zone Finished by Controller), bit 1 FZR (Finish Zone Recommended), bit 2 RZR (Reset Zone Recommended), bit 7 ZDEV.
+- **Why it exists (typical):** a zone left partly written for a long time strands NAND in open blocks with retention and data-integrity exposure. A zone left Full with stale data pins capacity. Vendors want the host to close the loop.
+- **FRL:** the limit after which FZR may be set. **RRL:** the analogous limit for RZR (which zone states it applies to is in the specification). Newer revisions add FRL1 to FRL3 and RRL1 to RRL3, selected per zone. Units and start-of-timer rules are in the specification.
+- **The excursion:** the controller does a Finish itself. The zone becomes Full, ZFC is 1, resources are released, and a Zone Descriptor Changed notice is sent (module 6.11).
+- **Linux:** the NVMe driver refuses namespaces whose ZOC is nonzero (dmesg: "zone operations:2 not supported for namespace:1"). A ZAE device is unusable with mainline Linux, so devices meant for Linux hosts normally report ZOC of 0.
+FOLLOW:
+- Why is an excursion a concern for a host? => A writer sees Zone Is Full (B9h) on a zone it thought had space. The remaining capacity is lost until Reset.
+- Does FZR force the host to act? => No. It is a recommendation. Only the excursion is an action by the controller.
+PITFALL: Treating an unexpected Zone Is Full as a firmware bug without checking ZFC in the zone descriptor. With ZAE it is the specified behaviour.
+VERIFY: Meaning, units and timer start of FRL and RRL, the FRL1 to FRL3 and RRL1 to RRL3 selection, and the ZFC, FZR and RZR bit positions, in the ZNS Command Set Specification.
+
+@@ 6.11 | Advanced | Concept | tags=zone-descriptor-changed,changed-zone-list,aen,log-page
+Q: How does the host learn that a zone changed behind its back: Zone Descriptor Changed and the Changed Zone List?
+SHORT: The controller can send a Zone Descriptor Changed asynchronous event (notice type), and the host reads the Changed Zone List log page (LID BFh) to get the zone IDs. The log holds up to 511 zone start LBAs, and a count of FFFFh means the list overflowed and the host must rescan with Report Zones. Reading the log without RAE clears it and re-arms the event.
+DEEP:
+- **Enable:** Set Features, Asynchronous Event Configuration, bit 27 (Zone Descriptor Changed Notices). The controller advertises support in OAES bit 27. Then keep an Asynchronous Event Request outstanding.
+- **Log layout (4096 bytes):** a 2-byte count (Number of Zone Identifiers), 6 reserved bytes, then 511 entries of 8 bytes each (2 + 6 + 511 x 8 = 4096). The entries are zone start LBAs.
+- **What triggers it:** changes the host did not cause, such as an excursion, a zone going Read Only or Offline, or an FZR or RZR attribute change.
+- **Re-arm rule:** as with other notice events, no new event is sent until the log is read. RAE = 1 reads without clearing.
+- **Overflow:** if more zones changed than fit, the count is FFFFh and the entries are not valid. Rescan.
+- **Not persistent:** it is not preserved across a controller reset. After a reset, rescan.
+```
+nvme zns changed-zone-list /dev/nvme0n1        # add --rae to retain
+nvme get-feature /dev/nvme0 -f 0x0b            # Async Event Configuration
+```
+FOLLOW:
+- Does mainline Linux consume this event? => Not to my knowledge. A host that needs it uses passthrough, SPDK or a periodic Report Zones. VERIFY on your kernel.
+- Why keep periodic Report Zones as well? => The event can be lost or overflowed, and reset clears the log. Treat the event as a hint.
+PITFALL: Reading the log with RAE = 1 in a loop. The event is never re-armed and you see no more notices.
+VERIFY: The Asynchronous Event Information value for Zone Descriptor Changed, the exact trigger list, and OAES and AEC bit 27, in the ZNS Command Set Specification and NVMe Base Specification.
+
+@@ 6.12 | Advanced | Numeric | tags=numeric,budget,writers,lsm,capacity
+Q: A host has 14 active and 8 open zones. How do you budget them across a WAL, data writers and compaction, and what does it cost?
+SHORT: Take steady-state open zones first, then add one slot for zone rotation, then use what remains of the active budget for parked Closed zones. With 1 metadata, 1 WAL, 3 data and 1 compaction writer that is 6 open, 7 at peak with rotation serialized. That leaves 8 - 7 = 1 spare open slot and 14 - 7 = 7 active slots for parked zones.
+DEEP:
+Assumptions: MAR field = 13 (14 active), MOR field = 7 (8 open), zone capacity 1077 MiB, one zone sustains about 400 MB/s. All figures here are assumed, not from a datasheet.
+
+| Role | Open zones | Note |
+|---|---|---|
+| Metadata or journal | 1 | Always open |
+| WAL | 1 | Always open |
+| Data writers (3 lifetime classes) | 3 | One zone each |
+| Compaction output | 1 | One at a time |
+| Steady open | 6 | |
+| Rotation slot | 1 | Serialize rotations with a semaphore |
+| Peak open | 7 | Leaves 8 - 7 = 1 spare |
+
+1. **Active:** the peak is 7 open, and active is at least open. That leaves 14 - 7 = 7 active slots for parked Closed zones, for example cold-lifetime zones that are only written occasionally.
+2. **Throughput check:** 6 writers x 400 MB/s = 2400 MB/s. If the device can do 3 GB/s, more open zones are needed to saturate it, and the budget must be redone.
+3. **Cost of Finish instead of parking:** finishing a zone at 25 percent fill gives up 0.75 x 1077 = 808 MiB. At 50 percent fill, 538.5 MiB. Parking costs an active slot, and Finish costs capacity, so the trade is per workload.
+4. **Why a rotation slot:** when a writer fills a zone, opening the next before the old one is Full needs both an extra open and an extra active. Without the slot, rotation fails with Too Many Open Zones exactly when the load is highest.
+5. **Why serialize:** two simultaneous rotations need 2 slots. A semaphore of 1 turns a fatal race into a short wait.
+FOLLOW:
+- What changes if MAR equals MOR at 8? => No separate parking budget: open writers and parked Closed zones share the same 8 slots, so each parked zone takes a slot from a writer. Finish or Reset zones instead of parking them.
+- What do you monitor? => Open and active counts from Report Zones per second, rotation wait time, and Too Many status counts (should be zero).
+PITFALL: Budgeting only steady-state writers. The peaks are at rotation and at recovery after a crash.
+VERIFY: None for the arithmetic. Check real MAR and MOR from Identify on the target drive.
+
+@@ 6.13 | Advanced | Debug | tags=debug,too-many-open,too-many-active,blkzone,nvme-cli
+Q: Writes to a zoned namespace start failing after N zones. How do you find out why?
+SHORT: Read the limits, then the actual zone states, then the status code. A failure at the open limit with implicit writers is masked by eviction, so failing at exactly MOR usually means the zones were opened explicitly. A failure at MAR with few open zones means Closed zones are eating the active budget. The errno separates the two: ETOOMANYREFS is open, EOVERFLOW is active.
+DEEP:
+Setup: a harness writes 4 KiB to the start of each of 20 empty zones in turn, on a drive with mar = 0xD and mor = 0x7 (14 active, 8 open).
+```
+$ cat /sys/block/nvme0n1/queue/max_active_zones /sys/block/nvme0n1/queue/max_open_zones
+14
+8
+$ ./write_zones.sh --mode implicit --zones 20
+zone 0..13 ok
+zone 14: write: Value too large for defined data type      # EOVERFLOW
+$ ./write_zones.sh --mode explicit --zones 20
+zone 0..7 ok
+zone 8: open: Too many references: cannot splice           # ETOOMANYREFS
+```
+1. **Implicit run, failure at zone 14:** Empty zones opened by writes go through implicit close (8 open, the rest Closed) until 14 are active. The 15th zone needs a new active slot, and no eviction can supply one, so it fails with active exceeded.
+2. **Explicit run, failure at zone 8:** explicitly opened zones cannot be evicted, so the 9th open fails with open exceeded, even though 6 active slots remain.
+3. **Confirm with Report Zones:** count zones by state. Expect 8 open and 6 Closed for the implicit run, and 8 explicit and 0 Closed for the explicit run.
+4. **Cross-check the kernel log:** `dmesg` shows "active zones exceeded" or "open zones exceeded" on the failed request. On the wire, SCT 1 with SC BDh or BEh.
+5. **Fix by evidence:** if the harness is wrong, close or finish zones and cap concurrency. If the device counts differently (fails earlier than Identify says), it is a firmware bug: file it with the Report Zones snapshot, both Identify values and the command trace.
+FOLLOW:
+- The implicit run fails at zone 8 instead. What is the likely cause? => The firmware returns Too Many Open Zones instead of implicitly closing. Spec wording on this differs by revision, so check the revision and datasheet before filing a bug.
+- The counts match but the error is on a Close command. What next? => Close is only valid on an open zone. Check for Invalid Zone State Transition (BFh) rather than a resource status.
+PITFALL: Trusting the harness's own count of zones. Compare with Report Zones after every phase, because Closed zones from a previous run are still holding slots.
+VERIFY: The exact dmesg wording and blkzone output format on your kernel version. The lines above are illustrative.
+
+@@ 6.14 | Advanced | Cross-layer | tags=host,zenfs,rocksdb,btrfs,f2fs,accounting
+Q: How do real host stacks account for zone resources, for example RocksDB with ZenFS, btrfs and f2fs?
+SHORT: They budget from the Identify limits, keep a central counter of active and open zones with reservations for metadata, and acquire resources before starting a zone. ZenFS subtracts reserved zones (metadata and extent migration) from the limits and hands the rest to lifetime-classified writers. The Linux zoned block layer exports the limits but does not arbitrate them, so each consumer has to.
+DEEP:
+- **Common pattern:** read max_open_zones and max_active_zones, subtract reserved zones, and use a counting semaphore for the rest. Take the open and active slots in one fixed order (ZenFS waits for an open token first, then takes an active token if it needs a new zone), and release on Full, Finish or Reset.
+- **ZenFS (RocksDB zoned backend):** it tracks active and open I/O zones against the device limits minus 2 reserved zones (one for metadata, one for extent migration), and picks a zone by the file's write lifetime hint so data with similar death times share a zone. It finishes a zone whose remaining capacity drops below a configurable finish threshold, and finishes the cheapest zone when active tokens run out. VERIFY details and constants in the source.
+- **btrfs (zoned mode):** counts active block groups against the limit and finishes zones it no longer needs to keep active. VERIFY current behaviour.
+- **f2fs (zoned):** several log heads write concurrently, and mount checks that the device allows enough open zones for them. VERIFY the check and message.
+- **Block layer:** since zone write plugging (Linux 6.10 or later, VERIFY) it serializes writes per zone, but resource limits stay a policy issue for the filesystem or application.
+- **Startup:** reconcile with Report Zones (module 6.08) before allowing writers.
+- **Degrade, do not fail:** on Too Many Open Zones a good stack waits for a slot and retries, and logs it, rather than failing the user's I/O.
+FOLLOW:
+- Why take the tokens in one fixed order? => Empty to open needs both, and two writers taking them in opposite orders can each hold one and wait for the other. One order avoids that deadlock.
+- How does a validator emulate these hosts? => With fio zbd mode and `max_open_zones`, plus a custom harness that models the same semaphore. Module 9 lists the tooling.
+PITFALL: Coding to a fixed number from a datasheet. Use the Identify values on the drive in front of you, because two firmware versions can differ.
+VERIFY: ZenFS reserved zone counts and selection policy, btrfs active block group handling, f2fs mount check, and the kernel version that introduced zone write plugging.
+
+@@ 6.15 | Principal | Scenario | tags=test-plan,boundary,matrix,concurrency,validation
+Q: How would you design the validation suite for zone resource limits (MAR and MOR) on a new ZNS firmware?
+SHORT: Build a host-side model of the resource rules, then drive it across the boundary: MAR-1, MAR, MAR+1 and the same for MOR, for every transition and every command type that opens a zone. Add concurrency races for the last resource, implicit close behaviour, reset and power-cycle recovery, and error injection. Pass criteria are exact status codes plus model-equal zone states after every step.
+DEEP:
+1. **Oracle:** a small model implementing the table from 6.04 (state, active count, open count per namespace). Every command is predicted, executed, and compared on status, zone state, write pointer and counts.
+2. **Boundary matrix:** for limit L in MAR, MOR: reach L-1, L, and try L+1 using each opener (write, append, Open Zone, write to Closed, Set Zone Descriptor Extension). Expect the exact status from 6.05 and no state change on failure.
+3. **MAR versus MOR configurations:** MAR > MOR (implicit close should work), MAR equal MOR (only Too Many Active seen), MOR field value 0 (one open zone), and unlimited FFFFFFFFh (write many zones, then check that no limit error appears).
+4. **Implicit close:** MOR + 1 implicit writers, expect zero errors, exactly MOR open zones, data intact. Then mix in explicit zones and prove they are never evicted.
+5. **Races:** N threads compete for the last slot with N = 2..64. Exactly one wins, the others get the right error, and the counts stay consistent. Repeat with Append.
+6. **Release paths:** last-write-to-capacity, Finish, Reset, Select All actions, controller-forced Read Only and Offline via fault injection. After each, the slot must be reusable.
+7. **Persistence:** power cycle or reset with zones open and Closed, then check state, write pointers and that MAR can still be reached but not exceeded.
+8. **Evidence and criteria:** per-run log with the command trace, the model diff and the Report Zones snapshot. Zero unexplained mismatches over a soak (for example 72 hours with error injection) is the exit criterion.
+FOLLOW:
+- What is the hardest case to get right? => Concurrent races combined with reset and error injection, because it exercises rollback paths. See 6.16.
+- Which behaviours are implementation-defined and must not be tested as pass or fail? => The victim choice for implicit close and, depending on the spec revision, whether the controller closes or fails. Record them as characterization data.
+PITFALL: Testing only sequentially. A resource counter bug that appears only under concurrency passes a single-thread suite.
+VERIFY: The status precedence, Set Zone Descriptor Extension resource rule, and Select All behaviours used as oracle rules, in the ZNS Command Set Specification.
+
+@@ 6.16 | Principal | Debug | tags=leak,accounting,soak,fault-injection,root-cause
+Q: After a long soak with error injection, the drive returns Too Many Active Zones although Report Zones shows only 3 active zones. How do you root-cause it?
+SHORT: Treat it as a resource accounting leak in the firmware. Prove it with a probe that measures how many zones can really be made active, quantify the leaked count, correlate the count with the injected events, then check whether a reset or power cycle heals it. The healing behaviour tells you whether the counter is runtime-only or wrongly rebuilt from persistent metadata.
+DEEP:
+1. **Capture:** Report Zones snapshot, the latest Identify, the log pages (error log, telemetry if available) and the command trace before touching anything.
+2. **Probe:** with the namespace quiet, Reset all active zones, then Explicitly Open empty zones one by one until Too Many Active Zones. If the count achieved is MAR - k, then k slots leaked. Repeat for open resources with MOR.
+3. **Correlate:** does k grow with a specific event? Typical leak paths are commands that fail after the state change (write to an Empty zone that then hits a media error or an abort), Reset racing a write, Append abort, a zone going Read Only, and recovery after an unsafe shutdown that rebuilds counts from NAND metadata.
+4. **Heal test:** after a controller reset, is k back to 0? Yes suggests a runtime counter that is not rolled back on an error path. No suggests the persisted or reconstructed state is wrong, for example a stale open flag in metadata.
+5. **Bisect:** replay the trace with one event class at a time. Reduce to the minimum sequence, for example "write to Empty zone, inject write error, check probe".
+6. **Report:** the sequence, k, the healing behaviour, and the model diff. The fix belongs in the firmware's error and rollback paths, and the regression test is the probe run after every injected error type.
+- **Add the probe to the suite:** run it at the end of every test, not only after this soak.
+FOLLOW:
+- Why not trust Report Zones as the truth? => It reports zone states, not the controller's internal counters. A leak shows only as a mismatch between the two.
+- What if k is negative, the device allows more than MAR? => A counter underflow or double release. It is also a bug, and it may let the host exceed the buffer sizing that MAR protects.
+PITFALL: Fixing the symptom by resetting all zones every time. The leak returns and the underlying error path stays untested.
+VERIFY: None for the method. Confirm the vendor tooling available to read internal resource counters, which is the fastest confirmation.
+
+@@ 6.17 | Principal | Cross-layer | tags=zae,policy,host,firmware,integrity
+Q: How would you validate a device that supports Zone Active Excursions, and what host policy would you write for it?
+SHORT: Validate that the controller only acts after the recommended limits expire, sets FZR before it acts, and afterwards reports a Full zone with ZFC set, released resources, intact acknowledged data and a Zone Descriptor Changed notice. Host policy: poll or subscribe for FZR and RZR, finish or reset before the limit, and treat Zone Is Full on a zone with ZFC as an excursion, not an error.
+DEEP:
+- **Preconditions:** ZOC bit 1 set, FRL and RRL read from Identify, and a way to shorten the limits (a vendor setting or test firmware), otherwise a test would take hours or days.
+- **Firmware validation:**
+  1. Leave a zone partly written and idle. Expect FZR clear before FRL and set after it.
+  2. Ignore FZR. The excursion happens: state Full, ZFC = 1, active and open resources released.
+  3. Every acknowledged LBA below the old write pointer reads back correct. The Finish must not lose data.
+  4. The Changed Zone List names the zone and the event is delivered once.
+  5. A write in flight at the time of the excursion gets a defined result: complete (data kept) or Zone Is Full, with no torn state.
+  6. Do it under a power cycle and under many zones at once, and check the sequence is consistent.
+  7. Host response in time (finish before FRL) prevents any excursion.
+- **Host policy:** every Report Zones interval, sweep for FZR and RZR. Prefer to keep writing or Finish, on your schedule, rather than let the device decide. Reset RZR zones when the data is dead.
+- **Compatibility:** mainline Linux refuses a ZOC nonzero namespace, so the host must be SPDK, xNVMe or a modified driver. State this in the test plan.
+- **Design point:** an excursion costs the remaining capacity of the zone. Size the zones and the FRL against the slowest writer.
+FOLLOW:
+- How do you tell an excursion from a host bug that finished the zone? => ZFC. It is set only when the controller did it.
+- What does a device with ZAE change in capacity planning? => Slow writers lose unwritten capacity, so plan to fill or finish every active zone within FRL.
+PITFALL: Validating only the happy path where the host reacts in time. The excursion path is the one that has firmware-specific rollback, resource release and notification logic.
+VERIFY: The definition and trigger of a Zone Active Excursion, the FRL and RRL timer semantics, in-flight command handling, and notification requirements in the ZNS Command Set Specification.

@@ -1,0 +1,415 @@
+# Module 10: ZNS Validation & Test Design
+
+@@ 10.01 | Basic | Concept | tags=test-plan,phases,dependencies,oracle,gating
+Q: What does a ZNS validation plan cover, and in what order do you build and run it?
+SHORT: Order it by dependency. Discover the drive's zoned profile first, then check static geometry, Identify data and Report Zones, then the state machine and management commands, I/O rules and boundaries, resource limits, Append, persistence across resets and power loss, data integrity and soak, media faults, performance and host-stack tests. Early phases gate later ones, because a broken Reset or Report Zones corrupts the meaning of every later result.
+DEEP:
+| Phase | Question it answers | Where in this page |
+|---|---|---|
+| 0 Profile | What does this drive claim (ZOC, OZCS, MAR, MOR, ZASL, DLFEAT, VWC)? | Modules 2 and 6 |
+| 1 Static | Is geometry consistent: ZSZE, ZCAP, zone count, descriptors well formed? | Modules 2 and 3 |
+| 2 State machine | Does every state x action give the right status and next state? | Module 4 |
+| 3 I/O rules | Write pointer, boundaries, read rules, zone status codes | Module 7 |
+| 4 Resources | MAR and MOR enforcement, implicit close | Module 6 |
+| 5 Append | Placement, ZASL, concurrency | Module 5 |
+| 6 Persistence | Reset and SPOR outcomes, WP recovery | 3.09, 3.15, 10.12 |
+| 7 Integrity and soak | Per-zone data checks over long mixed runs | 10.11 |
+| 8 Faults | Read Only and Offline transitions, aborts, timeouts | 3.16 |
+| 9 Performance | Zone bandwidth, Append scaling, reset impact | 10.08 |
+| 10 Host stack | Linux zoned block layer, fio zbd, file systems | Module 9 |
+
+- **Oracle sources, ranked:** the spec's transition and status tables as data; command completions (status, and DW0 for Append); Report Zones at quiescence; read-back of self-describing data; logs and events as corroboration. Expected values never come from the device's own report.
+- **Gate rule:** phases 0 to 3 run in minutes on every firmware build as a smoke gate. Phases 4 to 6 run nightly. Phases 7 to 10 run weekly and at the release gate.
+- **Traceability:** give each requirement an ID and link tests to it. The generic method (pyramid, traceability, statistics, metrics) is on the NVMe page, Validation Methodology module. This module covers what is specific to zones.
+FOLLOW:
+- Why do Reset and Report Zones come early? => Nearly every other test uses them for setup and verification, so a defect there changes the meaning of later results.
+- Which phase catches the most escapes? => Usually 2 to 4 for logic and 6 for recovery, so weight the effort there, not on happy-path throughput.
+PITFALL: Starting with fio workloads because they are easy, then finding that setup and verification relied on a broken Reset or report.
+VERIFY: Which optional zoned features (ZRWA, Zone Active Excursions, variable capacity) your target spec revision defines, since phases 4 to 8 depend on the profile.
+
+@@ 10.02 | Basic | Concept | tags=fixtures,known-state,reset-all,quarantine,precondition,isolation
+Q: How do you put a zoned drive into a known starting state before a test, and why is that harder than on a conventional drive?
+SHORT: Inventory every zone with Report Zones, quarantine Read Only and Offline zones, bring the rest to Empty with Reset (Select All only touches Open, Closed and Full zones), then report again. Fail the setup, not the test, if any healthy zone is not Empty or any zone is still active. Each test then draws zones from that pool, builds the states it needs, and a teardown returns them to Empty.
+DEEP:
+1. **Inventory:** full Report Zones, tally by state, record ZSLBA, ZCAP and attributes per zone (ZCAP can differ per zone with variable capacity).
+2. **Quarantine:** Read Only and Offline zones cannot be reset (Invalid Zone State Transition) and Reset-all skips them. Keep them out of the pool. A quarantine list that grows between tests is a finding in its own right.
+3. **Reset:** Reset-all is one command but slow on a full drive (see the Reset-all numeric question in Module 4). On a shared rig reset only the zones the run owns.
+4. **Verify preconditions:** pool zones are Empty with WP = ZSLBA, the active and open counts from the report are zero, no unread Zone Descriptor Changed event is pending, and DUT health is unchanged (critical warning, error log entry count).
+5. **Build states on demand:** use the table in 3.17 for how to reach each state, and record how many zones of each state the test needs so it can respect MAR and MOR.
+6. **Isolation:** parallel tests own disjoint zone ranges. MAR and MOR are per namespace, so concurrent tests share one budget and must be given a slice of it.
+7. **Teardown:** Reset or Finish what the test touched, re-report and check. On a failure keep the state for debug instead of cleaning up.
+
+The contrast with a conventional drive: there, a state such as "full and fragmented" is reached by running a workload. Here the state is explicit and per zone, some states are unreachable by commands, and the number of zones in the active and open states is capped.
+FOLLOW:
+- Does Format NVM put a zoned namespace back to Empty? => Expected to, but it costs a full-device erase and consumes PE cycles, so prefer targeted Reset and keep Format for rig recovery.
+- What if Reset-all leaves a healthy zone that is not Empty? => That is a DUT defect. Stop the run rather than continue on a pool you have not verified.
+PITFALL: Assuming Reset-all yields an all-Empty namespace. It skips Read Only and Offline zones, so after a fault test part of the drive stays unusable.
+VERIFY: The effect of Format NVM on zone state and attributes in the ZNS Command Set Specification.
+
+@@ 10.03 | Basic | Cross-layer | tags=tools,nvme-cli,blkzone,libzbd,fio,spdk,qemu,passthrough
+Q: Which tools do you use for what in ZNS validation, and why does the path (direct passthrough or block layer) matter?
+SHORT: Use direct paths to test the drive and the block layer to test the host stack. nvme-cli zns and io-passthru, SPDK and custom ioctls reach the controller unchanged, including illegal commands. blkzone, libzbd and fio's zbd mode go through the Linux zoned block layer, which validates, caches and orders requests. QEMU's zoned NVMe device is the cheap target for model and framework bring-up. Reproduce a failure on two paths before blaming either.
+DEEP:
+| Tool | Path | Good for | Blind to |
+|---|---|---|---|
+| nvme zns, nvme io-passthru | Driver passthrough, no block layer checks | Illegal actions, raw CDW fields, exact status, Append | Throughput, host stack behavior |
+| SPDK (spdk_nvme_zns_* API) | User-space driver, your own queues | High QD, Append concurrency, timing, queue-level fault injection | Kernel behavior |
+| blkzone, libzbd | Block layer ioctls | The host-visible zone view, quick state changes | Illegal commands (kernel rejects or rewrites them) |
+| fio with zonemode=zbd | Block layer | Workloads, verify, respecting open zone limits | Negative tests |
+| QEMU zoned NVMe | Emulation | Model bring-up, CI, differential comparison | Timing, media faults, power loss |
+| PCIe analyzer | The wire | CQE contents and order, timing | Firmware state |
+| Python over JSON output | Glue | Model, logging, orchestration | Nothing by itself |
+
+- **Rule of two paths:** a failure seen through the block layer is reproduced with passthrough (does the SSD do it?), and one seen with passthrough is reproduced through the kernel path (does the host stack cope?).
+- **Structured output:** run nvme-cli with JSON output and parse it in Python instead of scraping text, and log raw CQE fields for every command.
+- **Kernel view:** the zoned block layer may cache zone information, so a kernel-reported zone can lag the device. Use nvme-cli report-zones for ground truth.
+- **Illegal tests:** send them only by passthrough or SPDK.
+FOLLOW:
+- Why can an illegal-command test silently test Linux? => The block layer checks alignment and zone state and can fail the request itself, so the SSD never sees the command.
+- Which tool issues Zone Append? => Passthrough (io_uring passthrough or nvme io-passthru) or SPDK. Ordinary block writes are not Appends.
+PITFALL: Drawing conclusions about the SSD from a test that went through the block layer. If Linux rejected, reordered or merged the request, the drive never saw what you think.
+VERIFY: Subcommand and option names on your nvme-cli, libzbd and fio versions, the SPDK zns function names in spdk/nvme_zns.h, and the QEMU zoned option names (zoned.zone_size, zoned.zone_capacity, zoned.max_open, zoned.max_active, zoned.zasl).
+
+@@ 10.04 | Intermediate | Concept | tags=boundary,zcap,zsze,namespace-end,status,gap
+Q: Which boundary cases do you build for Write, Read and management commands, and what is expected at each?
+SHORT: Put cases at every edge of one geometry: WP, ZCAP minus 1, ZCAP, ZSZE minus 1, the next zone start and the namespace end. A write ending exactly at ZCAP succeeds and makes the zone Full. One block more fails with Zone Boundary Error and writes nothing. Reads past ZCAP inside a zone return unwritten data, cross-zone reads depend on the Read Across Zone Boundaries bit, and management SLBAs must be zone starts.
+DEEP:
+Geometry: 4 KiB LBAs, ZSZE = 0x10000, ZCAP = 0xDC00, so zone 2 starts at 0x20000, its writable range ends at 0x2DC00 and zone 3 starts at 0x30000.
+
+| Case (zone 2 Open, WP = 0x2DBF8 unless noted) | Expected |
+|---|---|
+| Write 8 blocks at WP (ends at ZCAP) | Success, zone becomes Full |
+| Write 16 blocks at WP (8 too many) | Zone Boundary Error (B8h), nothing written, WP unchanged |
+| Write 1 block at WP + 1 | Zone Invalid Write (BCh) |
+| Write 1 block at 0x2DC00 (first LBA above ZCAP) | Rejected. BCh or B8h depending on check order, record which |
+| Write 1 block to a Full zone | Zone Is Full (B9h) |
+| Write 1 block at the namespace size | LBA Out of Range (generic status 80h) |
+| Read 8 blocks at 0x2DBFC (spans ZCAP, same zone) | Success, blocks at or above ZCAP return the unwritten value |
+| Read 8 blocks at 0x2FFFC (spans into zone 3) | Success if Read Across Zone Boundaries is 1 and both zones are readable, else Zone Boundary Error |
+| Read 8 blocks ending past the namespace end | LBA Out of Range |
+| Zone management with SLBA = ZSLBA + 1 | Invalid Field in Command |
+| Zone management with SLBA at the namespace size | LBA Out of Range |
+
+- **Side effects:** after every rejected command, report the zone and read back the neighbors. Nothing may change.
+- **Repeat per state:** the same LBA gives different statuses in Empty, Closed, Full, Read Only and Offline zones.
+- **Repeat per profile:** with ZCAP = ZSZE there is no gap, and a write that runs past the last LBA of zone 2 crosses into zone 3 and gets Zone Boundary Error.
+- **Other places:** first and last zone, and 512 B and 4 KiB formats.
+FOLLOW:
+- Why test the gap between ZCAP and ZSZE? => It is addressable space that must never hold data. Firmware that sizes zones by ZSZE instead of ZCAP fails only there.
+- Why record which of two defensible statuses the drive returns? => A later change of behavior is then flagged even though both codes are legal.
+PITFALL: Testing boundaries only on Empty zones and only with Write. The same LBA and length can produce a different status in each state and command.
+VERIFY: The status for a write to an LBA above ZCAP that is not at the WP, the order of state and range checks, and the Read Across Zone Boundaries bit, in the ZNS Command Set Specification.
+
+@@ 10.05 | Intermediate | Concept | tags=report-zones,filters,pagination,partial,extended,zrasf
+Q: How do you test Report Zones itself: filters, partial reports, extended reports and pagination?
+SHORT: Give Report Zones its own oracle. With zones in a known mix of states, check that each state filter returns exactly the model's zone set in ascending order, that the seven state filters together equal the unfiltered report, that any chunk size paginates with no lost or repeated zone, that Partial Report changes only the header count, and that undersized buffers, reserved values and odd SLBAs behave as specified. The command must also change nothing.
+DEEP:
+1. **Population:** at least one zone in every state you can reach, interleaved so filtered results are not contiguous (Empty, Open, Empty, Full, Closed, and so on).
+2. **Filter equality:** for each ZRASF value compare the returned set to the model's. The seven per-state counts must add up to the zone count, which is NSZE / ZSZE.
+3. **Pagination:** read with 1, 2, 7 (an awkward prime), 64 and MDTS-sized buffers, advancing by ZSZE from the last returned ZSLBA. Every merged result must equal one big read taken at quiescence.
+4. **Header count:** repeat with Partial Report 0 and 1 and with a header-only buffer, and compare the Number of Zones with what fits and what matches.
+5. **Extended reports:** ZDES bytes follow each descriptor. For ZDEV zones the bytes equal what was set. For the others they are not asserted.
+6. **Negative cases:** NUMD too small for a header, reserved ZRA or ZRASF values, SLBA at or past the namespace end, SLBA inside a zone (record accept or reject), and the command sent to a non-zoned namespace.
+7. **Under load:** reports are samples at some instant. On zones being written assert bounds and monotonic WP only. On idle zones assert exact equality.
+8. **No side effects:** compare state and WP before and after thousands of reports, including during writes to other zones.
+FOLLOW:
+- Why check that the filters add up to the unfiltered report? => A filter that silently drops or double counts a state would hide inside a spot check.
+- Why use awkward chunk sizes? => Firmware loops over descriptors in batches, and off-by-one bugs appear when the chunk does not divide the zone count.
+PITFALL: Treating a report taken with commands in flight as an exact snapshot. It is a valid sample of some instant, so assert bounds, not equality.
+VERIFY: ZRASF encodings for Full and Read Only (05h and 06h), Partial Report header semantics, and the status for reserved ZRA or ZRASF values and for an SLBA inside a zone (see 4.02 and 4.08).
+
+@@ 10.06 | Intermediate | Concept | tags=capability,profile,gating,zoc,ozcs,zdes,mar,mor
+Q: How do you keep one ZNS suite valid across drives with different optional features, and what do you test when a feature is absent?
+SHORT: Read the capability profile first (ZOC bits, the Read Across Zone Boundaries bit in OZCS, MAR and MOR, ZDES per LBA format, ZASL against MDTS, recommended limits, DLFEAT, volatile write cache). Give each test a requires-list and a defined expectation when the capability is absent. Absent means test the rejection or the invariant, not skip. Store the profile with every result and fail a build whose profile changed without notice.
+DEEP:
+| Capability | If present | If absent |
+|---|---|---|
+| Variable Zone Capacity | Per-zone ZCAP in the model, ZCAP may change after Reset | Every zone reports the same ZCAP and Reset never changes it |
+| Zone Active Excursions | Controller Finish sets ZFC, resources are freed, host policy is exercised (6.17) | ZFC is never set. A controller-finished zone is a defect |
+| Read Across Zone Boundaries | Cross-zone read succeeds when both zones are readable | Cross-zone read returns Zone Boundary Error |
+| Zone descriptor extensions (ZDES > 0) | Set Zone Descriptor Extension and Extended Report round trip | Command rejected, ZDEV never set |
+| Finite MAR and MOR | Limit tests, eviction, exact error codes (6.15) | No limit (FFFFFFFFh): open zones up to a large count and confirm no spurious Too Many Open or Too Many Active |
+| ZASL below MDTS | Append at ZASL passes, ZASL + 1 fails | ZASL = 0: Append limited by MDTS, test at MDTS |
+| Volatile write cache | Durability tests need Flush or FUA to define the lower bound | Completed means durable, so the oracle is stricter |
+
+- **Data-driven profile:** capture Identify Controller, the zoned Identify Namespace data and Get Features output as JSON, hash it and store the hash with each result.
+- **Drift gate:** if the hash changes between builds and nobody announced it, stop. A silently changed capability invalidates the baseline.
+- **Expectation table:** tests read expected results from the profile, they do not hard-code one drive's numbers.
+FOLLOW:
+- Why test the rejection when a feature is absent? => A drive that accepts a command it does not advertise is defective, and a host that trusts Identify will misbehave.
+- What if the profile claims a feature you cannot exercise, such as Active Excursions? => Record it as not covered with an owner and a plan, never as a pass.
+PITFALL: Encoding the first drive's profile as the expected values. The suite then fails on every other drive or passes vacuously.
+VERIFY: ZOC and OZCS bit positions (module 2), the meaning of ZASL = 0, and the variable-capacity completion bit for Reset, in the ZNS Command Set Specification.
+
+@@ 10.07 | Intermediate | Concept | tags=fuzzing,state-aware,mutation,oracle,shrinking,seed
+Q: How do you fuzz a ZNS device so it reaches deep zone logic, and how does the oracle still judge each result?
+SHORT: Generate commands from the model's current zone states so most are structurally valid and land in interesting cells, then mutate one field at a time toward boundaries: ZSA and ZRA values, Select All, SLBA at zone starts, gaps and the namespace end, NUMD and NLB at their limits, Append size at ZASL. The model gives the allowed status set and every case also asserts nothing else changed. Log the seed and shrink failures to a short sequence.
+DEEP:
+- **Levels:** single-command field fuzzing, sequence fuzzing (legal and illegal orders across states), and concurrency fuzzing (several queues, races between management commands and I/O).
+- **State steering:** pick the target zone by state with probability inversely proportional to how often that state has been seen, so Full, Closed-with-data and at-the-limit cases get exercised instead of endless Empty-zone writes.
+- **Fields worth attacking:**
+  - ZSA over all 256 values, with and without Select All.
+  - Reserved bits in CDW13 and reserved ZRA and ZRASF values.
+  - SLBA at zone start, plus 1, mid-zone, ZSLBA + ZCAP, last LBA, namespace size and all ones.
+  - NLB and NUMD at 0, 1, the limit and limit plus 1.
+  - Append at ZASL and ZASL + 1, Append to a non-zone-start, and zoned commands to a non-zoned namespace.
+- **Oracle:** a permitted status set from the model, an unchanged-state check (Report Zones for touched zones plus a random sample of the rest), the controller still ready, and a known-good command succeeding afterward.
+- **Shrinking:** delete commands and zones while the divergence persists. State-dependent bugs need their prefix, so shrink the prefix too and keep the smallest sequence that still fails.
+- **Safety:** Format, Sanitize and firmware commit stay out of the mutation set unless the run is on a designated DUT.
+FOLLOW:
+- Why not fuzz with random bytes? => Almost every command dies at the first field check and zone logic is never reached. See the NVMe page, Validation Methodology module.
+- How do you know the fuzzer reached deep states? => Count each state x command cell and each status code observed, and report the cells that stayed at zero.
+PITFALL: A fuzzer whose only oracle is "the drive did not crash". Wrong statuses and silent state changes pass unnoticed.
+VERIFY: nvme-cli passthrough option names on your version, and which reserved fields the specification requires to be rejected with Invalid Field rather than ignored.
+
+@@ 10.08 | Intermediate | Concept | tags=performance,bandwidth,append,queue-depth,reset-latency,interference,steady-state
+Q: How do you validate ZNS performance, and what does a good result look like?
+SHORT: Measure what zoning changes: sequential write throughput per open zone and across MOR zones, Append versus Write scaling with queue depth in one zone, read latency while other zones are written or reset, and Reset, Finish and Open latency by fill level. Reach steady state first, report distributions from p50 to p99.99, and judge against the datasheet and the previous firmware with an agreed tolerance rather than against a single number.
+DEEP:
+1. **Zone-sequential write:** in Linux typically one Write per zone is in flight (zone write locking or plugging), so per-zone throughput is block size divided by latency. With 128 KiB and an assumed 250 us latency that is 131,072 B / 250 us = 524 MB/s. Four open zones give about 2.1 GB/s and eight give about 4.2 GB/s, so MOR bounds the parallelism. Sweep zones from 1 to MOR and block sizes, and check the scaling is linear until the NAND or link ceiling.
+2. **Append scaling:** queue depth 1 to 32 in one zone (arithmetic in 5.09). Find the knee and check latency past it.
+3. **Reads:** random reads over Full and Closed zones with and without concurrent writes. Percentile latency, not average.
+4. **Management latencies:** Open, Close, Finish and Reset by fill level 0, 25, 50 and 100 percent (see 4.14 and 4.15).
+5. **Interference:** a victim doing fixed-rate reads on zone set B, an aggressor doing writes, Finish or Reset on zone set A. Compare victim p99.9 with and without the aggressor.
+6. **Steady state:** repeat fill and reset cycles until throughput is stable by a stated rule (for example the slope and range windows of the SNIA Performance Test Specification), then measure.
+7. **Write amplification:** if the vendor log exposes NAND writes, compare with host writes. A zoned drive that shows a write amplification well above 1 for sequential zone writes needs an explanation.
+
+Pass criteria: absolute limits from the datasheet or customer, a relative bound against the previous firmware (for example no more than an agreed percentage regression at each percentile), and no unexplained bimodal latency.
+FOLLOW:
+- What limits one zone written with Write commands? => One outstanding write, so block size over latency. Larger blocks, more zones or Zone Append raise it.
+- What should a reset storm do to neighbors? => Deferred erase competes for dies. Measure the victim tail latency and the write throughput in the minute after the storm.
+PITFALL: Comparing a zoned run at steady state with a conventional run on a fresh drive, or the reverse. Both must be at steady state and the comparison stated.
+VERIFY: fio zbd option names on your version, and the steady-state criteria and workload definitions in the SNIA Solid State Storage Performance Test Specification.
+
+@@ 10.09 | Advanced | Trap | tags=reset,concurrency,race,in-flight,legal-outcomes,stale-data
+Q: A Reset Zone is submitted while writes and reads to the same zone are in flight. Which outcomes are legal, and which prove a bug?
+SHORT: Concurrent commands have no defined order, so each in-flight write may run before or after the Reset. Before: it succeeds and its data is then discarded. After: its SLBA no longer equals the write pointer, so it fails with Zone Invalid Write, unless it targets ZSLBA and reopens the zone. Reads return old data or the unwritten value. Asserting one fixed outcome is the trap. Bugs are outcomes outside the legal set, such as stale data in an Empty zone.
+DEEP:
+Setup: zone Z holds X > 0 blocks with WP at ZSLBA + X. Submit write W1 at WP (8 blocks), write W2 at WP + 8, then Reset R, with a read of the old range in flight.
+
+| Interleaving | W1 | W2 | R | Final zone |
+|---|---|---|---|---|
+| Reset runs first | Zone Invalid Write (BCh) | Zone Invalid Write | Success | Empty, WP = ZSLBA |
+| W1, then Reset, then W2 | Success | Zone Invalid Write | Success | Empty |
+| W1, W2, then Reset | Success | Success | Success | Empty |
+
+With X = 0 the zone is already Empty. If Reset runs first it is a no-op, W1 and W2 then succeed, and the zone ends Implicitly Open with WP = ZSLBA + 16. So the final state is a set, not always Empty.
+
+**Bug signatures:**
+- A write succeeds although a Reset had already completed before that write was submitted (completed-before-submitted order is real).
+- After everything drains, a read of an Empty zone returns an old generation (stale mapping or an unerased block).
+- A read returns a block that is neither its old data nor the unwritten value (foreign data).
+- Reset hangs behind the writes, or the writes to other zones are aborted.
+
+**Method:** sweep the submit delay of the Reset relative to the writes from 0 up to the Reset latency in small steps, so every interleaving occurs. Classify each run into a legal pattern using the model, and count how many times each pattern was seen. A pattern that never occurs means the race was not exercised.
+FOLLOW:
+- Do real hosts issue this? => Well-behaved hosts drain zone I/O before a Reset, so this is a robustness test: the device must stay consistent, not deliver a specific order.
+- Can a multi-block read see part old and part unwritten data? => It may unless the device promises atomicity. Each block must be old or unwritten, never foreign, and the atomicity claim needs checking.
+PITFALL: Asserting one deterministic outcome for a race. Assert the legal set and report which members occurred.
+VERIFY: Whether the specification requires ordering or serialization of a Reset against outstanding I/O to the same zone, and read atomicity against Reset, in the ZNS and NVM Command Set specifications.
+
+@@ 10.10 | Advanced | Concept | tags=reference-model,in-flight,linearization,real-time-order,unknown-outcome
+Q: How does a host reference model handle commands in flight, out-of-order completions and unknown outcomes without becoming flaky?
+SHORT: Update the model from completions, never from submissions, and use real-time order: if A completed before B was submitted, A precedes B, otherwise they may serialize either way. Per zone, keep the set of states consistent with the statuses seen so far and prune it as completions arrive. Check exactly at quiescent points. If an outcome is unknown after a timeout or reset, keep both branches until a Report Zones resolves them.
+DEEP:
+- **Command record:** doorbell-write time as submit, CQE-observed time as complete, plus the status and DW0. The device may have seen the command at any time in between.
+- **Precedence:** A precedes B only if A's CQE was observed before B's doorbell. Everything else overlaps.
+- **Example:** zone Empty, a Write of 8 blocks at ZSLBA and a Finish overlap.
+  - Write = Success, Finish = Success: only Write first fits. Zone Full with 8 blocks readable.
+  - Write = Zone Is Full, Finish = Success: only Finish first fits, so no data may be readable.
+  - Write = Success, Finish = Success, but read-back shows no data: neither order explains it, so it is a bug.
+  The statuses select the serialization.
+- **Cost:** k overlapping commands on one zone give up to k! orders. Keep k small in most tests, or run a dynamic program over subsets (2^k states). Zones are coupled only by shared MAR and MOR counters, so model resource counters as part of the set too. Implicit opens racing near the limit are the hard case.
+- **Unknown outcomes:** after a timeout, abort or controller reset, fork the model into the outcomes that could have happened. A later Report Zones and read-back must match at least one branch, or it is a violation.
+- **Design choices that remove ambiguity:** one management command per zone at a time, QD1 writes per zone, Append (order-free by design), and a small set of dedicated race tests that use the set model.
+- **Health metric:** log the size of the model's possible set. A set that stays above one for a long time means the test is too racy to judge.
+FOLLOW:
+- Is real-time order too strict? => It is the weakest safe rule. Overlapping commands are free, and only completed-before-submitted pairs are ordered. Use one monotonic host clock for all timestamps.
+- What resolves remaining ambiguity? => Statuses, returned Append LBAs, and Report Zones plus read-back at quiescence.
+PITFALL: Timestamping submit when the SQE is built instead of when the doorbell is written. The command may sit in the queue, and the model then claims an order the device never had.
+
+@@ 10.11 | Advanced | Concept | tags=data-integrity,pattern,generation,ledger,stale-data,read-back
+Q: How does the zone structure change the data pattern and checker compared with the conventional-drive design?
+SHORT: Sequential zones let you swap the per-LBA ledger for a per-zone one: a generation number bumped at every Reset, plus completed and durable write pointers. Each block header carries zone ID, zone generation, offset in zone and a CRC, so any block verifies on its own. Read-back then separates stale data after Reset, foreign-zone data, holes below the write pointer, and data above it that should read as unwritten.
+DEEP:
+- **Block layout (4 KiB):** magic, zone ID, zone generation G, block offset in the zone, run ID, then a PRNG payload seeded from (zone, G, offset) and a trailing CRC32C. For Append, the offset is unknown at submit, so use append ID plus block index and reconcile with the returned LBA.
+- **Ledger per zone:** G, submitted end, completed end (contiguous acknowledged) and durable end (last Flush or FUA), all in blocks.
+- **Size:** a 468,843,606-LBA namespace with a 4-byte per-LBA ledger needs 1.875 GB. With ZSZE = 0x10000 there are 7,153 full zones, and 16 bytes each is about 112 KiB.
+
+| Observation at read-back | Meaning |
+|---|---|
+| Header zone differs from the zone read | Mapping error across zones |
+| G below the zone's current generation | Stale data after Reset (data-disclosure bug) |
+| Current G, offset differs from the LBA offset | Misdirected within the zone |
+| Missing or bad header below completed end | Lost or corrupted acknowledged data |
+| Block at or above WP not equal to the unwritten value | Data leaked past WP or a partial write after failure |
+| Two generations inside one write | Torn write |
+
+- **Above the write pointer:** after Finish the gap, and after Reset the whole zone, must read as the unwritten value from DLFEAT. Check it, do not assume it.
+- **Reuse cycles:** run many Reset and rewrite cycles per zone, since old generations stay in NAND until erased and stale-data bugs need reuse to show.
+- **Read path:** use direct I/O, and confirm with the SMART data units read counter that reads reached the device.
+FOLLOW:
+- Why not rely on fio verify alone? => It is good for volume. A custom header names the fault class (stale, misdirected, torn) without reading a hexdump.
+- Should the checker read above the WP? => Yes. Unexpected data there means an unmapped or partial write leaked.
+PITFALL: Verifying through the page cache or a stale zone cache in the host. The read never reached the drive and every check passes.
+VERIFY: DLFEAT read behavior values, and whether reads above the WP may return an error when DULBE is enabled (module 7).
+
+@@ 10.12 | Advanced | Cross-layer | tags=spor,power-loss,lifecycle,windows,recovery,oracle
+Q: How do you cover sudden power-off at every point in a zone's life, and what does the oracle accept after recovery?
+SHORT: List the phases of a zone's life (first write, steady writes, reaching ZCAP, Open, Close, Finish, Reset, descriptor extension, Append bursts, eviction, recovery itself) and cut at defined offsets inside each: before the command reaches the drive, while it runs, after media work but before the CQE, after the CQE. Each phase has an allowed set of states and write pointers after recovery, and the read-back oracle applies to every case.
+DEEP:
+| Cut during | Allowed after recovery |
+|---|---|
+| Write stream | Durable end <= WP <= submitted end. Every LBA below WP reads back a written pattern. Zone is Closed, or Empty if nothing durable was written (see 3.09) |
+| Write reaching ZCAP | Full with all data, or Closed with a lower WP. Never Full with holes |
+| Finish (no CQE seen) | Old state with all data intact, or Full. Never Full with data below the old WP lost |
+| Reset (no CQE seen) | Old zone with all old data, or Empty with nothing old readable. Never half old |
+| Reset, CQE already seen | Empty, unless the product specification says otherwise |
+| Open or Close | Zone state in the allowed set. Active count equals the number of Closed zones with data or extension |
+| Set Zone Descriptor Extension | Empty without extension, or Closed with the complete extension. Never partial bytes |
+| Append burst | Acknowledged and flushed appends below WP, no holes below WP |
+| Recovery itself (nested cut) | The same outcomes as above and bounded time to ready |
+| Controller reset without power loss | Treat like power loss for unflushed data unless the product specification says otherwise |
+
+**Post-recovery checklist:** ready within the limit, no Read Only or Offline zones appeared unexpectedly, Report Zones state in the allowed set, no zone left open, WP within the bounds from the ledger, read-back of everything below WP and of the region above it, then continue writing at WP and finally Reset the zone. The last step catches a WP that reads well but that the firmware cannot write to.
+
+**Triggers:** use firmware markers or NAND-operation triggers with a swept delay (see the NVMe page, power-loss coverage question), and confirm each cut from SMART Unsafe Shutdown and Power Cycle counts and a logged marker.
+FOLLOW:
+- Why keep writing after recovery? => A bad open block or stale free-pool state only shows on the next program, not in the report or the read-back.
+- Which windows need a NAND-level trigger? => Program and erase in progress and Finish padding. Host-side timing cannot land there reliably.
+PITFALL: Judging recovery from Report Zones alone. State and WP can look right while data below the WP is a hole or an older generation.
+VERIFY: What the ZNS and NVM Command Set specifications and the product requirements guarantee after power loss for Reset, Finish and Set Zone Descriptor Extension in progress, and how PLP is declared.
+
+@@ 10.13 | Advanced | Numeric | tags=spor,sample-size,rule-of-three,windows,random-cut,rig-time
+Q: How many power-cut cycles does a zone SPOR campaign need, and why does random cutting not get there?
+SHORT: Count windows, not cycles. With 14 lifecycle phases and 4 cut offsets each there are 56 windows. Showing each has a failure rate under 5 percent at 95 percent confidence needs about 59 clean targeted hits per window, so 3,304 cycles: 6.9 days on one rig or 21 hours on eight at 3 minutes per cycle. A random cut in a 60 s workload hits a 1.5 ms Finish window with probability 2.5e-5, so the same confidence takes about 2.4 million cycles.
+DEEP:
+Assumptions: cycles are independent and identical, 3 minutes per cycle including power-up and verification, and every cut is confirmed to land in its intended window.
+1. **Windows:** 14 phases x 4 offsets = 56.
+2. **Clean hits per window:** n = ln(0.05) / ln(0.95) = 58.4, so 59 (the rule of three gives 3 / 0.05 = 60).
+3. **Cycles:** 56 x 59 = 3,304. Time: 3,304 x 3 = 9,912 min = 165.2 h = 6.9 days on one rig, 20.7 h on eight.
+4. **Random cutting:** p(hit) = 1.5 ms / 60 s = 2.5e-5 per cycle. For 59 hits: 59 / 2.5e-5 = 2.36 million cycles, about 13.5 years on one rig. Even one expected hit needs 1 / p = 40,000 cycles, or 83 days.
+5. **Across drives:** with 4 drives, 15 clean hits per window per drive (59 / 4 = 14.75). The total cycle count is the same, but NAND lots and firmware images are covered.
+6. **What the 5 percent means:** it bounds the per-hit failure probability. A deterministic bug in a window fails on the first targeted hit. The 59 hits are for timing-dependent bugs.
+7. **When a window fails once in 59:** the exact 95 percent bound is 4.74 events, so 4.74 / 59 is about 8 percent. After a fix, repeat with more hits.
+FOLLOW:
+- The supply fall adds plus or minus 2 ms of jitter to the cut. What do you do? => Trigger from the firmware marker with a swept delay of 0 to 3 ms in small steps, and count hits from the logged marker, not from the schedule.
+- How do you shrink the 56? => Weight by risk (Finish, Reset, first write, capacity boundary) and drop windows the design shows are equivalent, with the argument written down.
+PITFALL: Counting scheduled cuts as coverage. Calibration drift silently moves every cut into the same window, so log the marker that was actually hit.
+VERIFY: None for the arithmetic. Window count, window width and cycle time are assumptions to replace with your firmware's markers.
+
+@@ 10.14 | Advanced | Debug | tags=spor,audit,ledger,wp,recovery,triage,stale-data
+Q: After a power-cut run, six zones show the results below. VWC is enabled and there is no PLP. Which are legal, and which are bugs?
+SHORT: Zones 1 and 4 are legal. Zone 2 lost flushed data (WP below the durable end). Zone 3 has a WP ahead of its data, leaving a hole. Zone 5 is Empty but returns old-generation data, which is a data-disclosure bug. Zone 6 came back Explicitly Open, which cannot survive a power cycle. Compare each zone with the bounds durable <= WP <= submitted and read back everything.
+DEEP:
+Geometry: ZSZE = 0x10000, ZCAP = 0xDC00, all values in blocks relative to ZSLBA. The ledger columns are submitted end, completed end and durable end (last Flush completion).
+
+| Zone | Cut during | Ledger (sub / comp / dur) | After recovery | Read-back |
+|---|---|---|---|---|
+| 1 | Write stream | 0x4000 / 0x3F00 / 0x3000 | Closed, WP 0x3400 | Clean below WP, unwritten above |
+| 2 | Write stream | 0x2000 / 0x2000 / 0x2000 | Closed, WP 0x1F00 | Clean below WP |
+| 3 | Write stream | 0x1000 / 0x1000 / 0x0800 | Closed, WP 0x1000 | Blocks 0x0C00 to 0x0FFF return the unwritten value |
+| 4 | Finish, no CQE seen | 0x5000 / 0x5000 / 0x5000 | Closed, WP 0x5000 | Clean |
+| 5 | Reset, no CQE seen | 0x8000 / 0x8000 / 0x8000 | Empty, WP = ZSLBA | Blocks 0 to 0xFF return generation 7, current generation is 8 |
+| 6 | Explicit Open, 0x200 blocks flushed | 0x200 / 0x200 / 0x200 | Explicitly Open, WP 0x200 | Clean |
+
+1. **Zone 1, legal:** 0x3000 <= 0x3400 <= 0x4000 and the data is clean. Unflushed blocks may be lost.
+2. **Zone 2, bug:** the drive flushed up to 0x2000 but recovered only to 0x1F00, so 0x100 flushed blocks are gone. Suspect a journal or metadata update that trails the data.
+3. **Zone 3, bug:** the WP moved to 0x1000 before the data at 0x0C00 to 0x0FFF was persisted. WP metadata was made durable ahead of the data, and reads see a hole below the WP.
+4. **Zone 4, legal:** the Finish did not take effect. Full would also be legal. Both keep the data.
+5. **Zone 5, bug and severity 1:** a half-applied Reset kept part of the old mapping. An Empty zone returned data from before the Reset. Check that other zones' data was not exposed either.
+6. **Zone 6, bug:** open state and its resources are not preserved through a power cycle, so it must return as Closed (or Empty with nothing written). Also check the active and open counts.
+
+Next steps: repeat each case at the same marker with more hits (10.13), capture the firmware's journal state, and file zones 2, 3 and 5 as data-safety defects.
+FOLLOW:
+- What extra evidence separates zone 3's hypothesis? => Cut at swept delays around the WP metadata write. If the hole grows with the delay, the WP is persisted first.
+- Zone 4 shows Closed although the host had asked for Finish. Is that a bug? => Not without a CQE. An unacknowledged Finish may be lost, so the ledger's completion column decides.
+PITFALL: Auditing only the Report Zones column. Zones 3 and 5 look fine there and fail only in read-back.
+VERIFY: State of Open zones after a power cycle (Closed) and the rollback rules for WP after unexpected power loss in the ZNS and NVM Command Set specifications.
+
+@@ 10.15 | Principal | Scenario | tags=test-plan,reference-model,architecture,exit-criteria,automation,design
+Q: Design the full validation plan and reference model for a new ZNS SSD, from spec to exit criteria.
+SHORT: Build three separate artifacts: spec tables as data with clause references, a reference model that turns commands and completions into allowed outcome sets, and a harness that reaches the device directly. Drive it with directed matrices, state-steered random sequences and fault schedules. Check at completion, at quiescence and by read-back. Gate release on cell coverage, targeted-window statistics, mutation kill rate and open defects.
+DEEP:
+1. **Inputs and risk ranking:** pinned spec revisions, capability profile (10.06), customer requirements. Top risks: write pointer and recovery, state machine and resources, Append, Reset and stale data, media-driven Read Only and Offline, host interop.
+2. **Model (see 3.14 and 10.10):** pure code with unit tests, no device access. Layers: geometry and profile, per-zone state, WP, attributes and ZCAP, resource counters, durability watermarks (submitted, completed, durable), data ledger with zone generations, event log. Core function: outcomes = f(state, command), returning a set of (status, next state).
+3. **Harness:** one device abstraction over passthrough, SPDK and the block layer, with power and reset control, fault hooks and analyzer triggers. It logs every SQE and CQE with timestamps as JSON lines.
+4. **Generators:** directed matrix (63 cells x resource conditions, 3.17), seeded random with steering, race tests (10.09), fault schedules (10.12, 10.13, 3.16), fuzz (10.07) and performance (10.08).
+5. **Checks:** at completion (status in the allowed set, DW0 valid only on success), at quiescence (Report Zones diff and invariants), at the end of a run (full read-back), and continuous monitors (SMART, error log, events, dmesg).
+6. **Stages:** model unit tests on spec examples, QEMU differential, firmware simulation with exhaustive cut points, FPGA and silicon, then platform (fio zbd, file systems, kernel versions). Push each bug to the lowest layer that reproduces it.
+7. **Exit criteria, measurable:**
+   - Every state x command cell per profile hit at least N times, or waived with an owner.
+   - Every zone-specific status code seen at least once.
+   - Each SPOR window with the clean-hit count from 10.13.
+   - Random soak with zero unexplained divergences across S seeds and at least 3 drives.
+   - Mutation kill rate on critical cells (10.17).
+   - No open severity 1 or 2 defect, performance within tolerance, host matrix passing.
+FOLLOW:
+- What do you build first with one month? => Tables, model and the QEMU differential with the matrix and steered random, then SPOR windows for Reset, Finish and first write. Performance last.
+- How do you keep it valid across firmware builds? => Profile hash gate, a deviation register, replay of old field escapes as permanent tests, and mutants rerun on model changes.
+PITFALL: Fixing the model to match each divergence without a spec citation. The suite then converges on the firmware's own bugs and reports green.
+VERIFY: The pinned spec revisions for zoned command set behavior your customer requires, and which optional features the plan must cover.
+
+@@ 10.16 | Principal | Debug | tags=triage,taxonomy,severity,bug-report,repro,attribution
+Q: How do you triage ZNS-specific failures, and what goes into the bug report so firmware can act on it?
+SHORT: Classify by signature first: stale or foreign data, holes below WP, WP or state divergence, resource accounting, Append placement, wrong status, recovery outside the allowed set, latency, or host artifact. Each class has a first evidence step and a severity. The report holds a seeded minimal repro, model prediction against device result, raw CQE status, zone reports before and after, the profile, builds, and a frequency with denominators.
+DEEP:
+| Class | Signature | First evidence | Severity |
+|---|---|---|---|
+| Stale or foreign data | Old generation or another zone's block in an Empty zone or below the WP | Header decode, zone generation, mapping trace | 1 |
+| Hole or lost data | Unwritten value or bad CRC inside a completed range | Ledger against read-back, flush points | 1 |
+| Append overlap | Overlapping ALBAs in CQEs | CQE interval check (5.14) | 1 |
+| WP divergence | Report WP not equal to the completed end | Report right after drain, per-command WP deltas | 1 or 2 |
+| State divergence | Report state outside the model's set | Model set, events, Changed Zone List | 2 |
+| Resource accounting | Spurious or missing Too Many Active or Open | Recount from report, then bisect | 2 |
+| Wrong status | Correct refusal with wrong SCT or SC, or success where refusal expected | Raw CQE decode, side-effect check | 2 or 3 |
+| Recovery | Post-cut result outside the allowed set | Ledger watermarks (10.14) | By outcome |
+| Latency | p99.9 shift, reset impact | Baseline comparison, background activity | 3 |
+| Host artifact | Appears only through the block layer | Repeat by passthrough | None until repeated |
+
+**Method:**
+1. Freeze: stop on the first divergence, keep the drive powered and the state, capture reports, error log, SMART, Changed Zone List and vendor logs before any reset.
+2. Decode raw CQEs and compare with the model's allowed set.
+3. Reproduce from the seed, then shrink the sequence, its prefix and the zone set.
+4. Attribute: repeat on a second path, cite the spec clause, and note whether the model or a deviation entry is involved.
+5. Quantify: k failures in n runs by rig, firmware and host, with a bound (see 10.13).
+
+**Report fields:** title with class, severity, DUT and firmware build, host and kernel, capability profile hash, seed and shrunk sequence, model prediction against device result, raw CQE decode, reports before and after, logs, frequency, suspected layer, and the spec clause.
+
+**Severity rule:** any path where old or foreign data is readable, or acknowledged and flushed data is lost, is severity 1 regardless of frequency.
+FOLLOW:
+- The failure happens 2 times in 500 runs. What now? => Add stop-on-first-mismatch with a command ring buffer, raise load on the suspect window, and report with the denominator. Two in 500 has a 95 percent upper bound of about 1.3 percent (6.30 / 500).
+- Who receives a CQE-only violation? => Firmware directly, because the oracle uses no host data. Content mismatches need a path check and payload capture first.
+PITFALL: Filing "zone state wrong" without the command history. A state divergence has meaning only with the commands and completions that led to it.
+VERIFY: Local severity definitions and the release policy for data-safety defects.
+
+@@ 10.17 | Principal | Trap | tags=model-validation,qemu,mutation,three-way,deviation-register,false-pass
+Q: Your model and suite are green on QEMU and on the new drive. In how many ways can that still be wrong, and how do you prove the suite can fail?
+SHORT: The model may share a misreading of the spec with QEMU and the harness, the drive may never have reached the risky states, cells may have been skipped rather than passed, and the checker may be weak. Cite a spec clause for every model cell, compare model, QEMU and drive three ways with each discrepancy classified, and seed bugs into QEMU and the model to measure the kill rate. Unreached states must show as gaps, never as passes.
+DEEP:
+**Ways to be green and wrong:**
+- Model, harness and QEMU share an assumption (for example Close on an Empty zone, or the WP value in a Full zone).
+- The drive's profile hides rows: no Active Excursions, no Read Only injection. The cells were skipped, not passed.
+- Cells reached only from an idle, clean pool and never at the resource limits or under load.
+- The checker compares against the device's own report, or reads through a cache.
+
+**Three-way comparison:**
+
+| Model | QEMU | Drive | Classification |
+|---|---|---|---|
+| A | A | A | Agreement, still needs a spec clause |
+| A | A | B | Drive bug or a shared misreading: read the spec text |
+| B | A | A | Model bug: fix and cite |
+| A | B | A | QEMU deviation: add to the register |
+| A | B | C | Spec ambiguity: raise it, allow both, pin the drive's choice per build |
+
+**Deviation register:** cell, spec clause, behavior per implementation, decision, owner and date.
+
+**Mutation testing (ZNS-specific):** patch the QEMU zoned code or the model with realistic bugs: off-by-one at ZCAP, Reset not releasing the active resource for Closed zones, Finish not releasing the open resource, Append returning the previous append's LBA, WP not advancing for odd-length Appends, implicit close evicting an Explicitly Open zone, Select All skipping Full zones. Run the suite against each mutant. Kill rate = mutants detected / injected. Survivors are equivalent mutants, missing tests or weak oracles, so fix the last two.
+
+**Limits of QEMU:** it cannot model media faults, power loss or timing. Anything claimed on those needs a drive run, so list which claims rest only on drive evidence.
+FOLLOW:
+- Who arbitrates an ambiguous spec reading? => Record the interpretation, get the firmware design owner to sign it, and if needed raise a clarification. The model allows both readings with the drive's behavior pinned.
+- Can you mutate real firmware? => Only through test builds with hooks from the firmware team. QEMU mutants are the cheap first step and cover the logic cells.
+PITFALL: Treating QEMU as the specification. It is one implementation with its own choices.
+VERIFY: QEMU's zoned NVMe behavior for the cells in question against its current hw/nvme source and the ZNS Command Set Specification.

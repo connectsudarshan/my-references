@@ -1,0 +1,373 @@
+# Module 5: Zone Append
+
+@@ 5.01 | Basic | Concept | fig=append | tags=append,concurrency,write-pointer
+Q: What is Zone Append and why was it added to ZNS?
+SHORT: Zone Append writes data to a zone without the host naming the address. The host gives the zone start LBA and a length, the controller places the data at the current write pointer, advances it, and returns the chosen LBA in the completion entry. It exists so a host can keep many writes to one zone in flight without any of them failing because a peer got to the write pointer first.
+DEEP:
+A Write must carry SLBA equal to the write pointer at the moment it executes. NVMe does not promise that commands execute in submission order (certainly not across queues), so with two or more Writes in flight to one zone a reordered command finds the write pointer moved and fails. Without append the host has two choices: queue depth 1 per zone, which is latency bound, or host-side ordering (one submitter, locks, zone write plugging), which costs CPU and parallelism.
+
+Zone Append moves the serialization point into the controller, which already owns the write pointer:
+- The host submits any number of appends to the same zone, from any queue or thread, with no coordination.
+- The controller allocates each command a contiguous range at the write pointer, in whatever order it processes them.
+- Each completion entry returns the Assigned LBA (ALBA). The host records it in its index.
+- The price: the host no longer picks the address before submitting, so anything that needed the address up front (PI reference tags, replica placement, self-referencing pointers) has to change. See 5.11 and 5.15.
+
+Zone Append is an optional command in the ZNS command set. A host discovers support from the Commands Supported and Effects log page, and the Linux NVMe driver forces a ZNS namespace read-only if append is missing.
+FOLLOW:
+- Does Append make a zone randomly writable? => No. Data still lands sequentially at the write pointer. Only the host's control of the address is gone.
+- Is one append faster than one Write? => Not per command. The gain is that many appends can be outstanding to one zone at once.
+PITFALL: Describing Append as "write anywhere in the zone". It always lands at the write pointer, and the host learns where only from the completion.
+
+@@ 5.02 | Basic | Concept | tags=command,cdw,alba,cqe
+Q: What are the fields of a Zone Append command, and where does the result come back?
+SHORT: Opcode 7Dh, using the read/write command layout: the zone start LBA (ZSLBA) in CDW10-11, a zero-based NLB in the low half of CDW12, plus the usual data pointer and PI fields. The controller returns the Assigned LBA, the lowest LBA holding the data, as a 64-bit value in completion DW0 (low) and DW1 (high). A ZSLBA that is not the first LBA of a zone fails with Invalid Field in Command.
+DEEP:
+| Field | Location | Meaning |
+|---|---|---|
+| Opcode | CDW0 | 7Dh (Zone Management Send is 79h, Receive is 7Ah) |
+| NSID | CDW1 | Zoned namespace |
+| ZSLBA | CDW10, CDW11 | Lowest LBA of the target zone, not the write address |
+| NLB | CDW12 bits 15:0 | Number of blocks, zero-based |
+| PRINFO, FUA, LR, PIREMAP | CDW12 upper half | PI actions and write flags (see 5.11) |
+| ILBRT | CDW14 | Initial logical block reference tag |
+| LBAT, LBATM | CDW15 | Application tag and mask |
+| ALBA | CQE DW0 and DW1 | Result: assigned LBA |
+
+- **64-bit result:** most I/O completions leave DW1 reserved, so a driver has to be written to read both dwords for this opcode.
+- **Passthrough:** in Linux use the 64-bit ioctl (`NVME_IOCTL_IO64_CMD`); the 32-bit passthrough returns only DW0. `nvme zns zone-append` shows the assigned LBA in verbose mode (`-v`).
+- **Errors:** when the status is not success, the result field carries no valid ALBA. Do not consume it.
+- **Data transfer:** PRP or SGL and the metadata pointer work as for Write, subject to ZASL (5.04).
+FOLLOW:
+- What goes in the LBA field when appending to zone 7? => The first LBA of zone 7 (its ZSLBA), never a mid-zone LBA.
+- How does a sector-based OS see the result? => Linux converts the returned LBA to a sector and stores it in the completed request, so the bio's start sector becomes the assigned location.
+PITFALL: Reading only DW0. It works on small test namespaces and silently truncates once the ALBA passes 2^32.
+VERIFY: CDW12 bit positions for FUA, LR and PIREMAP, and CDW14 and CDW15 field roles, in the ZNS Command Set specification.
+
+@@ 5.03 | Basic | Trap | tags=write,ordering,zone-invalid-write
+Q: Can I keep several Writes outstanding to one zone if I submit them in LBA order?
+SHORT: Only by relying on behaviour the spec does not promise. A Write needs SLBA equal to the write pointer when it executes, and NVMe does not guarantee execution in submission order, certainly not across queues. A reordered Write finds the write pointer somewhere other than its SLBA and fails with Zone Invalid Write (SCT 1h, SC BCh). Use QD 1 per zone, host-side serialization, or Zone Append.
+DEEP:
+Example: the write pointer is 100 and the host submits W1 (LBA 100, 8 blocks) then W2 (LBA 108, 8 blocks). If the controller runs W2 first, W2's SLBA 108 does not equal the write pointer 100, so W2 fails with Zone Invalid Write and writes nothing. W1 then succeeds. The host must now resubmit W2, and any error handler that marks the zone bad turns a benign race into an outage.
+
+**Why labs miss it:** one submission queue, one core and a controller that fetches and executes in order make overlapping Writes work every time. Add a second queue, a firmware change or a busier controller and the failure appears at a low rate.
+
+| Strategy | Writes in flight per zone | Cost |
+|---|---|---|
+| QD 1 per zone | 1 | Latency-bound per zone; needs several open zones to fill bandwidth |
+| Host serialization (single owner, zone write plugging) | Effectively 1 at the device | CPU, locks, lost parallelism |
+| Zone Append | Many | Host loses address control (5.11, 5.15) |
+
+Note the other write-side status codes: a Write to a Full zone returns Zone Is Full (B9h), a Write past the zone capacity returns Zone Boundary Error (B8h). Zone Invalid Write is specifically the SLBA versus write pointer mismatch.
+FOLLOW:
+- Does a Zone Invalid Write damage the zone? => No. The failed Write places no data and leaves the write pointer where it was.
+- Does Linux let you issue overlapping Writes to a zone? => The block layer serializes writes per zone (zone write plugging), so ordinary filesystem writes do not hit this, but raw passthrough does.
+PITFALL: Passing a single-queue in-order test and concluding that overlapping Writes are safe.
+VERIFY: That the Base Specification gives no execution-order guarantee even within one submission queue, and that a failed Write leaves the write pointer unchanged.
+
+@@ 5.04 | Intermediate | Concept | tags=zasl,mdts,limits,identify
+Q: What is ZASL and how does it limit Zone Append?
+SHORT: Zone Append Size Limit is a one-byte field in the ZNS-specific Identify Controller structure (CNS 06h with CSI 02h). It is a power of two in units of the minimum memory page size: maximum append = 2^ZASL x 2^(12+CAP.MPSMIN) bytes. Zero means the limit is MDTS. An append larger than the limit fails with Invalid Field in Command, and unlike a Write it cannot be split without losing contiguity.
+DEEP:
+1. Read it with `nvme zns id-ctrl /dev/nvme0` (the field is reported as zasl).
+2. With MPSMIN = 0 (4 KiB pages): ZASL 0 means use MDTS, 1 is 8 KiB, 3 is 32 KiB, 5 is 128 KiB, 7 is 512 KiB.
+3. With 4 KiB LBAs, ZASL 5 allows 32 blocks, so NLB (zero-based) is at most 31.
+4. Linux computes the append limit in 512-byte sectors as `1 << (zasl + 3)` (assumes 4 KiB pages) and falls back to the transfer limit when ZASL is 0. A target such as the Linux nvmet reports the smaller of MDTS and the append limit.
+
+**Why splitting matters:** a large Write can be cut into ordered chunks and the result is one contiguous range. A large append cut into several appends comes back as several ALBAs, which need not be adjacent when other appends interleave. A record bigger than ZASL therefore needs extent-based indexing, or serialization of its chunks (submit the next after the previous CQE), or a Write path.
+
+**Validator cases:** append exactly ZASL bytes (expect success), one block more (expect Invalid Field in Command), and check that MDTS is not the bound you observe. Confirm the limit again after any firmware update or format change to a different LBA size.
+FOLLOW:
+- MDTS is 512 KiB and ZASL is 4. What is the largest append? => 64 KiB (2^4 x 4 KiB with MPSMIN 0). The smaller limit governs appends.
+- What does ZASL = 0 tell you? => No separate append limit is declared, so MDTS applies.
+PITFALL: Sizing appends by MDTS. The append limit can be far smaller, and exceeding it fails the whole command.
+VERIFY: Whether metadata bytes count toward ZASL, the exact unit wording (MPSMIN) in the ZNS Identify Controller definition, and that an over-limit append returns Invalid Field in Command.
+
+@@ 5.05 | Intermediate | Concept | tags=ordering,atomicity,alba,completion
+Q: What ordering and placement guarantees does Zone Append give, and what does it not give?
+SHORT: Guaranteed: each command's data lands as one contiguous range at the write pointer, ranges from different appends never overlap, and the ALBA reports where. Not guaranteed: that ranges follow submission order, that completions arrive in ALBA order, or that a multi-block append is atomic across power loss. Concurrent appends land in whatever order the controller serialized them, so the host must trust the ALBA and nothing else.
+DEEP:
+- **Per-zone serialization:** the controller allocates ranges one at a time (the ALBA of a command is the write pointer at allocation). Data transfer and media programming can overlap after that.
+- **Submission order:** no promise across queues, and none within one queue.
+- **Completion order:** CQEs can come back in any order relative to ALBA order.
+
+Example, three 4-block appends to an empty zone starting at 1000h:
+
+| Command | Submitted | Assigned ALBA | CQE arrives |
+|---|---|---|---|
+| A | 1st | 1008h | 3rd |
+| B | 2nd | 1000h | 1st |
+| C | 3rd | 1004h | 2nd |
+
+When all three complete, the write pointer is 100Ch.
+- **Read after append:** read the data only after the CQE, at the ALBA from that CQE.
+- **Atomicity:** power-fail write atomicity in NVMe is governed by AWUPF and NAWUPF, not by Zone Append. A multi-block append larger than the atomic size can be torn by power loss (see 5.13).
+- **Across zones:** no interaction. Ordering and allocation are per zone.
+FOLLOW:
+- A is submitted before B. Can B get the lower ALBA? => Yes, whenever there is any concurrency. Only waiting for A's CQE before submitting B makes the order deterministic.
+- Is the ALBA the first or the last block? => The first: the lowest LBA holding the data of that command. The data occupies ALBA through ALBA + NLB.
+PITFALL: Deriving an ordering rule from QD 1 tests, where ALBA order trivially equals submission order.
+VERIFY: Atomicity statement for Zone Append versus AWUPF/NAWUPF in the ZNS and NVM Command Set specifications.
+
+@@ 5.06 | Intermediate | Concept | tags=status,boundary,zone-state,implicit-open
+Q: How do zone state and zone capacity affect Zone Append, and what status does each failure produce?
+SHORT: Append is accepted in Empty, Implicitly Open, Explicitly Open and Closed zones. Empty and Closed zones open implicitly first, subject to the open and active limits. Full returns Zone Is Full, Read Only returns Zone Is Read Only, Offline returns Zone Is Offline. An append that would run past the zone capacity fails whole with Zone Boundary Error, and a ZSLBA that is not a zone start fails with Invalid Field.
+DEEP:
+| Condition | Result |
+|---|---|
+| Empty or Closed zone | Accepted; zone becomes Implicitly Open (if resources allow) |
+| Implicitly or Explicitly Open | Accepted; state kept |
+| Would pass zone capacity | Zone Boundary Error (SCT 1h, SC B8h), nothing written |
+| Full zone | Zone Is Full (B9h) |
+| Read Only or Offline zone | Zone Is Read Only (BAh), Zone Is Offline (BBh) |
+| Implicit open would exceed the open limit | Too Many Open Zones (BEh) |
+| Would exceed the active limit | Too Many Active Zones (BDh) |
+| ZSLBA not a zone start, or size above ZASL | Invalid Field in Command |
+| ZSLBA beyond the namespace | LBA Out of Range |
+
+- **All or nothing:** an append that does not fit fails completely. A smaller append issued afterwards can still succeed, so the zone tail is only discovered by trial.
+- **Filling exactly:** an append that ends exactly at the zone capacity succeeds and moves the zone to Full. This is the off-by-one to test.
+- **Concurrency consequence:** with several appends in flight the host cannot know the remaining space, so Zone Boundary Error is the ordinary "zone filled" signal. The host reacts by opening a new zone, not by treating it as a fault.
+- **Capacity versus size:** zone capacity can be smaller than zone size, and LBAs between them are never writable.
+FOLLOW:
+- Is Zone Boundary Error also used for Writes? => Yes, a Write that extends past the writable capacity gets the same status.
+- Where does the Full transition happen? => As part of the completion of the append that brings the write pointer to the end of the zone capacity.
+PITFALL: Retrying a Zone Boundary Error append on the same zone. It fails again at that size, so allocate a new zone or split the record.
+VERIFY: Status for an append that starts in range but ends beyond the zone capacity, and whether a failed append can leave an implicit-open side effect.
+
+@@ 5.07 | Intermediate | Cross-layer | tags=host,index,mapping,recovery
+Q: What must the host keep because of Zone Append, and how does it survive a crash?
+SHORT: The host needs a durable map from its own object identity to the returned ALBA, because the address exists only in the completion entry. In memory that is an in-flight table plus an index updated on each CQE. For crash recovery, either persist the mapping (log or metadata zone) or make every record self-describing so a scan from a checkpoint to the write pointer rebuilds the index.
+DEEP:
+- **In-flight table:** keyed by command ID: zone, length, object identity, buffer. On CQE the host looks up the entry, publishes object to (ALBA, length) in the index, then frees the buffer. The object is not readable before that.
+- **Publish only when durable:** do not expose or journal the mapping before the data is durable under your durability rules (FUA, or a Flush after the CQE).
+- **Recovery options:**
+  1. Mapping log: after the data CQE, append (object, ALBA) to a metadata zone. Costs an extra write, recovery reads the log.
+  2. Self-describing records: header with object id, host sequence number, length and CRC. Recovery scans from a checkpoint to the write pointer.
+  3. Hybrid: periodic index checkpoint plus a scan of the tail.
+- **Header limit:** a record cannot embed its own address, since it is unknown at submit time. It can embed a zone id and a host-assigned sequence number.
+- **Sequence numbers:** ALBA order is not submission order, so replay needs the host's own sequence to know logical order.
+- **Extents:** if a record is split over several appends, the index stores extents.
+FOLLOW:
+- Why not read the write pointer with Report Zones after each append? => It races with the other appends in flight. That is the exact mistake the ALBA removes.
+- What does GC need from the index? => Live bytes per zone, so the host can pick victims and relocate valid records (module 12).
+PITFALL: Journaling the (object, ALBA) mapping before the data is durable, then losing the data at power loss. The index points at blocks that were never written.
+
+@@ 5.08 | Intermediate | Cross-layer | tags=linux,block-layer,emulation,zone-write-plugging
+Q: How does Linux use Zone Append, and what happens on devices without it?
+SHORT: The block layer has a native request op, REQ_OP_ZONE_APPEND. The NVMe driver turns it into Zone Append, limits it by ZASL, and on completion copies the 64-bit result into the request sector so upper layers see the assigned location. The driver requires append on a ZNS namespace. Devices with no native append, such as SMR HDDs, get it emulated by the block layer as a regular write at a tracked write pointer.
+DEEP:
+- **Native path:** a bio with REQ_OP_ZONE_APPEND targets the zone start sector. `nvme_setup_rw` builds opcode 7Dh. In the completion path the driver converts the 64-bit result to a sector and stores it in the request. A filesystem such as btrfs reads the actual location from the completed bio.
+- **Limit:** the queue limit for hardware append size comes from ZASL, or from the transfer limit if ZASL is 0.
+- **No append support:** if the Commands Supported and Effects log does not list Zone Append, the NVMe driver forces the namespace read-only and logs a warning.
+- **Emulation:** when a zoned queue reports no hardware append size, zone write plugging rewrites an append into a regular Write at its tracked write pointer offset, prevents merging, and restores the append type at completion. It keeps the caller's view identical but the device sees ordered writes, so the concurrency benefit is lost.
+- **No mixing:** native appends are not plugged, so the block layer does not track the write pointer for such zones. Mixing regular writes and native appends on one zone is invalid: the kernel logs "Invalid mix of zone append and regular writes" and aborts plugged writes.
+- **Test consequence:** to exercise device-side append concurrency use NVMe passthrough or a native-append consumer, not ordinary writes on the block device.
+FOLLOW:
+- How can you check a system uses native append? => Look at the queue attribute for maximum append bytes in sysfs, and capture a trace showing opcode 7Dh on the wire.
+- Who uses append natively? => Zoned btrfs uses it for data. Other filesystems and databases use regular writes with host ordering.
+PITFALL: Assuming that an fio run on the block device with zonemode=zbd tested Zone Append. It issues Writes unless you go through passthrough or a user-space driver.
+VERIFY: Kernel version where zone write plugging replaced zone write locking (Linux 6.10 as I recall), the sysfs attribute name and value for emulated devices, and which filesystems use native append.
+
+@@ 5.09 | Advanced | Numeric | tags=throughput,queue-depth,littles-law,fio
+Q: One zone, 16 KiB records, 40 us command latency: how does throughput scale with queue depth for Write versus Zone Append?
+SHORT: A Write is limited to QD 1 per zone: 1/40 us = 25,000 IOPS x 16 KiB = 409.6 MB/s. Zone Append scales about linearly with QD until the zone's internal bandwidth ceiling: QD 2 gives 819 MB/s, QD 4 gives 1.64 GB/s, which a zone capped at 1.6 GB/s cannot exceed. About four appends in flight are enough. Assumes constant latency until the knee.
+DEEP:
+1. **Assumptions:** 16 KiB = 16,384 B. Latency from submit to CQE is 40 us and stays flat with QD until saturation. The zone can absorb 1.6 GB/s because it is striped across enough dies. Host CPU and the PCIe link (Gen4 x4 is about 7.9 GB/s) are not limits.
+2. **Write at QD 1:** IOPS = 1 / 40 us = 25,000. Bandwidth = 25,000 x 16,384 = 409.6 MB/s.
+3. **Append at QD n:** bandwidth = min(n x 409.6 MB/s, 1600 MB/s).
+
+| QD | Bandwidth (MB/s) |
+|---|---|
+| 1 | 410 |
+| 2 | 819 |
+| 4 | 1600 (1638 uncapped) |
+| 8 | 1600 |
+| 16 | 1600 |
+
+4. **Little's law check:** in flight = throughput x latency / size = 1.6e9 x 40e-6 / 16,384 = 3.9, so QD 4.
+5. **Zone fill time (256 MiB):** Write QD 1 takes 268,435,456 / 409.6e6 = 0.66 s. Append QD 4 takes 268,435,456 / 1.6e9 = 0.17 s.
+6. **Alternative without append:** four zones, each written at QD 1, give the same 1.64 GB/s, but they use four open and active zone resources (module 6) and split the data into four streams.
+
+Sweep it with fio through passthrough:
+```
+fio --name=zapp --filename=/dev/ng0n2 --ioengine=io_uring_cmd --cmd_type=nvme \
+    --zonemode=zbd --write_mode=zone_append --rw=write --bs=16k --direct=1 \
+    --iodepth=1 --max_open_zones=1
+```
+Repeat with iodepth 2, 4, 8, 16 and plot the knee.
+FOLLOW:
+- What if a zone maps to a single die? => The die's program rate is the ceiling, so QD beyond one or two only adds queueing latency (module 8).
+- Do real drives stay flat at 40 us? => No. Latency rises near saturation as the write buffer fills, so pick QD just past the knee.
+PITFALL: Extrapolating linear scaling forever. The ceiling is the zone's media parallelism and buffer, not the queue depth.
+VERIFY: fio option names (write_mode=zone_append, cmd_type) against the fio version in use.
+
+@@ 5.10 | Advanced | Debug | tags=duplicate,lost-data,retry,timeout
+Q: A zone scan shows one record twice and another record that the index cannot find. How do you debug an append workload?
+SHORT: Suspect a retry of a non-idempotent command and an address the host guessed instead of reading from the CQE. First reconcile: after quiescing, the write pointer advance must equal the sum of NLB+1 over every successful CQE, including ones the host dropped. A larger pointer means orphan or duplicate appends, a smaller one means the host believes in writes that did not happen.
+DEEP:
+Host log for one zone (ZSLBA 80000h, 16-block records):
+```
+t(ms)  event
+0.00   submit rec41 cid=11
+0.02   submit rec42 cid=12
+0.04   submit rec43 cid=13
+0.90   CQE cid=11 ALBA=80010h
+1.02   app timer (1 ms) on rec42: free cid=12 context, resubmit as cid=17
+1.05   CQE cid=13 ALBA=80000h
+1.10   CQE cid=12 ALBA=80020h status=OK   (no context, dropped)
+1.60   CQE cid=17 ALBA=80030h
+```
+1. The late CQE for cid 12 proves the first attempt executed. Record 42 exists at 80020h and 80030h. The index points to the second, and the first is an orphan that wastes space and shows up as a duplicate in a scan.
+2. Reconcile: write pointer 80040h minus 80000h = 64 blocks. The host counted only 48 blocks of live data.
+3. Log every CQE (cid, sqid, status, ALBA) before discarding it. An unknown cid is the smoking gun.
+4. For "lost" data check how the address was obtained: from the CQE, or from Report Zones plus a running offset (5.12), or from DW0 only (5.02).
+5. Confirm with a scan by self-describing headers: duplicate ids and missing ids.
+
+**Fix:** never blind-resubmit an append. Keep the context alive until the CQE arrives or the controller is reset, then reconcile against the zone. Make record ids unique so duplicates can be discarded by rule.
+FOLLOW:
+- Does an Abort make a retry safe? => Only if the original completes with the Command Abort Requested status. If the Abort reports the command was not aborted, the append may have executed.
+- Does a controller reset resolve the ambiguity? => It removes queue state but not media state. Read the zone report and scan the tail to learn what landed.
+PITFALL: Applying the Write mindset that a resubmit is idempotent. A resubmitted append can succeed twice.
+VERIFY: Abort command completion semantics (Command Not Aborted bit) in the Base Specification.
+
+@@ 5.11 | Advanced | Cross-layer | tags=pi,piremap,reference-tag,e2e
+Q: How does Zone Append interact with end-to-end protection information, and what is PIREMAP for?
+SHORT: The PI reference tag is derived from the LBA, but with Append the LBA is unknown at submit time. With PIREMAP set, the host builds reference tags as if the data began at the zone start, and the controller stores ILBRT + (ALBA - ZSLBA) + block index, so later reads with normal reference tag checking pass. With PIREMAP clear, tags are written as given.
+DEEP:
+See the NVMe page (E2E Data Protection module) for PI basics. PI adds 8 bytes per block: a 16-bit guard CRC of the data, a 16-bit application tag and a 32-bit reference tag. In Type 1 the reference tag is the low 32 bits of the LBA and increments per block.
+
+- **Guard and application tag:** location independent. Append does not affect them.
+- **Reference tag:** the problem. The host cannot compute LBA-based tags without knowing the ALBA.
+
+| PIREMAP | Host supplies | Stored on media | Typical use |
+|---|---|---|---|
+| 0 | Tags as they should be stored | Unmodified | Type 3 PI, or no reference tag checking |
+| 1 | ILBRT relative to ZSLBA | ILBRT + (ALBA - ZSLBA) + block index | Type 1 or 2 with reference tag checks on reads |
+
+Example: ZSLBA 80000h, ALBA 81200h. The offset is 1200h = 4,608 blocks. With ILBRT = 00080000h, the first stored reference tag is 00081200h.
+
+- **Linux:** sets the remap bit only when appending with reference tag checking enabled.
+- **Validator matrix:** PRACT 0 and 1, PRCHK bits, PIREMAP 0 and 1, PI type, and extended versus separate metadata buffers. Read back each case with reference tag checking and expect no Reference Tag Check Error (SCT 2h, SC 84h). Negative case: corrupt the host-supplied tags and expect the write-side check to fail.
+- **ZASL:** confirm whether metadata counts toward the append size limit.
+FOLLOW:
+- Does PIREMAP change the guard or application tag? => No. Only the reference tag values written to media.
+- With PRACT=1 who generates the tags? => The controller, so the host buffer carries no PI bytes. ILBRT and PIREMAP presumably still set the reference tag base, so keep ILBRT zone-relative (VERIFY).
+PITFALL: Type 1 PI with PIREMAP clear, then expecting reads to pass reference tag checks. The stored tags follow the address the host guessed, not the assigned one (some controllers, for example QEMU, instead reject this combination at write time with Invalid Protection Information).
+VERIFY: PIREMAP bit position (CDW12 bit 25 per Linux NVME_RW_APPEND_PIREMAP), whether Type 1 with PIREMAP clear is rejected (Invalid Protection Information, SCT 1h SC 81h, as QEMU does) or accepted, the exact remap formula, which values the write-side check compares against, PRACT interaction, and metadata versus ZASL, all in the ZNS Command Set specification.
+
+@@ 5.12 | Advanced | Trap | tags=address-prediction,report-zones,write-pointer,coverage
+Q: A host submits four 8-block appends to an empty zone and assumes they land at ZSLBA, +8, +16, +24. Why is that wrong, and what does Report Zones show mid-flight?
+SHORT: Addresses are assigned by the controller in execution order, so any command can land in any slot. Only each CQE's ALBA is authoritative. A Report Zones taken during the burst is a snapshot of a moving write pointer, so it cannot stand in for the ALBA either. The bug is intermittent: it appears only when reordering happens, and then reads return valid-looking data belonging to another record.
+DEEP:
+Example with ZSLBA = Z. Assigned ALBAs: rec1 at Z+16, rec2 at Z+0, rec3 at Z+24, rec4 at Z+8. The host's guessed map (rec1 at Z+0 and so on) is wrong for all four. Reads succeed, the PI guard passes (the data is intact), and only content verification with a per-record header notices.
+
+- **Why tests hide it:** QD 1, or a single queue on a firmware that happens to process in order, gives ALBA order equal to submission order every time.
+- **Report Zones mid-flight:** the write pointer it returns may lag behind appends whose completions are still pending, and it changes between your read and your use. Whether it already includes uncompleted appends is not something to depend on. Use it only when quiesced.
+- **Right pattern:** update the index from the CQE.
+- **Coverage assertion for the validator:** count ALBA inversions (pairs where a later-submitted append got a lower ALBA). If the count is zero over a run at QD 32, the test did not exercise concurrency and its pass means little. Add multiple queues and random submit delays until inversions appear.
+FOLLOW:
+- Would the guess be right with one SQ and QD 4? => It may hold on a given firmware, but nothing in the spec promises it.
+- How can address prediction be made legal? => Serialize: submit the next append only after the previous CQE. That is QD 1 and gives up the benefit.
+PITFALL: Using the write pointer from Report Zones as the address of an outstanding append.
+VERIFY: Whether a Report Zones write pointer can include appends that are not yet completed to the host.
+
+@@ 5.13 | Advanced | Cross-layer | tags=power-loss,durability,recovery,torn-append
+Q: What can the host conclude about completed and in-flight appends after a power loss or controller reset?
+SHORT: After recovery, LBAs below the zone's write pointer are written and those above are not. An append whose CQE arrived is durable only if it was made so: FUA, a completed Flush, or a non-volatile cache. Appends with no CQE may or may not have persisted, and because a large append is not necessarily atomic, the pointer can land inside one. Recovery must validate the tail, not trust host bookkeeping.
+DEEP:
+1. **Durable and acknowledged:** every such append must be fully readable below the recovered write pointer with correct content. Any miss is a firmware bug: acknowledged data lost.
+2. **Not acknowledged:** three outcomes: absent, fully present, or torn (only part of its range). Persisted data forms a prefix of the zone (everything below the pointer), so a torn record can only be the last one.
+3. **Non-durable acknowledged:** may be lost. A recovered write pointer lower than the last one seen before the cut is legal.
+4. **Zone state:** open zones are expected to come back Closed after a reset (module 3), and resource counters restart (module 6).
+
+**Host recovery:** read the zone report, scan each zone from the last checkpoint to the write pointer, verify header and CRC, drop a torn tail record from the index, and decide whether to finish the zone or keep appending after the tail.
+
+**Test design:**
+- Cut power to the SSD only (programmable slot power or PDU), keeping the host alive so its journal survives. Journal: record id, ALBA, CQE time, FUA or flush status.
+- Cut at random offsets during append bursts at several queue depths, thousands of cycles.
+- Assertions: durable-acknowledged records intact; every LBA below the recovered pointer readable; content below the pointer matches journal records, with at most one torn tail; recovered pointer not below the durable high-water mark.
+FOLLOW:
+- Should acknowledged non-FUA appends survive? => Not necessarily. Only with a non-volatile write cache or a Flush issued after their CQEs.
+- How do you detect a torn tail? => The record header length or CRC fails, or the record extends past the recovered write pointer.
+PITFALL: Comparing the recovered write pointer with the pointer seen just before the cut. A lower value is legal for non-durable data. Compare only with the durable high-water mark.
+VERIFY: Zone state of open zones after a controller-level reset, that the write pointer may land inside a multi-block append, and how Flush relates to zone append durability, in the ZNS and NVM Command Set specifications.
+
+@@ 5.14 | Principal | Scenario | tags=test-design,oracle,concurrency,fault-injection
+Q: Design a validation suite for Zone Append concurrency on new firmware. What is the oracle and what do you assert?
+SHORT: Drive many concurrent appends of varied sizes at one zone through several queues, log every command and CQE, and check invariants offline: every ALBA inside the zone, ranges disjoint, their union contiguous from the write pointer, final pointer (or Full state) equal to the total, and every range's content matching its self-describing payload. Add limit, state, PI and fault cases, and assert that reordering was actually produced.
+DEEP:
+**Payload:** each append carries per-block headers: unique append id, block index within the append, zone id, a host sequence number, and a CRC. Nothing location dependent, since the address is unknown at submit.
+
+**Oracle (offline, from the log):**
+1. Sort all successful (ALBA, NLB+1) intervals. Assert inside the zone, no overlaps, no gaps, starting at the initial write pointer.
+2. Quiesce, then Report Zones: write pointer equals start plus total blocks (Full state if the zone filled).
+3. Read back everything: block headers give append id and index, so each range must hold exactly one append's blocks in order.
+
+**Case groups:**
+- Size: 1 block, ZASL, ZASL plus 1 (Invalid Field), mixed sizes, sizes straddling NAND page or stripe boundaries of the device.
+- Capacity: exact fill, one block over (Zone Boundary Error), tail race with several outstanding.
+- State: Empty, Closed, Explicitly Open, Full, Read Only, Offline, plus open-limit and active-limit exhaustion (module 6).
+- Concurrency: 1 to 8 queues, QD sweep, multiple zones in parallel, reads of completed ranges during appends.
+- PI: PIREMAP 0 and 1, types, metadata forms (5.11).
+- Faults: abort and timeout mid-burst (5.10), controller reset, power cut (5.13), injected media errors if the drive has an injection interface.
+
+**Coverage assertions:** ALBA inversion count above zero, queue depth actually reached, and every status code above observed at least once.
+
+**Tooling:** SPDK or fio passthrough for the load, a CQE-level logger (or analyzer capture) for the log, a Python checker for the oracle. Keep logs so a failure can be replayed and handed to firmware.
+
+**Attribution rule:** overlapping ranges, or gaps in a complete CQE log, are device faults by construction (the oracle uses CQE data only). Content mismatches need the payload capture (5.16) before blaming either side.
+FOLLOW:
+- What is not a failure? => Different completion order, ALBA order differing from submission order, and Zone Boundary Error at the zone tail.
+- How do you keep it from becoming flaky? => Fix random seeds, log them, and bound each run by blocks, not time, so a run can be replayed.
+PITFALL: A checker that recomputes expected addresses from submission order. That encodes a guarantee the spec does not give and fails good firmware.
+
+@@ 5.15 | Principal | Cross-layer | tags=raid,mirroring,erasure-coding,design
+Q: You are building RAID 1 or erasure coding across ZNS SSDs and want Zone Append for concurrency. What breaks, and what are your options?
+SHORT: Each drive assigns its own ALBA, so two replicas of one write can land at different offsets in matching zones, and stripe chunks stop lining up. The host then needs per-device location metadata for every write, or must serialize per zone group and lose the concurrency. Rebuild, GC and scrub must use the map, not address arithmetic. It is a design trade-off rather than a bug.
+DEEP:
+With Write, every replica sits at the same offset, logical-to-physical is arithmetic and rebuild copies same offsets. With Append, concurrent records X, Y, Z can land on drive A as X, Y, Z and on drive B as Y, X, Z. Same bytes, different addresses.
+
+**Options:**
+1. **Serialize per mirrored zone group:** submit to both, wait for both CQEs, then the next. Simple, and back to QD 1.
+2. **Per-replica index:** record maps to (ALBA on A, ALBA on B). Costs metadata size and a journal, and each leg needs its own GC and recovery because zone contents differ.
+3. **Leader append plus ordered follower Write:** append to one leg, then Write the follower at the leader's ALBA. One address per record, but the follower's Writes must arrive in ALBA order, so ordering machinery returns on that leg.
+4. **Erasure coding:** chunk k of stripe S can land anywhere on each drive, so record a per-chunk address. Degraded reads and parity rebuild go through the map.
+
+**Failure semantics:** if one leg's append timed out and was retried (5.10), legs diverge. Scrub must compare by record id, not by offset.
+
+**Decision criteria:** first ask whether the bandwidth target can be reached with several zones at QD 1 (needs N open and active zones per stream). If yes, avoid append and keep arithmetic addressing. Use append when open-zone budget or latency at small sizes forces concurrency inside one zone.
+
+**Validation angle:** inject different completion orders on each leg, then read via each leg alone and compare contents; degrade one leg mid-run and verify reconstruction.
+FOLLOW:
+- Can both drives be made to assign identical ALBAs? => Not with concurrent appends. Only identical arrival order per zone, in practice QD 1, achieves it.
+- Which option minimizes metadata? => Leader append with follower Writes: one address per record, at the cost of ordering on the follower.
+PITFALL: Assuming logical zone n on both drives holds identical bytes at identical offsets once appends are used.
+
+@@ 5.16 | Principal | Debug | tags=firmware-race,triage,cqe,payload-capture
+Q: A soak test reads back another record's contents. It happens only at QD 32 over 4 queues and only on one firmware build. How do you decide whether it is a device bug or a host bug?
+SHORT: Log every command and CQE at the lowest layer available and test the invariant on CQE data alone. If two CQEs report overlapping ALBA ranges, the device assigned overlapping space, which is a firmware bug. If the ranges are disjoint but the content is wrong, examine host buffer reuse, PRP lists and the index, then use bus captures of the payload to see what the device received.
+DEEP:
+**Cheapest check first:** sort the CQE (ALBA, NLB+1) intervals and test disjointness and contiguity. It takes seconds and needs no analyzer.
+
+**Evidence to conclusion:**
+
+| Observation | Points to |
+|---|---|
+| Overlapping ALBA ranges in CQEs, confirmed on the wire | Firmware allocation race, for example a non-atomic write pointer update across cores |
+| Disjoint ALBAs, payload on the wire correct, media read wrong | Device data path or mapping (staging buffer, NAND page merge) |
+| Disjoint ALBAs, payload already wrong on the wire | Host: buffer reused before completion, PRP or SGL error |
+| Analyzer CQE ALBA correct, host index differs | Host: 32-bit result truncation, command ID mapping bug |
+| Only with timeouts or aborts | Duplicate append from a retry (5.10) |
+
+**Method:**
+1. Minimize: one zone, fixed size, sequence markers in every block.
+2. Bisect: queues 1 to 4, QD 4 to 32, append size, and sizes that are not multiples of the NAND page (tail merging across appends).
+3. Capture: analyzer trace of SQE, CQE and payload TLPs for the failing records; correlate by command ID.
+4. Compare firmware builds and ask for the internal allocation trace for the zone.
+5. Check the reconciliation from 5.10 (write pointer versus sum of successes).
+
+**Firmware hypotheses to hand over:** race in write pointer allocation between cores, staging buffer crossing a page boundary between adjacent appends, PI remap offset wrong, implicit close or eviction while appends are outstanding.
+FOLLOW:
+- Why capture the payload on the bus? => It separates "the device received wrong data" from "the device stored or mapped it wrongly".
+- What if the failure disappears with a logger attached? => Timing changed. Suspect a race and stress the same path with a lighter logger or hardware capture.
+PITFALL: Blaming firmware from a read-back mismatch without proving overlap in the CQE data, or blaming the host without a bus-level payload capture.

@@ -1,0 +1,350 @@
+# Module 16: Advanced NVMe Features
+
+@@ 16.01 | Basic | Concept | tags=hmb,dram-less,l2p,hmpre,hmmin
+Q: What is the Host Memory Buffer, and why do DRAM-less SSDs use it?
+SHORT: HMB lets the host lend the SSD a region of host DRAM that the controller reads and writes over PCIe DMA. DRAM-less client SSDs use it mainly to cache the logical-to-physical mapping table, since they have no onboard DRAM for it. It is optional: Identify Controller reports a preferred and a minimum size (HMPRE and HMMIN, in 4 KiB units), and the controller must still work correctly if the host gives it nothing.
+DEEP:
+- **Why it exists:** a flat mapping table costs about 4 bytes per 4 KiB of flash, roughly 0.1 percent of capacity (1 GiB per TiB). DRAM costs money, board area and power, so a DRAM-less design keeps a small SRAM cache and needs somewhere else to put the rest.
+- **Direction matters:** HMB is the controller using host memory. CMB and PMR (question 16.02) are the opposite: the host using controller memory.
+- **What goes in it:** mostly mapping-table cache. Vendors may also use it for other metadata or buffering, but that is implementation defined, and the host cannot see what is stored.
+- **The contract:** the host allocates the memory, builds a descriptor list and enables HMB with Set Features (Feature ID 0Dh). The memory is volatile host DRAM that the controller must treat as something that can be taken away.
+- **What you see on Linux:** `nvme id-ctrl` prints `hmpre`, `hmmin`, `hmminds` and `hmmaxd`, and dmesg logs a line like "allocated 64 MiB host memory buffer (1 segment)". Zero `hmpre` means the drive does not want HMB.
+- **Cost:** a mapping-cache miss becomes a small PCIe read to host memory in the middle of the command. The PCIe side of that cost is on the PCIe page (NVMe over PCIe module), and the sizing arithmetic is in question 16.05.
+FOLLOW:
+- Is HMB the same as CMB? => No. HMB is host memory used by the SSD. CMB is SSD memory exposed to the host through a BAR.
+- Does an SSD with DRAM ever use HMB? => It may report HMPRE, but HMB is far more useful, and far more common, on DRAM-less drives where it replaces the DRAM mapping cache.
+PITFALL: Assuming the host chooses what the controller puts in HMB. The host only provides memory, and the contents are opaque to it.
+VERIFY: HMPRE and HMMIN units (4 KiB) and the meaning of HMMINDS and HMMAXD in Identify Controller for your spec revision.
+
+@@ 16.02 | Basic | Concept | tags=cmb,pmr,hmb,comparison,p2p
+Q: How do HMB, CMB and PMR differ, and when would you use each?
+SHORT: Look at who owns the memory and whether it survives a reset. HMB is host DRAM used by the controller and is volatile. CMB is SSD memory mapped into a BAR that the host or a peer device can use for queues, PRP and SGL lists and data. PMR is also SSD memory in a BAR, but it is meant to keep its contents across resets and power cycles, so it needs explicit flush discipline.
+DEEP:
+| Feature | Memory lives in | Who accesses it | Persistent | Typical use |
+|---|---|---|---|---|
+| HMB | Host DRAM | Controller, by DMA | No | DRAM-less mapping cache |
+| CMB | SSD (volatile) | Host or peer by MMIO or DMA | No | SQ placement, P2P data staging |
+| PMR | SSD (persistent) | Host or peer by MMIO or DMA | Yes, with flush | Persistent log or metadata for host software |
+
+- **CMB in practice:** an SQ in the CMB saves the SQE fetch round trip because the host writes entries directly into the BAR. CQs stay in host memory because CPU reads of BAR space are slow non-posted reads. Peer-to-peer DMA (an RDMA NIC or GPU writing data straight into the CMB) is the other main use.
+- **PMR in practice:** it looks like byte-addressable persistent memory behind PCIe. Persistence is only defined after a write barrier or flush sequence, so a validation test that skips it proves nothing.
+- **Where the details live:** CMBLOC, CMBSZ, PMRCAP and friends are in the Controller Registers module (questions 2.13 and 2.14), and the PCIe routing, ACS and BAR-size effects are on the PCIe page.
+- **Validation angle:** each is a capability plus a behavior. Check advertised bits against real use, contents after CC.EN=0, FLR and PERST#, and error handling for accesses past the region.
+FOLLOW:
+- Which of the three survives PERST#? => Only PMR is meant to, and only if the required flush procedure was followed before the loss.
+- Why not put CQs in the CMB? => The host polls or reads CQEs, and each MMIO read to a BAR is a slow, stalling non-posted round trip. Host DRAM is far cheaper to poll.
+PITFALL: Treating CMB as persistent because it is on the SSD. It is ordinary volatile memory, and PMR is the persistent variant.
+VERIFY: Which CMB usage bits (SQS, CQS, LISTS, RDS, WDS) your drive advertises, and the PMR flush and persistence rules in your specification revision.
+
+@@ 16.03 | Basic | Concept | tags=placement,write-amplification,streams,fdp,zns,lifetime
+Q: Why would a host tell an SSD about data lifetime, and what mechanisms exist?
+SHORT: Mixing data with different lifetimes in one flash block leaves long-lived data behind when short-lived data dies, so garbage collection must copy it and write amplification rises. Telling the SSD which writes belong together lets it group them by lifetime. In growing order of host control the mechanisms are Streams (hints), Flexible Data Placement (host picks a placement target) and Zoned Namespaces (host writes sequentially and resets zones).
+DEEP:
+- **The problem:** flash is erased in blocks, while the host overwrites in small pieces. A block that mixes hot and cold data has to be cleaned while the cold pages are still valid. Write amplification (WAF) is media bytes written divided by host bytes written.
+- **Where the SSD helps itself:** firmware can guess from access patterns and separate streams internally, but it cannot know that one application file will be deleted in ten seconds and another kept for a year.
+
+| Mechanism | Introduced | Host says | Device still does | Compatibility |
+|---|---|---|---|---|
+| None | n/a | nothing | Guess and separate internally | Full |
+| Streams | NVMe 1.3 | Stream ID with each write | Decides how to use streams, GC unchanged | Old hosts unaffected |
+| FDP | Post 2.0 (2022 era) | Placement identifier per write | Keeps GC and LBA-to-flash mapping, honors grouping | Works with legacy writes |
+| ZNS | NVMe 2.0 family | Zone plus sequential writes | No GC of host data, host resets zones | Needs host software support |
+
+- **Where each is covered:** Streams and FDP are questions 16.06 to 16.11 and 16.17. ZNS has its own page, and 16.12 compares it with FDP.
+- **How to tell a benefit is real:** the WAF from the drive's counters goes down, not just throughput. Otherwise a fast fio run may be the cache.
+FOLLOW:
+- Does the host get better endurance too? => Lower WAF means fewer program and erase cycles for the same host writes, so yes, if the host groups data by lifetime correctly.
+- Is a hint required to be honored? => Streams and FDP are placement guidance with device-defined behavior, so correctness never depends on it. Check what your target spec revision says before writing a strict test.
+PITFALL: Calling all three "the same thing with different names". They differ in who owns garbage collection and whether old software still works.
+VERIFY: FDP ratification date and which specification revisions contain it, and Streams status in your target revision.
+
+@@ 16.04 | Intermediate | Concept | tags=hmb,set-features,descriptor-list,ehm,mr,hmminds,hmmaxd
+Q: How does a host enable HMB, what does the descriptor list look like, and what constraints does the controller impose?
+SHORT: The host allocates one or more chunks of host memory, builds a descriptor list (one 16-byte entry per chunk: 8-byte address, 4-byte size in memory-page units, 4 reserved), and sends Set Features with Feature ID 0Dh. CDW11 carries Enable HMB and Memory Return, CDW12 the total size in pages, CDW13 and CDW14 the list address, CDW15 the entry count. HMMINDS and HMMAXD constrain chunk size and entry count.
+DEEP:
+- **Sizes:** HMPRE (preferred) and HMMIN (minimum) are in 4 KiB units. The host chooses a total between them, subject to its own limit. Linux has a module parameter `nvme.max_host_mem_size_mb`, which was 128 in the source I checked.
+- **Chunks:** HMMINDS is the smallest descriptor size the controller accepts, and HMMAXD the most entries it accepts (0 is treated as no stated limit by Linux, see VERIFY). Linux starts from the largest chunk size it can get (one segment when an IOMMU can merge pages) and falls back to smaller chunks and more entries.
+- **Set Features fields** (as the Linux driver programs them):
+
+| Dword | Field | Meaning |
+|---|---|---|
+| CDW11 bit 0 | EHM | Enable Host Memory Buffer |
+| CDW11 bit 1 | MR | Memory Return: host asserts the buffer still holds what the controller left in it |
+| CDW12 | HSIZE | Total buffer size in memory pages |
+| CDW13, CDW14 | HMDLLA, HMDLUA | Descriptor list address, low and high |
+| CDW15 | HMDLEC | Number of descriptor list entries |
+
+- **Memory Return:** when the host disables and later re-enables HMB, MR=1 lets the controller trust its earlier contents. Linux sets it when it reuses the same buffer, for example after a reset that kept the allocation. If the host might have touched the memory, it must send MR=0 so the controller rebuilds.
+- **Disable:** EHM=0. The host may only free the memory after that command completes.
+- **After reset:** CC.EN=0, FLR and PERST# all drop the controller state, so HMB must be re-enabled. Linux does this during controller re-initialization.
+- **Controller must work without it:** if allocation fails, the driver logs it and continues.
+FOLLOW:
+- What happens if the host gives less than HMMIN? => The controller is not required to accept it, so Linux does not enable HMB below the minimum. A test should show the controller returns an error status or works correctly without the feature, not corrupt data.
+- Why must chunks respect alignment and size rules? => The controller uses them as DMA regions. A wrong size or an unaligned descriptor is a way to test error handling, not a valid setup.
+PITFALL: Freeing or reusing the HMB memory before the disable command completes. The controller can still be reading or writing it.
+VERIFY: Set Features 0Dh field layout, the units of the descriptor size field (CC.MPS pages), HMMINDS and HMMAXD semantics (including zero), MR behavior, and required status codes for an undersized or malformed list.
+
+@@ 16.05 | Intermediate | Numeric | tags=hmb,sizing,l2p,latency,hit-rate,descriptors
+Q: A 1 TiB DRAM-less SSD gets a 64 MiB HMB. How much of the mapping does that cover, what does the descriptor list look like, and what does it do to QD1 random read latency?
+SHORT: A 1 TiB drive with 4 KiB mapping and 4-byte entries has a 1 GiB table, so 64 MiB caches 6.25 percent of it. Under uniform random reads that gives about a 6 percent HMB hit rate, and average latency stays near the miss-dominated figure (about 131 microseconds in the model below). With a hot set that fits in the buffer, the same HMB drops it to about 82 microseconds.
+DEEP:
+Assumptions (state them in your answer): 4 KiB mapping unit, 4 bytes per entry, 4 MiB of controller SRAM, exclusive caching (an entry is in SRAM or HMB, not both), HMB hit costs 1.5 microseconds, a miss reads the mapping page from NAND at 60 microseconds, and the read itself costs 75 microseconds with a cached mapping.
+1. **Table size:** 1 TiB / 4 KiB = 2^28 entries. At 4 bytes each, 1 GiB.
+2. **Coverage:** 64 MiB / 4 B = 16 Mi entries, and 16 Mi x 4 KiB = 64 GiB of LBA space, which is 6.25 percent of 1 TiB. SRAM holds 4 MiB / 4 B = 1 Mi entries = 4 GiB, or 0.39 percent.
+3. **Descriptor list for 64 MiB:** HSIZE = 64 MiB / 4 KiB = 16,384 pages. If Linux gets 1 MiB chunks, that is 64 descriptors of 16 bytes = 1,024 bytes, and HMDLEC = 64. A single contiguous chunk needs one descriptor.
+4. **Uniform random reads:** P(SRAM) = 0.39 percent, P(HMB) = 6.25 percent, P(miss) = 93.4 percent. Average = 75 + 0.0625 x 1.5 + 0.934 x 60 = about 131 microseconds.
+5. **Hot-set workload:** 90 percent of reads go to 5 percent of the LBAs (51.2 GiB). That hot set needs 51.2 MiB of table, so it fits in the HMB. SRAM covers 4 / 51.2 = 7.8 percent of it. Then P(SRAM) = 7.0 percent, P(HMB) = 83 percent (plus about 0.2 percent from cold entries), P(miss) = about 9.8 percent. Average = 75 + 0.83 x 1.5 + 0.098 x 60 = about 82 microseconds.
+6. **Conclusion:** HMB helps locality far more than size. The A/B test that shows it needs a hot-set workload and a random-read latency measurement, not a sequential throughput test.
+FOLLOW:
+- Why does average latency barely change with HMB in step 4? => The tables are 16 times bigger than HMB, so almost every read still has to fetch a mapping page from NAND.
+- If the HMB round trip grows from 1.5 to 5 microseconds with L1 exit and IOMMU misses, what changes in step 5? => The HMB term goes from 0.83 x 1.5 = 1.2 to 0.83 x 5 = 4.2 microseconds, so the average rises to about 85 microseconds, still far better than 131, but the tail gets worse.
+PITFALL: Judging HMB by average latency alone. Its cost shows up in the tail, where L1 exit, IOMMU or host memory contention add microseconds to dependent reads.
+VERIFY: HMB hit and miss costs are illustrative. Measure your own drive with HMB on and off (for example `nvme.max_host_mem_size_mb=0`, check that your kernel treats zero as disabling HMB).
+
+@@ 16.06 | Intermediate | Concept | tags=streams,directives,directive-send,directive-receive,dtype,dspec
+Q: How do NVMe Streams work, and what is the Directive mechanism they are built on?
+SHORT: Directives (Directive Send 19h and Directive Receive 1Ah) are a generic way to pass extra information with I/O. The Streams directive (type 01h) lets the host allocate stream IDs and put a stream ID in each write (DTYPE=1, DSPEC=stream ID), so the drive can place related data together. The host enables it with the Identify directive (type 00h), asks for resources, and releases them when done. Support is optional and reported in OACS.
+DEEP:
+- **Discovery:** OACS bit 5 says Directives are supported. The Identify directive (type 00h) reports which directive types exist and lets the host enable one.
+- **Streams operations:** Directive Receive returns parameters (op 01h), status of open streams (02h) and allocates resources (03h). Directive Send releases one identifier (01h) or all resources (02h). Enabling uses the Identify directive with the target type set to Streams.
+- **Parameters that matter:** the controller reports its limit of streams (MSL), how many the namespace has allocated and open (NSSA and NSSO), a stream write size (SWS) and a stream granularity size (SGS). Aligning host writes to multiples of SWS is the efficient pattern.
+- **Write path:** Write carries DTYPE in CDW12 bits 23:20 and the stream ID in CDW13 bits 31:16 (DSPEC). A stream opens on first use, and the controller may close streams it needs to reuse.
+- **Limits:** the number of streams is small, and what the controller does with them is not specified, so results vary by drive and no strict effect can be tested.
+- **Validation ideas:** enable, allocate, over-allocate (expect an error or a lower count in CDW0), write with unallocated IDs, release and reuse, and confirm behavior after reset (allocations are not expected to persist, VERIFY). Compare WAF with and without streams from vendor counters.
+- **Linux status:** as far as I can tell, host support went through the block layer write-hint path and has since been removed from mainline NVMe, with FDP taking over the placement role (current `nvme.h` still carries the Streams definitions). Check your kernel version, or test with nvme-cli passthrough and SPDK.
+FOLLOW:
+- Is a Streams write that uses an unallocated ID an error? => The spec defines an error or fallback for it, so check the status for your revision. Do not assume success.
+- How do Streams differ from FDP? => Streams are hints with device-defined behavior and no reclaim visibility. FDP defines reclaim groups, units and handles, and reports events and statistics.
+PITFALL: Expecting a Streams test to prove the drive separated data. Without a WAF counter or vendor telemetry you can only prove the commands worked.
+VERIFY: Directive Receive and Send operation codes and their field positions, OACS bit 5, the SWS and SGS units, behavior of unallocated stream IDs, and what Linux versions still carry NVMe Streams support.
+
+@@ 16.07 | Intermediate | Concept | fig=fdp | tags=fdp,reclaim-group,reclaim-unit,ruh,placement-identifier
+Q: What are Flexible Data Placement's reclaim groups, reclaim units, reclaim unit handles and placement identifiers, and how does a write use them?
+SHORT: FDP is enabled per Endurance Group. A reclaim unit (RU) is a chunk of flash the controller fills and later reclaims as one; a reclaim group (RG) is a set of RUs that can be reclaimed independently. A reclaim unit handle (RUH) points at the RU currently accepting writes. The host puts a placement identifier in each write (DTYPE=2, DSPEC=PID), which selects an RG and an RUH, so data with the same lifetime lands in the same RU.
+DEEP:
+- **Vocabulary:**
+  - **Reclaim Unit (RU):** the unit the drive fills and reclaims. Its nominal size (RUNS) is reported in the FDP configuration.
+  - **Reclaim Group (RG):** a set of RUs. Think of it as a physical domain such as a die group or channel set.
+  - **Reclaim Unit Handle (RUH):** a pointer to the RU currently open for writes. When it fills, the controller moves the handle to a new RU.
+  - **Placement Identifier (PID):** a 16-bit value in the write command that names an RG plus a placement handle. The placement handle is mapped to an RUH per namespace.
+- **RUH types:** Initially Isolated (host data from different RUHs is separate when first written, but GC may combine survivors) and Persistently Isolated (GC keeps each RUH's data apart).
+- **Write path:** Write command with DTYPE = 2 (data placement, CDW12 bits 23:20) and DSPEC = PID (CDW13 bits 31:16). A write with no directive goes to the default handle.
+- **Still ordinary LBAs:** unlike ZNS, writes can be random and overwrites are allowed, and the LBA-to-flash mapping stays in the drive. The host controls grouping only.
+- **PID composition:** the RG occupies the top bits of the PID and the placement handle the low bits, with the split set by a field in the FDP configuration (RGIF). Example: with 2 RGs (RGIF = 1) and handle 3, PID = 0000h + 3 for RG0 and 8000h + 3 for RG1.
+- **Compare with mixed writes:** without FDP, hot and cold streams interleave in one open block, so GC copies cold survivors. With FDP, each lifetime class writes into its own RU, and a whole RU tends to die together.
+- **Diagram:** see the figure for RGs, RUs and RUH mapping.
+FOLLOW:
+- Who decides when a full RU is reclaimed? => The controller. The host cannot erase or reset an RU, unlike a zone.
+- What happens when an RU fills mid-write? => The controller switches the RUH to a new RU and continues. A large write can span RUs, and the host is not told unless it enabled the relevant event.
+PITFALL: Treating a PID as a physical address or a zone number. It selects where new data is grouped, not where old data is.
+VERIFY: FDP was ratified after NVMe 2.0 (a TP, believed to be TP4146 in 2022) and folded into later revisions. Check the PID field layout and RGIF, the exact RUH type semantics, and default handle behavior in your revision.
+
+@@ 16.08 | Intermediate | Concept | tags=timestamp,live-migration,namespace-management,host-managed,feature-0eh
+Q: Which host-managed features (Timestamp, live migration, and namespace management with placement) should a validator know, and what do they touch?
+SHORT: Timestamp (Feature 0Eh) lets the host set the controller's clock, in milliseconds since the Unix epoch, so log and event timestamps can be correlated with host time. Host-managed live migration (newer, Base 2.1 era) adds admin commands for tracking dirty data and moving controller state. Namespace Management gained FDP awareness: a create can carry a placement handle list that binds the namespace's handles to reclaim unit handles.
+DEEP:
+- **Timestamp:** Set Features 0Eh takes an 8-byte buffer with a 48-bit millisecond value and an attribute byte (a synch bit and an origin field). Linux sets it when ONCS reports support. The controller's clock keeps running but is not persistent across a controller reset, so hosts set it again after reset. It shows up in telemetry, the Persistent Event Log and FDP events, and a wrong or missing value makes cross-device correlation useless.
+- **Timestamp tests:** set, then read after a known delay, and check the counted delta and the origin and synch bits. Repeat after CC.EN=0 and a power cycle, and check log entries against the value that was set.
+- **Live migration:** Track Send and Receive (3Dh, 3Eh), Migration Send and Receive (41h, 42h) and Controller Data Queue (45h), advertised by an OACS bit. The host suspends a controller, tracks changed user data through a Controller Data Queue, and moves controller state to another controller (usually for virtualization with SR-IOV). It is recent, rare in shipping drives, and most relevant to validation on multi-controller devices.
+- **Namespace Management extensions:** Create takes the host-specified structure (see the Namespaces module, question 7.08). With FDP enabled, it also carries a count of placement handles and a list of RUH identifiers. A bad list returns Invalid Placement Handle List (generic status, SC 2Ah, VERIFY), and commands that need FDP fail with FDP Disabled (generic status, SC 29h) when it is off.
+- **Copy:** the on-drive copy offload is covered in the NVM Command Set module (question 6.10), so it is not repeated here.
+FOLLOW:
+- Why set the timestamp after every reset? => The controller has no wall clock, so the host must supply time. Without it, log timestamps count from an arbitrary origin.
+- Is live migration tied to SR-IOV? => Usually used with it, but the commands are defined on controllers generally. VERIFY the exact conditions in your revision.
+PITFALL: Comparing timestamps from two drives without checking each drive's origin and synch attributes.
+VERIFY: Timestamp field layout (48-bit value, attribute bits), live migration opcodes and OACS bit, the revision that introduced live migration, and Namespace Management placement handle list field layout and status codes 29h and 2Ah.
+
+@@ 16.09 | Advanced | Concept | tags=fdp,config-log,features,logs,events,ruh-status,ruh-update
+Q: What interface does FDP expose for configuration, status and events, and what would you script with nvme-cli?
+SHORT: FDP is enabled by Set Features 1Dh per Endurance Group, choosing one of the configurations advertised in the FDP Configurations log (20h). Then Reclaim Unit Handle Usage (21h), FDP Statistics (22h) and FDP Events (23h) logs report state, and Feature 1Eh selects which events are logged. I/O Management Receive returns RUH status, and I/O Management Send can update an RUH. nvme-cli has an `nvme fdp` plugin for all of it.
+DEEP:
+| Item | Value | Purpose |
+|---|---|---|
+| Feature FDP | 1Dh | Enable FDP, choose configuration index (per Endurance Group) |
+| Feature FDP Events | 1Eh | Enable event types for a placement handle |
+| Log FDP Configurations | 20h | Available configurations: RG count, RUH count, RU nominal size, RUH types |
+| Log RUH Usage | 21h | Attributes of each RUH (host or controller specified) |
+| Log FDP Statistics | 22h | Host bytes with metadata written, media bytes with metadata written, media bytes erased |
+| Log FDP Events | 23h | Recent events (host events or controller events) |
+| I/O Management Receive (12h) | MO=1 | RUH Status: per handle, PID, RUH ID, estimated active RU time remaining, RU available media writes |
+| I/O Management Send (1Dh) | MO=1 | RUH Update: force RUHs to start a new RU |
+
+- **Configurations log:** the count field is zero-based (Linux adds one). Each descriptor gives RG count, RUH count, maximum placement identifiers, RU nominal size, estimated RU time limit, and the RUH types.
+- **Change of configuration:** the config index is chosen when FDP is enabled. Expect enabling or changing it to be tied to the state of namespaces in the Endurance Group (VERIFY the rules).
+- **nvme-cli:** `nvme fdp configs`, `usage`, `stats`, `events`, `status` (per namespace), `update` (RUH Update), `set-events` and `feature` (enable, disable, show).
+- **Linux consumer:** the driver reads the FDP feature, the configuration log and RUH status, then exposes handles as write streams. In the source I checked, it supports only a single reclaim group and gives up otherwise.
+- **fio:** `--ioengine=io_uring_cmd --cmd_type=nvme --fdp=1 --fdp_pli=0,1,2` against the `/dev/ng0n1` character device, where the indexes refer to `nvme fdp status` entries.
+FOLLOW:
+- What is RUH Update used for? => Closing the current RU and starting a new one on chosen handles, typically at a natural data boundary, for example after finishing a segment.
+- Why do events matter to a validator? => They report host mistakes (an invalid PID) and device actions (an RU closed by the time limit), which are the evidence for debugging poor WAF.
+PITFALL: Trusting a single reading of the statistics log. The counters are cumulative, so take deltas across the test interval.
+VERIFY: Log page and feature IDs, the field layouts, whether RUH Update and RUH Status opcodes and management operation values match your revision, and the enable and reconfigure rules for FDP.
+
+@@ 16.10 | Advanced | Numeric | tags=fdp,waf,statistics-log,ru-size,erutl,fill-time
+Q: Using the FDP statistics log, how do you compute WAF, and what do RU size and RU time limit imply for a slow-writing placement handle?
+SHORT: WAF is delta media bytes with metadata written divided by delta host bytes with metadata written, taken across the test window. For example 3.60 TB host and 4.50 TB media gives 1.25. RU size sets how long a handle needs to fill its RU: at 1 MB/s a 4 GiB RU takes over an hour, and if the estimated time limit is shorter, the controller may close the RU partly written, which shows up as an event and hurts efficiency.
+DEEP:
+Assumptions: illustrative configuration of 1 RG, 8 RUHs, RU nominal size 4 GiB, and a hypothetical estimated RU time limit of 600 seconds.
+1. **WAF:** read log 22h before and after the run. Counters are 128-bit byte counts (HBMW, MBMW, MBE). Deltas: HBMW = 3.60 TB, MBMW = 4.50 TB. WAF = 4.50 / 3.60 = 1.25.
+2. **Sanity check:** the host side of the delta should match your own fio byte count (including metadata bytes if the format has them). If not, other writers exist or counters wrap.
+3. **Open capacity:** 8 handles x 4 GiB = 32 GiB is always held in open RUs. That is fine on a multi-TB drive, and it is why the number of handles is limited.
+4. **Fill time at 200 MB/s per handle:** 4 GiB / 200 MB/s = 4,295 MB / 200 MB/s = about 21.5 seconds.
+5. **Fill time at 1 MB/s:** 4,295 MB / 1 MB/s = about 4,295 seconds (1.2 hours).
+6. **Time limit:** with a 600 second limit and 1 MB/s, only 600 MB (about 14 percent of the RU) is written before the limit. The controller may then close the RU partly used. That is an RU Time Limit Exceeded or RU Not Fully Written event, and the unwritten space is wasted or padded, which raises WAF.
+7. **What to do:** give slow lifetime classes fewer handles, merge them with a similar class, use RUH Update at natural boundaries, or size RUs to the workload.
+FOLLOW:
+- Why use media bytes with metadata rather than NAND page counts? => It is the standard, portable counter defined for FDP, so your WAF calculation is comparable across drives that report it.
+- What if WAF is below 1.0? => Suspect compression or deduplication in the drive, counter wrap or a wrong delta. Standard flash writes cannot amplify below 1.
+PITFALL: Comparing WAF between an FDP run and a non-FDP baseline that was not preconditioned to steady state. A fresh drive shows WAF near 1.0 for both.
+VERIFY: Whether the statistics counters include metadata as named, the units and exact meaning of the estimated RU time limit, and controller behavior when the limit is exceeded.
+
+@@ 16.11 | Advanced | Debug | tags=fdp,debug,invalid-pid,events,ruh-status,fio
+Q: Your FDP tests show WAF of 2.1, barely better than the non-FDP baseline. You collect the output below. What does it tell you, and what do you check next?
+SHORT: The output shows most writes are not landing on the intended handles. The events log has many Invalid Placement Identifier events, and RUH status shows only handle 0 with large RU consumption while the others stay nearly untouched. The host is sending bad PIDs, so (as I read the spec) the controller falls back to the default handle and the workload is still mixed. Fix the PID list first, then repeat under steady state.
+DEEP:
+Illustrative output (formats abbreviated, not from a real drive):
+```
+$ nvme fdp status /dev/nvme0n1
+Placement Identifier 0; Reclaim Unit Handle Identifier 0  ruamw=214000
+Placement Identifier 1; Reclaim Unit Handle Identifier 1  ruamw=1048576
+Placement Identifier 2; Reclaim Unit Handle Identifier 2  ruamw=1048576
+Placement Identifier 3; Reclaim Unit Handle Identifier 3  ruamw=1048576
+
+$ nvme fdp events /dev/nvme0 -e 1 -E
+  type=03h Invalid Placement Identifier  pid=0x0004  count=48231 (this window)
+  type=00h RU Not Fully Written          pid=0x0000
+```
+1. **Read the status:** four handles exist, and only handle 0 is depleting. The others still show a full RU of available writes (1,048,576 blocks is 4 GiB at 4 KiB, matching a 4 GiB RU if ruamw counts logical blocks), so nothing was written to them.
+2. **Read the events:** Invalid Placement Identifier with pid=0x0004 means the host used a PID outside the list. As I read the spec, such a write is not failed. The controller treats it as a write without a directive and logs the event, so everything ends up in handle 0.
+3. **Root cause candidates:** the fio `--fdp_pli` list is an index list into `nvme fdp status`, not a raw PID list. Or the PID list was captured before the configuration or namespace changed. Or a different namespace has different placement handles.
+4. **Confirm:** trace the write commands with the kernel NVMe tracepoints (or an analyzer for passthrough or user-space drivers): check DTYPE (2) and DSPEC on real commands. Count writes per PID.
+5. **Then:** fix the mapping, rerun after preconditioning, take deltas of the statistics log, and confirm the events log no longer shows PID errors.
+6. **If PIDs are valid but WAF is still poor:** look for RUs closing early (RU Not Fully Written or Time Limit Exceeded), too few handles for the lifetime classes, and Initially Isolated behavior where GC mixes survivors from several handles.
+FOLLOW:
+- How do you tell a PID error from a config change? => An Implicitly Modified RUH or Controller Level Reset event points at the device. An Invalid PID event points at the host.
+- Why check DTYPE on the wire and not just the fio job? => The application or driver can rewrite or drop the directive, and only a trace shows what the drive received.
+PITFALL: Concluding "FDP does not work on this drive" from WAF alone. Verify the writes reached the intended handles first.
+VERIFY: The Invalid Placement Identifier behavior (write succeeds on the default handle versus error) for your revision, the units of RUAMW, and the event type values used by your nvme-cli version.
+
+@@ 16.12 | Advanced | Trap | tags=fdp,zns,streams,comparison,gc,compatibility
+Q: A colleague says "FDP is ZNS without the write-pointer rule, so the host must do garbage collection". What is right and what is wrong?
+SHORT: The similarity is that both let the host separate data by lifetime. But FDP keeps normal random-write semantics and drive-side garbage collection, so the host does not manage reclaim, does not reset anything, and needs no sequential writes. ZNS removes the drive's mapping and GC in exchange for host software that writes sequentially per zone and resets zones. So "host does GC" is true of ZNS and false of FDP.
+DEEP:
+| Aspect | Conventional | Streams | FDP | ZNS |
+|---|---|---|---|---|
+| Write pattern | Random | Random | Random | Sequential per zone (or Zone Append) |
+| Host names placement | No | Stream ID (hint) | PID (RG + handle) | Zone |
+| Who does GC | Drive | Drive | Drive | Host (zone resets) |
+| Overwrite in place | Yes | Yes | Yes | No (reset first) |
+| Legacy software works | Yes | Yes | Yes | Needs zoned support |
+| Drive DRAM for mapping | Full table | Full table | Full table | Coarse zone mapping |
+| Visible to host | Nothing | Little | RG, RU, events, stats | Zones, write pointers |
+| Over-provisioning | Needed | Needed | Needed | Much less |
+
+- **Why FDP was designed this way:** adoption. Hosts can begin with a few handles and unchanged software still runs, so there is no flag day.
+- **Where FDP helps less:** ZNS guarantees WAF near 1 for a host that writes sequentially, while FDP only lowers WAF as far as the host grouping and the drive's isolation allow.
+- **Test implication:** an FDP test must tolerate a drive that ignores or reinterprets placement, and correctness tests remain ordinary read-after-write tests. A ZNS test must check zone state machine rules that FDP does not have.
+- **Detail:** ZNS zone states, append and resources are on the ZNS page, so keep this answer at the comparison level in an interview.
+FOLLOW:
+- Can one namespace be both FDP and zoned? => They are different mechanisms. FDP applies to an Endurance Group's namespaces using the NVM command set, and a ZNS namespace is a different command set. Do not assume a combination is valid without checking the spec.
+- Which needs more host software work? => ZNS, because the host must implement a log-structured layout and GC. FDP only needs a lifetime classifier and the PID tag.
+PITFALL: Assuming FDP gives ZNS-like WAF with none of the work. It is guidance, and its benefit depends on the workload and lifetime grouping.
+VERIFY: Whether FDP is defined for command sets other than NVM in your revision, and the FDP requirement for over-provisioning, if any.
+
+@@ 16.13 | Advanced | Concept | tags=key-value,kv,command-set,csi,store,retrieve,sike
+Q: What does the NVMe Key Value command set offer, how does it differ from the NVM command set, and how would you test it?
+SHORT: The Key Value command set (CSI 01h) replaces LBAs with variable-length keys and values: Store (01h), Retrieve (02h), List (06h), Delete (10h), Exist (14h) and Flush (00h) operate on keys inside a KV namespace. The drive keeps the key-to-media mapping instead of the host filesystem. It is a separate namespace type chosen by CSI, with its own Identify data and a configuration feature, and it is rare in shipping products.
+DEEP:
+- **Same opcode, different meaning:** opcode 01h is Write in the NVM command set and Store in the KV set. The namespace's CSI decides the meaning.
+- **Commands:** Store takes options such as Store If Key Exists and Store If No Key Exists, so a host can do an insert or an update conditionally. Retrieve returns the value or part of it. List returns keys, in pieces, to walk the namespace. Delete removes a key. Exist tests for a key without moving data. Reservations are also defined for KV.
+- **Limits:** key length is small (16 bytes was the figure I remember for the standard command set) and value size is bounded by the namespace's reported maximum. VERIFY both.
+- **Status codes you will see:** Invalid Value Size (85h), Invalid Key Size (86h), KV Key Does Not Exist (87h), Unrecovered Error (88h) and Key Exists (89h), which libnvme lists among the generic status codes. VERIFY the exact SCT and code assignments before using them in a checker.
+- **Test plan:**
+  1. Boundaries: key length 0, 1, max and max+1, value size 0, 1, max and max+1.
+  2. Conditional stores: SIKE and SINKE against existing and missing keys.
+  3. Overwrite with different sizes, then Retrieve and compare bytes, including partial retrieves.
+  4. List while inserting and deleting, and with far more keys than fit in one reply.
+  5. Capacity: fill until the drive rejects, delete, and check space returns.
+  6. Power loss during Store: the key holds the old or the new value, never a mix.
+  7. Similar keys and hash-collision candidates, since the drive maps keys internally.
+- **Relevance:** very little KV hardware ships. Know what it is and how it differs, but do not expect deep KV questions unless the team builds it.
+FOLLOW:
+- How does a host select a KV namespace? => Through the namespace's CSI in its descriptor list, after the controller is set to use all supported I/O command sets.
+- What does KV do to the SSD's internal design? => It moves the index into firmware, which must be persistent, crash-consistent and bounded in DRAM, so it replaces an FTL with an FTL-plus-index.
+PITFALL: Testing KV like LBA I/O. Sizes are not sector multiples, so no alignment rules apply, but key and value limits do.
+VERIFY: KV opcodes, maximum key and value sizes, Store option bits, Feature 20h (Key Value Configuration) contents, and the status code table in the NVMe Key Value Command Set specification.
+
+@@ 16.14 | Advanced | Concept | tags=command-sets,iocs,feature-19h,computational-storage,slm,cp,csi
+Q: How does the 2.x command-set architecture work, and where do computational storage and the I/O Command Set Profile fit in?
+SHORT: NVMe 2.x separates the Base specification from command set specifications, and each namespace declares a Command Set Identifier: NVM 0, Key Value 1, ZNS 2, Subsystem Local Memory 3, Computational Programs 4. The host picks a command set combination with the I/O Command Set Profile feature (19h). Computational storage is built from the last two: memory the drive exposes, and programs that run against it.
+DEEP:
+- **Layers:** transport (PCIe, RDMA, TCP), Base (queues, admin, fabrics), and command sets (NVM, ZNS, KV, and the newer ones). A test plan should name which layer defines each behavior.
+- **Selecting command sets:** with CAP.CSS reporting support, the host sets CC.CSS to "all supported I/O command sets", reads Identify (CNS 1Ch) for the list of supported combinations, and picks one by index with Set Features 19h (IOCSCI in CDW11 bits 8:0). Combination bits map NVM, KV, ZNS, SLM and CP. The overview is in the Fundamentals module (question 1.09).
+- **Subsystem Local Memory (SLM):** memory in the subsystem that is addressable by commands, in memory range sets, and can be a place programs read and write. It is not the same as CMB, which is host-visible through a PCIe BAR.
+- **Computational Programs (CP):** programs are loaded and activated in compute namespaces, then executed against memory ranges, with the results returned by commands. This maps onto the SNIA Computational Storage architecture, where a Computational Storage Engine works on Function Data Memory.
+- **How recent:** SLM and CP arrived with the Base 2.1 generation of specifications (2024 and later, believed, VERIFY). Most drives in the field do not implement them.
+- **What a validator cares about:** capability discovery, isolation of programs from user data and from each other, resource exhaustion, error and abort paths, and the effect of compute load on storage QoS, power and thermals.
+- **Other 2.x additions (pointers):** FDP (16.07 to 16.12), host-managed live migration and timestamp (16.08), and Copy (question 6.10).
+FOLLOW:
+- Is SLM the same as CMB? => No. CMB is BAR memory the host maps. SLM is memory accessed through NVMe commands within the subsystem and used by programs.
+- Why is Feature 19h needed if CC.CSS selects all command sets? => CC.CSS chooses the mode, and the profile chooses which combination of command sets the controller presents, since not all combinations may be valid together.
+PITFALL: Assuming an opcode means the same in each command set. The namespace CSI decides, and a test harness must decode by CSI.
+VERIFY: Which specification revision introduced SLM and CP, Identify CNS 1Ch and Feature 19h fields, and the combination vector bit positions.
+
+@@ 16.15 | Principal | Scenario | tags=fdp,validation-plan,conformance,power-loss,automation
+Q: Design a validation plan for an SSD that claims FDP support. What do you test, how do you observe it, and what are the pass criteria?
+SHORT: Use four tiers: conformance (configuration log, feature enable, PID handling, status codes, log formats), function (every handle takes data, RUH update, events, namespace binding), robustness (resets, power loss with open RUs, format, misuse) and outcome (WAF and latency at steady state against a non-FDP baseline). Observe with logs, RUH status and a wire trace. Pass criteria come from the specification, not from vendor claims.
+DEEP:
+1. **Conformance:** validate log 20h against feature 1Dh (counts consistent, config index valid), enable and disable rules, structure sizes and zero-based counters, FDP-off behavior for every FDP command (expect FDP Disabled), log formats across reads with offsets.
+2. **Placement functional:** for each handle, write and read back. Confirm RUH status changes (RU available media writes falls by the bytes written), RUH Update starts a new RU, PID validity (in-range, out-of-range, wrong namespace) and the event each produces, and that data integrity never depends on PID.
+3. **Events:** enable each event type through Feature 1Eh, provoke each (invalid PID, RU time limit, controller reset), and check timestamps, NSID and PID fields against what you did.
+4. **Namespace binding:** create namespaces with different placement handle lists, including invalid lists, and check they see the handles you assigned.
+5. **Robustness:** reset (CC.EN=0, FLR, PERST#) with open RUs, then check data integrity with a full-drive verify, and that RUHs reinitialize as documented. Power loss during writes to each handle: read-after-loss must show old or new data per the atomicity rules. Format and sanitize with FDP on.
+6. **Outcome:** precondition to steady state, run a fixed multi-stream workload with and without placement (fio with `--fdp=1 --fdp_pli=...` vs no directive), and compare WAF (from log 22h deltas), tail latency and throughput. Repeat across at least two lifetime mixes.
+7. **Pass criteria:** define them as measurable rules, for example: no data mismatch under any PID misuse; every documented event produced; WAF at or below a stated fraction of baseline for a workload with clearly separable lifetimes.
+8. **Automation:** a Python or SPDK harness driving nvme passthrough, a log snapshotter before and after each case, and a per-case record of PID sequence, bytes and log deltas so any failure replays.
+9. **Coverage traps:** RG count above one (Linux handles only one, so use a passthrough tool), multiple namespaces sharing one RUH, and a change of FDP configuration that resets state.
+FOLLOW:
+- What is the hardest thing to verify externally? => That the drive really separated the data physically. You only see it through WAF, events and vendor telemetry, so agree on those with the vendor.
+- How do you keep the WAF test from being noise? => Steady state, fixed span, repeated runs, the same seed, and deltas of the counters rather than absolute values.
+PITFALL: Judging conformance by one benchmark showing lower WAF. Benefit and correctness are separate questions and need separate tests.
+VERIFY: Every FDP requirement above against the current NVM Command Set and Base specifications, especially reset behavior, format and sanitize interaction, and the enable and reconfigure rules.
+
+@@ 16.16 | Principal | Cross-layer | tags=hmb,robustness,fault-injection,iommu,reset,firmware
+Q: How would you validate that a DRAM-less SSD stays correct when host memory misbehaves, that is, when HMB is disabled, corrupted, delayed or lost?
+SHORT: Treat HMB as an untrusted cache. Inject faults on the host side: take the buffer away with active I/O, corrupt or scribble its contents, delay or fail its DMA through the IOMMU or a PCIe fault injector, reset the controller with HMB enabled, and cycle power states. Pass means no silent data corruption and no hang, only slower or clean-error behavior, plus HMB being re-enabled and correct after each recovery.
+DEEP:
+The risk: if the drive keeps mapping updates only in HMB, or trusts what it reads back, then a host that reuses the memory, loses it in a reset or flips a bit can turn the FTL into a source of wrong data. So the firmware must protect HMB contents and keep the authoritative copy in NAND.
+1. **Baseline:** an HMB A/B run (16.05) so you know the healthy behavior.
+2. **Disable under load:** EHM=0 while random reads and writes run. The command must complete, later I/O must remain correct, and the controller must have stopped touching the memory (verify with an IOMMU unmap of that range after completion, which faults if it touches it).
+3. **Memory Return misuse:** re-enable with MR=1 after the host overwrote the buffer with a pattern. A robust drive should detect bad content (checksums or versioning) and rebuild, not use stale or garbage entries. This is a hostile test, so the pass criterion is data integrity, not necessarily acceptance.
+4. **Corruption:** flip bits or replace chunks with a pattern (using a custom kernel module, QEMU or a hypervisor page write) while I/O runs, then run a full read-verify against a known pattern with checksums per LBA. Expect either detection with clean recovery or a defined error, never wrong data.
+5. **DMA failure and delay:** with an IOMMU fault, a PCIe fault injector (poisoned TLP, completion timeout) or a delay injector, check the drive responds with a controlled error and recovers, and a stuck HMB read does not hang the whole controller. Correlate with AER on the PCIe side.
+6. **Reset and power:** FLR, CC.EN=0, PERST#, S3 and S4 suspend, shutdown and unsafe shutdown with HMB on. After each, HMB must be re-enabled by the driver (dmesg shows the allocation), and a full verify must pass.
+7. **Unsafe shutdown case:** if the drive holds dirty mapping updates in HMB when power is cut, the mapping must be recoverable from NAND metadata after power-up. Test with power loss at random points under write load.
+8. **Signals and evidence:** dmesg, `nvme smart-log` (unsafe shutdowns, media errors), Error Information log, IOMMU fault logs, PCIe analyzer capturing MRd TLPs to the HMB addresses.
+9. **Report:** by fault, the drive response (error, slower, hang, corruption) and whether firmware recovered without host help.
+FOLLOW:
+- What is the most damaging outcome? => Silent corruption, where the drive returns wrong data for a valid LBA with success status.
+- How does a security review relate? => The SSD can read and write host memory, so the IOMMU should confine it to the HMB range, and a firmware bug that goes out of range should fault, not corrupt the host.
+PITFALL: Only testing the happy path (enable and disable cleanly). The interesting failures come from resets, resume and a host that reuses memory.
+VERIFY: What the specification requires of the controller when HMB is disabled or the descriptor list is invalid, MR semantics, and shutdown and reset obligations regarding data held in HMB.
+
+@@ 16.17 | Principal | Scenario | tags=fdp,experiment-design,waf,steady-state,application,lifetime
+Q: A storage team wants proof that FDP will cut WAF for their database on your SSD. How do you design and defend the experiment?
+SHORT: Define the claim as a measured WAF difference, then remove every other variable. Precondition to steady state, run the real write pattern (or a trace-driven model) with and without placement tags, map lifetime classes to handles deliberately, and measure host and media bytes from the FDP statistics log across a long window. Repeat, report the spread, and explain the result through events and RUH usage. A lower WAF without a mechanism is not proof.
+DEEP:
+1. **Hypothesis:** for example, a compaction workload with three lifetime classes (WAL, hot levels, cold levels) writes less media data with three handles than with one. State it before measuring.
+2. **Classifier:** decide how the application labels data (by file, level or age) and how many classes it can express. A workload with 12 classes and 8 handles forces merging, so the merge rule is part of the experiment.
+3. **Baseline:** same drive, same firmware, same capacity, same span, without FDP tags (or with FDP disabled). Reformat between configurations, then precondition long enough to hit steady state (several times capacity of writes, checked by a flat WAF slope).
+4. **Measure:** log 22h deltas over a window in steady state, plus latency percentiles, throughput and events during the window. Compute WAF for both arms.
+5. **Explain:** RUH status and events show RU closures, PID errors and time-limit events. Compare per-handle write rates to RU size (question 16.10), since a slow handle can waste an RU.
+6. **Controls:** confirm PIDs on the wire, keep the same host software revision, fix temperature and power state, and run each arm several times to get a spread.
+7. **Sensitivity:** try isolation types (Initially and Persistently Isolated, if the drive offers both configurations), different RU sizes (configuration index), and over-provisioning, since FDP benefit shrinks as OP grows.
+8. **Threats to validity:** fresh-drive effects, background scrubbing, HMB or DRAM state, host page-cache changes, and counters that include metadata.
+9. **Decision:** state the gain with its spread, the conditions where it fails (uniform lifetimes, too few handles), and the cost (host classifier, monitoring events).
+FOLLOW:
+- What if WAF improves but tail latency worsens? => Look for RU Update or GC bursts aligned with RU closure. FDP can concentrate erase and reclaim into fewer, larger events, so report both.
+- What would make you say "not proven"? => Overlapping run-to-run spreads, an arm that never reached steady state, or gains that disappear when handle count matches the number of lifetime classes.
+PITFALL: Comparing a tuned FDP arm to an untuned baseline, or an FDP arm on a freshly formatted drive to a baseline on a used one.
+VERIFY: Which FDP configurations (handle counts, RU sizes, isolation types) your drive offers, and that the statistics log counters are supported.

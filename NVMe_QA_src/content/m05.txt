@@ -1,0 +1,418 @@
+# Module 5: Admin Command Set
+
+@@ 5.01 | Basic | Concept | tags=admin-queue,opcodes,overview
+Q: What is the admin queue, and which admin commands should you know by opcode?
+SHORT: The admin queue is queue pair 0, one submission and one completion queue that exist whenever the controller is enabled. It carries every command that is not ordinary data movement: Identify, queue creation, features, logs, abort, async events, firmware, namespace management, format, sanitize and security. The host programs it through AQA, ASQ and ACQ before setting CC.EN. I/O queues do not exist until an admin command creates them.
+DEEP:
+| Opcode | Command | Where covered |
+|---|---|---|
+| 00h / 01h | Delete / Create I/O Submission Queue | this module |
+| 04h / 05h | Delete / Create I/O Completion Queue | this module |
+| 02h | Get Log Page | this module, detail in module 13 |
+| 06h | Identify | this module, structures in module 7 |
+| 08h | Abort | this module |
+| 09h / 0Ah | Set Features / Get Features | this module |
+| 0Ch | Asynchronous Event Request | this module |
+| 0Dh / 15h | Namespace Management / Attachment | module 7 |
+| 10h / 11h | Firmware Commit / Firmware Image Download | this module |
+| 14h | Device Self-test | module 13 |
+| 18h | Keep Alive | this module |
+| 7Ch | Doorbell Buffer Config | this module |
+| 80h, 81h, 82h, 84h | Format NVM, Security Send, Security Receive, Sanitize | module 12 |
+
+- **Opcode spaces overlap:** the queue selects the command set. 01h is Write on an I/O queue but Create I/O Submission Queue on the admin queue, and 02h is Read versus Get Log Page.
+- **Direction bits:** opcode bits 1:0 give the data direction: 00b none, 01b host to controller, 10b controller to host, 11b both. Identify (06h), Get Log Page (02h) and Get Features (0Ah) are 10b, Set Features (09h) and Firmware Image Download (11h) are 01b, Firmware Commit (10h) is 00b.
+- **Others you may meet:** Directive Send and Receive (19h, 1Ah), Virtualization Management (1Ch), NVMe-MI Send and Receive (1Dh, 1Eh), Get LBA Status (86h). C0h to FFh are vendor specific.
+- **Sizing in Linux:** the admin queue has 32 entries and one is reserved for the Async Event Request.
+- **Why validators care:** it is the only path that changes controller state (queues, features, firmware, namespaces), so a stall here blocks the whole device, and it is exercised far less than the I/O path.
+FOLLOW:
+- Can the admin queue be deleted or resized while the controller is enabled? => No. There is no Create or Delete for queue 0, and its base and size stay as programmed until CC.EN is cleared and the controller is set up again.
+- What happens if you put Read (02h) on the admin queue? => It is decoded as Get Log Page, because the queue chooses the command set. Expect a log-page error or odd data, never a read.
+PITFALL: Decoding an opcode without checking which queue it came from. In a trace, read the SQID first.
+
+@@ 5.02 | Basic | Concept | tags=identify,cns,namespace-list,csi
+Q: What does Identify return, and which CNS values matter?
+SHORT: Identify (06h) returns a 4096-byte structure chosen by CNS in CDW10 bits 7:0. The core four are 00h Identify Namespace (needs an NSID), 01h Identify Controller, 02h Active Namespace ID list and 03h Namespace Identification Descriptor list. CNS 05h, 06h and 07h are the command-set-specific versions, selected by CSI in CDW11 bits 31:24. The 10h to 13h family serves namespace management and multi-controller subsystems.
+DEEP:
+| CNS | Returns | Also needs |
+|---|---|---|
+| 00h | Identify Namespace data structure | NSID |
+| 01h | Identify Controller data structure | nothing |
+| 02h | Active NSID list: up to 1024 NSIDs greater than the NSID given, ascending | NSID as start point |
+| 03h | Namespace Identification Descriptor list: EUI-64, NGUID, UUID and CSI descriptors | NSID |
+| 05h | I/O command set specific Identify Namespace (for ZNS, the zoned fields) | NSID, CSI |
+| 06h | I/O command set specific Identify Controller (for ZNS, ZASL) | CSI |
+| 07h | I/O command set specific Active NSID list | NSID, CSI |
+| 08h | I/O command set independent Identify Namespace | NSID |
+| 10h, 11h | Allocated NSID list, Identify Namespace for an allocated NSID | NSID |
+| 12h, 13h | Controllers attached to an NSID, controllers in the subsystem | NSID, CNTID |
+
+- **CDW10 layout:** CNS in bits 7:0 and the controller identifier CNTID in bits 31:16, used by the controller-list variants.
+- **CSI values:** 0 is the NVM command set, 2 is Zoned Namespace. The descriptor types for CNS 03h are 01h EUI-64 (8 bytes), 02h NGUID (16), 03h UUID (16) and 04h CSI (1).
+- **Everyday use:** `nvme id-ctrl /dev/nvme0`, `nvme id-ns /dev/nvme0n1`, `nvme list-ns /dev/nvme0` and `nvme ns-descs /dev/nvme0 -n 1`. Field-by-field decoding of the namespace side is module 7.
+- **Data buffer:** always 4096 bytes, one page at a 4 KiB memory page size, so PRP1 alone describes it when the buffer is page aligned.
+FOLLOW:
+- Why does CNS 02h return at most 1024 IDs? => 4096 bytes divided by 4 bytes per NSID. The host passes the last NSID it received to fetch the next page.
+- Which identifier should a test use to recognize a namespace across reboots and controller resets? => The descriptor list (NGUID, EUI-64 or UUID). The NSID is only a local handle.
+PITFALL: Assuming NSIDs 1 to NN are all active. NN is the largest NSID the controller can have, and active ones can be sparse, so use CNS 02h.
+VERIFY: Behavior for an inactive NSID (zero-filled structure versus error) and for NSID 0 or FFFFFFFFh on CNS 00h; the CNS 10h to 13h contents in the NVMe Base Specification.
+
+@@ 5.03 | Basic | Concept | tags=features,get-features,set-features,fid
+Q: How do Get Features and Set Features work, and which feature identifiers should you know?
+SHORT: Set Features (09h) and Get Features (0Ah) read and change controller settings named by a Feature Identifier in CDW10 bits 7:0. Small values sit in CDW11, larger ones in a data buffer (Timestamp, Autonomous Power State Transition, Host Behavior Support). Get Features returns the value in completion DW0. Get has a Select field and Set has a Save bit, covered in the advanced question on them.
+DEEP:
+| FID | Feature | Value layout |
+|---|---|---|
+| 01h | Arbitration | AB bits 2:0, LPW 15:8, MPW 23:16, HPW 31:24 |
+| 02h | Power Management | PS bits 4:0, workload hint bits 7:5 |
+| 04h | Temperature Threshold | TMPTH 15:0, TMPSEL 19:16, THSEL 21:20 |
+| 06h | Volatile Write Cache | WCE bit 0 |
+| 07h | Number of Queues | NSQR 15:0, NCQR 31:16, 0's based |
+| 08h | Interrupt Coalescing | THR bits 7:0, TIME bits 15:8 |
+| 09h | Interrupt Vector Configuration | IV bits 15:0, CD bit 16 |
+| 0Bh | Asynchronous Event Configuration | critical warnings bits 7:0, notices from bit 8 |
+| 0Ch | Autonomous Power State Transition | enable bit 0, table in buffer |
+| 0Eh | Timestamp | 8-byte buffer |
+| 0Fh | Keep Alive Timer | KATO in CDW11 |
+| 16h | Host Behavior Support | 512-byte buffer |
+
+- **Scope:** most features are controller-wide. A few are per namespace, and giving an NSID for a controller-wide feature may be rejected.
+- **Persistence:** by default a new value is volatile and returns to its default at a controller-level reset. The Save bit changes that.
+- **Meaning of the layouts:** they let you decode a raw `nvme get-feature` value by hand, which is what you need when reading a trace.
+- **Commands:** `nvme get-feature /dev/nvme0 -f 0x07 -H`, `nvme set-feature /dev/nvme0 -f 0x06 -v 0`.
+FOLLOW:
+- Where do Interrupt Coalescing and Arbitration get their full treatment? => Interrupt Coalescing and vector configuration are module 10, arbitration is module 3, power features are module 11.
+- Which feature must be set before any I/O queue exists? => Number of Queues, because it decides how many I/O queues the controller will accept.
+PITFALL: Reading a Get Features value as a plain number. Most values are packed bit fields, so 0x00030002 in Arbitration is AB = 2 and MPW = 3, not a number.
+VERIFY: Feature-specific field layouts and units (interrupt coalescing time is in 100 microsecond units) against the Set Features section of the Base Specification.
+
+@@ 5.04 | Intermediate | Concept | tags=create-cq,create-sq,delete-queue,qprio,ien,iv
+Q: What are the fields and ordering rules of Create and Delete I/O Queue commands?
+SHORT: Create I/O Completion Queue (05h) must precede Create I/O Submission Queue (01h) because the SQ names its CQ. Both take the queue base in PRP1, QID and 0's based QSIZE in CDW10, and PC in CDW11 bit 0. The CQ adds IEN (bit 1) and interrupt vector IV (bits 31:16). The SQ adds QPRIO (bits 2:1) and CQID (bits 31:16). Deletion runs in reverse: every SQ first, then the CQ.
+DEEP:
+| Field | Create I/O CQ (05h) | Create I/O SQ (01h) |
+|---|---|---|
+| PRP1 | base of the queue memory | base of the queue memory |
+| CDW10 | QID 15:0, QSIZE 31:16 | QID 15:0, QSIZE 31:16 |
+| CDW11 bit 0 | PC, physically contiguous | PC, physically contiguous |
+| CDW11 other | IEN bit 1, IV 31:16 | QPRIO 2:1, CQID 31:16 |
+
+Worked encodings: an SQ with QID 4 bound to CQ 4, PC set, medium priority (10b) has CDW11 = (4 << 16) | (2 << 1) | 1 = 0x00040005. A CQ with IEN and PC set and vector 4 has CDW11 = 0x00040003. Depth 1024 means QSIZE = 1023 = 0x3FF.
+
+| Condition | Status (SCT 1) |
+|---|---|
+| SQ names a CQ that does not exist | Completion Queue Invalid, SC 00h |
+| QID is 0, in use, or above the granted count | Invalid Queue Identifier, SC 01h |
+| QSIZE larger than CAP.MQES allows | Invalid Queue Size, SC 02h |
+| IV beyond the controller's vectors | Invalid Interrupt Vector, SC 08h |
+| Delete CQ while an SQ still uses it | Invalid Queue Deletion, SC 0Ch |
+
+- **QPRIO:** 00b urgent, 01b high, 10b medium, 11b low. It only has effect when CC.AMS selects weighted round robin with urgent priority (module 3). Otherwise it is ignored.
+- **IEN = 0:** the CQ raises no interrupt and the host polls it. This is how Linux poll queues are created.
+- **Deleting an SQ:** commands still outstanding are aborted and complete on the CQ with Command Aborted due to SQ Deletion (generic 08h).
+FOLLOW:
+- Why are sizes 0's based? => A field value n means n + 1 entries, so QSIZE 1023 is a 1024-entry queue and the 16-bit field can express 65536 entries.
+- What does PC = 0 mean? => PRP1 points to a PRP list describing scattered queue pages. It is allowed only if the controller does not require contiguous queues (CAP.CQR = 0).
+PITFALL: Creating the SQ first, or passing 1024 as QSIZE. The first gives Completion Queue Invalid, the second asks for 1025 entries.
+VERIFY: Minimum legal QSIZE, CAP.CQR bit and semantics, and whether outstanding commands on a deleted SQ must complete with 08h or may complete normally.
+
+@@ 5.05 | Intermediate | Numeric | tags=number-of-queues,queue-memory,msix,sizing
+Q: A host wants 64 I/O queue pairs at depth 1024. How does the Number of Queues negotiation work, and how much queue memory results?
+SHORT: The host sends Set Features FID 07h with NSQR and NCQR, 0's based, so 64 pairs is CDW11 = 0x003F003F. The controller answers in DW0 with the counts it actually allocated, also 0's based, for example 0x001F001F for 32 pairs. The host must live with the smaller of the two. Memory for 64 pairs at depth 1024 is 64 x (64 KiB + 16 KiB) = 5 MiB.
+DEEP:
+1. Request: 64 SQs and 64 CQs, so NSQR = NCQR = 63 = 0x3F, CDW11 = (63 << 16) | 63 = 0x003F003F.
+2. Grant: the controller may grant fewer, never more. Suppose DW0 = 0x001F001F. NSQA = NCQA = 31, meaning 32 SQs and 32 CQs. The host uses min(NSQA, NCQA) + 1 = 32 pairs, as Linux does.
+3. Memory at depth 1024: SQ entry 64 B x 1024 = 65,536 B = 64 KiB. CQ entry 16 B x 1024 = 16,384 B = 16 KiB. One pair is 80 KiB, so 64 pairs is 5,120 KiB = 5 MiB. The 32 granted pairs need 2.5 MiB.
+4. Vectors: one MSI-X vector per CQ if possible, plus vector 0 for the admin queue. A 33-entry MSI-X table serves 32 I/O CQs, so a 64-CPU host maps 2 CPUs to each queue.
+5. Admin queue: 32 entries in Linux is 32 x 64 B = 2 KiB for the SQ and 512 B for the CQ, on top of the I/O queues.
+
+- **One-shot feature:** the value can be set only before I/O queues are created. A later Set Features is expected to fail with Command Sequence Error.
+- **Get Features:** FID 07h returns the granted counts, so a validator can check them after the fact.
+- **Checks:** granted at most requested; Create queue with QID equal to the granted count (1-based) succeeds; QID one above it fails with Invalid Queue Identifier.
+FOLLOW:
+- Why can NSQA differ from NCQA? => Several SQs may share one CQ, so a controller can offer more SQs than CQs. The host then pairs one to one up to the smaller count.
+- What limits the depth of each queue? => CAP.MQES (0's based) and host memory. Linux takes the smaller of MQES + 1 and its io_queue_depth setting.
+PITFALL: Reading the DW0 counts as 1-based. A value of 0x001F001F means 32 queues, not 31.
+VERIFY: Command Sequence Error on a repeated Set Features for this FID, and whether request value FFFFh is reserved.
+
+@@ 5.06 | Intermediate | Concept | tags=get-log-page,lid,numd,lpo,rae
+Q: How is a Get Log Page command built: LID, NUMD, LPO and RAE?
+SHORT: Get Log Page (02h) selects the log with LID in CDW10 bits 7:0. Length is NUMD, a 0's based dword count split across NUMDL (CDW10 bits 31:16) and NUMDU (CDW11 bits 15:0). RAE is CDW10 bit 15. A byte offset LPO goes in CDW12 and CDW13, honored only if the controller supports extended data. RAE = 0 re-arms the asynchronous event linked to that log.
+DEEP:
+- **Worked example:** the SMART log is 512 bytes = 128 dwords, so NUMD = 127 = 0x7F. CDW10 = (0x7F << 16) | 0x02 = 0x007F0002 with RAE = 0, or 0x007F8002 with RAE = 1.
+- **Error log:** 64 entries x 64 B = 4096 B = 1024 dwords, so NUMD = 1023 and CDW10 = 0x03FF0001. Identify Controller ELPE (0's based) says how many entries exist.
+- **LSP:** a log-specific field in the bits just below RAE, used by a few logs (for example to create a host telemetry snapshot).
+- **LPO:** lets the host read a large log in pieces. Support is advertised in the Log Page Attributes byte of Identify Controller (bit 2, extended data).
+- **RAE:** with RAE = 0 the read clears the event that announced the log, so the controller may report the next one. With RAE = 1 a host can peek without re-arming.
+- **Errors:** an unsupported LID gives Invalid Log Page (SCT 1, SC 09h). The Commands Supported and Effects log (LID 05h) tells what a drive implements.
+- **Commands:** `nvme get-log /dev/nvme0 --log-id=2 --log-len=512`. Per-log field decoding is module 13.
+FOLLOW:
+- Why is the length split into two fields? => NUMD is 32 bits wide, and NUMDL alone (16 bits) caps a read at 65,536 dwords (256 KiB). NUMDU extends it for very large logs such as telemetry.
+- Does the transfer length interact with MDTS? => It should be treated as bounded by MDTS, so a large log is fetched in MDTS-sized pieces using LPO.
+PITFALL: Passing the byte length as NUMD. NUMD = bytes / 4 - 1, so 512 bytes is 127, not 512.
+VERIFY: The exact width and position of LSP, whether a Get Log Page longer than MDTS fails, and the LID 00h Supported Log Pages log (NVMe 2.0 onward).
+
+@@ 5.07 | Intermediate | Trap | tags=abort,acl,timeout,dw0
+Q: The Abort command completes with Success. Was the target command aborted?
+SHORT: Not necessarily. Abort is a best-effort request. Bit 0 of completion DW0 tells the result: 0 means the target was aborted, 1 means it was not, for example because it had already completed or could not be stopped. An aborted command completes on its own queue with Command Abort Requested (generic 07h). The number of Abort commands in flight is capped by ACL in Identify Controller, and one past it fails with Abort Command Limit Exceeded.
+DEEP:
+- **Command layout:** CDW10 SQID in bits 15:0 and CID in bits 31:16 name the victim. The Abort itself always travels on the admin queue.
+- **Outcomes:**
+
+| Abort CQE | Meaning |
+|---|---|
+| Success, DW0 bit 0 = 0 | the target was aborted and will complete with status 07h |
+| Success, DW0 bit 0 = 1 | not aborted: already finished, unknown CID, or not stoppable |
+| SCT 1, SC 03h | more than ACL + 1 Aborts outstanding |
+
+- **ACL:** Identify Controller byte 258, 0's based, with a recommended minimum of 4 outstanding Aborts.
+- **Two completions:** the Abort has its own CQE, and the target has one too. Do not reuse the target's CID until you have seen the target's CQE.
+- **Linux policy:** on an I/O timeout the driver sends one Abort, limited to ACL + 1 in flight, and resets the controller if the command times out again. An admin queue timeout skips the Abort and resets straight away.
+- **Test ideas:** abort a command sitting in the SQ, one mid-flight, one already completed, an unknown CID, and ACL + 2 concurrent Aborts.
+FOLLOW:
+- Can a controller decline every Abort? => Abort is a request and the DW0 bit exists to report a refusal, so a host needs its own timeout and reset path instead of relying on Abort.
+- What log evidence shows an abort was requested? => The Linux message `I/O tag ... QID N timeout, aborting`, then a completion with SC 07h for the victim, or a second timeout and `reset controller`.
+PITFALL: Treating Abort Success as proof the victim is gone. A Success with DW0 bit 0 = 1 means the victim may still complete, or already did.
+VERIFY: The recommended ACL minimum, and whether an Abort may target an Async Event Request or another Abort, in the Base Specification.
+
+@@ 5.08 | Intermediate | Concept | tags=aer,async-events,aerl,rae,aec
+Q: Walk through the Asynchronous Event Request lifecycle, including AERL and re-arming.
+SHORT: The host posts Async Event Request (0Ch) commands that carry no data and stay outstanding. When an enabled event occurs, the controller completes one AER with the event type, information and log page ID in DW0. The host then reads that log page with RAE = 0 and posts a new AER. AERL in Identify Controller (0's based) limits how many may be outstanding, and one more returns Asynchronous Event Request Limit Exceeded.
+DEEP:
+1. **Enable:** Set Features FID 0Bh chooses the events: critical warnings in bits 7:0 and notices from bit 8 (namespace attribute 8, firmware activation 9, telemetry log 10, ANA change 11).
+2. **Post:** the host submits up to AERL + 1 AERs. Linux posts one.
+3. **Event:** a completion arrives with DW0 bits 2:0 event type, bits 15:8 event information, bits 23:16 the log page to read.
+4. **Read the log** with RAE = 0. Until then the controller does not report another event of that kind.
+5. **Re-post** an AER, or the next event has nowhere to go.
+
+| Type | Information examples | Log |
+|---|---|---|
+| 0 Error | 00h write to invalid doorbell, 01h invalid doorbell value, 03h persistent internal error, 05h firmware image load error | 01h |
+| 1 SMART/Health | 00h reliability, 01h temperature threshold, 02h spare below threshold | 02h |
+| 2 Notice | 00h namespace changed, 01h firmware activation starting, 02h telemetry changed, 03h ANA change | 04h, 03h, 08h, 0Ch |
+| 6 I/O command set | 00h reservation log available, 01h sanitize completed | 80h for reservations |
+| 7 Vendor | vendor defined | vendor |
+
+- **No timeout:** an AER is meant to stay outstanding, so a host driver must exempt it from command timeouts.
+- **Reset:** all outstanding AERs vanish on a controller reset and must be posted again.
+- **Linux:** for SMART and Error events it stores the value and raises a udev change event (NVME_AEN=...) for userspace, so somebody must read the log page.
+FOLLOW:
+- What if an event happens with no AER outstanding? => The controller is expected to hold the event and report it when the next AER arrives. Do not rely on this: test it against your drive.
+- What does AERL = 3 mean? => Four AERs may be outstanding at once. The fifth fails with SCT 1, SC 05h.
+PITFALL: Re-posting an AER without reading the log page with RAE = 0. The controller may keep that event class masked, so the host silently loses later events.
+VERIFY: Whether the event mask is per event type or per event, the buffering of events when no AER is outstanding, and the Telemetry Log Changed log page ID, in the Base Specification.
+
+@@ 5.09 | Intermediate | Concept | fig=fwslots | tags=firmware,download,commit,slots,activation
+Q: Explain firmware update: download, commit actions, slots and activation.
+SHORT: Two admin commands do it. Firmware Image Download (11h) moves the image into the controller in dword-aligned chunks with an offset. Firmware Commit (10h) names a slot in FS (bits 2:0) and an action in CA (bits 5:3). CA 0 stores without activating, 1 stores and activates at the next reset, 2 activates an existing slot at the next reset, and 3 activates immediately without a reset. The Firmware Slot log page shows what is active.
+DEEP:
+1. **Discover:** Identify Controller FRMW (byte 260) has bit 0 slot 1 read-only, bits 3:1 number of slots, bit 4 activation without reset supported, bit 5 multiple update detection. FWUG (byte 319, 4 KiB units, 00h no information, FFh no restriction), MTFA (bytes 271:270, 100 ms units) and MDTS also matter.
+2. **Download:** CDW10 holds NUMD (0's based dwords), CDW11 the dword offset. Each chunk is at most MDTS and each offset a multiple of FWUG. A 4 MiB image in 64 KiB chunks is 64 commands, NUMD = 0x3FFF, offsets stepping by 0x4000.
+3. **Commit:** CDW10 = (CA << 3) | FS. For example slot 2 with CA 1 is 0x0A. FS = 0 lets the controller pick.
+4. **Activate:** by reset, or live for CA 3.
+
+| CA | Action |
+|---|---|
+| 0 | Replace the image in slot FS, do not activate |
+| 1 | Replace the image in slot FS, activate at the next reset |
+| 2 | Activate the existing image in slot FS at the next reset |
+| 3 | Request immediate activation of the image in slot FS, without a reset |
+| 6, 7 | Replace or activate a Boot Partition (module 12) |
+
+5. **Verify:** Firmware Slot log page (03h): AFI byte holds the active slot in bits 2:0 and the slot for the next reset in bits 6:4, then FRS1 to FRS7 as 8-byte revision strings. Identify Controller FR bytes 71:64 show the running revision.
+- **Live activation:** the controller may announce Firmware Activation Starting (notice 01h), then pause command processing (CSTS.PP set) for at most MTFA.
+- **Rollback:** keep the old image in another slot and use CA 2.
+FOLLOW:
+- What does plain Success on CA 1 mean for the reset needed? => The image takes effect at the next controller-level reset (CC.EN cleared then set). Statuses 10Bh, 110h and 111h are committed-but answers that name a stronger reset.
+- What happens when a commit targets slot 1 and slot 1 is read-only? => Invalid Firmware Slot (SCT 1, SC 06h). A corrupt image gives Invalid Firmware Image (SC 07h).
+PITFALL: Trusting the commit status as proof of activation. Read the Firmware Slot log and Identify FR after the reset.
+VERIFY: AFI bit positions, the exact meaning of CA 1 and 2 across spec revisions (reset scope), out-of-order and overlapping download rules, and MTFA units.
+
+@@ 5.10 | Advanced | Concept | tags=features,select,save,capabilities,persistence
+Q: What do the Select field of Get Features and the Save bit of Set Features do, and how would you test them?
+SHORT: Get Features CDW10 bits 10:8 select what is returned: 0 current, 1 default, 2 saved, 3 supported capabilities. Set Features CDW10 bit 31 (SV) asks that the value also persist across resets and power cycles. A feature that cannot be saved fails with Feature Identifier Not Saveable (SC 0Dh) and one that cannot be changed fails with Feature Not Changeable (SC 0Eh). Select 3 lets a validator discover what each feature allows.
+DEEP:
+| SEL | Returns |
+|---|---|
+| 0 | Current value |
+| 1 | Default value |
+| 2 | Saved value |
+| 3 | Supported capabilities, reported in DW0 |
+
+- **Three values per feature:** current (in effect now), default (fixed by the vendor), saved (written with SV = 1).
+- **Reset behavior:** unsaved current values return to the default at a controller-level reset. A saved value is loaded back instead of the default.
+- **Capabilities word:** flags for saveable, namespace specific and changeable. It replaces guessing from error codes.
+- **Other statuses:** Feature Not Namespace Specific (SC 0Fh) can come back when an NSID is given for a controller-wide feature.
+
+Test design:
+1. Sweep FID 00h to FFh with SEL = 3. Unsupported FIDs must fail cleanly (Invalid Field) and the drive must stay healthy.
+2. For each supported, changeable FID: Set with SV = 0, then Get SEL 0 must show the new value, and SEL 1 and SEL 2 must not move.
+3. Reset the controller: current must equal saved if any, otherwise default.
+4. Set with SV = 1, power cycle, and Get SEL 0 must equal the saved value.
+5. Where the capabilities word says not saveable, Set with SV = 1 must return SC 0Dh.
+6. Restore defaults at the end (SEL 1 value, SV = 1 if it had been saved).
+FOLLOW:
+- What does `nvme set-feature -s` do? => It sets the SV bit. Use it only on scratch drives, because a saved bad value such as a low temperature threshold outlives every power cycle.
+- How do you reset a feature to the vendor default? => Read SEL 1, write that value back with Set Features, and use SV = 1 if a saved value exists. There is no separate reset command.
+PITFALL: Forgetting that saved values outlive your test run, so the next run starts from a changed baseline.
+VERIFY: SEL 3 DW0 bit positions (save, namespace specific, changeable), the reset rule when a saved value exists, and whether SEL 3 exists before NVMe 1.4.
+
+@@ 5.11 | Advanced | Numeric | tags=temperature-threshold,kelvin,async-events,aec,thermal
+Q: Encode a temperature threshold of 85 C, and an under-temperature threshold on sensor 3, then explain what you should see on the drive.
+SHORT: NVMe temperatures are in Kelvin, so 85 C is 358 K = 0x166. Temperature Threshold (FID 04h) packs TMPTH in bits 15:0, TMPSEL in 19:16 and THSEL in 21:20, so an over-temperature threshold on the composite temperature (TMPSEL 0, THSEL 0) is CDW11 = 0x00000166. An under threshold of 0 C (273 K = 0x111) on sensor 3 is CDW11 = (1 << 20) | (3 << 16) | 0x111 = 0x00130111.
+DEEP:
+1. Convert: 85 + 273 = 358 = 0x166. 0 + 273 = 273 = 0x111. For reference 70 C is 343 K = 0x157.
+2. Pack the first case: TMPTH = 0x166, TMPSEL = 0 (composite), THSEL = 0 (over). CDW11 = 0x00000166.
+3. Pack the second: TMPTH = 0x111, TMPSEL = 3 (sensor 3), THSEL = 1 (under). CDW11 = 0x00100000 + 0x00030000 + 0x111 = 0x00130111.
+4. Commands: `nvme set-feature /dev/nvme0 -f 4 -v 0x166`, then `nvme get-feature /dev/nvme0 -f 4 -H` to read it back.
+
+What to see when a threshold is crossed:
+- SMART log composite temperature (bytes 2:1) is in Kelvin, so a reading of 0x0166 is 358 K.
+- The SMART Critical Warning temperature bit (bit 1) sets, and if the event is enabled in Async Event Configuration (bit 1 of FID 0Bh) an AER completes with type 1, information 01h and log 02h, so DW0 = 0x00020101.
+- Read the SMART log with RAE = 0 to re-arm.
+- Identify Controller WCTEMP and CCTEMP (bytes 267:266 and 269:268) are also in Kelvin.
+
+Test: read the current composite temperature, set the threshold about 2 K above it, apply load, expect the event within the sensor update interval, then restore the threshold.
+FOLLOW:
+- What are TMPSEL values? => 0 is the composite temperature and 1 to 8 select temperature sensors 1 to 8. The value 0xF selects all.
+- Why test both over and under? => Firmware often has separate code paths, and separate bugs, for the over and under directions.
+PITFALL: Setting the threshold in Celsius. 85 (0x55) as TMPTH means 85 K, which the drive is always above, so the event condition is permanently true.
+VERIFY: TMPSEL encodings (0 composite, 1 to 8 sensors, 0xF all), default threshold values, and the SMART and Identify offsets, in the Base Specification.
+
+@@ 5.12 | Advanced | Debug | tags=firmware-commit,status,cqe,reset,decode
+Q: Firmware Commit with CA = 3 completes with DW3 = 0x02230007. Decode it and say what the host does next.
+SHORT: DW3 0x02230007 is phase 1, SC 11h, SCT 1, DNR 0, CID 7: Firmware Activation Requires Controller Level Reset. The image was committed but this image cannot activate live, so the old firmware is still running. The host schedules a controller reset, or a stronger reset if the drive asks for one, then verifies with the Firmware Slot log page. It is neither a failure nor an activation.
+DEEP:
+CQE DW3 layout: CID bits 15:0, phase bit 16, SC bits 24:17, SCT bits 27:25, CRD bits 29:28, More bit 30, DNR bit 31.
+
+Decode 0x02230007: (DW3 >> 17) & 0xFF = 0x11 = SC; (DW3 >> 25) & 7 = 1 = SCT; bit 16 = 1 = phase; low 16 bits = 7 = CID; bits 31:28 = 0, so DNR = 0.
+
+| SC (SCT 1) | DW3, CID 7, P 1 | Meaning | Next step |
+|---|---|---|---|
+| 06h Invalid Firmware Slot | 0x020D0007 | slot invalid or read only | pick another slot |
+| 07h Invalid Firmware Image | 0x020F0007 | image rejected | redownload, check the file |
+| 0Bh | 0x02170007 | committed, conventional reset needed | PCIe reset or power cycle |
+| 10h | 0x02210007 | committed, NVM Subsystem Reset needed | NSSR |
+| 11h | 0x02230007 | committed, controller level reset needed | CC.EN toggle |
+| 12h | 0x02250007 | live activation would exceed MTFA | activate by reset instead |
+| 13h | 0x02270007 | prohibited by the controller | vendor specific, retry later |
+
+Investigation after the status:
+1. Read the Firmware Slot log: the AFI shows the slot chosen for the next reset while the active slot is unchanged.
+2. Do the named reset, for example `nvme reset /dev/nvme0` (controller reset through sysfs), `nvme subsystem-reset /dev/nvme0` for NSSR.
+3. Identify FR and the Firmware Slot log must now show the new revision.
+4. If the old image still runs, the new one failed to load or fell back. Check the error log, any Firmware Image Load Error event (05h), and vendor logs.
+FOLLOW:
+- Is 111h a failed test? => Only if the drive advertised live activation (FRMW bit 4) and the image is supposed to support it. Otherwise it is a valid answer.
+- How does nvme-cli report 10Bh, 110h and 111h? => As Success plus a note that firmware requires a reset, because the commit did succeed.
+PITFALL: Reading SC without SCT. SC 11h in SCT 0 is SGL Descriptor Type Invalid, an unrelated generic status.
+VERIFY: Exact definitions of SC 0Bh, 10h, 11h, 12h and 13h across spec revisions, and DW0 contents (multiple update detection) of the Commit completion.
+
+@@ 5.13 | Advanced | Debug | tags=admin-queue,timeout,identify,hang,linux
+Q: An Identify command on the admin queue times out and Linux resets the controller. How do you tell wedged firmware from a lost interrupt or a lost doorbell?
+SHORT: Look at what each hop did. Read CSTS (RDY, CFS) and check the BAR is readable. Check the admin CQ memory for a CQE the host missed, which means a lost interrupt. On an analyzer, follow the chain: SQ tail doorbell write, the SQE fetch, the CQE write, then the vector 0 MSI-X write. The first missing link locates the fault at the host, the PCIe link, the firmware, or the interrupt path.
+DEEP:
+- **Symptom in dmesg:** `I/O tag N (...) opcode 0x6 (...) QID 0 timeout, reset controller`. The default admin timeout in Linux is 60 seconds. A message `completion polled` instead means a CQE was sitting in the queue and the interrupt was lost.
+
+| Evidence | Meaning |
+|---|---|
+| CSTS reads 0xFFFFFFFF | link or device gone, so move to PCIe debug (see the PCIe page) |
+| CSTS.CFS = 1 | controller reports a fatal status |
+| CSTS.RDY = 1, CFS = 0, no CQE | alive but not answering: wedged firmware or an unseen doorbell |
+| CQE present in host memory | interrupt lost: vector 0 masked, wrong MSI-X entry, or IOMMU remap |
+| SQ doorbell TLP seen, no SQE read | firmware not polling the SQ, or the doorbell write was dropped |
+| SQE read seen, no CQE write | firmware hung inside the command |
+| CQE write seen, wrong phase or CID | firmware bug in the completion path |
+
+- **Doorbell addresses:** with DSTRD = 0 the admin SQ tail doorbell is at BAR0 + 1000h and the admin CQ head doorbell at 1004h (module 3).
+- **Not a bug:** some admin commands legitimately run long (Format NVM, a firmware commit that writes NAND). Compare with the command timeout before calling a hang.
+- **Recovery check:** after the reset the controller must go RDY 0 to 1 within the CAP.TO limit and Identify must work. Repeat 100 times to catch intermittent hangs.
+- **Firmware side:** UART or JTAG shows which command the admin task was running and whether the admin queue was being polled.
+- **Misuse events:** a doorbell value beyond the queue size raises an Error AEN (01h invalid doorbell value) and log 01h entries.
+FOLLOW:
+- Does Linux try an Abort first? => Not for the admin queue. The driver resets the controller directly on an admin timeout, and only I/O queue commands get an Abort first.
+- How would you reproduce it on demand? => Use firmware fault injection to swallow the CQE, delay it past the timeout, or mask vector 0, and confirm the driver's reaction and recovery each time.
+PITFALL: Blaming firmware before checking whether the CQE reached host memory. A lost interrupt looks identical from the driver but is a different owner.
+VERIFY: The exact dmesg strings on your kernel version, the 60 second default (nvme_core.admin_timeout), the doorbell offsets for your DSTRD, and the Error event names for invalid doorbell writes.
+
+@@ 5.14 | Advanced | Concept | tags=oacs,effects-log,keep-alive,dbbuf,discovery
+Q: How does a host discover which admin commands a drive supports, and what do Keep Alive and Doorbell Buffer Config do?
+SHORT: OACS in Identify Controller flags optional admin commands: Security, Format, Firmware, Namespace Management, Device Self-test, Directives, NVMe-MI, Virtualization Management, Doorbell Buffer Config, Get LBA Status. The Commands Supported and Effects log (LID 05h) lists every admin and I/O opcode with support and side-effect flags. Keep Alive (18h) resets a liveness timer, and Doorbell Buffer Config (7Ch) sets up shadow doorbells for emulated controllers.
+DEEP:
+- **OACS bits (Identify Controller bytes 257:256):** 0 Security, 1 Format NVM, 2 Firmware, 3 Namespace Management, 4 Device Self-test, 5 Directives, 6 NVMe-MI, 7 Virtualization Management, 8 Doorbell Buffer Config, 9 Get LBA Status.
+- **Effects log (LID 05h):** 4096 bytes, 256 admin entries then 256 I/O entries of 4 bytes each, indexed by opcode. Bit 0 command supported, bit 1 logical block content change, bit 2 namespace capability change, bit 3 namespace inventory change, bit 4 controller capability change. Bits 18:16 say what other commands may run at the same time.
+- **Keep Alive:** opcode 18h, no data. The timeout is Set Features FID 0Fh (KATO, in milliseconds) with granularity from KAS in Identify Controller (100 ms units, 0 means unsupported). It matters most on fabrics. On PCIe it is optional.
+- **Doorbell Buffer Config:** opcode 7Ch. PRP1 is a shadow doorbell page and PRP2 an event index page, so a host in a virtual machine can update memory instead of trapping on MMIO doorbell writes. Its value is mostly on emulated or virtualized controllers.
+- **Pointers:** Format, Sanitize, Security Send and Receive are module 12, Device Self-test is module 13.
+
+Validator use: build a support matrix from OACS and the effects log at start of every run and cross-check it. An opcode with bit 0 clear must fail with Invalid Command Opcode (generic 01h), and an opcode with bit 0 set must succeed with valid arguments.
+FOLLOW:
+- Why does the effects log matter for safety? => Flags such as namespace inventory change and logical block content change tell the OS which commands change state. Linux reads it during passthrough, for example to freeze I/O queues around commands with side effects.
+- What if OACS says Firmware is supported but Firmware Commit returns Invalid Opcode? => It is a conformance bug: the capability bit and the actual behavior disagree, and a cross-check test should catch it.
+PITFALL: Assuming the identify bits are complete. Vendor commands in C0h to FFh appear only in the effects log, if at all.
+VERIFY: OACS bit positions (bit 9, Get LBA Status), effects log bit definitions and bits 18:16, and Keep Alive support on PCIe controllers.
+
+@@ 5.15 | Principal | Scenario | tags=conformance,negative-testing,fuzzing,automation,admin
+Q: Design an automated conformance and negative-test suite for a new SSD's admin command set.
+SHORT: Start with discovery (Identify, effects log, Get Features SEL 3) to build a capability map, then drive a table of expected outcomes: valid cases per command, invalid-field cases, state-order cases, limit cases (ACL, AERL, queue counts) and reset interactions. After each case run a health probe. Randomized fuzzing runs only on non-destructive opcodes on scratch drives, with seeds logged, and failures are triaged by status code, drive state and repeatability.
+DEEP:
+1. **Discovery:** Identify Controller, per-namespace Identify, the descriptor list, the effects log and a SEL 3 sweep of FIDs. Store it as a golden capability map, per firmware build.
+2. **Case table** (opcode, CDW10 to CDW15, NSID, buffer, expected SCT and SC and DNR), grouped as:
+   - valid boundaries (max queue size, max granted queues, last slot, smallest and largest NUMD)
+   - invalid fields (reserved CNS and LID, bad NSID, QID 0, unsupported FID, non-zero reserved bits where the spec calls for rejection)
+   - order and state (Create SQ before CQ, Delete CQ with SQ attached, a second Number of Queues, commit without download)
+   - limits (ACL + 2 concurrent Aborts, AERL + 2 AERs, more queues than granted)
+   - interaction (admin storm while I/O runs, reset during an admin command, queue delete with outstanding I/O)
+3. **Oracles:** exact status when the spec is exact, a set of allowed statuses when it is loose. Structural checks on every returned structure: reserved bytes zero, lists ascending, counts consistent (active NSID list against NN, ELPE against error log length).
+4. **Health probe after every case:** CSTS.CFS clear, Identify and SMART reads succeed, a 4 KiB write plus read-verify passes, and no unexpected Error log growth.
+5. **Automation:** Python over NVME_IOCTL_ADMIN_CMD, `nvme admin-passthru`, or SPDK, with cases as data (YAML or JSON). Log raw command and CQE per case, run each case in a fresh controller state, and store analyzer traces for failures.
+6. **Metrics:** coverage (opcodes x field classes), pass rate per build, flake rate on reruns, time to detect.
+Rule for destructive opcodes: exclude Format, Sanitize, Security Send and Firmware Commit from random fuzz, and run them only in dedicated cases on scratch drives.
+FOLLOW:
+- How do you treat behavior the spec leaves open? => Mark it advisory. Record the observed behavior per vendor and only fail on the change between firmware builds.
+- How do you keep fuzz results reproducible? => Log seed and case index, pin the firmware build, save the CQE and trace, and replay the exact sequence from a fresh reset.
+PITFALL: Scoring every unusual status as a bug. A conformance suite that mixes must-fail and may-fail cases produces noise that hides real defects.
+
+@@ 5.16 | Principal | Scenario | tags=firmware-update,power-loss,fault-injection,reset,validation
+Q: How would you validate the firmware update path, including power loss at every stage?
+SHORT: Build a matrix of commit actions, slots and reset types, and inject faults at each stage: mid download, between download and commit, inside commit, during activation, and on first boot of the new image. Pass criteria are that the drive always boots a valid image, never bricks, keeps data and saved settings, and reports the slot state truthfully. Judge the result from the drive (log page, Identify FR, behavior), not from the commit status.
+DEEP:
+1. **Matrix:** CA 0, 1, 2, 3; slot 0 (controller picks), the first and last slot, read-only slot 1, an invalid slot; reset by CC.EN toggle, NSSR, PCIe reset, and power cycle; with and without I/O load.
+2. **Fault points:** partial download; download done but not committed; power cut during commit (image write); during activation reset; first boot; and during live activation (CA 3).
+3. **Bad images:** truncated, single bit flipped, wrong header, image for another product. Expect Invalid Firmware Image at commit and the old firmware still running.
+4. **Download rules:** offsets not multiples of FWUG, overlapping or interleaved downloads (multiple update detection where supported), chunks above MDTS.
+5. **Evidence per run:** Firmware Slot log before and after, Identify FR and FRMW, SMART unsafe shutdowns, dmesg, Error log, a data pattern written before and verified after, and saved features compared before and after.
+6. **Live activation:** measure the longest command latency during activation against MTFA x 100 ms, check the Firmware Activation Starting event, and confirm outstanding commands complete.
+7. **Decision:** the pass criterion is zero bricks and zero data loss. With N injections and no failures, the rule of three gives a 95% upper bound of about 3/N on the failure rate, so 1000 clean injections show a rate below about 0.3%. Randomize the cut time within each phase, because a few fixed points miss narrow windows.
+Automation needs a programmable power switch with controllable cut timing, a console log, and a recovery path for a drive that hangs.
+FOLLOW:
+- What do you do when the drive comes back but reports the wrong slot as active? => Capture the log page, vendor logs and UART, then rerun the same cut point. The suspect is the ordering of slot metadata updates in firmware.
+- How do you know the cut landed in the phase you wanted? => Use firmware or console timestamps, or a PCIe trace, to relate the cut time to the commit and activation events.
+PITFALL: Testing only the happy path with the vendor tool. Real bricks come from the seconds around commit and first boot.
+VERIFY: Whether a controller must fall back to a previous image after a failed boot (vendor behavior), and CA 3 support requirements, in the Base Specification.
+
+@@ 5.17 | Principal | Cross-layer | tags=aer,temperature,root-cause,linux,firmware
+Q: A drive crosses its temperature threshold but the host never sees the event. How do you find where it was lost?
+SHORT: Walk the event path. Was the event class enabled in Async Event Configuration? Was an AER outstanding? Had the previous event's log been read with RAE = 0, or is that class still masked? Did the controller write the completion (DW0 0x00020101) and the interrupt? Did the host driver forward it? Linux only enables notice events by default and hands SMART events to userspace, so a missing enable or a missing log read is the usual cause.
+DEEP:
+| Step | Check | Evidence |
+|---|---|---|
+| 1 | Did the condition exist? | SMART critical warning bit 1, composite temperature against the threshold in Kelvin |
+| 2 | Is it enabled? | `nvme get-feature -f 0x0b -H`, bit 1 for temperature. Linux sets only notice bits |
+| 3 | Threshold set as intended? | Get Features 04h, over versus under, TMPSEL |
+| 4 | AER outstanding? | driver post count, or the AER in the admin SQ trace |
+| 5 | Class re-armed? | was the SMART log read with RAE = 0 after the last event? |
+| 6 | CQE written? | analyzer: admin CQ write with DW0 0x00020101 (type 1, info 01h, LID 02h) |
+| 7 | Interrupt delivered? | vector 0 MSI-X write, `/proc/interrupts` |
+| 8 | Host handled it? | udev NVME_AEN event, tracepoints |
+
+- **Decode DW0 = 0x00020101:** bits 2:0 = 1 (SMART/Health), bits 15:8 = 01h (temperature threshold), bits 23:16 = 02h (SMART log).
+- **Likely causes in rank order:** event class not enabled, AER never re-posted after reset, log page never read so the class stayed masked, firmware bug (condition met but no event), interrupt path.
+- **Firmware side:** UART or telemetry to see whether the event was raised internally and suppressed by the mask.
+- **Experiment:** enable the event, set the threshold near the current temperature, cross it, and confirm the sequence. Then repeat without reading the log, to prove the mask.
+Decision criteria: the first step where evidence and expectation diverge names the owner (host config, host driver, spec-mandated masking, firmware).
+FOLLOW:
+- How would you make this a regression test? => Script the enable, threshold, heat step and log read loop, assert the DW0 value and the number of events across several crossings, and run it after every firmware build.
+- Does a reset change anything? => Yes. AERs are dropped and the Async Event Configuration returns to default unless saved, so the host must reconfigure and repost after every controller reset.
+PITFALL: Checking only the drive. The drive may be correct while the host never enabled the event or never re-armed it.
+VERIFY: Default Async Event Configuration values after reset, whether the mask is per class or per event, and the AER-when-none-outstanding behavior, in the Base Specification.

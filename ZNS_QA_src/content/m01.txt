@@ -1,0 +1,327 @@
+# Module 1: Why Zoned Storage
+
+@@ 1.01 | Basic | Concept | tags=nand,ftl,erase,program
+Q: Why does a conventional SSD need an FTL, and what does that FTL cost?
+SHORT: NAND is read and programmed in pages but erased only in whole blocks, and pages in a block are programmed in order, so data cannot be overwritten in place. A conventional SSD hides this behind a Flash Translation Layer that redirects every overwrite to a fresh location, tracks it in an L2P table and garbage-collects stale pages later. The costs are DRAM for the table, spare capacity, write amplification and latency variability.
+DEEP:
+- **The media rule:** program a page (for example 16 KiB), erase a block (many MiB, and larger once the firmware groups blocks across dies into a superblock). Overwrite means invalidate the old copy and write a new one elsewhere.
+- **The interface promise:** NVMe (NVM command set) lets the host overwrite any LBA at any time in any order. The FTL keeps that promise by remapping.
+- **What the FTL must do:** L2P mapping, write buffering and striping across channels and dies, garbage collection, wear leveling, bad block management, ECC and refresh.
+- **Four costs of the promise:**
+  - DRAM for the mapping table (about 1 GB per TB at 4 KiB granularity, see the numeric question later in this module).
+  - Over-provisioning (OP) so GC always has free blocks to work with.
+  - Write amplification (WAF): NAND writes greater than host writes, which burns endurance.
+  - Tail latency: GC copies share dies and channels with host I/O.
+- **Validation consequence:** behaviour depends on fill level and history. A fresh-out-of-box drive says little about steady state.
+FOLLOW:
+- What does Deallocate (TRIM) do for the FTL? => It marks LBAs invalid so GC does not relocate stale data, which lowers WAF.
+- Why is the erase block bigger than the program page? => Erase is a whole-block electrical operation on shared substrate, so the granularity is set by the array design, not by choice.
+PITFALL: Treating GC as free background work. It steals die time and endurance, and its cost grows as the drive fills.
+
+@@ 1.02 | Basic | Concept | fig=conv_vs_zns | tags=zoned-model,zones,write-pointer,host-managed
+Q: What is the zoned storage idea, and how does it differ from a conventional block device?
+SHORT: The LBA space is divided into fixed-size zones. Each zone must be written sequentially at its write pointer, and it can be rewritten only after the whole zone is reset. Because the device never sees overwrites, it needs no remapping or device GC. The host decides which data goes into which zone and reclaims space itself by copying live data and resetting zones. Placement and GC responsibility move from the device to the host.
+DEEP:
+| Aspect | Conventional SSD | Zoned (ZNS) SSD |
+|---|---|---|
+| Write rule | Any LBA, any order, overwrite allowed | Sequential at write pointer, per zone |
+| Reclaim | Device GC, invisible to host | Host copies live data, then resets zone |
+| Mapping | Page-level L2P, large table | Zone to erase-block mapping, tiny table |
+| Spare capacity | Large OP for GC headroom | Small reserve for bad blocks and metadata |
+| Data placement | Device guesses lifetimes | Host chooses zone, so lifetimes can align |
+| Latency source | Hidden GC and background work | Mostly visible host actions |
+
+- **Core trick:** if all data in a zone dies together, a reset frees it with zero copying, so GC moves nothing and WAF approaches 1.
+- **Contract, not magic:** the host must honor the write pointer and resource limits. See the Zones, States & the Write Pointer module for the rules.
+- **Host-managed:** the device exposes the media constraint instead of hiding it.
+FOLLOW:
+- What is the unit of reclaim? => A whole zone (via reset), which maps to whole erase blocks inside the device.
+- Does the host now see NAND geometry? => Only coarsely: zone size and zone capacity, not pages or dies.
+PITFALL: Describing zones as "just big erase blocks". A zone is a logical write-ordering contract, and its mapping to NAND is a firmware choice.
+
+@@ 1.03 | Basic | Concept | tags=smr,zac,zbc,heritage
+Q: Where does the zoned model come from, and what is the connection to SMR hard drives?
+SHORT: Shingled magnetic recording overlaps tracks like roof shingles, so rewriting one track damages its neighbours and bands must be written sequentially. The T10 ZBC (SCSI) and T13 ZAC (ATA) standards exposed that as zones with write pointers, Report Zones and Reset Write Pointer. NVMe ZNS reuses the same host-managed zoned model for flash, so one Linux zoned block layer and the same tools serve both.
+DEEP:
+- **Why SMR needed it:** the write head is wider than the read element, so density gains come from overlapping tracks. In-place update of a middle track is impossible without rewriting the rest of the band.
+- **Zone types in ZAC and ZBC:**
+  - Conventional zones: random write, no write pointer, used for metadata.
+  - Sequential write required: only writes at the write pointer are accepted.
+  - Sequential write preferred: random writes are accepted but may be slow (host-aware drives).
+- **What ZNS kept:** write pointer, zone states, Report Zones, open, close, finish and reset semantics. The state machine is deliberately close to ZAC and ZBC.
+- **What ZNS changed:** all zones are sequential write required, zone capacity may be smaller than zone size, and Zone Append exists (see the Zone Append module).
+- **Typical sizes:** SMR zones are commonly 256 MiB. ZNS zone sizes are device-defined and often larger, so check the Identify data rather than assume.
+FOLLOW:
+- Why does that matter to a firmware validator? => Host tools such as blkzone and fio zonemode=zbd behave the same across SMR and ZNS, so test infrastructure is reusable.
+- Does flash have SMR's overlap problem? => No. Its constraint is page-order programming and block erase, but the resulting host contract looks similar.
+PITFALL: Assuming ZNS inherited conventional or sequential-write-preferred zones. NVMe ZNS defines only sequential write required zones.
+VERIFY: ZBC and ZAC zone type names and the 256 MiB typical zone size; ZNS zone types in the Zoned Namespace Command Set Specification.
+
+@@ 1.04 | Intermediate | Concept | tags=host-managed,host-aware,drive-managed,models
+Q: Compare drive-managed, host-aware and host-managed zoned devices. Where does ZNS fit?
+SHORT: Drive-managed devices hide the sequential constraint behind their own translation layer and look like ordinary disks. Host-aware devices accept random writes but report zones and prefer sequential ones. Host-managed devices reject non-sequential writes, so the host must comply. ZNS is host-managed: every zone is sequential write required. A conventional NVMe SSD is the flash analogue of drive-managed.
+DEEP:
+| Model | Random writes | Host must know zones | Who hides the media |
+|---|---|---|---|
+| Drive-managed | Accepted | No | Device, always |
+| Host-aware | Accepted but penalised | Optional, for speed | Device, as a fallback |
+| Host-managed | Rejected (error) | Yes | Nobody; host adapts |
+
+- **Drive-managed SMR:** uses a persistent cache and its own translation layer. It behaves like a normal disk until sustained random writes exhaust the cache, then throughput collapses.
+- **Host-aware:** compatibility with legacy software, but performance is unpredictable when the host does not follow the rules, so it appears to have seen little use.
+- **Host-managed:** predictable and simple for the device, but software must be zone-aware. Linux reports it in `/sys/block/<dev>/queue/zoned` as `host-managed`.
+- **ZNS nuance:** there is no host-aware flavour. Later additions such as ZRWA give a limited random-write window inside a zone, but the namespace stays host-managed (see the ZRWA module).
+FOLLOW:
+- Why does the drive-managed cliff matter for SSD validation? => It is the same pattern as a conventional SSD at steady state: fine until the hidden reclaim engine is overloaded.
+- Can a legacy filesystem use a host-managed disk directly? => No. It must be zone-aware, or sit behind a translation layer such as dm-zoned.
+PITFALL: Calling ZNS "host-aware". Errors on non-sequential writes are the defining host-managed behaviour.
+
+@@ 1.05 | Intermediate | Concept | tags=waf,gc,lifetime,mixed-placement
+Q: Explain how garbage collection produces write amplification and why mixed data lifetimes make it worse.
+SHORT: WAF is bytes programmed to NAND divided by bytes the host wrote. When GC reclaims a block, it must first copy the still-valid pages elsewhere. If a fraction v of the victim block is valid, freeing one block's worth of space costs v/(1-v) extra writes per host write, so WAF is 1/(1-v). Mixing short-lived and long-lived data in one block leaves blocks partly valid, which keeps v high.
+DEEP:
+1. Steady state: every host write consumes free space, so GC must free the same amount.
+2. Reclaiming a block with valid fraction v frees (1-v) of a block and costs a copy of v.
+3. Per unit of host data, the device writes 1 (host) plus v/(1-v) (relocation) = 1/(1-v).
+
+| Valid fraction v in victim | WAF = 1/(1-v) |
+|---|---|
+| 0 (all stale) | 1.0 |
+| 0.25 | 1.33 |
+| 0.50 | 2.0 |
+| 0.75 | 4.0 |
+| 0.80 | 5.0 |
+
+- **Why mixing hurts:** hot data dies quickly but sits next to cold data that stays. Blocks age into a partly valid state and GC keeps copying the cold pages again and again.
+- **Why zones help:** if the host groups by expected death time, a zone is either all valid or all stale, and reset frees it with v = 0.
+- **What OP does:** more spare capacity lowers the average v of the victims chosen, so WAF drops. See the OP numeric question below.
+FOLLOW:
+- Is the v of the victim the same as average drive utilisation? => No. Greedy GC picks the emptiest blocks, so victim v is lower than average valid fraction, but under uniform random writes it still rises steeply with fill.
+- Where do you read WAF from a real drive? => From vendor or OCP log fields for media writes versus the host-written counter in the standard SMART log.
+PITFALL: Quoting a WAF without the workload and fill level. WAF is a property of the workload, the OP and the firmware together.
+VERIFY: Names of the media-written and host-written fields in the OCP SMART / Health Information Extended log.
+
+@@ 1.06 | Intermediate | Numeric | tags=l2p,dram,mapping,capacity
+Q: How much DRAM does a page-level L2P table need on a 4 TB SSD, and what does a zone-level mapping need instead?
+SHORT: With 4 KiB mapping units and 4-byte entries, a 4 TiB drive needs 2^30 entries, which is 4 GiB of table, the familiar 1 GB per TB rule. A zoned device with 1 GiB zones only maps each zone to its erase blocks: 4096 zones x 64 blocks x 4 bytes is about 1 MiB, plus zone descriptors, roughly 1.25 MiB in total. That is about 3000 times smaller.
+DEEP:
+Assumptions: 4 TiB user capacity, 4 KiB mapping granularity, 4-byte physical addresses, 1 GiB zones, 16 MiB erase blocks, 64 bytes of state per zone.
+1. Page-level L2P: 4 TiB / 4 KiB = 2^42 / 2^12 = 2^30 entries. Times 4 bytes = 4 GiB.
+2. With a 16 KiB mapping unit (some large-capacity drives do this) it falls to 1 GiB, at the price of read-modify-write for small writes.
+3. Zoned: 4 TiB / 1 GiB = 4096 zones. Each zone is 1 GiB / 16 MiB = 64 blocks, at 4 bytes each = 256 bytes per zone. Total = 4096 x 256 B = 1 MiB.
+4. Zone state: 4096 x 64 B = 256 KiB. Total about 1.25 MiB. Ratio = 4 GiB / 1.25 MiB = about 3277.
+
+- **Why reads still work:** inside a zone the LBA-to-die, block and page mapping is arithmetic on the stripe layout, so no per-LBA table is needed.
+- **What does not shrink:** DRAM used for write buffers, per-block wear and validity metadata, bad block tables and firmware structures. Real ZNS drives may still carry DRAM for these, so the benefit is often lower cost and power rather than no DRAM.
+FOLLOW:
+- Why is a 4-byte entry enough? => 2^32 units x 4 KiB = 16 TiB of addressable space, above the 4 TiB drive.
+- Does the DRAM saving change the failure model? => Yes. A small table can be persisted quickly, so power-loss recovery is simpler, but write-buffer contents still need capacitor-backed flushing.
+PITFALL: Claiming a ZNS SSD ships with no DRAM. The mapping table shrinks by orders of magnitude, but other DRAM users remain.
+VERIFY: Typical mapping granularity and entry width on shipping drives are vendor-specific, so present them as assumptions.
+
+@@ 1.07 | Intermediate | Concept | tags=zns,nvme,command-set,overview
+Q: What exactly is ZNS in NVMe terms, and where does it stand in the market?
+SHORT: ZNS is the NVMe Zoned Namespace Command Set. A namespace using it is divided into equal-size zones that are all sequential write required, each with a write pointer and a state. It adds Zone Management Send and Receive, an optional Zone Append command, and zone-specific identify data and status codes. It was standardized around 2020 and published as a command set specification with NVMe 2.0.
+DEEP:
+- **Command set model:** since NVMe 2.0, command sets are selected per namespace by a Command Set Identifier, so one controller can expose NVM and Zoned namespaces together. See the ZNS Architecture module.
+- **Core elements:** zone size and zone capacity, the write pointer, zone states, resource limits on open and active zones, and reads that follow their own rules above the write pointer.
+- **Relationship to SMR:** same host-managed model, shared software stack, flash-specific additions.
+- **Availability:** enterprise ZNS drives have shipped (for example the Western Digital Ultrastar DC ZN540 and Samsung PM1731a), and Linux gained ZNS support in the 5.x series.
+- **Market view, hedged:** ZNS needs zone-aware software, so adoption has been narrower than the original hype suggested. The backward-compatible Flexible Data Placement (FDP) specification appears to have drawn more attention. Treat this as an assessment to confirm against current vendor roadmaps.
+FOLLOW:
+- Is ZNS a new transport or a new interface? => Neither. It is a command set that runs over the same queues and transports as NVM.
+- Which Linux kernel introduced ZNS support? => The 5.x series, around 5.9, with zone append support in the block layer.
+PITFALL: Treating "ZNS" as a product feature switch. It is a different namespace type with different rules, not a mode of a conventional namespace.
+VERIFY: Ratification timing (TP 4053, 2020) and inclusion in NVMe 2.0; the Zoned command set CSI value; first Linux kernel with ZNS support; which vendors currently ship ZNS drives.
+
+@@ 1.08 | Intermediate | Concept | tags=latency,tail-latency,gc,reset
+Q: Why do conventional SSDs show tail latency spikes, and what does ZNS change?
+SHORT: In a conventional SSD, host I/O shares dies and channels with GC copies, wear leveling and refresh, and NAND program and erase operations take from hundreds of microseconds to milliseconds, so reads and writes can queue behind them. The spikes are load and fill dependent and invisible to the host. ZNS removes most device-initiated relocation, so latency is more predictable, but reset, finish, host GC and media effects like read retry remain.
+DEEP:
+- **Sources of tail in a conventional drive:**
+  - GC copy traffic and block erases.
+  - Write buffer exhaustion when the host outruns the media.
+  - Wear leveling and read-disturb refresh.
+  - Mapping table cache misses on drives with partial L2P caching.
+- **Rough scale (order of magnitude, vendor dependent):** NAND read tens of microseconds, program hundreds of microseconds to a millisecond or more, erase several milliseconds. A read stuck behind an erase gives a tail hundreds of times the median, unless program and erase suspend are used.
+- **What ZNS changes:** the host controls when data moves, so relocation can be scheduled or throttled. With zone-aligned lifetimes there may be almost none.
+- **What remains:**
+  - Zone Reset (erase) and Zone Finish can take long, so measure them as first-class operations.
+  - ECC and read retries on aged blocks.
+  - Host GC competing with foreground I/O, which is now your problem.
+  - Per-zone write concurrency limits: one writer per zone at low queue depth.
+FOLLOW:
+- Is a lower median latency a ZNS benefit? => Not necessarily. The benefit is in the tail and its stability over time.
+- What does a validator plot to show the difference? => Percentile latency versus time at steady state, with fill level and media writes overlaid.
+PITFALL: Claiming ZNS has no tail latency. It moves and exposes the sources rather than removing every one of them.
+
+@@ 1.09 | Advanced | Numeric | tags=op,waf,endurance,capacity
+Q: Estimate the capacity and endurance a zoned SSD gains over a conventional one with 7 percent and 28 percent OP.
+SHORT: Using the common greedy, uniform-random approximation WAF = (1+a)/(2a) for OP ratio a, 7 percent OP gives WAF of about 7.6 and 28 percent gives about 2.3. On 4096 GiB of raw NAND that exports 3828 GiB and 3200 GiB. A zoned drive with a 3 percent reserve exports about 3973 GiB, gaining about 4 percent and 24 percent, and with WAF near 1.1 it writes about 7 times less NAND per host byte than the 7 percent case.
+DEEP:
+Assumptions: 4096 GiB raw NAND, OP ratio a = spare / user capacity, ZNS reserve of 3 percent for bad blocks and metadata, ZNS device WAF of 1.1, host GC not included.
+1. a = 0.07: WAF = 1.07 / 0.14 = 7.64. User = 4096 / 1.07 = 3828 GiB.
+2. a = 0.28: WAF = 1.28 / 0.56 = 2.29. User = 4096 / 1.28 = 3200 GiB.
+3. ZNS: user = 4096 x 0.97 = 3973 GiB. Gain = 3973/3828 - 1 = 3.8 percent, and 3973/3200 - 1 = 24.2 percent.
+4. Endurance per host byte scales as 1/WAF. Against the 7 percent case: 7.64 / 1.1 = about 6.9 times less wear. Against the 28 percent case: 2.29 / 1.1 = about 2.1 times.
+
+- **Read the result carefully:** the model is a worst-case-like uniform random workload. Real drives with hot and cold separation do better, so the gap is smaller in practice.
+- **Do not double count:** capacity gain and WAF gain are separate levers. A vendor can sell the WAF gain as endurance or trade it for capacity.
+- **Host GC moves the goalposts:** any host-side relocation adds back to total WAF. See the last question in this module.
+FOLLOW:
+- Why does WAF fall as OP rises? => GC victims are drawn from a larger pool of blocks, so they hold less valid data when chosen.
+- Is the 3 percent reserve a spec value? => No. It is an assumption. Real reserves depend on media, bad block budget and firmware.
+PITFALL: Mixing GB and GiB. Raw NAND is binary while user capacity is often decimal, and this alone can add several points of apparent OP.
+VERIFY: The (1+a)/(2a) approximation is a widely quoted greedy-GC model, so cite it as a rule of thumb, not a measured value.
+
+@@ 1.10 | Advanced | Concept | tags=host-burden,gc,resources,tradeoffs
+Q: What does ZNS take away from the host in flexibility, and what new work does it create?
+SHORT: The host must write each zone sequentially at the write pointer, so it cannot update in place. It must group data by lifetime, run its own GC by copying live data and resetting zones, stay within open and active zone limits, and handle zones that go Read Only or Offline. In return it gets less OP, less device DRAM, lower WAF and steadier latency.
+DEEP:
+- **Write ordering:** writes must reach the device in write-pointer order, which in practice limits each zone to one in-flight writer unless the host stack guarantees ordering. Zone Append lifts this at the price of device-chosen placement.
+- **Allocation:** choose which zone each write goes to, ideally by expected lifetime.
+- **Host GC:** pick victim zones, read live data, rewrite, update host metadata, reset. This needs CPU, bandwidth and free-zone reserve.
+- **Resource budgeting:** the device caps open and active zones (see the Zone Resources module). The software must never exceed the caps or expect automatic eviction to be free.
+- **Failure handling:** zones can become Read Only or Offline. After power loss the host must rediscover write pointers with Report Zones and recover partial writes.
+- **Metadata:** in-place updated metadata needs somewhere to live, typically a small conventional namespace or a log with checkpoints.
+- **Legacy software:** filesystems and applications that overwrite in place cannot run directly, so a translation layer or a rewrite is needed.
+FOLLOW:
+- What is the biggest risk of moving GC to the host? => Foreground I/O and GC interfering with each other, so you rebuilt the tail latency problem in software.
+- Which of these does a device validator test? => Enforcement of every rule: rejecting misordered writes, respecting limits, honest state reporting.
+PITFALL: Presenting ZNS only as savings. The savings are paid for in host complexity, and some workloads never recover that cost.
+
+@@ 1.11 | Advanced | Concept | tags=lsm,f2fs,btrfs,rocksdb,log-structured
+Q: Which host software fits zoned storage naturally, and why does lifetime alignment matter?
+SHORT: Software that already writes sequentially and deletes data in large batches fits best: LSM-tree databases such as RocksDB (through the ZenFS plugin), log-structured filesystems such as F2FS, and copy-on-write filesystems such as Btrfs in zoned mode. Their files or segments die together, so if they map to the same zone, a reset frees it with almost no copying. Poor alignment turns every zone reset into a copy job.
+DEEP:
+- **LSM trees:** SSTables are written once, sequentially, and deleted whole after compaction. Files created at the same level or time have similar lifetimes.
+- **F2FS:** log-structured, with segments and its own cleaner. It has supported zoned block devices for host-managed SMR and ZNS.
+- **Btrfs:** copy-on-write allocation was extended with a zoned mode for host-managed devices (Linux 5.12).
+- **Poor fits:** ext4 has no zoned mode, and update-in-place B-tree engines have to be redesigned or placed behind a translation layer.
+- **Lifetime hints:** the deciding factor is whether the software can tell the allocator which data will die together. RocksDB gives write lifetime hints per file, and ZenFS uses them to pick zones.
+- **Validation angle:** a device test suite should mimic these patterns, such as many zones opened at once and whole-zone resets in bursts, not just a single sequential stream.
+FOLLOW:
+- What does dm-zoned do? => It exposes a zoned device as a regular block device by adding a translation and GC layer, which reintroduces some of what ZNS removed.
+- Why do lifetime hints have such leverage? => They decide zone occupancy, which decides victim validity and therefore host WAF.
+PITFALL: Assuming that any log-structured design maps well. If different lifetimes are interleaved in the same zone, host GC copies as much as device GC would have.
+VERIFY: Kernel versions for F2FS and Btrfs zoned support and current XFS zoned support; ZenFS maintenance status. Detailed stack coverage is in the Host Software Stack module.
+
+@@ 1.12 | Advanced | Trap | tags=trap,ftl,waf,firmware
+Q: A colleague says ZNS SSDs have no FTL and no write amplification. What is wrong with that?
+SHORT: Both claims are false. The FTL shrinks but still does zone-to-block mapping, bad block management, wear leveling, ECC, read disturb and retention refresh, write buffering with power-loss protection, and zone state persistence. Write amplification does not vanish either: it moves to the host GC, plus a device residual from padding, metadata and media management. The end-to-end figure is the product of application, host and device factors.
+DEEP:
+- **What stays in firmware:**
+  - Zone-to-erase-block allocation and mapping, including replacement of grown bad blocks, or moving a zone to Read Only or Offline when spares run out.
+  - Wear leveling across the pool of free blocks, since zone resets do not wear evenly by themselves.
+  - LDPC and read retry, read disturb management, data retention refresh.
+  - Write buffer, power-loss capacitors, recovery of write pointers and zone states after an unsafe shutdown.
+  - Zone state machine enforcement, resource accounting, and error reporting.
+- **Where WAF comes from now:**
+  - Application: compaction or cleaning inside the software.
+  - Host zone GC: copying live data before reset.
+  - Device: padding during Zone Finish or close, metadata, refresh, and internal relocation, often small.
+- **Formula:** total WAF = application x host GC x device.
+
+The correct claim is "ZNS removes the device GC that comes from overwrite remapping, and gives the host the means to reduce WAF".
+FOLLOW:
+- How would a validator catch a firmware that quietly relocates zone data? => Compare media-written counters against host-written bytes on a zone-aligned, whole-zone-reset workload, where the expected device WAF is close to 1.
+- Why is the device firmware still complex? => Media management, power-loss safety and error handling are unchanged, and the zone state machine is a new surface.
+PITFALL: Answering "yes, WAF is 1" when asked about ZNS. It is device WAF that approaches 1 for well-aligned workloads, not the system's.
+
+@@ 1.13 | Advanced | Debug | tags=debug,fio,waf,latency,steady-state
+Q: Random-write p99.9 latency on a conventional SSD spikes 50x above the median every few seconds after the drive fills. How do you prove GC is responsible, and what would you compare on a ZNS drive?
+SHORT: Precondition to steady state, run a timed fio job with per-second latency logs, and read the media-written and host-written counters before and after. If the spikes track a WAF well above 1 and disappear when the same data is written to zones and reset whole, GC is the cause. Then repeat on ZNS with zone-aware writes and compare percentile latency versus time, and total media writes, not just averages.
+DEEP:
+1. Precondition: fill the drive sequentially twice, then run random 4 KiB writes for at least one to two drive capacities, until throughput is stable. Record fill percentage.
+2. Measure, with logs:
+```
+nvme smart-log /dev/nvme0
+fio --name=rw --filename=/dev/nvme0n1 --direct=1 --ioengine=io_uring \
+    --rw=randwrite --bs=4k --iodepth=32 --time_based --runtime=1800 \
+    --write_lat_log=lat --log_avg_msec=1000 --percentile_list=50:99:99.9:99.99
+nvme smart-log /dev/nvme0
+```
+3. Compute WAF: media bytes written during the run divided by host bytes written. Host bytes come from Data Units Written (units of 512,000 bytes). Media bytes come from a vendor or OCP extended log.
+4. Correlate: plot the lat log against time. GC-driven spikes are periodic and scale with fill, and WAF rises as the drive fills. A single spike at time zero is a warm-up artifact, not GC.
+5. Control: repeat at 50 percent fill. If spikes vanish, GC pressure is the variable.
+6. ZNS side: check `cat /sys/block/nvme0n2/queue/zoned` shows `host-managed`, write sequentially with zone-aware fio (`--zonemode=zbd`), and reset whole zones. Expect WAF near 1, flatter latency, and reset time visible as its own event.
+
+| Illustrative result | Conventional (fill 90%) | ZNS (zone-aligned) |
+|---|---|---|
+| WAF | 3 to 5 | about 1.0 to 1.1 |
+| p99.9 / median | tens of x | a few x |
+
+The table is illustrative, not measured data.
+FOLLOW:
+- What if ZNS shows spikes anyway? => Suspect zone reset or finish stalls, host GC contention, too many open zones, or media retries. Correlate with timestamps of those operations.
+- Why does fio need direct=1 for zonemode=zbd? => Buffered I/O is reordered by the page cache and cannot honor the write pointer.
+PITFALL: Reading a latency histogram without time. Averaged percentiles hide the periodicity that identifies GC.
+VERIFY: The `nvme ocp smart-add-log` plugin name and the physical media written field name in the OCP log; fio option names against the installed fio version.
+
+@@ 1.14 | Principal | Cross-layer | tags=fdp,zns,conventional,data-placement,comparison
+Q: Compare conventional, FDP and ZNS as ways to place data on an SSD, and say how validation changes for each.
+SHORT: Conventional gives full compatibility and pays in OP, DRAM and WAF. FDP keeps normal writes but lets the host tag them with a placement identifier so the device groups data by lifetime. The device still does GC, and it is backward compatible. ZNS forces sequential zones and hands GC to the host, giving the largest savings and the largest software burden. Validation shifts from a plain LBA workload, to hint behaviour, to a strict state machine.
+DEEP:
+| Aspect | Conventional | FDP | ZNS |
+|---|---|---|---|
+| Write rule | Any LBA, any order | Any LBA, plus placement hint | Sequential per zone |
+| Who does GC | Device | Device | Host |
+| Host changes needed | None | Optional tagging | Zone-aware software |
+| Compatibility | Full | Works with legacy software | Requires zone-aware host |
+| DRAM and OP savings | None | Moderate, less GC pressure | Largest |
+| Failure of host discipline | None | Falls back to normal WAF | Errors or host-side GC storm |
+
+- **FDP in brief:** specified by TP 4146 (ratified late 2022). Terms include Reclaim Unit, Reclaim Group, Reclaim Unit Handle and Placement Identifier. It has a log with host-written and media-written statistics.
+- **Design choice:** if the workload has clean lifetime groups and the team owns the software, ZNS gives the strongest gains. If software is mixed or third-party, FDP gets much of the WAF benefit with less risk.
+- **Validation implications:**
+  - ZNS: state machine and illegal-transition coverage, resource limits, Zone Append ordering, error status codes.
+  - FDP: Reclaim Unit Handle behaviour, placement identifier validation, statistics log accuracy, behaviour under hint misuse.
+  - Conventional: steady-state WAF and QoS under preconditioning.
+- **Market view, hedged:** FDP is often described as easier to adopt, but this should be confirmed against current deployments.
+FOLLOW:
+- Can one drive offer both? => Possibly as different namespaces or configurations, but treat that as vendor-specific and check Identify and configuration data.
+- What does FDP lose relative to ZNS? => Placement is a hint and the device still runs GC, so WAF is lower but not host-guaranteed to approach 1, and OP is not fully eliminated.
+PITFALL: Framing this as "best technology wins". The right answer depends on software ownership, workload lifetimes and operational risk.
+VERIFY: FDP TP number and ratification date, FDP log page and term names in the current NVMe Base Specification; any statement about market adoption of ZNS versus FDP.
+
+@@ 1.15 | Principal | Scenario | tags=migration,tco,decision,validation-risk
+Q: A customer asks whether to move a storage fleet from conventional NVMe SSDs to ZNS. How do you build the case, and what do you validate first?
+SHORT: Start from the workload: measure its overwrite pattern, data lifetimes, baseline WAF and tail latency at production fill. Prototype the zone-aware software with host GC and measure end-to-end WAF, latency and CPU cost. Build a cost model for DRAM, OP, endurance and operations. Then set go or no-go gates and validate the device rules the software will lean on, including limits, error handling and power-loss recovery.
+DEEP:
+1. **Characterize:** capture write traces (block trace or application counters) and estimate the data death-time distribution. Small random in-place updates or unpredictable lifetimes argue against ZNS. Bulk sequential, append-only or LSM patterns argue for it.
+2. **Baseline:** on the current drives at 70 to 90 percent fill, record WAF, p99 and p99.9 latency and throughput after preconditioning.
+3. **Prototype:** run the actual software (or a faithful replay) on ZNS with a real host GC. Record end-to-end WAF, GC CPU use, GC bandwidth share and tail latency.
+4. **Cost model:** exported capacity per dollar (OP), DRAM and power, drive life in years from WAF, and the engineering and operations cost of new tooling and telemetry.
+5. **Software readiness:** minimum kernel, filesystem and tool versions, firmware update and drive replacement procedures, support for multiple vendors with different zone size and limits.
+6. **Device validation gates:** vendor-to-vendor differences in open and active zone limits and zone append size; behaviour on unsafe shutdown (write pointer recovery); Read Only and Offline zone handling; reset and finish latency; long-run stress with injected errors.
+7. **Decide:** set thresholds in advance, for example a minimum cost or endurance gain at equal p99.9, and a rollback path.
+
+- **Hidden costs:** host CPU for GC, engineering time, fewer drive vendors, and smaller test coverage in the field.
+FOLLOW:
+- What single result would make you stop? => Prototype end-to-end WAF close to the conventional baseline, because the host GC then erased the gain.
+- How do you de-risk a phased rollout? => Canary a small fleet slice with full telemetry on zone events, resets and media errors, and keep data restorable to conventional drives.
+PITFALL: Deciding on vendor datasheet WAF. The decision depends on the customer's workload and the customer's software.
+
+@@ 1.16 | Principal | Cross-layer | tags=waf,benchmark,methodology,stack
+Q: How do you fairly quantify the benefit of ZNS for a database workload, and what does the arithmetic look like across the stack?
+SHORT: Compare at the same exported capacity or cost, same fill, and steady state, and measure write amplification at every layer. Total WAF is application x host GC x device. With assumed factors of 10 x 3 = 30 on a conventional SSD versus 10 x 1.2 x 1.05 = 12.6 on ZNS, the media wear falls about 2.4 times. Application WAF is unchanged, so it caps the possible gain.
+DEEP:
+Assumptions (hypothetical): leveled LSM compaction gives application WAF 10; the conventional device WAF is 3; ZNS host GC WAF is 1.2 and device WAF is 1.05.
+1. Conventional: 10 x 3 = 30 NAND bytes per user byte.
+2. ZNS: 10 x 1.2 x 1.05 = 12.6 NAND bytes per user byte.
+3. Ratio: 30 / 12.6 = about 2.4 times less wear, or 2.4 times more sustained writes for the same endurance.
+4. Application WAF (the 10) is the same in both, so ZNS cannot fix it. Reducing it needs a different compaction strategy.
+
+Method for fairness:
+- **Equal footing:** same NAND, same host-visible capacity or same cost, same fill and dataset, same CPU budget, and the same steady-state definition (for example throughput stable within 5 percent over a window).
+- **Measure each layer:** application counters (user bytes versus bytes written to files), host GC counters (bytes relocated), device counters (media versus host bytes). Do not infer one from the others.
+- **Report tails and CPU:** p99.9 over time, and host CPU per GB written.
+- **Repeat:** several runs with variance, since GC behaviour is chaotic.
+- **Sensitivity:** vary fill and lifetime alignment. The gain should degrade in a predictable way as alignment worsens.
+
+- **Pitfall in the design:** an unfair baseline, such as comparing ZNS against a conventional drive left at 7 percent OP with a tuned software stack against a stock one.
+FOLLOW:
+- What single metric would you present to management? => Cost per user byte written over the drive lifetime at target p99.9, which combines capacity, endurance and QoS.
+- How does validation feed the model? => Firmware defects that add hidden relocation show up as device WAF above about 1.05 in the zone-aligned test, which directly weakens the case.
+PITFALL: Attributing the whole gain to ZNS when part of it came from better software lifetime hints that would also help a conventional drive.
+VERIFY: The example factors are assumptions, not measurements; label them as such in any presentation.

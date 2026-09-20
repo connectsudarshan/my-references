@@ -1,0 +1,375 @@
+# Module 6: NVM Command Set (I/O Commands)
+
+@@ 6.01 | Basic | Concept | tags=opcodes,oncs,command-set,reservations
+Q: Which commands make up the NVM Command Set, and which of them are optional?
+SHORT: Flush (00h), Write (01h) and Read (02h) are the core. Everything else is optional and advertised in the ONCS field of Identify Controller: Write Uncorrectable (04h), Compare (05h), Write Zeroes (08h), Dataset Management (09h), Verify (0Ch), Copy (19h) and the four reservation commands. A validator reads ONCS first and only expects a command to work when its bit is set.
+DEEP:
+| Opcode | Command | ONCS bit | Data direction |
+|---|---|---|---|
+| 00h | Flush | (core) | none |
+| 01h | Write | (core) | host to controller |
+| 02h | Read | (core) | controller to host |
+| 04h | Write Uncorrectable | 1 | none |
+| 05h | Compare | 0 | host to controller |
+| 08h | Write Zeroes | 3 | none |
+| 09h | Dataset Management | 2 | host to controller |
+| 0Ch | Verify | 7 | none |
+| 0Dh, 0Eh, 11h, 15h | Reservation Register, Report, Acquire, Release | 5 | mixed |
+| 19h | Copy | 8 | host to controller (source ranges) |
+
+- **Opcode pattern:** bits 1:0 of the opcode give the data direction (00b none, 01b host to controller, 10b controller to host, 11b bidirectional), which is why Write is 01h and Read is 02h.
+- **Reservations, briefly:** Register adds, removes or replaces a host key, Acquire takes or preempts a reservation, Release releases or clears it, Report lists registrants and the holder. Six reservation types exist, and a host that the type excludes gets Reservation Conflict (generic status 83h). Multi-host detail belongs to the multipath module.
+- **Not in this list:** Zone Management Send (79h), Receive (7Ah) and Zone Append (7Dh) belong to the separate Zoned Namespace command set, and the Admin commands live in the Admin module.
+- **Validation habit:** an unadvertised command must fail cleanly with Invalid Command Opcode (generic 01h). Test both directions: supported commands work, unsupported ones are rejected without side effects.
+FOLLOW:
+- What does the ONCS-clear case look like on the wire? => The CQE returns SCT 0, SC 01h (Invalid Command Opcode) and the namespace is unchanged.
+- Why does the opcode encode data direction? => Controllers and analyzers can size the DMA phase from the opcode alone, without a per-opcode table.
+PITFALL: Assuming an optional command exists because the drive is "enterprise class". Read ONCS, and treat Invalid Opcode on an unadvertised command as correct behavior.
+VERIFY: ONCS bit positions and whether Flush is still listed as mandatory in the NVM Command Set revision you target.
+
+@@ 6.02 | Basic | Concept | tags=read,write,slba,nlb,fua,lr,cdw12
+Q: What are the important fields in a Read or Write command?
+SHORT: The namespace ID, a 64-bit starting LBA (SLBA, CDW10 and CDW11), a 16-bit Number of Logical Blocks (NLB, CDW12 bits 15:0, zero-based), the FUA and Limited Retry flags, PRINFO for protection information, a hint byte in CDW13, and the data pointer (PRP or SGL) plus an optional metadata pointer. NLB of 0 means one block.
+DEEP:
+| Location | Bits | Field |
+|---|---|---|
+| CDW10 and CDW11 | 63:0 | SLBA |
+| CDW12 | 15:0 | NLB (zero-based) |
+| CDW12 | 23:20 | DTYPE (directive type, for example Streams) |
+| CDW12 | 29:26 | PRINFO: PRACT in bit 29, PRCHK in bits 28:26 |
+| CDW12 | 30 | FUA |
+| CDW12 | 31 | LR (Limited Retry) |
+| CDW13 | 7:0 | Dataset Management hints |
+| CDW14 and CDW15 | | Reference tag, application tag and mask (protection information) |
+
+- **FUA on a Write:** the controller must put the data (and metadata) on non-volatile media before it posts the completion. It covers only that command.
+- **LR:** a hint that the controller may give up error recovery sooner. It trades a higher chance of an error for lower latency.
+- **CDW13 hints:** access frequency, access latency, sequential-request and incompressible bits. They are hints only.
+- **PRINFO:** a pointer here. The PRACT and PRCHK behavior is in the end-to-end protection module.
+- **Data pointer and size:** PRP and SGL rules and the MDTS limit are in the data transfer module. A transfer above MDTS is rejected with Invalid Field in Command.
+FOLLOW:
+- Where does Linux set FUA? => On a Write whose block-layer request carries REQ_FUA, and only when the controller reports a volatile write cache. Without one, the kernel never sets it.
+- Does Read use the same layout? => Yes, the same SLBA, NLB and flag positions. Read has no data direction to the controller, only a destination buffer.
+PITFALL: Treating LR or the CDW13 hints as guarantees. They are hints, and a compliant drive may ignore them.
+VERIFY: The meaning of FUA on a Read, and the exact CDW12 bit positions for the revision you target.
+
+@@ 6.03 | Basic | Numeric | tags=encoding,slba,nlb,cdw12,fua,lba-size
+Q: Encode a 128 KiB write with FUA at byte offset 4,096,000,000, on a 4096-byte-LBA namespace and on a 512-byte-LBA namespace. What goes in CDW10 to CDW12?
+SHORT: SLBA is the byte offset divided by the LBA size, and NLB is the block count minus one. With 4 KiB LBAs: SLBA 1,000,000 (0xF4240), NLB 31, so CDW10 = 0x000F4240, CDW11 = 0, CDW12 = 0x4000001F (FUA is bit 30). With 512 B LBAs: SLBA 8,000,000 (0x7A1200), NLB 255, CDW12 = 0x400000FF.
+DEEP:
+Assumptions: MDTS permits 128 KiB (for example MDTS = 5 with a 4 KiB minimum page size gives 128 KiB), and no PI or directives are used.
+1. 4 KiB LBAs: 4,096,000,000 / 4096 = 1,000,000 = 0xF4240. Blocks = 131,072 / 4096 = 32, so NLB = 31 = 0x1F.
+2. 512 B LBAs: 4,096,000,000 / 512 = 8,000,000 = 0x7A1200. Blocks = 131,072 / 512 = 256, so NLB = 255 = 0xFF.
+3. FUA is CDW12 bit 30, which is 0x40000000. OR it with NLB: 0x4000001F and 0x400000FF.
+4. SLBA is split little-endian: CDW10 holds SLBA bits 31:0, CDW11 holds bits 63:32 (zero here).
+
+- **Ceiling from the field width:** a 16-bit NLB allows 65,536 blocks per command, which is 256 MiB at 4 KiB or 32 MiB at 512 B. MDTS normally cuts in far earlier.
+- **From the shell:** `nvme write /dev/nvme0n1 --start-block=1000000 --block-count=31 --data-size=131072 --data=pat.bin --force-unit-access`. The `--block-count` option is the raw zero-based NLB.
+FOLLOW:
+- What is the visible symptom of passing NLB = 32 for 4 KiB blocks when you meant 128 KiB? => A 33-block command. The drive pulls one block more than your buffer holds, so either the transfer fails or the LBA after your range is overwritten with stray memory.
+- What if SLBA + NLB + 1 exceeds the namespace size? => LBA Out of Range (generic status 80h), checked against NSZE.
+PITFALL: Mixing units. SLBA counts namespace LBAs, not 512-byte sectors, and the Linux sector conversion is done inside the driver, not in your passthrough command.
+VERIFY: The `--block-count` semantics for your nvme-cli version (see its `--help`).
+
+@@ 6.04 | Intermediate | Concept | tags=flush,vwc,fua,durability,volatile-write-cache
+Q: What does a successful Write completion guarantee, and what do FUA, Flush and the volatile write cache change?
+SHORT: A completed Write guarantees that later reads see the data, not that it is on NAND. If the controller has a volatile write cache and it is enabled, the data can still be lost at power loss. Durability comes from FUA on that write, or from a Flush submitted after the write completed. With no volatile cache, or the cache disabled, completion itself means durable.
+DEEP:
+- **Where the cache is advertised:** Identify Controller VWC field, bit 0 = a volatile write cache is present. Bits 2:1 say whether Flush accepts NSID FFFFFFFFh (all namespaces).
+- **Control:** Get/Set Features, Volatile Write Cache (Feature ID 06h), bit 0 of CDW11 is WCE. Try `nvme get-feature /dev/nvme0 -f 6 -H`. Linux shows the result as `write back` or `write through` in `/sys/block/nvme0n1/queue/write_cache`.
+- **Linux mapping:** REQ_PREFLUSH becomes a Flush command and REQ_FUA becomes the FUA flag on a Write. With no volatile cache present, the kernel does neither, because completion is already durable.
+
+| Configuration | Durable when the Write completes? |
+|---|---|
+| No VWC present, or WCE = 0 | Yes |
+| VWC present and enabled, plain Write | No, only visible |
+| Same, Write with FUA | Yes, for that Write only |
+| Same, Flush submitted after the Write completed, Flush completed | Yes |
+| Drive with power-loss protection that still reports VWC | Contract says no, hardware may say yes |
+
+- **The last row:** a validator tests the contract, not the capacitor. Do not remove Flush or FUA from a test because the drive happens to hold up its cache.
+- **Cost:** Flush latency scales with the dirty data in the cache, and FUA on every write can cut random write IOPS sharply on drives that flush per write.
+FOLLOW:
+- What does Flush do when there is no volatile cache? => It completes successfully and quickly. It stays a valid command.
+- Does FUA on one write flush earlier writes? => No. It covers that command's data and metadata. Earlier completed writes are only covered by a Flush.
+PITFALL: Inferring durability from a completion on a drive that reports a volatile cache. A power-loss test that never uses FUA or Flush and then demands the data is testing a guarantee the spec does not give.
+VERIFY: Exact Flush scope wording in the NVM Command Set specification, the VWC bits 2:1 encoding, and behavior when WCE is cleared.
+
+@@ 6.05 | Intermediate | Trap | tags=zero-based,off-by-one,nlb,dsm,nr
+Q: Which NVMe I/O fields are zero-based, and which are not?
+SHORT: The NLB in Read, Write, Compare, Verify, Write Zeroes and Write Uncorrectable is zero-based. So is the Number of Ranges in Dataset Management and Copy, the NLB inside each Copy source range, and the atomic write fields AWUN, AWUPF, NAWUN, NAWUPF, NABSN and NABSPF. The Length in each Dataset Management range is not: it is a plain block count. Mixing them gives silent off-by-one bugs.
+DEEP:
+| Field | Encoding |
+|---|---|
+| NLB in Read, Write, Compare, Verify, Write Zeroes, Write Uncorrectable | zero-based (0 = 1 block) |
+| Dataset Management NR (CDW10) | zero-based (0 = 1 range, max 255 = 256 ranges) |
+| Dataset Management range Length | one-based block count |
+| Copy NR and source range NLB | zero-based |
+| AWUN, AWUPF, NAWUN, NAWUPF, NABSN, NABSPF | zero-based counts of logical blocks (for the boundary sizes a raw 0 means no boundary, as Linux treats NABSPF) |
+| NABO | an offset in blocks (not a count) |
+
+Worked example, a discard of 1 GiB at byte offset 8 GiB on 4 KiB LBAs: SLBA = 8 GiB / 4096 = 2,097,152 = 0x200000. Length = 1 GiB / 4096 = 262,144 = 0x40000, not 0x3FFFF. The 16-byte range entry in little-endian is `00 00 00 00` (context attributes), `00 00 04 00` (length), `00 00 20 00 00 00 00 00` (SLBA). The command itself has NR = 0.
+
+- **Linux as a reference:** the driver sends `(bytes >> lba_shift) - 1` for Read, Write and Write Zeroes, and the un-decremented count for each discard range. Its atomic write code uses `nawupf + 1` and `nabspf + 1`.
+- **Spot it in a trace:** compare (NLB + 1) times the LBA size with the PRP or SGL length. For Dataset Management compare Length times the LBA size with the amount your test intended.
+FOLLOW:
+- What limits the sizes at the top end? => NLB is 16 bits (65,536 blocks), a Dataset Management range Length is 32 bits, a command holds up to 256 ranges, and the drive may report smaller limits (see the Dataset Management question).
+- Why is this a validation trap and not only a coding trap? => An off-by-one in the test's own model, such as trimming one block too few, shows up as the drive returning old data after a discard and gets filed as a firmware bug.
+PITFALL: Applying the "minus one" rule uniformly. A Dataset Management range Length of NLB - 1 trims one block fewer than intended.
+VERIFY: Zero-based status of Verify NLB, Write Uncorrectable NLB and NABSN/NABSPF in your spec revision, and the nvme-cli semantics for `nvme dsm --blocks`.
+
+@@ 6.06 | Intermediate | Concept | tags=dsm,trim,deallocate,ranges,granularity
+Q: How does the Dataset Management command work, and why is Deallocate only a hint?
+SHORT: The data buffer holds up to 256 range entries of 16 bytes: context attributes, length in blocks, starting LBA. With the AD bit set the controller may deallocate the ranges so the FTL can drop the mappings and stop relocating that data. The wording is "may": the drive can ignore ranges or honor only the parts that fit its internal granularity. IDR and IDW are access-pattern hints.
+DEEP:
+- **Command layout:** CDW10 NR (zero-based, so 1 to 256 ranges), CDW11 bit 0 IDR, bit 1 IDW, bit 2 AD. The buffer is (NR + 1) x 16 bytes, at most 4096 bytes.
+- **Range entry (little-endian):** bytes 3:0 context attributes, bytes 7:4 length in logical blocks, bytes 15:8 SLBA.
+- **What the FTL gains:** mappings removed and NAND pages marked invalid, so garbage collection copies less, write amplification drops, and steady-state performance recovers.
+- **Granularity:** Identify Namespace reports a preferred deallocate granularity (NPDG) and alignment (NPDA). A range smaller than or off-alignment with the internal unit may be only partly deallocated, or not at all, and the untouched blocks still return old data.
+- **Limits:** newer NVM Command Set revisions report Dataset Management limits (DMRL for ranges, DMRSL for range size, DMSL for total size) in the NVM-specific Identify Controller structure, where 0 conventionally means "not reported".
+- **Host side:** `blkdiscard`, `fstrim` and the mount option `discard` end up here, and `nvme dsm /dev/nvme0n1 --ad --slbs=0 --blocks=8` sends one by hand. Linux splits discards into at most 256 ranges per command.
+- **Firmware angle:** a trim storm can stall foreground I/O while the FTL updates its tables. Trim while reading and writing, and watch p99 latency and command timeouts, not only correctness.
+FOLLOW:
+- Is a successful Dataset Management completion a promise that reads return zeros? => No. It depends on what the controller actually deallocated and on DLFEAT (next question).
+- What do the context attributes do? => Hints such as access frequency, latency and sequential access, in bits of the first dword. Only AD changes what a read returns.
+PITFALL: Asserting zeros for every trimmed block. A compliant drive may keep old data for unaligned or small ranges, so that assertion fails good drives.
+VERIFY: NPDG and NPDA semantics, the DMRL, DMRSL and DMSL fields and their meaning of 0, and how partial ranges are handled in your revision.
+
+@@ 6.07 | Intermediate | Concept | tags=compare,verify,write-uncorrectable,media-error,status
+Q: What do Compare, Verify and Write Uncorrectable do, and how does a validation engineer use them?
+SHORT: Compare reads the LBAs, matches them against host-supplied data and fails with Compare Failure (SCT 2, SC 85h) on a difference. Verify makes the controller read and check the LBAs (ECC, protection information) without transferring data to the host. Write Uncorrectable marks LBAs so that reads fail with Unrecovered Read Error (SCT 2, SC 81h) until rewritten. All three are optional and advertised in ONCS.
+DEEP:
+- **Compare (05h):** the host sends data, the controller compares it inside the drive. On a mismatch the command fails and no data is returned, so you learn there is a difference and not where. Follow with a normal Read to find the bytes.
+- **Compare limitation:** it does not exercise the read DMA path back to the host, so it cannot replace read verification for a PCIe or host-memory data-path test.
+- **Verify (0Ch):** no data transfer, so it checks the media and error correction path at full speed and without PCIe bandwidth. Use it for scrub-like sweeps and as a cheap "can you still read this" check. A size limit (VSL) may apply.
+- **Write Uncorrectable (04h):** no data transferred. The blocks are flagged so that reads return status 81h, and the flag persists across power cycles until the blocks are written. It gives a deterministic media error without physical damage.
+- **Use in tests:**
+  - Read after Write Uncorrectable must return 81h, and Verify on the same range must also fail. A drive that implements Verify as an empty success will pass a plain Verify test but fail this one.
+  - Rewriting part of the range must clear only that part.
+  - The host error path: Linux logs a critical medium error for the sector and returns EIO, and the Error Information Log should record the failure.
+- **Errors you may also meet:** Guard, Application Tag and Reference Tag check errors (82h to 84h) when PRCHK is set, and Deallocated or Unwritten Logical Block (87h) if enabled.
+FOLLOW:
+- Can Compare replace a read-and-check loop? => Only for the media path. Keep normal read verification to cover the return DMA.
+- Does Write Zeroes clear an uncorrectable mark? => It is a write, so it should replace the mark. Whether a deallocate clears it is worth testing and checking in the spec.
+PITFALL: Treating Verify success as proof that the data is what you wrote. Verify shows the drive can read and validate it, not that it matches your expectation.
+VERIFY: The Verify and Write Uncorrectable size limits (VSL, WUSL), persistence of the mark across power cycles, and whether Dataset Management deallocate clears it.
+
+@@ 6.08 | Intermediate | Debug | tags=cqe,status,decode,compare-failure,lba-range
+Q: Three I/O commands complete with CQE dword 3 values 0x050B0012, 0x05030012 and 0x01010012. Decode each one and say what you check next.
+SHORT: Dword 3 holds the command ID in bits 15:0, the phase tag in bit 16, and the status above it: SC in 24:17, SCT in 27:25, CRD 29:28, More 30 and DNR 31. So 0x050B0012 is CID 0x12, phase 1, SCT 2, SC 85h: Compare Failure. 0x05030012 is SCT 2, SC 81h: Unrecovered Read Error. 0x01010012 is SCT 0, SC 80h: LBA Out of Range.
+DEEP:
+Shift right by 17 to drop the command ID and phase, then take the low 8 bits for SC and the next 3 for SCT.
+1. 0x050B0012 >> 17 = 0x285. SC = 0x85, SCT = 2. Media and data integrity, Compare Failure.
+2. 0x05030012 >> 17 = 0x281. SC = 0x81, SCT = 2. Unrecovered Read Error.
+3. 0x01010012 >> 17 = 0x080. SC = 0x80, SCT = 0. Generic, LBA Out of Range.
+4. In all three the low 16 bits are 0x0012 (CID) and bit 16 is the phase tag, 1 in each.
+
+| Status | Likely cause | Check next |
+|---|---|---|
+| 2 / 85h Compare Failure | Media differs from expected, or your expected buffer was wrong, or a concurrent write | Read the range back, diff against the model, check whether a write to the same LBAs was in flight |
+| 2 / 81h Unrecovered Read Error | ECC failure beyond correction, or a Write Uncorrectable mark | Did the test inject one? Error Information Log entry with LBA, SMART media error count |
+| 0 / 80h LBA Out of Range | SLBA + NLB + 1 above NSZE | Identify Namespace NSZE and your NLB encoding (zero-based) |
+
+- **Tie the CQE to the command:** CID alone is not unique across queues. Dword 2 carries the SQ Identifier in bits 31:16 and the SQ Head Pointer in bits 15:0, so use SQID and CID together.
+- **Retry policy:** the DNR bit says a retry will not help. A Compare Failure is not transient, so do not retry it in a validation harness.
+FOLLOW:
+- Which bit tells you the entry is new? => The phase tag in bit 16, which flips each time the controller wraps the completion queue.
+- What would a dword 3 of 0x00050012 mean? => Phase 1, SCT 0, SC 02h, Invalid Field in Command. Check reserved bits, NLB against MDTS and the opcode-specific fields first.
+PITFALL: Reading dword 3 bits 31:16 as one 16-bit status. The phase tag sits at bit 16, so shifting by 16 gives 0x50B and not 0x285.
+
+@@ 6.09 | Advanced | Concept | tags=dlfeat,write-zeroes,deac,dulbe,deallocated,read-after-trim
+Q: What do you read back from a deallocated block, and how do DLFEAT, Write Zeroes with DEAC and DULBE change the answer?
+SHORT: DLFEAT in Identify Namespace decides it. Bits 2:0 give the value read from a deallocated block (000b not reported, 001b all 00h, 010b all FFh), bit 3 says Write Zeroes supports the Deallocate bit, and bit 4 says whether the PI guard of such blocks is FFFFh or a CRC of the value. If DULBE is enabled, reading a deallocated or unwritten block fails with status 287h instead.
+DEEP:
+- **Write Zeroes (08h):** transfers no data and makes the range read as zeros. With DEAC (CDW12 bit 25) the controller deallocates the range instead of writing zeros, which is cheaper on NAND.
+- **DEAC only when it matches:** DEAC must be a no-op when deallocated blocks would not read as zeros. Linux sets DEAC only if DLFEAT reads 001b with bit 3 set, and omits it when the block layer says do not unmap.
+- **DULBE:** the namespace advertises support in NSFEAT bit 2. Software enables it with Set Features, Error Recovery (Feature ID 05h), CDW11 bit 16. Read, Compare, Verify and Copy that touch deallocated or unwritten blocks then return SCT 2, SC 87h.
+
+| DLFEAT bits 2:0 | A read of a deallocated block returns |
+|---|---|
+| 001b | all bytes 00h |
+| 010b | all bytes FFh |
+| 000b | not reported. Recent text limits it to 00h or FFh, older text allowed other values |
+
+- **The oracle that always works:** for each trimmed LBA the legal reads are the previous data (the drive chose not to deallocate) or the DLFEAT value. Anything else is a failure, such as a value from an older generation or from another LBA.
+- **Write Zeroes without DEAC:** always reads zeros, regardless of DLFEAT, but costs real NAND writes.
+- **With protection information:** the guard of a deallocated block is FFFFh or a CRC (DLFEAT bit 4), so reads with PRCHK do not have to fail. See the end-to-end protection module.
+FOLLOW:
+- What does Linux do on a drive whose DLFEAT says FFh? => It issues Write Zeroes without DEAC, because it cannot use the deallocate shortcut to produce zeros.
+- Is DULBE on by default? => No. It is opt-in through Set Features, so a test must enable and read it back.
+PITFALL: Trusting DLFEAT without testing it. A drive that claims zeros and returns stale data is a data-leak bug, and it is exactly what this field lets you catch.
+VERIFY: DLFEAT wording when not reported, DEAC interplay with DLFEAT, the Error Recovery DULBE bit, and which commands raise 287h in your revision.
+
+@@ 6.10 | Advanced | Concept | tags=copy,simple-copy,source-ranges,mssrl,mcl,msrc
+Q: How does the Copy command work, and what are its limits and failure semantics?
+SHORT: Copy (19h) moves data inside the drive without the host reading it. The data buffer holds up to NR + 1 source range descriptors (32 bytes in format 0, each with an SLBA and a zero-based NLB), and CDW10 and CDW11 give the destination start LBA (SDLBA). The ranges are laid out back to back in list order. Limits are MSSRL, MCL and MSRC, and on a partial failure dword 0 names the first range not copied.
+DEEP:
+- **Command fields:** SDLBA in CDW10 and CDW11, NR in CDW12 bits 7:0 (zero-based), descriptor format in bits 11:8, PRINFOR and PRINFOW for protection information, plus FUA and LR (FUA applies to the write side).
+- **Format 0 descriptor:** SLBA at bytes 15:8, NLB at bytes 17:16 (zero-based), expected initial reference tag at bytes 27:24, plus application tag and mask.
+- **Limits from Identify Namespace:** MSSRL (largest single range), MCL (largest total) and MSRC (largest range count). Breaking any of them fails with Command Size Limit Exceeded (SCT 1, SC 83h).
+- **Failure:** dword 0 of the CQE holds the lowest numbered source range not successfully copied. The whole command is not specified as atomic, so a partial copy can leave the destination partly written.
+- **Overlap:** the host should not let the destination overlap the sources. If it does, an overlapped block may come from any of the source ranges.
+- **Test plan:**
+  1. Negative tests at MSSRL + 1, MSRC + 1 and total MCL + 1.
+  2. Content tests: single-block ranges, unaligned starts, many ranges, ranges that cross atomic or zone boundaries.
+  3. Sources that are deallocated or unwritten (the result depends on DLFEAT and DULBE, so define the expected value from those).
+  4. Power loss mid-copy: each destination LBA must be old or new, never a third value.
+  5. Writes to the source while the copy runs: define the result as unspecified and test only for no corruption.
+- **From userspace:** `nvme copy /dev/nvme0n1 --sdlba=... --slbs=a,b --blocks=n1,n2`. Check `--help` for the zero-based convention.
+FOLLOW:
+- Can the host assume the copy is all-or-nothing? => No. Use dword 0 on failure to find where it stopped, and re-issue the rest.
+- Why not read then write from the host? => It costs two PCIe transfers per byte and host CPU. Copy keeps the data inside the drive, so bandwidth and tail latency behave very differently, which is the point of testing it.
+PITFALL: Treating overlapping source and destination like memmove. The result is undefined, so a test that expects memmove behavior fails compliant drives.
+VERIFY: Copy descriptor formats and cross-namespace support by revision, the CDW12 field positions, the dword 0 wording, and what deallocated source blocks copy as.
+
+@@ 6.11 | Advanced | Concept | tags=atomicity,awun,awupf,nawun,nawupf,nabo,nabspf,torn-write
+Q: What do AWUN, AWUPF, NAWUN, NAWUPF and the atomic boundary fields promise, and how should a test use them?
+SHORT: AWUN and NAWUN say a write up to that size that does not cross an atomic boundary is atomic against other reads and writes in normal operation. AWUPF and NAWUPF say that if such a write fails because of power loss or another error, later reads return all old or all new data. All are zero-based block counts. NABSN, NABSPF and NABO set the boundaries. Larger or boundary-crossing writes get no guarantee.
+DEEP:
+- **Where:** AWUN and AWUPF are in Identify Controller. NAWUN, NAWUPF, NACWU, NABSN, NABO and NABSPF are in Identify Namespace, valid when NSFEAT bit 1 is set, and they replace the controller values for that namespace.
+- **Zero-based:** a value of 0 means one logical block. So a drive can be "atomic" while giving only 512 B on a 512e format, and a 4 KiB write may still tear into eight pieces.
+- **Normal versus power fail:** AWUN is a concurrency promise (a reader overlapping a writer sees all old or all new). AWUPF is a persistence promise across power loss or error.
+- **Boundaries:** NABSN and NABSPF give the boundary spacing and NABO the offset of the first one. A write that crosses a boundary loses the guarantee even when it is small.
+- **Overlap:** two overlapping writes that each fit inside the atomic unit leave one whole result or the other. Larger overlapping writes can leave a mix.
+- **Fused Compare and Write:** Identify Controller FUSES bit 0 and ACWU/NACWU give an atomic compare-and-swap. It is used mainly in shared-storage setups and by SPDK, not by the Linux block layer.
+- **Software:** recent Linux kernels derive block-layer atomic write limits from NAWUPF and NABSPF (not AWUPF) and give up if NABO is nonzero. Databases care because their page size is often larger than one LBA.
+- **Test method:** compute the atomic unit as NAWUPF + 1 when NSFEAT bit 1 is set, else AWUPF + 1. Test writes at exactly that size, aligned to a boundary, and check that every unit after power loss is homogeneous.
+FOLLOW:
+- Which value protects a database from torn pages after a crash? => AWUPF or NAWUPF. AWUN only covers concurrent readers.
+- What happens to a write that exceeds these limits? => It still executes, just without the guarantee, and it can tear on power loss.
+PITFALL: Reading these fields as bytes, or as one-based. A raw value of 7 with 4 KiB LBAs is 32 KiB, not 7 KiB and not 28 KiB.
+VERIFY: The wording of the normal-operation rule for overlapping reads and writes, the meaning of NABSN or NABSPF equal to 0, the NSFEAT bit 1 override rules, and how AWUPF relates to AWUN.
+
+@@ 6.12 | Advanced | Numeric | tags=torn-write,states,power-loss,atomic-unit,checker
+Q: A 4 KiB-LBA namespace reports NAWUPF = 3, NABSPF = 7 and NABO = 0. Power is cut during a write. How many post-recovery data states must your checker accept for a 16 KiB write at LBA 4, a 16 KiB write at LBA 6, and a 128 KiB write?
+SHORT: The atomic unit is NAWUPF + 1 = 4 LBAs (16 KiB) and the boundary spacing is NABSPF + 1 = 8 LBAs (32 KiB). A 16 KiB write at LBA 4 sits inside a boundary window and fits the unit, so 2 states (all old or all new). At LBA 6 it crosses the boundary at LBA 8, so nothing is guaranteed: up to 2^4 = 16 states. The 128 KiB write covers 32 LBAs above the unit: up to 2^32 states.
+DEEP:
+1. Unit = (3 + 1) x 4096 B = 16,384 B, 4 LBAs. Boundary = (7 + 1) x 4096 B = 32,768 B, 8 LBAs, first boundary at LBA 0 because NABO = 0.
+2. LBA 4 to 7: 4 LBAs, no boundary inside (the next boundary is at LBA 8). The guarantee applies. Old or new: 2 states.
+3. LBA 6 to 9: 4 LBAs, but the boundary at LBA 8 splits it into LBAs 6 to 7 and 8 to 9. No guarantee, so each LBA can be old or new independently: 2^4 = 16 states. A drive that splits at the boundary gives only 4 states.
+4. 128 KiB at 4 KiB: 32 LBAs, above the 4-LBA unit. Worst case 2^32 = 4,294,967,296 states.
+5. On a 512 B LBA format with AWUPF = 0: a 4 KiB write is 8 LBAs and can tear in 2^8 = 256 ways.
+
+| Write | Guaranteed atomic? | Worst-case states |
+|---|---|---|
+| 16 KiB at LBA 4 | Yes | 2 |
+| 16 KiB at LBA 6 | No (crosses boundary) | 16 |
+| 128 KiB at LBA 0 | No (above unit) | 2^32 |
+
+- **What the checker does:** enumerating states is impossible, so check properties. Every LBA must hold the old or new value, never a third one. Every LBA is homogeneous internally. Atomic-unit-sized, aligned writes must be all old or all new.
+- **How to see tearing inside an LBA:** stamp each 512 B (or smaller) chunk of an LBA with the write ID, the LBA and the offset. A torn LBA then shows two write IDs.
+FOLLOW:
+- Is the LBA itself always the smallest atomic unit? => Yes, a power-fail guarantee of at least one block is the floor, so a tear inside a single LBA is a bug regardless of the reported values.
+- Should a stricter drive be failed for splitting at boundaries? => No. Report it as information, and fail only a violation of the reported guarantee.
+PITFALL: Checking only that each LBA holds old or new. Tearing inside an LBA, or across an aligned atomic-sized write, passes such a check.
+VERIFY: The rule for boundary offset (NABO) with respect to the first boundary, whether NABSPF = 0 means no boundary, and that a single LBA is always atomic.
+
+@@ 6.13 | Advanced | Cross-layer | tags=ordering,queues,read-after-write,fused,happens-before
+Q: What ordering does NVMe guarantee between commands in one queue and across queues, and what must a host do to get read-after-write?
+SHORT: None between commands, in the same queue or across queues, except for fused pairs. The controller treats each command as an independent entity, so it may execute and complete them in any order, and overlapping commands in flight have undefined results. The host gets ordering by waiting for a completion before it submits the dependent command. After a Write completes, a Read submitted later, on any queue, must return that data or newer.
+DEEP:
+- **What the spec says, paraphrased:** except for fused operations, each command is processed independently, with no reference to other commands in the same or other submission queues.
+- **Fetch versus execute:** queues are arbitrated (round robin, weighted round robin or vendor), and SQEs in one queue are fetched in order. Fetched in order does not mean completed in order.
+- **Write A then Write B to the same LBA, not waiting:** either can win. If both fit the atomic write unit the result is one whole value. If not, a mix is possible.
+- **Read overlapping a Write in flight:** old or new, or a mix if the write exceeds the atomic size.
+- **Fused pairs:** FUSE = 01b (first) and 10b (second), adjacent in the same SQ, execute as one unit, for example Compare and Write. If the first fails the second completes with Aborted, Failed Fused (generic 09h).
+- **The rule for a checker (happens-before):** a Read must reflect a Write only if the Read was submitted after the Write's completion. Use safe timestamps: take the completion time as when the host saw the CQE, and the submission time as just before ringing the doorbell. If the Read's earliest time is after the Write's latest time, the Read must reflect it. Anything else may return old or new.
+- **Where PCIe fits:** the controller's posted write of the CQE follows its data writes (see the PCIe page, flow control and ordering questions), so seeing the CQE implies the data is in host memory. The host must still store the SQE before it rings the doorbell, using the right barriers.
+- **fio:** `--iodepth` above 1 with overlapping offsets breaks verify. Keep the random map on, so each block has one write in flight.
+FOLLOW:
+- Does running a single queue at QD 1 per thread give ordering across threads? => No. Ordering comes only from your own wait-for-completion.
+- Does the driver preserve order within a queue? => It submits in order but the controller need not complete in order. Linux gets ordering through the block layer's flush and FUA handling and by waiting for completions.
+PITFALL: Assuming submission order is execution order inside one queue. It is not, and two queues give even less.
+VERIFY: The exact wording that a Read submitted after a Write's completion returns the written data, and whether it is required across controllers of a shared namespace.
+
+@@ 6.14 | Advanced | Trap | tags=flush,scope,ordering,per-core-cache,multi-queue
+Q: A colleague says "the Flush completed, so everything I submitted before it is durable". What is wrong with that?
+SHORT: Flush covers only commands that had already completed when the Flush was submitted. A write still in flight, or one that completes after the Flush was submitted, gets no guarantee even if its CQE arrives before the Flush CQE. FUA likewise protects only its own command. The safe sequence is write, wait for its completion, submit Flush, wait for the Flush completion, and only then call the data committed.
+DEEP:
+| Event order | Durable after the Flush completes? |
+|---|---|
+| Write completes, then Flush submitted | Yes |
+| Flush submitted, Write completes before Flush completes | Not guaranteed |
+| Write submitted before Flush, completes after Flush | Not guaranteed |
+| Write with FUA completes | Yes, that Write, without any Flush |
+
+- **Why "not guaranteed" is not "not done":** a real drive often flushes everything cached, so sloppy tests pass by luck. The bug only appears with a drive whose Flush takes a snapshot of its buffers at the moment the Flush arrives.
+- **The firmware bug this catches:** a multi-core controller has per-queue or per-core write staging. A write completes on core A, the Flush is handled on core B, and B flushes only its own buffers. Data completed before the Flush was submitted is lost at power cut.
+- **Test design:** many writer threads on many queues, each recording "completed at t". A separate thread issues Flush on a different queue, and records "Flush submitted at s, completed at c". The commit set is every write whose completion time is below s. Cut power after c, and every commit-set write must be present.
+- **Scope:** Flush with NSID FFFFFFFFh only if the controller says it is supported. Otherwise a per-namespace Flush does not cover other namespaces.
+- **Latency:** Flush time grows with dirty data. The Linux `nvme_core.io_timeout` default is 30 s, so measure Flush with a full write buffer against that.
+FOLLOW:
+- Does Flush act as a barrier for writes submitted after it? => No. It says nothing about later commands. Order comes from waiting.
+- Why issue the Flush on a different queue than the writes? => Because the guarantee is per namespace, not per queue, and per-queue caches are where the bugs hide.
+PITFALL: Testing Flush from the same thread and queue that did the writes. It hides exactly the per-core cache bugs a Principal-level test should find.
+VERIFY: The Flush scope wording in the specification and the encoding of the broadcast NSID support bits.
+
+@@ 6.15 | Principal | Scenario | tags=read-after-write,multi-queue,miscompare,stale-data,triage,firmware
+Q: An 8-queue fio verify run shows about one miscompare per 10^8 reads. The read returns the previous version of an LBA that another queue wrote and completed a few milliseconds earlier. Is it a drive bug, and how do you prove it?
+SHORT: It is a drive bug only if the read was submitted after the write's completion was observed. So the first job is to prove the ordering from timestamps. If it holds and the read returns exactly the previous version, the drive is serving stale data: a visibility race between cores or between the write buffer and the mapping table. If the read was submitted before the write completed, the data is legal and the test is wrong.
+DEEP:
+1. **Prove happens-before.** On a PCIe analyzer, find the write's CQE (a MemWr to the CQ) and the read's doorbell write (MemWr to the BAR). If the doorbell is after the CQE, the read must reflect the write. Without an analyzer, use host tracing (`nvme:nvme_setup_cmd` and `nvme:nvme_complete_rq` in Linux) with SQID and CID.
+2. **Classify the returned data.** Exactly the previous version means stale mapping or cache. Garbage or a mix means a torn write, misdirected DMA or a media problem, a different bug.
+3. **Measure the window.** Re-read the LBA later. If it now returns the new data, it is a transient race. If not, it is a lost update. Plot the miscompare rate against the delay between write completion and read submission, and find where it goes to zero. A window of a few microseconds is a race between cores.
+4. **Raise the rate.** Shrink the LBA range to 64 LBAs so collisions are constant. Use two queues at QD 1 with the writer and reader on different CPUs. A one-in-10^8 event becomes minutes.
+5. **Isolate.** Does it also fail when writer and reader share a queue? If only cross-queue, suspect per-core write staging or a per-queue cache. Does it need GC or trim activity? If yes, suspect the mapping update path.
+6. **Rule out the host.** Overlapping in-flight writes in the test (random map off), a missing store barrier before the doorbell, or a filesystem in the path all give legal stale data. Use the raw device with O_DIRECT.
+7. **Firmware evidence.** Ask for the L2P entry and the write buffer state at the failure. The typical cause is posting the completion before the new mapping or buffer entry is visible to the other cores, which needs a release barrier on a weakly ordered ARM core.
+
+| Evidence | Verdict |
+|---|---|
+| Read doorbell before write CQE | Legal race, fix the test |
+| Read after CQE, returns exactly the previous version | Drive bug: visibility |
+| Returns a mix or unrelated data | Different bug: tear, DMA or mapping |
+| Fails only across queues | Per-core staging or cache |
+
+- **Report:** a minimal repro (queues, LBA range, block size), trace and analyzer timestamps with the margin over clock error, and the observed window.
+FOLLOW:
+- How big a timestamp margin do you need? => Bigger than the worst clock skew between the analyzer and host, and you must count from the CQE seen to the doorbell, not from the actual internal completion.
+- The rate is 10^-8. How many reads do you need to believe a fix? => With zero failures in N trials the 95 percent bound is about 3/N, so 3 x 10^9 reads to bound the rate at 10^-9, in the high-collision configuration.
+PITFALL: Filing a stale read as a bug before proving the read was submitted after the write's completion. The spec allows old data otherwise.
+VERIFY: Confirm the read-after-write guarantee text (submitted after completion) in the NVM Command Set specification.
+
+@@ 6.16 | Principal | Cross-layer | tags=power-loss,oracle,flush,fua,atomicity,test-design,statistics
+Q: Design the workload and checker for a sudden-power-loss test that validates Flush, FUA and the atomic write claims. What may the drive legally return after power comes back, and how many cuts do you need?
+SHORT: Track per LBA a committed value (proven durable by a completed FUA write, or by a Flush that was submitted after the write completed and then completed) and a set of in-doubt values (writes in flight or completed but not flushed). After power-up each LBA must hold the committed value or one of the in-doubt values, atomic units must be whole, and the result must be stable on reread. Anything else fails.
+DEEP:
+1. **Workload.** Unique stamps: every 512 B carries LBA, write ID, sequence number and CRC. Mix block sizes around the atomic unit and boundaries, several queues, some FUA writes, periodic Flush from a separate queue, plus trim and Write Zeroes.
+2. **Log.** The host log of submit and completion times must survive the cut, so keep it off the drive under test, on another device or across a network.
+3. **State model.** For each LBA:
+   - committed = latest value durable by a completed FUA or a completed Flush
+   - in-doubt = later writes that were in flight, or completed but not covered
+   - legal result = committed or any in-doubt value. A later write may survive while an earlier one does not.
+4. **Cut strategy.** Random cut timing tied to the workload phase, including during write bursts, during a Flush, with GC and journal checkpoints active, and with the write cache full. Also test a clean shutdown (CC.SHN) separately, which must lose nothing.
+5. **After power-up.** Wait for CSTS.RDY, check no controller fatal status, read the whole touched range (LBAs never written must not return another LBA's data), and apply the model. Read again after a second clean power cycle. A value that changes back is a failure.
+6. **Rig check.** The SMART Unsafe Shutdowns counter should rise by one per cut. If not, your rig is not cutting power hard.
+7. **Failure classes:** committed value lost (Flush or FUA violation), torn atomic unit, foreign data from another LBA (mapping corruption, the worst), 81h on a written block, and not-ready or link failures counted separately.
+8. **Statistics.** With zero failures in N effective cuts, the 95 percent upper bound on the per-cut failure rate is about 3/N. To bound it at 10^-3 you need 3,000 effective cuts. If 40 percent of cuts land with a relevant write in flight, that is 3,000 / 0.4 = 7,500 raw cuts, or 250 hours at 2 minutes per cycle on one rig, so use several rigs.
+9. **Stronger claims.** A drive with power-loss protection may promise that no completed write is lost. Treat that as a product requirement with its own test, not as an NVMe rule.
+FOLLOW:
+- What if the drive returns data newer than in-doubt writes you expected? => Only values that were actually written to that LBA may appear. A value never written to it is corruption.
+- Why count only effective cuts? => A cut when nothing is in flight cannot expose a torn or lost write, so it adds no evidence about that failure.
+PITFALL: Checking the read-back against the last acknowledged write instead of the committed and in-doubt model. That flags legal outcomes as failures, and trusting a host log stored on the drive under test hides the real ones.
+VERIFY: The rule that Flush covers writes completed before its submission, the Unsafe Shutdowns field position in the SMART log, and whether clean shutdown must persist all completed writes.
+
+@@ 6.17 | Principal | Cross-layer | tags=dsm,write-zeroes,trim,gc,oracle,test-design,firmware-nand
+Q: How would you design a validation suite for Dataset Management deallocate and Write Zeroes that passes compliant drives and still catches real data-integrity bugs?
+SHORT: Model each LBA as written, deallocated or unknown. After a trim the only legal reads are the previous data (the drive chose not to deallocate) or the DLFEAT value, and the choice must stay stable across rereads and power cycles. Write Zeroes must always read zeros. Test the edges, trim and overwrite races with GC, and power loss. Never accept another LBA's data or a value from an older generation.
+DEEP:
+1. **Discover.** ONCS bits 2 and 3, DLFEAT, NPDG and NPDA, the Dataset Management limits, DULBE and NSFEAT.
+2. **Oracle after a trim** of LBA X with previous value v:
+   - the read returns v (not deallocated) or the DLFEAT value
+   - anything else is a failure, especially an older version of X or data from LBA Y (mapping bug)
+   - once a read returns the DLFEAT value it must stay that value until X is written. Old data coming back is a resurrection bug.
+   - rereads are identical
+3. **Case matrix.** Full aligned units, sub-granularity ranges, ranges straddling NPDG, single blocks, the maximum range count and length, overlapping and duplicate ranges in one command, ranges beyond NSZE (LBA Out of Range, and check that the namespace is untouched).
+4. **Write Zeroes.** With and without DEAC, odd sizes, sizes up to the reported limit, followed by partial overwrites. Zeros must be read regardless of DLFEAT. DEAC on a drive whose DLFEAT is not zeros must not change data.
+5. **Races.** Fill to 90 percent, then random overwrite to force GC, and mix in trim of the same LBAs. The classic bug is GC relocating a page while the host trims it, and then the stale copy is restored to the map. Also trim against writes still in the write buffer.
+6. **Power loss.** Treat a trim like a write. After a sudden cut, X may read old data, but must not read a third value. Whether Flush commits a trim is a question for the spec.
+7. **Performance guard.** A whole-device trim must not exceed the I/O timeout (30 s in Linux by default) or stall foreground I/O beyond your latency target. Full-range trim should also restore steady-state write performance and lower write amplification.
+8. **Automation.** A seeded, replayable generator, a model in software with three-valued expectations, and CQE and per-LBA dumps of the legal set at any mismatch.
+FOLLOW:
+- Should a drive fail if it never deallocates? => Not for conformance, since deallocate is a "may". It can fail a product requirement that says trim must reclaim space, tested through free space, WAF and performance.
+- How do you tell "kept old data" from "stale bug"? => Old data equal to the most recent value before the trim is legal. An earlier generation, or another LBA's data, is a bug.
+PITFALL: Asserting zeros after any trim, which fails compliant drives, or accepting any value after a trim, which misses resurrected and misdirected data.
+VERIFY: Whether Flush persists a deallocation, the DLFEAT not-reported wording, NPDG/NPDA semantics and how a Dataset Management command with one out-of-range entry is processed.

@@ -1,0 +1,395 @@
+# Module 14: Multi-Controller, Multipath & Virtualization
+
+@@ 14.01 | Basic | Concept | fig=multictrl | tags=multi-controller,dual-port,cntlid,cmic,subsystem
+Q: What does a dual-port, multi-controller NVMe SSD look like, and what is shared between its controllers?
+SHORT: One NVM subsystem holds one shared pool of media and namespaces, and exposes it through two or more controllers. On a dual-port PCIe SSD each port has its own link and its own controller, with a distinct 16-bit CNTLID. Everything a host can touch directly (BAR0 registers, queues, interrupts, features) is per controller. The data, the namespaces, the FTL and the NQN are shared. CMIC in Identify Controller says the drive is multi-port or multi-controller.
+DEEP:
+- **Per controller:** its own PCIe function and BAR0 (CAP, CC, CSTS, doorbells), admin queue and I/O queues, MSI-X table, Set Features state (such as number of queues and power state), Async Event Request queue and its controller-scoped log pages.
+- **Per subsystem:** the NAND and FTL, the namespaces and their contents, the subsystem NQN, reservation state per namespace, and the NVM Subsystem Reset domain.
+- **Identity:** CNTLID (Identify Controller bytes 79:78) is unique only inside one subsystem. The pair (subsystem NQN, CNTLID) names a controller. CMIC (byte 76) has a multi-port bit, a multi-controller bit and, on recent revisions, an ANA-reporting bit.
+- **Typical dual-port drive:** a U.2 or U.3 form factor that can present two PCIe links, often two x2 links, to two hosts or two root ports of one host. Each host runs its own driver instance on its own controller.
+- **Multi-controller is not the same as multi-port:** a single-port drive can still expose several controllers, for example one per SR-IOV virtual function (questions later in this module).
+- **What to read:**
+
+```
+nvme id-ctrl /dev/nvme0 | grep -E "cntlid|cmic|subnqn"
+nvme list-ctrl /dev/nvme0        # CNS 13h: all controllers in the subsystem
+nvme list-subsys                 # host view: which paths belong to which subsystem
+```
+- **What the diagram shows:** two hosts, two ports and two controllers on top of one shared namespace and ANA state per controller.
+FOLLOW:
+- Can host B see the queues host A created? => No. Queues, doorbells and CC/CSTS belong to one controller. Hosts interact only through shared namespaces and subsystem-wide state.
+- Is CNTLID unique across drives? => No. It is unique only within an NVM subsystem, so two drives can both have CNTLID 0.
+PITFALL: Validating a dual-port drive by running the same test on each port one after another. The bugs live in concurrent cross-port traffic, resets and reservations.
+VERIFY: CMIC bit positions and the CNTLID location in Identify Controller for the revision you target (Linux nvme.h and SPDK nvme_spec.h agree on bits 0, 1 and 3 for multi-port, multi-controller and ANA).
+
+@@ 14.02 | Basic | Concept | tags=ana,states,alua,path-status,anatt
+Q: What is Asymmetric Namespace Access (ANA), and what are the ANA states?
+SHORT: ANA lets a multi-controller subsystem tell the host how good each path to a namespace is right now, like SCSI ALUA. Namespaces are grouped into ANA groups, and each controller reports one state per group: Optimized, Non-optimized, Inaccessible, Persistent Loss or Change. The host reads them from the ANA log page and prefers Optimized paths. A command sent down a bad path fails with a path-related status (SCT 3).
+DEEP:
+| State | Value | Meaning | Host behavior |
+|---|---|---|---|
+| Optimized | 01h | Full-performance path | Use it |
+| Non-optimized | 02h | Works, but slower or more expensive | Use only if no Optimized path |
+| Inaccessible | 03h | Controller alive, cannot serve I/O to this group now, may recover | Do not use, re-check later |
+| Persistent Loss | 04h | Will not become accessible without outside intervention | Do not use, treat path as failed |
+| Change | 0Fh | Transitioning between states | Do not rely on it, bounded by ANATT |
+
+- **State is per (controller, ANA group):** the same namespace can be Optimized through controller 0 and Inaccessible through controller 1.
+- **Error statuses:** an I/O command to a namespace in the wrong state completes with SCT 3 and SC 01h (Persistent Loss), 02h (Inaccessible) or 03h (Transition), which Linux names status 301h, 302h and 303h.
+- **ANATT:** Identify Controller reports ANA Transition Time in seconds, the longest a group may stay in Change state.
+- **Why not just use a controller failure signal:** ANA says "the controller is fine but this path is not," for example a firmware update, a mirrored-cache failover or an array controller taking over.
+- **On a plain dual-port SSD** both controllers usually report Optimized for every group, so ANA is dormant until a fault or vendor feature changes it.
+FOLLOW:
+- Is ANA required for multipath? => No. Without ANA the host treats all paths as equal. ANA is optional and advertised by CMIC and the ANACAP field.
+- What does the host do on Persistent Loss? => It stops sending I/O on that path for the group, and only a later ANA change or a reset makes it consider the path again.
+PITFALL: Treating Inaccessible as a dead drive. The controller is alive and answering admin commands, so a reset is the wrong reaction.
+VERIFY: ANA state values, ANATT units, and the exact Path Related status code values (Persistent Loss 01h, Inaccessible 02h, Transition 03h) in the Base Specification.
+
+@@ 14.03 | Basic | Concept | tags=nvme-mi,bmc,smbus,mctp,out-of-band
+Q: What is NVMe-MI, and why does an SSD need a management interface outside the normal queues?
+SHORT: NVMe Management Interface (NVMe-MI) lets a BMC or enclosure controller monitor and manage an SSD without the host OS. It runs over SMBus or I2C, or over MCTP carried on SMBus or on PCIe vendor-defined messages. It reads health, temperature and vital product data, and can send some admin commands. It keeps working when the host is down, the driver is hung or the controller is disabled.
+DEEP:
+| Path | Transport | Typical use |
+|---|---|---|
+| Basic Management Command | SMBus block read, 7-bit address 6Ah, no MCTP | Tiny fixed health block for simple BMCs |
+| NVMe-MI over MCTP | MCTP over SMBus/I2C, or MCTP over PCIe VDMs | Full command set, from a BMC |
+| In-band tunnel | NVMe-MI Send and Receive admin commands (1Dh and 1Eh) | Host software using the MI command set |
+
+- **Roles:** the BMC is the management controller, the SSD contains a management endpoint. MCTP message type 04h carries NVMe-MI.
+- **What it does:** subsystem health poll, read MI data structures (port and controller information), configuration get and set, VPD read and write, and tunneled admin commands (a limited set) and PCIe register access.
+- **Why outside the queues:** a fleet needs temperature, wear and fault data from a drive that has no working host, and an enclosure needs to know a slot's drive is present before any OS boots.
+- **Independent of NVMe state:** MI can answer while CC.EN is 0. Access that needs the PCIe link fails with a dedicated "PCIe inaccessible" MI status when the link is down.
+- **Validation relevance:** the SSD's management firmware shares resources with the I/O path. Heavy MI polling must not perturb I/O latency, and MI must survive resets, power states and hangs.
+FOLLOW:
+- Is MI over PCIe VDM out of band? => It bypasses the NVMe queues (so it is logically out of band) but rides the same PCIe link, so it needs the link up. SMBus MI does not.
+- Which tools speak MI on Linux? => libnvme has an MI layer that talks MCTP (with nvme-cli front ends on recent builds), and BMC stacks such as OpenBMC carry their own.
+PITFALL: Assuming NVMe-MI is one interface. The SMBus Basic Management Command, MI over MCTP and the in-band MI Send/Receive commands have different reach, format and failure behavior.
+VERIFY: 6Ah address and MCTP message type 04h in the NVMe-MI spec, which admin commands are allowed through the MI tunnel, and the nvme-cli MI support on your build.
+
+@@ 14.04 | Intermediate | Concept | tags=linux,native-multipath,iopolicy,head-device,list-subsys
+Q: How does Linux native NVMe multipath present and use multiple paths?
+SHORT: With nvme_core.multipath enabled, the driver merges every controller in one subsystem that exposes the same shared namespace into one head block device, such as /dev/nvme0n1. The per-path nodes (nvme0c0n1, nvme0c1n1) are hidden. Each I/O picks a path by ANA state and I/O policy (numa, round-robin, or queue-depth on newer kernels), preferring Optimized paths. On a path error it requeues the I/O on another path.
+DEEP:
+- **Naming:** head node `nvme<subsys>n<ns>`, hidden per-path nodes `nvme<subsys>c<ctrl>n<ns>`. Without multipath, every controller shows its own `nvme<ctrl>n<ns>` and one shared namespace appears twice.
+- **When paths merge:** same subsystem NQN, namespace flagged shared, and matching identifiers (NGUID, EUI-64, UUID). If the IDs do not match, the driver logs an error and refuses the merge.
+- **Policy:** `cat /sys/class/nvme-subsystem/nvme-subsys0/iopolicy`. `numa` (default) sends I/O to the path nearest the submitting CPU's node, `round-robin` alternates, `queue-depth` picks the path with the fewest outstanding requests. All only choose among Optimized paths, falling back to Non-optimized only when none is Optimized.
+- **Per-path state:** `/sys/class/nvme/nvme0/nvme0c0n1/ana_state` and `ana_grpid` show what the driver last learned from the ANA log.
+- **Host view:**
+
+```
+nvme list-subsys
+cat /sys/module/nvme_core/parameters/multipath
+```
+- **Setting:** `multipath` is a module parameter you set at boot or module load, and it cannot be flipped at run time.
+- **Testing consequence:** fio against the head node measures the combined multipath behavior. To exercise one path, take the others away (ANA Inaccessible, controller reset, disconnect) or load nvme_core with multipath=N.
+FOLLOW:
+- Two drives report the same NGUID. What happens? => Only IDs within one subsystem merge. Identical NGUIDs on different subsystems are a firmware or manufacturing defect, and the driver may reject or mishandle them.
+- Does numa policy spread load across both ports? => Not necessarily. A single-node host sends everything to one Optimized path, so use round-robin or queue-depth to load both.
+PITFALL: Running a throughput test on a dual-port drive and concluding the second port is unused. With the numa policy on a single-node host that is the expected behavior.
+VERIFY: Which kernel version introduced the queue-depth policy, and the exact sysfs path of the per-path ana_state attribute on your kernel.
+
+@@ 14.05 | Intermediate | Concept | tags=ana,log-page,change-count,aen,rgo
+Q: How is the ANA log page laid out, and how does the host learn that an ANA state changed?
+SHORT: The ANA log page (Log Identifier 0Ch) starts with a 16-byte header holding a change count and the number of group descriptors, then one descriptor per ANA group: 32 bytes of group ID, NSID count, group change count and state, followed by the NSID list. It is per controller. A state change triggers an Async Event, notice type ANA Change, if the host enabled it, and the host re-reads the log.
+DEEP:
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 8 | Change Count of the log |
+| 8 | 2 | Number of ANA Group Descriptors |
+| 10 | 6 | Reserved |
+| 16 | 32 + 4 x NNSID | First descriptor, then the next, back to back |
+
+- **Descriptor:** bytes 0-3 ANAGRPID, 4-7 number of NSIDs, 8-15 group Change Count, byte 16 state (low 4 bits), 17-31 reserved, then NNSID 32-bit NSIDs.
+- **Per controller:** each controller reports its own view, so the host reads the log from every controller in the subsystem.
+- **Return Groups Only:** bit 0 of the log specific field omits the NSID lists, which shortens the read when there are many namespaces.
+- **Notification:** Set Features, Async Event Configuration (FID 0Bh) enables the ANA Change notice (bit 11). The controller then completes an Async Event Request with type 2 (notice), info 03h, and log page ID 0Ch, so CQE DW0 reads 000C0302h. The host must read the log, or the controller will not send more of that event.
+- **Also reactive:** Linux re-reads the log after an I/O fails with an ANA error status, and again on reconnect and reset.
+- **Change count:** lets a host detect a change it missed (for example an event lost during a reset) by comparing counts.
+FOLLOW:
+- Why does a host need a separate read per controller? => The state is per (controller, group). Controller 0's log says nothing certain about controller 1's view.
+- What if the AEN is masked or never enabled? => Correct hosts still learn from failing I/O statuses and periodic re-reads, but recovery is slower. A validator should test both.
+PITFALL: Reading the log once at connect time and caching it. States change, and stale Optimized states send I/O down a path that fails.
+VERIFY: Descriptor and header byte offsets, the RGO bit position and the Change Count semantics against the Base Specification.
+
+@@ 14.06 | Intermediate | Concept | tags=reservations,registrants,holder,types,write-exclusive
+Q: How do NVMe reservations work, and what do the six reservation types allow?
+SHORT: A reservation lets hosts share a namespace safely. Each host registers a 64-bit key with the namespace, and one registrant can acquire a reservation of a chosen type, becoming the holder. The six types (write exclusive or exclusive access, each in plain, registrants-only, and all-registrants forms) decide who can read and write. A non-permitted command completes with Reservation Conflict, status 83h.
+DEEP:
+| Type | Value | Holder | Other registrants | Non-registrants |
+|---|---|---|---|---|
+| Write Exclusive | 1 | R/W | Read only | Read only |
+| Exclusive Access | 2 | R/W | None | None |
+| Write Exclusive, Registrants Only | 3 | R/W | R/W | Read only |
+| Exclusive Access, Registrants Only | 4 | R/W | R/W | None |
+| Write Exclusive, All Registrants | 5 | R/W (each registrant is a holder) | R/W | Read only |
+| Exclusive Access, All Registrants | 6 | R/W (each registrant is a holder) | R/W | None |
+
+- **Objects:** a registrant is a host (registered through a controller), a key is 64 bits, and a namespace has at most one reservation at a time.
+- **Scope:** the reservation belongs to the namespace, so it applies to every controller that has the namespace attached, which is what makes it work for dual-port and dual-host drives.
+- **Registrants-only types:** the holder is one host, but every registrant is allowed the same access, which suits a cluster.
+- **All-registrants types:** there is no single holder, and the reservation ends when the last registrant unregisters.
+- **Use:** cluster managers use reservations to fence a failed node so it cannot write after the cluster moved on (questions 14.09, 14.11 and 14.17).
+- **Capability:** Identify Controller ONCS bit 5 says reservations exist, and Identify Namespace RESCAP says which types and whether Persist Through Power Loss is supported.
+FOLLOW:
+- Does a Read to a Write Exclusive namespace from a non-holder work? => Yes, reads are allowed. Only modifying commands conflict.
+- Is reservation state per controller or per namespace? => Reservation state is per namespace. Registration is tracked per controller and host.
+PITFALL: Assuming a reservation is a lock that prevents the holder's own race conditions. It only arbitrates access between hosts and does nothing about ordering within one host.
+VERIFY: Which commands the spec's reservation table blocks for each type (Write, Write Zeroes, Write Uncorrectable, Dataset Management, Copy, Flush, Verify, Compare) and how All Registrants types end.
+
+@@ 14.07 | Intermediate | Numeric | tags=ana,log-page,size,mdts,numd
+Q: How big can the ANA log page get, and why can that matter for a driver?
+SHORT: Size = 16-byte header + 32 bytes per group descriptor + 4 bytes per NSID listed. A drive with 128 ANA groups and 1024 namespaces reports up to 16 + 128 x 32 + 1024 x 4 = 8208 bytes. Linux sizes its buffer from the Identify Controller limits and disables ANA if that exceeds the maximum transfer size, so a log 16 bytes over a limit like 8 KiB makes it log an error and turn multipath ANA off.
+DEEP:
+1. Header: 16 bytes (change count 8, group count 2, reserved 6).
+2. Worst-case descriptors: NANAGRPID (Identify Controller bytes 351:348) groups x 32 bytes = 128 x 32 = 4096 bytes.
+3. Worst-case NSID lists: each namespace appears once, so the maximum is the maximum number of namespaces x 4 bytes = 1024 x 4 = 4096 bytes.
+4. Total: 16 + 4096 + 4096 = 8208 bytes.
+5. Get Log Page NUMD (zero-based dword count) for the full read: 8208 / 4 - 1 = 2051.
+6. Small example: 2 groups and 3 NSIDs total = 16 + 2 x 32 + 3 x 4 = 92 bytes, which matches the decode in question 14.10.
+
+- **Linux check:** the driver computes header + NANAGRPID x 32 + max namespaces x 4 and compares it to its maximum transfer size derived from MDTS. If larger it logs "ANA log page size ... larger than MDTS" and disables ANA support. A drive with MDTS = 1 and a 4 KiB minimum page, 8192 bytes, would fail at 8208.
+- **Max namespaces:** newer kernels use MNAN, and refuse ANA if MNAN is zero or larger than NN.
+- **Validation checks:**
+  - Advertised NANAGRPID and namespace limits are consistent with the largest log the drive returns.
+  - Partial reads (NUMD smaller than the log, non-zero log page offset) return the correct slice.
+  - Sum of NNSID across descriptors matches the number of attached namespaces, and no NSID appears twice.
+FOLLOW:
+- How does a host read a log of unknown size safely? => Read the 16-byte header first for the group count, then compute the size, or read the maximum computed from Identify Controller.
+- Does RGO reduce the size a lot? => Yes. With Return Groups Only the size is 16 + 32 x groups, no NSID lists, so 4112 bytes for 128 groups.
+PITFALL: Testing ANA only with two namespaces. Tables near the limits are where transfer size, MDTS and buffer bugs live.
+VERIFY: NANAGRPID and MNAN field locations, that the spec applies MDTS to Get Log Page, and the exact Linux message text on your kernel.
+
+@@ 14.08 | Intermediate | Concept | tags=nvme-mi,health-poll,ccs,basic-management,bmc
+Q: What does the NVMe-MI health poll return, and how would a BMC use it and the Basic Management Command?
+SHORT: The NVM Subsystem Health Status Poll returns an 8-byte structure: subsystem status, SMART warnings, composite temperature, percentage of life used, and a 16-bit Composite Controller Status of sticky change flags. The BMC polls it, alerts on the flags and clears them. The older SMBus Basic Management Command returns an even smaller block (temperature, warnings, life used) without MCTP, for simple BMCs.
+DEEP:
+- **Health poll structure:** NSS (NVM Subsystem Status), SW (SMART warnings), CTEMP (composite temperature), PDLU (percentage drive life used), CCS (2 bytes), 2 reserved bytes.
+- **CCS bits:** flag events that happened since the last clear, for example Ready (bit 0), Controller Fatal Status (bit 1), Shutdown Status (bit 2), NVM Subsystem Reset Occurred (bit 4), Namespace Attribute Changed (bit 6), Firmware Activated (bit 7), Composite Temperature change (bit 9), Percentage Used (bit 10), Available Spare (bit 11), Critical Warning (bit 12).
+- **Clearing:** the poll has a clear option that resets the CCS flags after they are read, so a BMC does not see the same event twice. A Configuration Set can also clear selected bits.
+- **Basic Management Command:** an SMBus block read at command 00h returns a length byte, status flags, SMART warnings, composite temperature, percentage drive life used and a PEC byte. Command 08h returns vendor ID and serial number.
+- **Other MI commands:** Read NVMe-MI Data Structure (opcode 00h), Configuration Get and Set (04h and 03h), and further commands such as controller health poll, VPD read and write and reset.
+- **Validation cross-checks:** compare MI temperature, life used and warnings with in-band SMART (Get Log Page 02h) at the same instant. They should agree within the sensor update interval. A mismatch shows two separate firmware sources of truth.
+- **Response status:** the MI response header carries a status, where 00h is success, 04h invalid parameter and 21h PCIe inaccessible.
+FOLLOW:
+- Why sticky flags rather than levels? => A BMC polling every few seconds could miss a short event, so the flag latches it until read.
+- What does the BMC see if the PCIe link is down? => Health polls that the management endpoint can answer without the link still work, and PCIe-dependent MI commands return "PCIe inaccessible".
+PITFALL: Treating the Basic Management Command temperature as identical to SMART. Its encoding has special values for no data and sensor failure that a naive parser reads as temperatures.
+VERIFY: Basic Management Command byte encodings (SMART warnings polarity, temperature special values, status flag bits, the length byte value, what command 08h returns), all MI opcodes beyond 00h, 01h, 03h and 04h, and CCS bit positions in the NVMe-MI spec.
+
+@@ 14.09 | Advanced | Concept | tags=reservations,register,acquire,release,preempt,ptpl,notification
+Q: Walk through the reservation commands and their actions, including preempt, PTPL and the notifications.
+SHORT: Reservation Register (0Dh) adds, removes or replaces a host's key. Acquire (11h) takes the reservation, or preempts or preempts-and-aborts another host's registration. Release (15h) releases the reservation or clears everything. Report (0Eh) returns the registrants, holder and type. Preempted hosts learn through a reservation notification log page (80h). Persist Through Power Loss (PTPL) decides whether state survives a power cycle.
+DEEP:
+| Command | Opcode | Actions | Data |
+|---|---|---|---|
+| Reservation Register | 0Dh | 0 Register, 1 Unregister, 2 Replace | Current key and new key |
+| Reservation Acquire | 11h | 0 Acquire, 1 Preempt, 2 Preempt and Abort | Current key and preempt key |
+| Reservation Release | 15h | 0 Release, 1 Clear | Current key |
+| Reservation Report | 0Eh | none | returns a status structure |
+
+- **Ignore Existing Key:** an IEKEY bit makes the controller ignore the current key check.
+- **Preempt:** the acquirer names a preempt key. Registrants with that key are removed. If that key belongs to the holder, the acquirer becomes the new holder. The removed hosts receive a Registration Preempted or Reservation Preempted notification.
+- **Preempt and Abort:** as preempt, and it also aborts commands in flight from the preempted controllers. It is the fencing primitive.
+- **Clear:** the release action that removes the reservation and every registration.
+- **Report:** returns a generation counter (increments on reservation changes), reservation type, number of registered controllers and PTPL state, then one entry per controller: CNTLID, whether it holds the reservation, host ID and key. Use the extended form for 128-bit host IDs.
+- **Notifications:** a Reservation Notification log page (80h) lists Registration Preempted (01h), Reservation Released (02h) and Reservation Preempted (03h). The controller signals it with an async event (type 6, info 00h), and Set Features FID 82h masks each kind.
+- **PTPL:** set through the CPTPL bits of Register or through FID 83h. With PTPL on, reservations and registrants survive power loss. Without it, a power cycle clears them.
+- **CLI:** `nvme resv-register`, `resv-acquire`, `resv-release`, `resv-report`.
+FOLLOW:
+- Does a controller reset drop registrations? => Reservation state is per namespace and normally survives controller-level resets. Whether it survives a subsystem reset or power cycle depends on PTPL.
+- What does a preempted host get on its next write? => Reservation Conflict (83h) if the type blocks it. It also gets a notification if unmasked.
+PITFALL: Testing only the success path. The valuable cases are wrong keys, IEKEY, preempting yourself, and acquire when already holding a different type.
+VERIFY: Bit positions in CDW10 for RREGA, IEKEY, CPTPL, RACQA, RRELA and RTYPE, the NVMe 2.4 rename of Registered Controller to Registrant in the Report structure (nvme-cli 3.0 moves these commands under `nvme resv`, old names kept as aliases), the exact semantics of Preempt when the preempt key is not the holder's, and whether reservation state survives a subsystem reset without PTPL.
+
+@@ 14.10 | Advanced | Debug | tags=ana,log-page,decode,hex,inaccessible,cqe
+Q: A Write to NSID 3 through /dev/nvme0 fails with CQE DW3 = 06050012h. Decode the status and the ANA log dump below.
+SHORT: DW3 06050012h has phase 1, SC 02h, SCT 3 and DNR 0: a path-related Inaccessible status for CID 0012h. The log shows group 1 Optimized (NSIDs 1 and 2) and group 2 Inaccessible (NSID 3) on this controller. So NSID 3 is not reachable through nvme0 right now. It is a path state, not a media failure. The host should try the other controller and re-read the log.
+DEEP:
+CQE DW3 layout: CID bits 15:0, phase bit 16, SC bits 24:17, SCT bits 27:25, CRD bits 29:28, M bit 30, DNR bit 31. Here 06050012h gives CID 0012h, P = 1, SC = 02h, SCT = 3, DNR = 0.
+
+```
+0000: 07 00 00 00 00 00 00 00 02 00 00 00 00 00 00 00
+0010: 01 00 00 00 02 00 00 00 03 00 00 00 00 00 00 00
+0020: 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+0030: 01 00 00 00 02 00 00 00 02 00 00 00 01 00 00 00
+0040: 05 00 00 00 00 00 00 00 03 00 00 00 00 00 00 00
+0050: 00 00 00 00 00 00 00 00 03 00 00 00
+```
+1. Header (0x00-0x0F): change count 7, two group descriptors.
+2. Descriptor 1 at 0x10: group 1, 2 NSIDs, group change count 3, state 01h Optimized. NSID list at 0x30: 1 and 2.
+3. Descriptor 2 at 0x38: group 2, 1 NSID, group change count 5, state 03h Inaccessible. NSID list at 0x58: 3.
+4. Total 0x5C = 92 bytes, so a 92-byte read is complete.
+
+- **Meaning:** SCT 3 SC 02h is ANA Inaccessible, and it matches the group 2 state, so the drive is behaving consistently.
+- **Next steps:** read the log from the other controller (`nvme ana-log /dev/nvme1`), where group 2 should be Optimized or Non-optimized. If both are Inaccessible, the subsystem has no usable path and the host should queue or fail I/O.
+- **Where it would be a bug:** the log says Optimized but the command returns 302h, or the state changed with no ANA Change event when the host enabled it.
+- **Host reaction (Linux):** with multipath, a path error without DNR set triggers failover, so the I/O reruns on another path. Through a raw controller device you see the status directly, as here.
+FOLLOW:
+- The host read only 64 bytes. What is lost? => The tail: descriptor 2 starts at 0x38, so only its first 8 bytes fit, and group 2's state at 0x48 is missing. Read the header first and size the read from the group count.
+- The AEN never arrived after the state change. What do you check? => That FID 0Bh bit 11 is set, that an Async Event Request was outstanding, and that a previous ANA event was cleared by reading the log.
+PITFALL: Retrying the write on the same controller. An Inaccessible group will keep failing until the state changes, and the retry burns the command timeout budget.
+VERIFY: Group change count semantics relative to the header change count, and the printed format of `nvme ana-log` on your nvme-cli.
+
+@@ 14.11 | Advanced | Trap | tags=reservations,host-id,multipath,conflict,hostid
+Q: A Linux host reserves a namespace through nvme0 and things work, but the same writes fail with Reservation Conflict when multipath uses nvme1. What went wrong?
+SHORT: Reservations track hosts by Host Identifier and registrations per controller. If the two controllers have different Host IDs, or the key was registered only through nvme0, nvme1 can be treated as another or unregistered host and gets Reservation Conflict, status 83h. It is not a path error, so multipath does not fail over. Register the same key through every controller and give all of the host's controllers one Host ID.
+DEEP:
+- **Symptom:** the failure appears only when the path changes, for example after failover or with a different iopolicy. 83h is a generic status, not SCT 3, so Linux does not treat it as a path error and returns it to the application.
+- **Evidence:**
+  - `nvme resv-report /dev/nvme0n1 --eds` lists registered controllers with CNTLID, holder flag, host ID and key. Missing nvme1 means never registered. Different host IDs mean two hosts.
+  - `nvme get-feature /dev/nvme0 -f 0x81 -l 16` and the same for nvme1 shows the Host Identifier feature (FID 81h). A 128-bit ID needs the extended-host-ID bit.
+  - The Reservation Conflict shows in the CQE (SCT 0, SC 83h). Linux maps it to a reservation-conflict block error (BLK_STS_RESV_CONFLICT), not a path error.
+- **Linux and Host ID:** fabrics controllers send HOSTID in Connect, but the in-tree PCIe driver code does not appear to issue Set Features 81h itself, so on a dual-port PCIe SSD a script or udev rule has to set it on each controller (`nvme set-feature -f 0x81`, 16-byte buffer, extended bit in CDW11).
+- **Why the design works this way:** in a cluster, node A's two paths must be one host, or a node would fence itself when it switches paths. Different hosts must get different IDs, or fencing does nothing.
+- **Fix:** same Host ID on every controller of one host, register the same key through each controller (once per path), then acquire once.
+- **Test angle:** a drive should show two registrants under the same host ID as one host, and a different host ID as a conflict. A drive that treats the two paths of one host as strangers fails multi-path clusters.
+FOLLOW:
+- Would Reservation Conflict retry on another path? => No. The host driver sees a generic status, not a path status, so it completes the I/O with an error. A retry would conflict again with the same key state.
+- How does the Host ID relate to the Host NQN? => They are separate. Host NQN identifies a host to a fabrics target. Host ID is a Set Features value used for reservations and other host-scoped tracking.
+PITFALL: Registering a key only on the path you happened to use for setup, and blaming the SSD when I/O on the other path conflicts.
+VERIFY: How PCIe controllers get their Host ID on your Linux kernel, the rule for controllers sharing a Host ID (must they share the key?), and the CDW11 bit that selects a 128-bit Host ID.
+
+@@ 14.12 | Advanced | Cross-layer | tags=reset,dual-port,nssr,flr,blast-radius,pcie
+Q: On a dual-port SSD shared by two hosts, which resets and events on host A's side are visible to host B?
+SHORT: Anything scoped to one controller or one PCIe port stays on A's side: writing CC.EN to 0, a Function Level Reset, or a reset of A's PCIe link. B keeps running. An NVM Subsystem Reset (NSSR write), a power cycle or a firmware-level reset crosses over and resets every controller, so B loses its queues, sees CSTS.NSSRO set and must reinitialize.
+DEEP:
+| Event on host A | Scope | Effect on host B |
+|---|---|---|
+| CC.EN 1 to 0 | Controller A | None, B's queues and I/O continue |
+| Function Level Reset of A's function | Controller A | None |
+| PCIe reset of A's port (PERST# or hot reset) | Controller A | None expected, each port has its own reset domain |
+| NSSR (write "NVMe" to NSSR at offset 20h) | Whole subsystem | B's controller resets, link may drop, CSTS.NSSRO set |
+| Power cycle or vendor reset | Whole drive | B loses everything |
+| Format NVM or Sanitize of a shared namespace | Data of that namespace | B's I/O to it is affected, namespace-changed events may follow |
+
+- **What survives:** namespaces, data and (with care) reservation state. Controller resets keep reservations. A subsystem reset or power cycle keeps them only if PTPL was on.
+- **What A's reset does to shared state:** commands A had in flight are discarded by the controller reset, but media operations already started, and background work such as GC, may still complete.
+- **Detection by B:** after an NSSR B sees its controller drop (registers read CSTS.NSSRO = 1, or reads return all ones during the reset), and Linux resets and reconnects.
+- **Test design:**
+  1. Run continuous verified I/O from both hosts to separate LBA ranges on a shared namespace.
+  2. Inject each event on A. Record B's I/O latency, error count and data integrity.
+  3. Pass: controller-scoped events leave B's max latency within normal spread, and no B command fails. Subsystem-scoped events produce a bounded B disruption with full recovery and no corruption.
+  4. Check A's recovery, with reservations and namespace attachments intact.
+FOLLOW:
+- Does a hot reset on A's PCIe link touch B's link? => It should not, since each port has its own reset and link state. If B's link drops, suspect the drive's reset isolation and check the spec and the design.
+- What would you check first if B stalls when A does CC.EN=0? => Whether A's controller disable makes firmware quiesce shared resources (for example FTL locks or a global flush) and how long that holds B's completions.
+PITFALL: Assuming a drive-level reset only ever happens by NSSR. Firmware crashes and power events also reset every controller.
+VERIFY: NSSR register offset, magic value and the CSTS.NSSRO bit, and the spec wording on which controllers a PCIe Conventional Reset of one port resets.
+
+@@ 14.13 | Advanced | Concept | tags=virtualization,primary,secondary,virt-mgmt,vq,vi,sriov
+Q: How does the Virtualization Management command assign resources to secondary controllers, and in what order do you bring a VF up?
+SHORT: Virtualization Management (admin opcode 1Ch) acts on a controller ID with an action and resource type. Actions: Primary Flexible Allocation (01h), Secondary Offline (07h), Secondary Assign (08h) and Secondary Online (09h). Resource type 0 is VQ (queue resources) and 1 is VI (interrupt resources). The primary assigns VQ and VI counts to each secondary, then brings it Online. Identify (CNS 14h and 15h) reports what exists and what is assigned.
+DEEP:
+- **Identify Primary Controller Capabilities (CNS 14h):** whether VQ and VI are supported, total flexible resources (VQFRT, VIFRT), how many are assigned to secondaries, private resources of the primary, the maximum a single secondary can have (VQFRSM, VIFRSM) and the granularity (VQGRAN, VIGRAN).
+- **Identify Secondary Controller List (CNS 15h):** per secondary, controller ID, associated primary, Online state, VF number and the VQ and VI counts currently assigned.
+- **Command fields:** CDW10 carries the action, the resource type and the target CNTLID. CDW11 carries the number of resources (NR).
+- **Bring-up order:**
+  1. Identify primary capabilities. Plan totals against limits.
+  2. Optionally give the primary flexible resources (action 01h).
+  3. Enable the VFs at the PCIe level (`echo N > sriov_numvfs`) so the functions exist. Secondaries start Offline.
+  4. With the secondary Offline, assign VQ resources (action 08h, RT 0, NR) and VI resources (action 08h, RT 1, NR).
+  5. Bring the secondary Online (action 09h). Its controller now accepts CC.EN and the VF driver can initialize it.
+- **Errors:** command-specific statuses Invalid Secondary Controller State (20h), Invalid Number of Controller Resources (21h) and Invalid Resource Identifier (22h) are what to expect for assigning while Online, exceeding the limits, or bad IDs.
+- **Linux:**
+
+```
+nvme primary-ctrl-caps /dev/nvme0
+nvme list-secondary /dev/nvme0
+nvme virt-mgmt /dev/nvme0 -c 1 -r 0 -a 8 -n 4    # assign 4 VQ to CNTLID 1
+```
+- **PCIe side:** see the PCIe page, SR-IOV module, for the VF mechanics. NVMe adds the queue and vector budget on top.
+FOLLOW:
+- Can you resize a VF's queues while it is Online? => Take it Offline, reassign, bring it Online. Expect a live controller to reject the change with Invalid Secondary Controller State.
+- Does a VF need its own namespaces? => It needs namespaces attached with Namespace Attachment. Private namespaces isolate tenants, shared ones let several controllers see the same data.
+PITFALL: Enabling VFs and expecting I/O. An unassigned or Offline secondary cannot create queues, so the VF's driver fails at initialization.
+VERIFY: Virtualization Management CDW10 and CDW11 field positions and action encodings, whether resources are assigned before or after the VFs are enabled on your drive, the CNS 14h and 15h structures, whether an admin queue is counted as a VQ resource, and which reset states clear assignments.
+
+@@ 14.14 | Advanced | Numeric | tags=virtualization,vq,vi,granularity,budget,msix
+Q: A drive reports 256 flexible VQ resources with granularity 4, and 128 flexible VI resources with granularity 2. You want 30 VFs with equal shares. What can each VF get, and what breaks if you push it?
+SHORT: Equal share is 256 / 30 = 8.53 VQ, which rounds down to a multiple of 4: 8 each, 240 in total, 16 left over. VI is 128 / 30 = 4.27, so 4 each (multiple of 2), 120 total, 8 left over. Each VF can then create up to 8 queue pairs but only has 4 interrupt vectors, so queues share vectors. A number such as 9 VQ breaks the granularity and may be rejected.
+DEEP:
+These are example values, not from a real drive.
+1. VQ per VF: floor(256 / 30) = 8 (8.53). Granularity 4 makes 8 valid, 9 invalid. Assigned: 8 x 30 = 240. Unassigned: 256 - 240 = 16.
+2. VI per VF: floor(128 / 30) = 4 (4.27). Granularity 2 makes 4 valid. Assigned: 4 x 30 = 120. Unassigned: 128 - 120 = 8.
+3. Per-VF limits: both 8 and 4 must be no more than VQFRSM and VIFRSM (for example 64 each).
+4. Queue-to-vector ratio: 8 queue pairs over 4 vectors means about 2 CQs per vector. The driver uses fewer than 8 queues or shares vectors, and interrupt cost per completion is higher than with one per queue.
+5. Leftover: 16 VQ and 8 VI can go to the primary through flexible allocation, or to two premium VFs. For example, two VFs with 16 VQ (2 x 8 more) exactly uses the leftover 16.
+
+- **What to check:** the sum of assigned resources equals the totals the primary reports as assigned (the assigned counters), and no over-assignment is accepted.
+- **Boundary cases to test:** NR not a multiple of granularity, NR above the per-secondary maximum, total above the pool, assignment to an Online secondary, unassign (NR=0) and reassign, all VFs at maximum, and pool exhaustion order.
+- **Effect on hosts:** a tenant told "8 queues" but with 4 vectors may see interrupt contention. Sizing IRQs with queues is a design decision, not an accident.
+FOLLOW:
+- Does the VI count include the admin queue's vector? => The admin CQ uses a vector too, so a VF with 4 VIs may have only 3 for I/O queues (VERIFY how the spec counts vector 0).
+- What if the drive rounds NR instead of rejecting? => That is implementation behavior only if the spec allows it. A validator should record which it does and flag the mismatch with the spec text.
+PITFALL: Dividing pool by VF count and using the raw quotient. Granularity and per-secondary maximums make the usable share smaller.
+VERIFY: Whether NR must be a multiple of the granularity or is rounded, how vector 0 and the admin queue are counted in VI and VQ resources, and the field names VQFRT, VQFRSM, VQGRAN, VIFRT, VIFRSM and VIGRAN.
+
+@@ 14.15 | Principal | Scenario | tags=failover,validation,fault-injection,fio,automation,ana
+Q: How would you design a validation plan for path failover on a dual-port SSD?
+SHORT: Build a fault matrix (graceful ANA change, controller reset, PCIe link drop, silent hang, NSSR, both paths down and back) and run each under verified fio load with two hosts or two controllers. Measure application errors, longest I/O stall, failover and failback time and data integrity. Define pass criteria per fault class, capture host logs, ANA logs and analyzer traces on both ports, and automate it as a loop with randomized timing.
+DEEP:
+| Fault | Injection | Expected host reaction | Pass criteria |
+|---|---|---|---|
+| ANA state flip (Optimized to Inaccessible) | Vendor or debug command | ANA Change event, reroute | Zero app errors, stall in milliseconds |
+| Controller disable/reset | CC.EN=0 or sysfs `reset_controller` | Requeue, resume after reset | Zero app errors, stall bounded by reset time |
+| PCIe link down on one port | Slot or PERST# control, interposer | Controller dead, failover | Zero app errors, stall bounded by detection |
+| Silent hang | Firmware knob stops completions | I/O timeout, then reset | Stall about the timeout, then continues |
+| NSSR | Register write | Both controllers reset | Recovery, no corruption |
+| All paths down, one returns | Sequential faults | Queue while no path, resume | No error within the queue window |
+| Failback | Restore state | Traffic returns to Optimized | Path used again, no flap |
+
+- **Workload:** fio with `--direct=1`, mixed random read and write, CRC verification that runs while the fault is active (`--verify=crc32c` with `--verify_backlog`), plus a Flush stream. Use queue depths that keep both paths busy (`iopolicy=round-robin`).
+- **Measurements:** per-I/O maximum latency and a time series of completions (find the gap), application error count, time from fault to first completion on the surviving path, time from restore to failback.
+- **Evidence:** kernel nvme tracepoints, `nvme list-subsys` sampled fast, dmesg timestamps, ANA log snapshots, analyzer capture on both ports with a shared time marker.
+- **Randomize:** fault time relative to command boundaries, queue depth, write size, and whether a Flush or a large write is in flight.
+- **Compliance checks:** path errors carry DNR = 0 (Linux does not fail over when DNR is set), ANA statuses match the log, and Change state ends within ANATT.
+- **Automation:** a state-machine harness that arms an injector, runs the workload, applies a fault, waits for a settle window, checks invariants (no miscompare, no unexpected error, bounded stall) and stores artifacts on failure.
+FOLLOW:
+- How do you decide the stall limit? => From the host's timeouts and the product requirement, for example one I/O timeout (30 s default on Linux) for silent hangs, and far less for graceful and link-down cases.
+- Why test with two hosts, not just two controllers on one? => Two hosts have separate Host IDs, separate reservation identities and separate reset behavior, which is what a real dual-port deployment stresses.
+PITFALL: Testing failover only when the workload is idle. Failover with writes in flight, a Flush queued or GC running is where data-integrity bugs surface.
+VERIFY: Linux default timeouts and retry counts on your kernel, and whether path errors with DNR set skip failover in that version.
+
+@@ 14.16 | Principal | Debug | tags=failover,timeout,anatt,stall,dmesg,root-cause
+Q: After you disable one port of a dual-port SSD under load, application I/O freezes for about 30 to 60 seconds before continuing on the other path. Is it a bug, and how do you root-cause it?
+SHORT: It can be correct behavior. Failover speed depends on how the failure is detected. A link that drops or a controller that reads all ones is caught in milliseconds, but a controller that silently stops completing commands is caught only by the I/O timeout, 30 seconds by default on Linux, and possibly twice with an Abort attempt. So classify the failure regime first from timestamps, then decide whether the drive should have signaled a path error.
+DEEP:
+Three regimes explain most freezes:
+1. **Loud failure:** link down or the controller registers read all ones. The driver notices at the next poll or timeout check, resets the controller, cancels in-flight requests with Host Aborted (371h, path related), and multipath reroutes them. Freeze: typically a few seconds at most.
+2. **Silent hang:** the link is up, but the controller stops posting CQEs. Nothing tells the host until the I/O timeout fires (30 s), after which the driver sends Abort and waits again, or resets. Freeze: about one to two timeout periods.
+3. **Stuck transition:** a group sits in ANA Change state past ANATT. Linux logs "ANATT timeout, resetting controller" at about twice the reported ANATT, then reroutes.
+
+- **Method:**
+  - Line up timestamps: fault injection time, last completion, first timeout message in dmesg, reset, first completion on the other path.
+  - Look at dmesg for the wording of the timeout, the abort and the reset ("I/O ... timeout, aborting", "controller is down", "ANATT timeout").
+  - Read CSTS and the PCIe link state on the failed port at the freeze midpoint. All ones means a dead link or function.
+  - Capture the surviving controller's ANA log. If the fault injection changed the ANA state on the good side, the ANA Change event should have reduced the stall.
+  - Analyzer: does the failing port still ack TLPs but never complete commands (silent hang), or is the link gone?
+- **Decision:** if the drive can know it cannot serve a controller, it should complete with a path-related status or set CSTS.CFS, not stay silent. A firmware fix means detecting the internal fault and failing fast. A host-side tuning (`nvme_core.io_timeout`) trades stall time for false timeouts when GC or throttling delays completions.
+FOLLOW:
+- The freeze is exactly 60 seconds every time. What does that suggest? => Two 30-second timeouts in sequence: the I/O timed out, an Abort was tried, and only the second timeout reset the controller.
+- Multipath is on, but the I/O froze rather than rerouting immediately. Why? => Failover happens when a request completes with a path error or is cancelled, so until then it sits in the hung controller's queue.
+PITFALL: Reporting the freeze as a drive defect when the injection method made a silent hang. Check what the fault looked like to the host before assigning blame.
+VERIFY: Linux abort and reset flow in nvme_timeout on your kernel version (single or double timeout), and the exact dmesg strings.
+
+@@ 14.17 | Principal | Cross-layer | tags=fencing,preempt-abort,stale-write,split-brain,reservations,data-integrity
+Q: How would you build a test that proves a failed-over write cannot land late and overwrite newer data, and how do reservations fit?
+SHORT: The hazard is a write still executing on the failed path after the host retried it on the other, so the old data overwrites the newer data. NVMe gives no ordering across controllers. The test stalls a write on controller A, fences A (controller reset, or reservation Preempt and Abort from B), lets B write newer data, releases the stall, and asserts the LBA still holds the newer sequence number.
+DEEP:
+- **Sequence:** W1(seq n) goes to LBA L through A and is delayed inside the drive. The host times out and fails W1 over to B, then the application writes W2(seq n+1) to L through B. A recovers and executes W1 late. If it lands, L holds n, stale data with no error.
+- **Fences:** (a) reset A so its outstanding commands are discarded, confirmed by CSTS.RDY dropping. (b) If A is unreachable or belongs to another host, B (as a registrant) issues Reservation Acquire with Preempt and Abort against A's key. A's registration is removed, commands from A are aborted, and A's later writes get Reservation Conflict.
+- **Setup:** two hosts or two controllers with different Host IDs, a shared namespace, a reservation type that blocks writes from non-registrants (for example 4, Exclusive Access Registrants Only), keys registered for both.
+- **Making the stall:** a firmware or debug knob to hold one controller's commands mid-flight. Sleeping in the host cannot do it, because the command must be inside the drive.
+- **Data model:** every write carries LBA, global sequence number, writer ID and CRC. The host keeps a shadow of the newest acknowledged sequence per LBA.
+- **Assertions:**
+  1. After fencing, A's write gets no success that alters media, or its effect precedes W2.
+  2. A read of L through both controllers returns seq n+1.
+  3. Reservation Report shows A removed, generation incremented, and A's controller has a Registration Preempted notification pending.
+  4. A control run without the fence documents whether the drive can misorder, which is allowed by the spec, so it is a hazard to report and not a failure.
+- **Scale:** loop with random delays between the stall and the fence, many LBAs and sizes, and Flush in the mix. Search the whole range for stale sequence numbers after each run.
+FOLLOW:
+- Does Preempt and Abort guarantee A's commands are gone? => It requests it, but a command past the point of no return may still complete. The test asserts the final data order, not that no command ran.
+- Why not just wait longer before retrying? => A hung controller gives no bound. Without a fence, any delay is only a guess.
+PITFALL: Testing fencing on an idle namespace. The race needs a command in flight inside the drive at the moment of the fence.
+VERIFY: What the spec requires of Preempt and Abort for commands already in progress, and which reservation types block writes from unregistered or preempted hosts.

@@ -1,0 +1,391 @@
+# Module 9: Host Software Stack for Zoned Storage
+
+@@ 9.01 | Basic | Concept | tags=blk-zoned,ioctl,sysfs,struct-blk-zone,units
+Q: How does Linux represent a zoned NVMe namespace, and what can user space do with it?
+SHORT: Linux exposes a ZNS namespace as a host-managed zoned block device: a fixed zone size in 512-byte sectors, a per-zone record (start, length, write pointer, capacity, type, condition), and a small ioctl set: BLKREPORTZONE, BLKRESETZONE, BLKOPENZONE, BLKCLOSEZONE, BLKFINISHZONE, plus BLKGETZONESZ and BLKGETNRZONES. Every value is in 512-byte sectors, whatever the LBA size.
+DEEP:
+Zoned attributes live in `/sys/block/<dev>/queue/`: `zoned` (reads `host-managed` for ZNS), `chunk_sectors` (zone size), `nr_zones`, `max_open_zones` and `max_active_zones` (0 means no limit), `zone_append_max_bytes` and `zone_write_granularity`. How Identify fields become these values is in 2.14.
+
+The per-zone record is `struct blk_zone`:
+
+| Field | Meaning |
+|---|---|
+| start, len | Zone start sector and zone size in sectors |
+| wp | Write pointer sector |
+| capacity | Zone capacity in sectors (valid when BLK_ZONE_REP_CAPACITY is set in the report flags) |
+| type | 1 conventional, 2 sequential write required, 3 sequential write preferred |
+| cond | Zone condition |
+| non_seq, reset | SMR-era hints, left at 0 by the NVMe driver |
+
+Condition codes are 0 NOT_WP (conventional), 1 EMPTY, 2 IMP_OPEN, 3 EXP_OPEN, 4 CLOSED, 0xD READONLY, 0xE FULL, 0xF OFFLINE. They match the NVMe Zone State values because the driver copies the upper nibble of the descriptor's ZS byte.
+
+| ioctl (magic 0x12) | Number | Argument |
+|---|---|---|
+| BLKREPORTZONE | 130 | struct blk_zone_report: start sector, zone count, then the zone array |
+| BLKRESETZONE | 131 | struct blk_zone_range: sector, nr_sectors |
+| BLKGETZONESZ, BLKGETNRZONES | 132, 133 | one u32 |
+| BLKOPENZONE, BLKCLOSEZONE, BLKFINISHZONE | 134, 135, 136 | struct blk_zone_range |
+
+- **Reset all:** a whole-device reset can reach the NVMe driver as a Reset Zone with Select All set.
+- **Full zones:** the driver reports the WP of a Full zone as zone start plus zone size, ignoring the descriptor value (see 3.12).
+- **Newer kernels:** the header adds a v2 report ioctl and a cached-report flag (annotated Linux 6.19), so a report may come from the kernel's cache, not the drive.
+FOLLOW:
+- Is `len` the Zone Size or the Zone Capacity? => The Zone Size. Capacity is its own field, and writable space can be smaller.
+- Which shell tool prints these fields? => `blkzone report`: start, len, cap and wptr in hex 512-byte sectors, with wptr relative to the zone start.
+PITFALL: Multiplying Linux values by the LBA size. Every zone address and length in the ioctls, blkzone and chunk_sectors is in 512-byte sectors, so with 4 KiB LBAs divide by 8 before comparing with nvme-cli (sysfs zone_append_max_bytes and zone_write_granularity are in bytes).
+VERIFY: ioctl numbers and the v2 report and cached flag in include/uapi/linux/blkzoned.h for the kernel under test.
+
+@@ 9.02 | Basic | Concept | tags=stack,layers,responsibility,block-layer
+Q: Which layers sit between an application and a ZNS SSD on Linux, and who keeps writes sequential at each?
+SHORT: The application or a zone-aware filesystem, then the block layer's zone write handling, then the NVMe driver, then the device. The application or filesystem must produce sequential writes and do its own reclaim. The block layer orders writes per zone and tracks the write pointer, the driver translates geometry and commands, and the device enforces the rules with zone status codes. The device is the last line of defense, not the first.
+DEEP:
+| Layer | Examples | Job for sequential writes |
+|---|---|---|
+| Application | RocksDB with ZenFS, log engines, fio zonemode=zbd | Pick the zone, track the WP, reset, recover after a crash |
+| Filesystem | zonefs, f2fs, btrfs zoned mode | Allocate append-only and reclaim (zonefs leaves this to the application) |
+| Device mapper | dm-linear, dm-flakey, dm-crypt, dm-zoned | Some targets pass zones through; dm-zoned emulates random writes |
+| Block layer | Zone write plugging (mq-deadline on old kernels) | Order writes per zone, track WP, emulate Zone Append if absent |
+| NVMe driver | nvme | Map Identify to queue limits, parse Report Zones, force read-only if Zone Append is missing |
+| Device | Firmware | Enforce WP, state machine and MAR/MOR; return zone status codes |
+
+- **Bypass paths:** NVMe passthrough, SPDK and xNVMe skip the filesystem and the ordering logic. Then ordering is your job (9.07, 9.11).
+- **Who reports a failure:** an EIO with no NVMe command behind it came from the block layer or a filesystem. A Zone Invalid Write completion means the device saw an out-of-order write.
+- **Validation consequence:** pick the layer under test. Passthrough tests the device, the block device tests the kernel path, a filesystem tests end to end.
+FOLLOW:
+- Where does garbage collection live? => Above the block layer: filesystem reclaim (f2fs, btrfs) or the application (ZenFS resets zones when RocksDB compaction empties them). The block layer never moves data.
+- Which layer decides a namespace is read-only? => The NVMe driver, for example when Zone Append is not advertised (2.15).
+PITFALL: Testing device conformance through a filesystem. The layers above reorder, retry and repair things, so an illegal command never reaches the drive.
+VERIFY: Which device-mapper targets pass zoned geometry through on your kernel (dm-linear, dm-flakey and dm-crypt as I recall).
+
+@@ 9.03 | Basic | Concept | tags=zonefs,f2fs,btrfs,zenfs,dm-zoned,consumers
+Q: Which software can use a zoned namespace on Linux, and which of it hides the zone rules?
+SHORT: They range from exposing to hiding the rules. Raw block access with libzbd or ioctls, zonefs, SPDK and xNVMe expose zones. f2fs and btrfs zoned mode hide them behind POSIX files and run their own reclaim. ZenFS puts RocksDB on zones. dm-zoned is a legacy target that emulates random writes on SMR. Choose by how much sequential-write logic the team wants to own.
+DEEP:
+| Option | Interface | Zone rules visible? | Reclaim |
+|---|---|---|---|
+| Raw block + libzbd or ioctls | pread/pwrite with direct I/O | Fully | The application |
+| zonefs | One file per zone | Yes: file size is the WP | The application (truncate to 0 resets) |
+| f2fs | POSIX | No | f2fs garbage collection |
+| btrfs zoned mode (5.12) | POSIX | No | btrfs background reclaim |
+| ZenFS | RocksDB FileSystem API | Hidden from RocksDB | Zone reset when a zone holds no live data |
+| SPDK, xNVMe | User-space NVMe | Fully | The application |
+| dm-zoned | Block device | No | dm-zoned (legacy) |
+
+- **dm-zoned:** its documentation describes conventional zones (or a second regular device) for caching and metadata. ZNS has no conventional zones, so it is an SMR-era mechanism, not the way to run ZNS.
+- **Common lesson:** somebody always does garbage collection. Zoned storage moves it out of the drive into whichever row you pick.
+- **Validation angle:** raw and passthrough for conformance, zonefs for simple file-level state checks, a filesystem or ZenFS for end-to-end churn (9.09, 9.10).
+FOLLOW:
+- Which needs the least new code for an existing application? => A zoned filesystem, at the price of reclaim behavior you do not control.
+- Why is zonefs handy in a lab? => File operations map one to one onto zone actions (append, truncate to 0, truncate to full), and errors show up as permission changes (9.08).
+PITFALL: Assuming POSIX means no zone problems. f2fs and btrfs can still hit active-zone limits or reclaim-driven ENOSPC on a drive with small MAR.
+VERIFY: The kernel version where zonefs appeared (5.6 as I recall) and dm-zoned behavior on ZNS in your kernel.
+
+@@ 9.04 | Intermediate | Concept | tags=zone-write-plugging,mq-deadline,ordering,write-pointer
+Q: How does Linux keep writes to a zone in order, and what changed when zone write plugging replaced zone write locking?
+SHORT: Before, mq-deadline held a per-zone write lock so only one write per zone was in flight. Zone write plugging (Linux 6.10 as I recall) moved this into the block layer, independent of the scheduler: each zone with writes gets a plug that tracks the write pointer offset and queues later writes while one is in flight. Either way, one Write per zone reaches the device at a time, and a write not at the tracked WP fails in the block layer.
+DEEP:
+| | Zone write locking | Zone write plugging |
+|---|---|---|
+| Where | I/O scheduler dispatch | Block layer core |
+| Scheduler needed | mq-deadline (default for zoned devices) | Any |
+| Write pointer | Device is the only oracle | Tracked per zone in memory |
+| Zone Append | Native; the SCSI disk driver emulated it | Native or emulated by the block layer (5.08) |
+| Kernel | Up to 6.9 as I recall | 6.10 onward as I recall |
+
+- **Mechanism:** the first write to a zone allocates a plug. While one write is in flight, later bios for that zone wait in a list, and consecutive ones can be merged into one request. The plug is freed when the zone is empty or full and nothing is pending.
+- **Mismatch check:** a write whose start sector is not the tracked WP is failed with an I/O error by the block layer, before any NVMe command exists.
+- **Error path:** when a write fails, queued writes for that zone are aborted (a rate-limited "Aborting plugged BIOs" warning) and the plug is marked as needing a WP update. Further writes fail until a Report Zones, Reset or Finish resyncs it.
+- **Append:** native Zone Append is not plugged. Mixing it with regular writes on one zone is invalid and logs "Invalid mix of zone append and regular writes".
+- **Result:** per-zone queue depth at the device is 1 for Writes, so scale by spreading over zones or by using Zone Append.
+FOLLOW:
+- Does plugging change what the device sees? => Yes. It never sees two Writes to one zone from the block layer, so QD 32 on the block device does not test device-side reordering.
+- What is zoned_qd1_writes? => A recent sysfs attribute that switches write handling to a single issuer at queue depth 1. Its default is on for SMR HDDs and off for ZNS SSDs.
+PITFALL: Concluding the device tolerates concurrent writes because a block-device test passed. The kernel serialized them first.
+VERIFY: The kernel that introduced zone write plugging (6.10 as I recall), whether your distribution back-ported it, and the zoned_qd1_writes attribute (documented as January 2026).
+
+@@ 9.05 | Intermediate | Concept | tags=libzbd,blkzone,units,tools
+Q: What do libzbd and its tools add over blkzone and raw ioctls, and where do units bite?
+SHORT: libzbd is a C library over the block-layer ioctls. zbd_open checks that the device is zoned and returns geometry and limits, zbd_report_zones filters by condition, zbd_reset_zones, open, close and finish work on ranges, and macros test type and condition. blkzone from util-linux is the shell equivalent, and libzbd ships a zbd CLI. The trap is units: libzbd takes bytes, blkzone takes 512-byte sectors, and nvme-cli takes LBAs.
+DEEP:
+- **Open:** `zbd_open(path, flags, &info)` returns -ENXIO for a non-zoned device. `struct zbd_info` reports nr_zones, zone_size (bytes), zone_sectors, max_nr_open_zones, max_nr_active_zones (0 no limit, -1 unknown) and the zone model.
+- **Report:** `zbd_report_zones(fd, ofst, len, ro, zones, &nr)`. The `ro` filter values include EMPTY, IMP_OPEN, EXP_OPEN, CLOSED, FULL, RDONLY, OFFLINE and NOT_WP. Range operations take a byte offset and length, and length 0 means to the end of the device.
+- **Tests:** macros such as `zbd_zone_empty()` and `zbd_zone_is_open()` keep harness code readable.
+
+| Tool | Unit | Path | Best for |
+|---|---|---|---|
+| `blkzone report/reset/open/close/finish` (-o offset, -l length, -c count) | 512-byte sectors | Block-layer ioctls | Quick looks and scripts |
+| libzbd, `zbd report` | Bytes | Block-layer ioctls | Harnesses and applications |
+| `nvme zns report-zones` and friends | LBAs | NVMe passthrough | Device-level and illegal commands |
+| `lsblk -z` | Sysfs values | Sysfs | Inventory across a lab |
+
+- **Filter codes:** libzbd's ZBD_RO_EMPTY 1, IMP_OPEN 2, EXP_OPEN 3, CLOSED 4, FULL 5, RDONLY 6 and OFFLINE 7 equal the NVMe ZRASF state values (libnvme, SPDK and QEMU agree). libzbd also has ZBC-only values (NOT_WP 0x3f, NON_SEQ 0x11, RWP_RECOMMENDED 0x10) that mean nothing to NVMe. Linux nvme.h names 05h READONLY and 06h FULL, which is swapped against those sources, so do not copy ZRASF numbers from that header.
+- **Harness rule:** model in libzbd if you like, but always re-read the WP from the device after any error.
+FOLLOW:
+- Which open flags for a write test? => Pass O_DIRECT (zbd_open forwards flags to open). Buffered writes are reordered by the page cache.
+- What does a range with length 0 mean? => Everything from the offset to the end of the device capacity.
+PITFALL: Passing sectors to libzbd or LBAs to blkzone. The call succeeds and acts on the wrong zone.
+VERIFY: lsblk zone columns and blkzone option letters on your util-linux version, the zbd CLI subcommands in your libzbd release, and the ZRASF state values (Full 05h, Read Only 06h) in the ZNS Command Set Specification.
+
+@@ 9.06 | Intermediate | Concept | tags=fio,zonemode-zbd,max-open-zones,zone-reset,append
+Q: How does fio's zonemode=zbd work, and which options matter for a ZNS test?
+SHORT: With zonemode=zbd fio reads the zone layout, keeps writes sequential within every sequential zone even for random workloads, spreads randomness across zones, limits open zones with max_open_zones, and turns trim into Reset Zone. zone_reset_threshold and zone_reset_frequency emulate host garbage collection. fio issues ordinary Writes unless you use ioengine=io_uring_cmd with write_mode=zone_append.
+DEEP:
+| Option | Meaning |
+|---|---|
+| `zonemode=zbd` | Sequential in each zone, random across zones, trim becomes reset |
+| `max_open_zones=N` | Zones written by all jobs at once. Default is the device limit and a larger value is refused |
+| `job_max_open_zones=N` | Same limit per job |
+| `ignore_zone_limits=1` | Allow max_open_zones above the device limit (negative tests) |
+| `zone_reset_threshold=F` | Reset only once the written ratio of the IO range passes F |
+| `zone_reset_frequency=F` | Once past the threshold, one reset per 1/F write requests |
+| `read_beyond_wp=1` | Allow reads above the write pointer (off by default, they return without media reads) |
+| `recover_zbd_write_error=1` | With `continue_on_error`, resync the WP after a failed write |
+| `write_mode=zone_append` | Zone Append writes, `io_uring_cmd` engine only |
+
+- **Serialization:** for host-managed devices fio serializes writes to sequential zones, so `iodepth=32` does not put 32 writes into one zone.
+- **Remainders:** if the free space in a zone is not a multiple of the block size, fio finishes the zone to free the open resource, unless `write_zone_remainders` is set.
+- **Direct I/O:** use `direct=1` so the page cache cannot reorder writes.
+
+```
+fio --name=zw --filename=/dev/nvme0n2 --direct=1 --ioengine=io_uring --zonemode=zbd \
+    --rw=randwrite --bs=128k --iodepth=8 --numjobs=4 --group_reporting \
+    --max_open_zones=8 --zone_reset_threshold=0.8 --zone_reset_frequency=0.01 \
+    --time_based --runtime=600
+```
+FOLLOW:
+- Does randwrite produce random device writes? => No. Random picks the zone and inside it writes land at the write pointer.
+- What if the device has MOR 14 and you ask for max_open_zones=20? => fio refuses unless ignore_zone_limits is set.
+PITFALL: Reading a zonemode=zbd run on the block device as a Zone Append or multi-writer test. It issues one Write at a time per zone.
+VERIFY: Option names and defaults in your fio version (`fio --version`, the HOWTO), and that write_mode=zone_append exists there.
+
+@@ 9.07 | Intermediate | Cross-layer | tags=passthrough,ng,io-uring-cmd,bypass,spdk
+Q: How do you reach a ZNS namespace without the block layer, and what do you gain and lose compared with /dev/nvme0n2?
+SHORT: Use NVMe passthrough: nvme-cli through the controller or generic namespace character device, fio's io_uring_cmd engine on /dev/ngXnY, or a user-space driver (SPDK, xNVMe). Illegal commands, real Zone Append concurrency and exact status codes reach the drive. You lose the kernel's write ordering and write pointer tracking, so the ordering and the model are yours.
+DEEP:
+| Path | Node or API | Native Zone Append | Write ordering |
+|---|---|---|---|
+| Block device | /dev/nvme0n2 | Only from kernel users such as btrfs | Kernel serializes |
+| ioctl passthrough | /dev/nvme0 or /dev/ng0n2 with nvme-cli | Yes (`nvme zns zone-append`) | None |
+| io_uring_cmd | fio on /dev/ng0n2 | Yes (`write_mode=zone_append`) | None |
+| SPDK, xNVMe | Library calls | Yes | None |
+
+- **Gains:** a Write at the wrong LBA, an illegal state transition or a reserved ZSA byte actually arrives and returns the raw CQE status. The block layer would reject or repair those.
+- **Losses:** no plugging, no merge control, no error-to-errno mapping. Retries, timeouts and reset recovery are yours.
+- **Do not mix:** changing zones through passthrough while a filesystem or block-device writer uses the namespace can leave the kernel's write pointer tracking stale. Later failures then look like device bugs. Use a dedicated namespace.
+- **Result width:** Zone Append returns a 64-bit address, so use the 64-bit passthrough ioctl (5.02).
+- **Practice:** conformance runs use passthrough on an unmounted namespace, stack runs use the block device, and both use the same zone model.
+FOLLOW:
+- Why can you not provoke Zone Invalid Write from /dev/nvme0n2 on a recent kernel? => The write plug fails a write that is not at the tracked WP before any command is built. Use passthrough.
+- How do you see the raw status? => nvme-cli prints status name and code, the ioctl returns the status, and nvme tracepoints log each completion.
+PITFALL: Running passthrough zone actions on a namespace that a mounted filesystem also uses. The kernel's view drifts and the failures are self-inflicted.
+VERIFY: ng device naming and the kernel that added io_uring passthrough (5.19 as I recall), fio io_uring_cmd support, and how the kernel's zone cache reacts to out-of-band zone changes.
+
+@@ 9.08 | Intermediate | Concept | tags=zonefs,direct-io,errors,explicit-open,truncate
+Q: How does zonefs expose a ZNS namespace, and how does it handle I/O errors and zone resource limits?
+SHORT: zonefs shows every zone as a file: conventional zones under cnv/, sequential zones under seq/. A seq file's size is its write pointer, writes must be direct I/O appends at the end, truncate to 0 resets the zone and truncate to the zone capacity finishes it. The explicit-open mount option opens zones when a file is first opened for writing so writes cannot hit the active zone limit, and errors= picks the reaction to I/O errors and zone state changes.
+DEEP:
+| Operation on a seq file | Zone effect |
+|---|---|
+| Direct write at end of file | Write at the WP |
+| Buffered write or writable shared mmap | Rejected |
+| Write not at end (or end of last in-flight write) | Fails |
+| `truncate(0)` | Reset Zone |
+| Truncate up to the zone capacity | Finish Zone |
+| Read of any kind | Allowed |
+
+- **Metadata:** none beyond a fixed superblock in the first zone. The file tree is built from Report Zones at mount, so file sizes come from the device. `mkzonefs` finishes that first zone if it is sequential (always true on ZNS), so zonefs exposes one zone less than the device has.
+- **Errors:** `errors=remount-ro` (default), `zone-ro`, `zone-offline` and `repair`. A zone that turns Read Only shows as a read-only file and one that turns Offline as a file with no access and size 0. Both changes are permanent.
+- **explicit-open:** an Open Zone is sent at first write open and a Close Zone at last close if the zone is neither full nor empty. Sysfs under `/sys/fs/zonefs/<dev>/` shows limits such as the maximum active sequential files.
+- **Validation use:** file operations reach Reset, Finish and Open in a few lines of shell. Read Only and Offline injection appears as permission changes, so a test can assert on `stat`.
+FOLLOW:
+- Where does a seq file's size come from after a power cycle? => It is rebuilt at mount from the write pointer the drive reports.
+- Why does zonefs not hide random writes? => It never tries. Any write not at the end of the file fails.
+PITFALL: Writing a seq file with buffered I/O. It is rejected, so use O_DIRECT with block-aligned sizes.
+VERIFY: Mount option names and the ordering note in the zonefs document for your kernel (the text mentions an elevator, which zone write plugging supersedes).
+
+@@ 9.09 | Advanced | Cross-layer | tags=f2fs,btrfs,zoned-mode,reclaim,zone-capacity
+Q: How do f2fs and btrfs zoned mode use a ZNS SSD, and what do they demand from the device?
+SHORT: Both replace overwrite semantics with append-only zone allocation and run their own reclaim. btrfs zoned mode (Linux 5.12) allocates zone-sized block groups, keeps superblocks in a two-zone ring, and reclaims by relocating live extents and resetting the zone. f2fs is log-structured with several logs, does garbage collection per zone-sized section, and honors zone capacity. Both consume active and open zones, so MAR and MOR shape their behavior.
+DEEP:
+| | btrfs zoned | f2fs |
+|---|---|---|
+| Since | 5.12 | Zoned support earlier; ZNS zone capacity handled |
+| Space unit | Block group of whole zones | Section of 2 MiB segments, sized to a zone |
+| Metadata | Superblocks in a ring of 2 zones at 0, 512 GiB, 4 TiB | Needs in-place updates, so a conventional area or device |
+| Reclaim | Threshold-driven relocation then Reset Zone | Garbage collection then reset of freed sections |
+| Resource use | Device active-zone limit applies (btrfs documentation) | `active_logs` 2, 4 or 6 (default 6) open logs |
+
+- **btrfs limits:** all devices must share one zone size (4 MiB to 8 GiB, power of two). No NODATACOW, no fallocate-style preallocation, no booting from the zoned device, and only single and DUP profiles at first. Reclaim can produce intermittent ENOSPC.
+- **f2fs and capacity:** if Zone Capacity is below Zone Size, segments past the capacity are marked permanently used. A segment spanning the capacity boundary counts as partly usable.
+- **f2fs discard:** `discard_unit=section` is the default on zoned devices, so discards are section-sized, which on a zoned device ends as zone resets (as I recall).
+- **Device impact:** small MAR (for example 14) leaves few logs or block groups writable together. Expect Too Many Active Zones or stalls, and count implicit opens and closes on the wire.
+- **Validation:** run a fill-delete-refill churn and diff `blkzone report` before and after. Expect Reset and Finish traffic you did not issue.
+FOLLOW:
+- Why does reclaim show up as resets? => It copies live data to a new zone and resets the old one, so reset rate follows churn and fill level.
+- What if a filesystem assumes writable space equals Zone Size? => It writes past the capacity and gets Zone Boundary Error.
+PITFALL: Treating a filesystem run as a passive load. Its reclaim thread issues zone management on its own schedule, even under a read-mostly load.
+VERIFY: Whether btrfs uses Zone Append for data on your kernel, whether f2fs runs on a zoned-only device without a conventional one, and the btrfs superblock offsets.
+
+@@ 9.10 | Advanced | Concept | tags=zenfs,rocksdb,lifetime-hints,libzbd,metadata
+Q: How does ZenFS place RocksDB data on zones, and what does it need from a ZNS device?
+SHORT: ZenFS is a RocksDB FileSystem plugin that stores files as extents inside zones of a raw zoned device, using libzbd for zone operations and pread/pwrite for data. It uses RocksDB's write lifetime hints to co-locate data that dies together, so whole zones become empty and are reset without copying. It needs sequential writes at the WP, enough open and active zones for its writers, and a few zones for its metadata log.
+DEEP:
+- **Layout:** extents are block-aligned and never span zones. A zone can hold extents of several files. Metadata is a rolling log in the first zones (superblock, snapshot, incremental updates). RocksDB LOG and LOCK files live on another filesystem (`--aux_path`).
+- **Reclaim:** the README says ZenFS does no garbage collection of its own. A zone is reset when its live-byte count reaches zero. RocksDB compaction, by deleting SST files, is the reclaim engine.
+- **Requirements:** libzbd, Linux 5.4 or later for SMR and 5.9 or later for ZNS, RocksDB 6.19.3 or later. ZenFS 2.0 changed the on-disk format, so migrate with `zenfs backup` and `restore`.
+- **Backends:** a raw zoned device, or a zonefs mount (which costs one zone), which the README says should use `explicit-open`.
+- **Device demands:** WAL, flush and compaction outputs each hold an open and active zone, so the MAR and MOR budget limits compaction parallelism (6.12).
+- **Validation tools:** `db_bench --fs_uri=zenfs://dev:nvme0n2` for churn, and the modified `db_crashtest.py` scripts that kill the DB at random or fixed points and check recovery. A host kill is not a device power loss, so add a power-cycle rig for that.
+FOLLOW:
+- Where did write amplification go? => The device multiplier drops toward 1 (module 8), but RocksDB's own rewriting stays and must be measured separately (9.17).
+- What breaks if lifetime hints are wrong? => Zones stay partly live, few become empty, and free zones run out even though space is technically free.
+PITFALL: Calling ZenFS GC-free and stopping there. Compaction does the reclaim, and wrong lifetime prediction strands live data in old zones.
+VERIFY: Current ZenFS requirements (scheduler advice, metadata zone count, active-zone needs) in the README of the release you test.
+
+@@ 9.11 | Advanced | Concept | tags=spdk,xnvme,user-space,zone-append,windows
+Q: How do SPDK and xNVMe support ZNS, and how does validating through them differ from validating through Linux?
+SHORT: Both are user-space. SPDK offers spdk_nvme_zns_* calls at the NVMe driver level (append, report, open, close, finish, reset, offline, set descriptor extension) and spdk_bdev_zone_* at the bdev level. xNVMe gives one C API and CLI, with a zoned command set library, over several backends (io_uring, io_uring_cmd, libaio, SPDK and others). There is no kernel write plugging, so you order writes or use Zone Append yourself, and queue-depth races are real.
+DEEP:
+- **SPDK NVMe driver:** `spdk_nvme_zns_zone_append` (plus `_with_md` and vector forms), `spdk_nvme_zns_report_zones`, `open_zone`, `close_zone`, `finish_zone`, `reset_zone`, `offline_zone`, `set_zone_desc_ext`. Geometry: `spdk_nvme_zns_ns_get_zone_size`, `get_num_zones`, `get_max_open_zones`, `get_max_active_zones`, and `spdk_nvme_zns_ctrlr_get_max_zone_append_size`.
+- **SPDK bdev:** `spdk_bdev_get_zone_size`, `get_max_open_zones`, `get_max_active_zones`, `get_optimal_open_zones`, `spdk_bdev_get_zone_info`, `spdk_bdev_zone_management`, `spdk_bdev_zone_append`, and `spdk_bdev_io_get_append_location` for the assigned LBA. The uring bdev supports zoned devices by default.
+- **xNVMe:** backends on Linux are io_uring, io_uring_cmd, libaio and block ioctls, plus SPDK. The zoned command set is `libxnvme_znd`, and CLI tools include `xnvme` and `zoned`. The same code runs on several backends, which helps isolate a kernel effect from a device effect.
+- **Windows:** xNVMe lists a Windows backend on the platform's NVMe driver, but that says nothing about ZNS. Treat Windows as unsupported for ZNS unless the vendor documents otherwise.
+- **Why validators use them:** precise control of queue depth and queue count, no kernel cache, raw status in every completion, and far more Zone Append commands per second than the kernel path. That is where device-side races show up.
+FOLLOW:
+- Why is SPDK good for Zone Append stress? => Fine QD control, low overhead, and the completion carries the assigned LBA, so the oracle is direct.
+- What do you lose? => Plugging, splitting, error mapping and Identify gating of the kernel. Test those on Linux separately.
+PITFALL: Assuming a pass in SPDK proves the Linux path works. The kernel adds ordering, splitting, errno mapping and driver-level gating that need their own tests.
+VERIFY: SPDK's zone_block virtual bdev and RPC names, xNVMe zoned CLI subcommands, and any Windows ZNS support statement.
+
+@@ 9.12 | Advanced | Numeric | tags=fio,sizing,zone-reset,host-gc,capacity
+Q: Size a fio zonemode=zbd run on a 3,600-zone namespace that emulates host GC: how many resets per second, how long is one device pass, and which option values do you use?
+SHORT: Zone capacity is 0x3C000 x 4 KiB = 960 MiB, so a zone takes 7,680 writes of 128 KiB. At an assumed 2.0 GB/s, one hour writes 7.2 TB, about 7,153 zone fills or 1.99 device passes, so about 2 resets per second. Steady state needs one reset per 7,680 writes: zone_reset_frequency near 1.3e-4. Keep max_open_zones at or below the device limit.
+DEEP:
+Assumptions: 4 KiB LBAs, ZSZE 0x40000, ZCAP 0x3C000, 3,600 zones, 128 KiB writes, sustained 2.0 GB/s (decimal, assumed), Linux max_open_zones 14.
+1. **Geometry:** zone size 0x40000 x 8 = 2,097,152 sectors (1 GiB). Capacity 0x3C000 = 245,760 blocks = 1,006,632,960 B = 960 MiB. Usable space 3,600 x 960 MiB = 3.30 TiB against 3.52 TiB nominal, so 6.25 percent of the LBA space can never be written.
+2. **Writes per zone:** 1,006,632,960 / 131,072 = 7,680.
+3. **Fill time:** 1,006,632,960 / 2.0e9 = 0.50 s per zone if one zone absorbed the full rate. In practice several zones share it.
+4. **Per hour:** 2.0e9 x 3,600 = 7.2e12 B. Zone fills = 7.2e12 / 1.00663e9 = 7,152.6. Resets per second = 7,152.6 / 3,600 = 1.99. Device passes per hour = 7,152.6 / 3,600 zones = 1.99 (the same number by coincidence: 3,600 seconds per hour and 3,600 zones).
+5. **Reset rate in fio:** one reset per zone of writes gives 1 / 7,680 = 1.302e-4 for `zone_reset_frequency`. The reset fires after every 1/F write requests once past `zone_reset_threshold`.
+6. **Threshold trap:** the written ratio is measured against the IO range. If that range counts zone size, the ratio tops out near 0.9375 (960/1,024), so a threshold above that never triggers.
+7. **Open zones:** default `max_open_zones` is the device limit (14). Choosing 12 leaves 2 for other host activity such as finishes.
+```
+fio --name=hostgc --filename=/dev/nvme0n2 --direct=1 --ioengine=io_uring --zonemode=zbd \
+    --rw=randwrite --bs=128k --iodepth=8 --numjobs=4 --group_reporting --max_open_zones=12 \
+    --zone_reset_threshold=0.8 --zone_reset_frequency=0.00013 --time_based --runtime=3600
+```
+FOLLOW:
+- What if the device sustains 1 GB/s? => Everything halves: 3.6 TB per hour, about 1.0 reset per second, about 1 pass per hour. Writes per zone are unchanged.
+- Why log reset latency next to write latency? => Resets compete with writes for the same dies, so a bandwidth-only report hides their cost (module 4, module 8).
+PITFALL: Setting zone_reset_threshold above the writable fraction. The trigger never fires and the run just fills the namespace and stalls.
+VERIFY: Whether fio measures the threshold ratio against zone size or zone capacity, and how it counts the IO range across multiple jobs.
+
+@@ 9.13 | Advanced | Debug | tags=write-error,zone-invalid-write,triage,blkzone,trace
+Q: A host log says "write error at wrong LBA" on a zoned NVMe namespace. Decode the log below and prove whether the host or the device is at fault.
+SHORT: Two writers both believed the write pointer was 0x182000 and wrote the same LBA within a millisecond. One succeeded and moved the WP to 0x182020, and the loser failed. blkzone confirms the drive holds exactly one 32-block write, so the device is consistent and the host raced. Linux maps this failure to plain EIO, so use traces to see whether the block layer or the device rejected it.
+DEEP:
+```
+app.log 12:04:11.207 writer-3 zone 6 wp_model=0x182000 pwrite lba=0x182000 nlb=32 -> 131072 ok
+app.log 12:04:11.207 writer-5 zone 6 wp_model=0x182000 pwrite lba=0x182000 nlb=32 -> -5 EIO "write error at wrong LBA"
+dmesg   [ 812.440118] I/O error, dev nvme0n1, sector 12648448 op 0x1:(WRITE) ...
+# blkzone report -o 12582912 -c 1 /dev/nvme0n1
+  start: 0x000c00000, len 0x200000, cap 0x1e0000, wptr 0x010100 reset:0 non-seq:0, zcond: 2(oi) [type: 2(SEQ_WRITE_REQUIRED)]
+```
+1. **Zone 6:** 4 KiB LBAs, zone size 0x40000 blocks, so zone 6 starts at LBA 0x180000 = sector 12,582,912 (0xC00000). Matches `start`.
+2. **Failing LBA:** 0x182000 x 8 = 12,648,448, the sector in dmesg. It is 0x2000 blocks (32 MiB) into the zone.
+3. **WP check:** one 32-block write moves the WP to offset 0x2020 blocks = 0x10100 sectors. blkzone shows `wptr 0x010100`. Exactly one write landed, and the zone is implicitly open (cond 2).
+4. **Verdict:** both writers shared a stale WP model. Whichever raced second was doomed, so the device is consistent and the host is at fault.
+5. **Who rejected it:** Linux maps Zone Invalid Write to plain EIO, so the app cannot tell. With zone write plugging the block layer fails the write and no NVMe command exists for it. On older kernels or passthrough the command reaches the drive and completes with status 0x1BC (SCT 1, SC BCh). Enable nvme tracepoints or blktrace to see which.
+6. **Collateral:** after the first failure the plug wants a WP update (and a warning "Aborting plugged BIOs" may appear if writes were queued). Later errors in that zone are noise. Triage the first failure only.
+
+| Observation | Suspect |
+|---|---|
+| Device WP = model + acknowledged writes, two writers | Host (this case) |
+| WP ahead of everything acknowledged | Device (phantom advance) or a timed-out write that did land and was retried |
+| Zone Invalid Write on strictly serial QD 1 writes at the LBA just read from Report Zones | Device |
+| Mismatch starts right after a timeout, abort or reset | Recovery bug: resync the WP with Report Zones after any ambiguous failure |
+
+Collect: kernel version, scheduler, nvme trace events, the WP before and after, and a per-zone lock audit of the app.
+FOLLOW:
+- Does it matter that the first writer succeeded and the second failed? => No. Which racer wins is arbitrary. Two writers sharing one write pointer is the bug.
+- What is the host fix? => One owner per zone, or a lock spanning WP read to submit, or Zone Append with addresses taken from completions, plus a WP resync after any failure.
+PITFALL: Chasing the later errors. Once the first write to a zone fails, the tracked WP is untrusted and every following error is a consequence.
+VERIFY: The exact dmesg wording on your kernel, the errno the application sees, and the blkzone output format on your util-linux version.
+
+@@ 9.14 | Advanced | Trap | tags=scheduler,mq-deadline,kernel-version,zone-write-locking
+Q: The ZenFS README and many older guides say to set the zoned device's IO scheduler to deadline. Is that still needed, and what happens if you ignore it?
+SHORT: It depends on the kernel. Before zone write plugging, ordering of writes within a zone relied on mq-deadline's zone write lock, so another scheduler could let writes reach the device reordered and fail with Zone Invalid Write under concurrency. With plugging (Linux 6.10 as I recall) the block layer orders writes itself and the scheduler no longer decides correctness. Check the kernel, do not copy the command.
+DEEP:
+- **Old rule:** a scheduler with the zoned-write-ordering feature (mq-deadline) was the default for zoned devices, and ZenFS says `echo deadline > /sys/class/block/<dev>/queue/scheduler`, redone at every enumeration because the setting reverts.
+- **Symptom when wrong:** intermittent Zone Invalid Write under multi-threaded or QD greater than 1 writes, invisible at QD 1 in a quiet lab.
+- **New kernels:** the setting is harmless, and the ordering comes from the per-zone plug (9.04). A test that reproduces only on old kernels is evidence about the kernel, not the drive.
+- **Experiment:** run `fio --zonemode=zbd --rw=randwrite --iodepth=32 --numjobs=4 --direct=1` once per scheduler on each kernel and count Zone Invalid Write with nvme tracepoints or dmesg. Expect zero on 6.10 or later. On an old kernel, `none` may be refused or may misorder.
+- **Multiple hardware queues:** they are why ordering needs one serialization point. Writes to one zone can otherwise enter through different queues.
+- **Generalization:** treat tuning lines in old READMEs as versioned facts and record the kernel in every result.
+FOLLOW:
+- Does native Zone Append need the deadline scheduler? => No. Appends are not ordered by the host, and the lock existed for regular writes.
+- How do you check what a machine does? => `uname -r`, `cat /sys/block/<dev>/queue/scheduler`, and a QD 32 write test.
+PITFALL: Copying a tuning line from an old README into a test plan. On a new kernel it is a no-op, and on an old one skipping it produces failures that look like firmware bugs.
+VERIFY: The kernel where zone write plugging landed (6.10 as I recall), whether your distribution kernel back-ported it, and whether scheduler changes are refused on zoned devices in the old kernel you test.
+
+@@ 9.15 | Principal | Scenario | tags=emulation,null-blk,zloop,qemu,triage
+Q: A host team's zoned stack passes on null_blk, zloop and QEMU ZNS but fails on the real drive within hours. What do the emulators not model, and how do you triage it?
+SHORT: Emulators model geometry and write-pointer rules but not the drive's timing, background work, firmware reordering under load, real Read Only and Offline transitions, resource-accounting quirks or power loss. Triage by capturing the failing trace on hardware, classifying the failure (timing, state, resources, error path, power), and reproducing each class in QEMU with the drive's real Identify values until it either fails there (host bug) or clearly needs hardware.
+DEEP:
+| Emulator | Gives you | Lacks |
+|---|---|---|
+| null_blk (`zoned=1`, `zone_size`, `zone_nr_conv`) | Fast zoned block device inside the kernel | No NVMe path: no Identify parsing, no CQE status mapping |
+| zloop | One file per zone, a full zone state machine, optional native append | Limits and options vary by kernel; no NVMe layer |
+| QEMU `nvme-ns,zoned=on` | The real NVMe driver path, with `zoned.zone_size`, `zone_capacity`, `max_open`, `max_active`, `descr_ext_size`, `cross_read` on the namespace and `zoned.zasl` on the `nvme` controller device | Emulated NVMe 1.4 controller, no real latency, media errors or GC |
+
+1. **Capture:** an nvme trace or analyzer capture of the failing window, dmesg, Report Zones before and after.
+2. **Classify:** timing dependence (only at high QD or after hours), state (a zone left open or full), resources (MAR or MOR exhaustion), error path (Read Only or Offline), or power.
+3. **Mirror the drive:** copy ZSZE, ZCAP, MAR, MOR, ZASL and ZDES from `nvme zns id-ns` and `id-ctrl` into QEMU parameters, and run the same workload.
+4. **Compare traces:** opcode, LBA and status streams from emulator and drive. The first divergence points at what the emulator lacks.
+5. **A/B on hardware:** same host on two firmware builds, or two drives. A failure that follows the firmware is the drive.
+6. **Decide:** if QEMU with matching limits reproduces it, it is a host bug. If it needs timing, background erase, wear or power, it belongs on the hardware rig.
+FOLLOW:
+- When is the emulator authoritative? => For host logic against the spec, such as expected status codes and state transitions. Not for firmware behavior.
+- What common hardware-only failures appear after hours? => Read Only transitions from media wear, MAR accounting drift, and latency spikes that trip host timeouts.
+PITFALL: Treating an emulator as an oracle for the drive. Agreement shows the host follows the spec as the emulator implements it, not that the drive does.
+VERIFY: QEMU parameter names in the docs for your QEMU version, and null_blk and zloop zone capacity and limit options for your kernel.
+
+@@ 9.16 | Principal | Scenario | tags=regression,automation,kernel-matrix,oracle,gating
+Q: Design the automated host-stack regression suite that gates a ZNS firmware release on Linux. What matrix, oracles and pass criteria do you use?
+SHORT: Layer it: device conformance through passthrough, kernel-stack behavior on the block device, and end-to-end runs on zonefs, f2fs, btrfs and ZenFS, plus a fault tier. Run a small kernel matrix (one LTS before and one after zone write plugging, plus current). The oracle is a host-side zone model checked against Report Zones and fixed-seed data verification. Pass means no unexplained non-success status, WP model equal to the device WP after every quiesce, and data intact after power cycles.
+DEEP:
+| Tier | Tools | Proves | Oracle |
+|---|---|---|---|
+| 1 Device conformance | nvme-cli passthrough, SPDK | Transitions, status codes, limits | Spec table plus zone model |
+| 2 Kernel stack | fio zonemode=zbd, blkzone, libzbd | Bring-up, sysfs values, plugging, error mapping | Identify vs sysfs, WP model |
+| 3 Filesystem and app | zonefs, f2fs, btrfs, ZenFS db_bench and crashtest | Reclaim churn, resource use, recovery | fsck or data verify |
+| 4 Faults | Power-cycle rig, injected zone errors, host kill | WP after loss, Read Only and Offline handling | Invariants after recovery |
+
+- **Kernel matrix (versions to confirm):** ZNS needs 5.9 or later, btrfs zoned 5.12, plugging 6.10 as I recall, plus the current stable. Record `uname -r` in every result.
+- **Automation:** `nvme zns report-zones` with JSON output, a state-model checker (module 10), and an artifact bundle per run: dmesg, nvme traces, Identify dumps, blkzone reports, fio JSON, tool versions.
+- **Known-issue list:** keyed by kernel version, so a kernel behavior is not filed as a firmware bug.
+- **Blame split:** a 2 x 2 of old and new firmware on old and new kernels. A failure that follows the firmware is the drive.
+- **Flakes:** rerun with the same seed, then vary it. A seed-stable failure is a logic bug, a seed-sensitive one is a race.
+- **Coverage:** count transitions seen on the wire, status codes seen, MAR and MOR hits, and Zone Append concurrency reached.
+FOLLOW:
+- Which results need the power rig? => WP after unclean shutdown, zones left open or closed, and wear-driven Read Only transitions. Emulators cannot show these.
+- How do you keep the suite fast? => Short tier 1 and 2 on every build, tier 3 nightly with churn, tier 4 weekly with a long soak.
+PITFALL: One kernel and one workload. A suite that passes only on the newest kernel misses customers on LTS releases, where write ordering and error mapping differ.
+VERIFY: Which kernel versions your customers run and the exact kernel cut-overs for ZNS, btrfs zoned and zone write plugging.
+
+@@ 9.17 | Principal | Cross-layer | tags=host-gc,waf,attribution,counters,reclaim
+Q: The host now owns garbage collection. How do you measure its cost end to end and decide whether the ZNS drive delivers the promised benefit, without blaming the wrong layer?
+SHORT: Split write amplification by layer. Host WAF is engine or filesystem bytes written per user byte (compaction, reclaim copies). Device WAF is NAND bytes written per host byte, which should stay near 1 on ZNS. Measure host writes from block-layer counters, NAND writes from the drive's SMART or vendor log, and resets from traces. If device WAF is near 1 and latency is flat, remaining cost is host policy, not the drive.
+DEEP:
+1. **Formula:** total WAF = host WAF x device WAF. Assumed example: host WAF 3.0 and device WAF 1.05 give 3.15. ZNS removes the device multiplier but does not touch the host one.
+2. **Host counters:** application statistics (compaction bytes, reclaim relocated bytes), `/sys/block/<dev>/stat` sectors written, and `iostat`. Sectors are 512 bytes.
+3. **Device counters:** host data units written and, if the drive exposes it, physical NAND writes in the OCP SMART extension or a vendor log. Without the NAND counter you cannot separate host reclaim from device relocation.
+4. **Resets:** count Reset Zone commands (opcode 79h, ZSA 04h) in a trace, or diff Report Zones snapshots.
+5. **Steady state:** run for several device passes so free zones are consumed and reclaim is active (9.12), then compare latency percentiles during reclaim and idle.
+6. **Starvation test:** shrink the free-zone budget until the host runs out of empty zones. Expect ENOSPC or stalls at the host, and correct statuses from the drive. Add a Reset-all during churn.
+7. **Decide:** device WAF materially above 1 means the firmware is copying internally (partial-zone handling, Finish, wear leveling, data refresh), so investigate module 8 behaviors. High host WAF is fixed by host policy: lifetime hints, tiering, reclaim thresholds.
+FOLLOW:
+- What if host WAF is huge? => Change placement and reclaim policy in the software. The drive is not the cause.
+- Can the drive hide reset cost? => Reset can complete fast with erase in the background, so watch the latency of the next writes, not only the Reset completion (module 4).
+PITFALL: Dividing total bytes written to the drive by user bytes and calling it ZNS WAF. Without NAND-side counters that number is host WAF only.
+VERIFY: Which SMART or log fields your drive exposes for NAND (physical) writes, their units, and the OCP datacenter NVMe SSD specification revision that defines them.

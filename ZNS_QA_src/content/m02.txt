@@ -1,0 +1,327 @@
+# Module 2: ZNS Architecture & Command Set Basics
+
+@@ 2.01 | Basic | Concept | tags=architecture,command-set,nvme-2
+Q: Where does ZNS sit in the NVMe architecture, and is it a different kind of device?
+SHORT: ZNS is not a different kind of drive. It is an I/O command set, the Zoned Namespace Command Set, layered on the common NVMe Base architecture. Since NVMe 2.0 the specifications are split into the Base Specification, command set specs (NVM, Zoned Namespace, Key Value), transport specs (PCIe, RDMA, TCP) and NVMe-MI. One controller can serve NVM namespaces and zoned namespaces together, because the command set is a property of each namespace.
+DEEP:
+- **Base specification:** queues, doorbells, admin commands, controller registers, status field, namespace management. All of it is unchanged for ZNS (see the NVMe page).
+- **NVM Command Set:** Read, Write, Flush and friends. The ZNS command set is built on top of it: a zoned namespace accepts most NVM commands, with changed rules, and adds Zone Append, Zone Management Send and Zone Management Receive.
+- **Transport independence:** the same zoned command set runs over PCIe, RDMA or TCP. Nothing in the zoned model is PCIe specific, so the PCIe page applies as it is.
+- **Per namespace, not per controller:** each namespace has exactly one Command Set Identifier (CSI) fixed when it is created.
+- **History:** ZNS was ratified around 2020 as a Technical Proposal against NVMe 1.4, and became a standalone command set specification when NVMe 2.0 restructured the documents in 2021.
+- **What this means for a validator:** a ZNS test plan is the Base regression plus the NVM command set regression plus the zoned deltas. Most bugs still live in the shared parts.
+FOLLOW:
+- Can one controller expose both conventional and zoned namespaces? => Yes. The namespace CSI decides which command set governs I/O to it, and the controller advertises support through CAP.CSS and the Identify data.
+- Does ZNS need a new transport or queue model? => No. Same submission and completion queues, same PRP and SGL rules, same admin command set.
+PITFALL: Treating ZNS as a feature bit of a conventional namespace. A namespace has one CSI from creation, and zoned behavior is not something a host toggles on an existing NVM namespace.
+VERIFY: The technical proposal number and the NVMe revision in which ZNS was first published, in the NVMe specification history.
+
+@@ 2.02 | Basic | Concept | tags=csi,namespace-descriptor,opcodes
+Q: What is the Command Set Identifier (CSI), and where does it appear?
+SHORT: CSI is an 8-bit value naming an I/O command set: 00h is NVM, 01h is Key Value and 02h is Zoned Namespace. The host reads a namespace's CSI from the Namespace Identification Descriptor list (descriptor type 04h). It also supplies a CSI in Identify to get command-set-specific data, such as the ZNS Identify Namespace structure. Opcodes are interpreted relative to the namespace's command set, so the same opcode can mean different things.
+DEEP:
+- **Namespace Identification Descriptor:** Identify with CNS 03h returns a list of descriptors (EUI-64, NGUID, UUID, CSI). The CSI descriptor has type 04h and length 1.
+- **Identify commands:** CDW11 bits 31:24 carry the CSI for the command-set-specific CNS values, so the same CNS can return NVM or ZNS structures depending on CSI.
+- **Other commands that take a CSI:** Get Log Page (the Commands Supported and Effects log is per command set) and namespace creation through Namespace Management.
+- **Not in every command:** an I/O SQE has an opcode and an NSID, not a CSI. The controller finds the command set from the namespace.
+- **Opcode overlap:** opcodes are not globally unique across command sets. The SPDK header lists the Key Value Store command at 01h, the same value as NVM Write. A trace decoder needs the CSI of the target namespace.
+- **Legacy mode:** with CC.CSS at 000b (NVM only) no CSI descriptor is needed, and every namespace is NVM.
+FOLLOW:
+- Which CSI values does Linux act on? => 00h and 02h. For any other CSI the source I read logs that the block device is not supported for that command set and does not expose a usable block device.
+- What if the host is in multiple-command-set mode and a namespace reports no CSI? => Linux treats it as an error ("Command set not reported for nsid") and skips the namespace.
+PITFALL: Decoding a captured I/O opcode without knowing the CSI of the namespace it targeted.
+VERIFY: Reserved and newer CSI values, and the exact status a controller returns for a zoned opcode sent to an NVM namespace (Invalid Command Opcode is what QEMU returns).
+
+@@ 2.03 | Basic | Concept | fig=zonemodel | tags=zone-size,zone-capacity,write-pointer,lba-space
+Q: How is a zoned namespace's LBA space divided, and what are zone size, zone capacity and the write pointer?
+SHORT: The LBA space is cut into equal-sized, contiguous, non-overlapping zones. Zone size (ZSZE) is the number of LBAs each zone occupies in the address space, a namespace constant. Zone capacity (ZCAP) is the number of usable LBAs counted from the start of the zone, and is at most ZSZE. Each zone has a write pointer marking the next LBA to be written, which moves only forward until the zone is reset.
+DEEP:
+- **Layout:** zone n starts at LBA n x ZSZE. The first zone starts at LBA 0, so a zone start LBA (ZSLBA) is always an exact multiple of the zone size.
+- **Zone type:** every zone in a zoned namespace is sequential-write-required (zone type 2h in the descriptor). There are no conventional zones. A host that wants random-write space uses a separate NVM namespace.
+- **Size versus capacity:** the LBAs at zone offsets ZCAP to ZSZE-1, that is above ZSLBA+ZCAP-1, are not usable. The split lets the zone size stay a round number for address math while the device picks a capacity that fits its NAND geometry.
+- **Write pointer:** an LBA inside the zone, reported in the zone descriptor. Writes land at it and advance it. Zone states and the exact WP rules are module 3.
+- **Capacity totals:** the namespace size covers all zones at ZSZE each. Usable capacity is the sum of the ZCAP values (zonedstorage.io).
+FOLLOW:
+- Can zones in one namespace have different sizes? => No. Zone size is a namespace-wide constant. Only capacity may differ per zone, and only when the Variable Zone Capacity bit in ZOC is set.
+- Why is the write pointer an LBA and not a byte offset? => All NVMe addressing is in logical blocks, and the size of a block depends on the LBA format in use.
+PITFALL: Assuming the whole address range up to ZSZE is usable. The gap between ZCAP and ZSZE is address space with no storage behind it.
+VERIFY: Whether NSZE must be an exact multiple of ZSZE, and the WP validity per zone state (module 3).
+
+@@ 2.04 | Intermediate | Concept | tags=cap-css,cc-css,command-set-selection,init
+Q: How does a host enable zoned command sets: what do CAP.CSS and CC.CSS do?
+SHORT: CAP.CSS (bits 44:37) says which selection modes the controller supports: bit 0 for NVM command set only, bit 6 for one or more I/O command sets, bit 7 for admin only. The host writes CC.CSS (bits 6:4) before or with the write that sets CC.EN. The value 000b selects NVM only, 110b selects all supported I/O command sets, and 111b admin only. Zoned namespaces need 110b, and Linux writes 110b whenever CAP.CSS bit 6 is set.
+DEEP:
+| CC.CSS | Mode | Effect |
+|---|---|---|
+| 000b | NVM Command Set only | Legacy behavior, only NVM namespaces are usable |
+| 110b | All supported I/O command sets | Namespaces use their own CSI, so ZNS works |
+| 111b | Admin Command Set only | No I/O command set, admin commands only |
+
+- **Init order:** read CAP, choose CSS, write CC with EN=1, wait for CSTS.RDY, then Identify Controller, the namespace lists and the namespace descriptors.
+- **Change rule:** CSS is a field the host sets while the controller is disabled. Changing the mode means a disable and re-enable, so it cannot be flipped on a running controller.
+- **I/O Command Set Profile:** Set Features feature ID 19h selects which combination of command sets is enabled. The Linux and SPDK code I read do not set it and use the controller default.
+- **Validation loop:** for every CSS value, both those advertised in CAP.CSS and those not, enable the controller and check the outcome: RDY, CFS, and which namespaces enumerate.
+FOLLOW:
+- What does a driver stuck in 000b mode see on a ZNS drive? => It cannot use the zoned namespaces. Whether they are hidden or listed but inaccessible is set by the spec, so a validator should record what the drive does.
+- Why does Linux keep the CSS choice in its saved controller config? => It re-writes CC on every reset and needs to know if it is in multiple-command-set mode to demand a CSI descriptor per namespace.
+PITFALL: Enabling with CSS 110b on a controller whose CAP.CSS does not advertise bit 6. Read CAP first.
+VERIFY: CAP bit range 44:37 and CC bit range 6:4, the default and semantics of the I/O Command Set Profile feature (FID 19h), and controller behavior for an unsupported CSS value.
+
+@@ 2.05 | Intermediate | Concept | tags=identify,cns,csi,structures
+Q: Which Identify commands does a host use to learn about a zoned namespace, and what does each return?
+SHORT: The generic ones are Identify Controller (CNS 01h), Identify Namespace (00h) and the descriptor list (03h, which carries the CSI). Command-set-specific ones take a CSI in CDW11: CNS 05h returns the ZNS Identify Namespace structure, CNS 06h the ZNS Identify Controller structure (ZASL), and CNS 07h lists active namespaces for one command set. CNS 08h returns an I/O-command-set-independent namespace structure.
+DEEP:
+| Identify | CNS | CSI needed | Returns |
+|---|---|---|---|
+| Namespace | 00h | no | NSZE, NCAP, NUSE, LBA formats, FLBAS |
+| Controller | 01h | no | Controller-wide capabilities |
+| Namespace descriptors | 03h | no | EUI-64, NGUID, UUID, CSI |
+| I/O CS Namespace | 05h | yes (02h) | ZOC, OZCS, MAR, MOR, RRL, FRL, per-LBAF ZSZE and ZDES |
+| I/O CS Controller | 06h | yes (02h) | ZASL |
+| Active NS list for a CSI | 07h | yes | NSIDs using that command set |
+| I/O CS Independent Namespace | 08h | no | Attributes not tied to a command set |
+
+- **Size:** every structure is 4096 bytes.
+- **Linux sequence (as of the source I read):** descriptor list first, then the independent structure (CNS 08h) when the controller reports NVMe 2.0 or later, else CNS 00h. For a zoned namespace it then reads CNS 05h with CSI 02h. The first zoned namespace also triggers CNS 06h with CSI 02h to get ZASL.
+- **Why split it:** command-set-specific data moves to CNS 05h and 06h, so NVM software keeps parsing the same generic structures unchanged.
+FOLLOW:
+- Is ZASL per namespace? => No. It sits in the controller structure (CNS 06h, CSI 02h), so it is one value for all zoned namespaces of that controller.
+- Where does the zone size live? => In the ZNS Identify Namespace structure, in the LBA format extension entry that matches the LBA format in use.
+PITFALL: Issuing CNS 05h or 06h with the wrong or missing CSI. The CSI must match the namespace or command set you ask about.
+VERIFY: CNS 1Ch (the I/O command set combinations structure) and CNS 08h availability by revision, and the error a controller returns for a CSI mismatch.
+
+@@ 2.06 | Intermediate | Concept | tags=identify-ns,zoc,ozcs,mar,mor,zdes,lbafe
+Q: Walk through the ZNS Identify Namespace structure: what does each field tell the host?
+SHORT: ZOC lists zone operation characteristics (bit 0 Variable Zone Capacity, bit 1 Zone Active Excursions). OZCS lists optional zoned command support (bit 0 Read Across Zone Boundaries). MAR and MOR are the maximum active and open resources, zeroes-based, where FFFFFFFFh means no limit. RRL and FRL are recommended limits for reset and finish. A per-LBA-format extension gives zone size (ZSZE) and zone descriptor extension size (ZDES).
+DEEP:
+| Field | Bytes | Meaning |
+|---|---|---|
+| ZOC | 1:0 | Bit 0 variable zone capacity, bit 1 zone active excursions |
+| OZCS | 3:2 | Bit 0 read across zone boundaries |
+| MAR | 7:4 | Max active resources, zeroes-based |
+| MOR | 11:8 | Max open resources, zeroes-based |
+| RRL | 15:12 | Reset recommended limit |
+| FRL | 19:16 | Finish recommended limit |
+| LBAF extension i | 2816 + 16i | 8-byte ZSZE, 1-byte ZDES, 7 reserved |
+
+- **Zeroes-based:** MAR=13 means 14 active zones. Linux adds 1 to both, and the 32-bit wrap of FFFFFFFFh becomes 0, meaning no limit.
+- **ZDES:** in units of 64 bytes, as nvme-cli computes `zdes << 6`. Zero means no extension. Descriptor extensions are module 11.
+- **Extension index:** the entry used is the one matching the namespace's current LBA format, as chosen by FLBAS.
+- **Newer revisions:** later revisions add further recommended-limit fields (RRL1 to RRL3, FRL1 to FRL3, SPDK shows them at bytes 20 to 43), so treat bytes after 19 as revision dependent.
+FOLLOW:
+- What are MAR and MOR used for? => They bound how many zones can be active and open at once, so the host must budget zones. Module 6 covers this.
+- What does RAZB change? => It says whether one read may span the boundary of two zones. Module 7 covers the read rules.
+PITFALL: Reading MAR or MOR as counts. They are zeroes-based, and FFFFFFFFh is a sentinel for no limit.
+VERIFY: The byte offsets above (checked against the Linux and SPDK structure definitions, confirm in the ZNS command set specification), the units and meaning of RRL and FRL, and any ZRWA related OZCS bits added after the base ZNS revision.
+
+@@ 2.07 | Intermediate | Numeric | tags=zone-size,zone-capacity,lba-math,geometry
+Q: A namespace reports ZSZE=0x80000, ZCAP=0x6C000 for every zone, 4 KiB LBAs and 512 zones. Work out the sizes, the start of zone 3, and where LBA 2,050,000 falls.
+SHORT: ZSZE is 524,288 blocks, 2 GiB. ZCAP is 442,368 blocks, 1.6875 GiB, so 84.4 percent of each zone is usable. The address space is 512 x 2 GiB = 1 TiB but usable capacity is 864 GiB. Zone 3 starts at LBA 1,572,864 (0x180000), which is sector 12,582,912 in the 512-byte units Linux tools print. LBA 2,050,000 is in zone 3 at offset 477,136, above its capacity, so it is in the unusable gap.
+DEEP:
+Assumptions: all zones have the same capacity, no variable zone capacity, 4096-byte LBA format.
+1. Zone size: 0x80000 = 524,288 blocks x 4096 B = 2,147,483,648 B = 2 GiB.
+2. Zone capacity: 0x6C000 = 442,368 blocks x 4096 B = 1.6875 GiB.
+3. Usable fraction: 442,368 / 524,288 = 0.84375.
+4. Address space: 512 x 524,288 = 268,435,456 blocks = 1 TiB.
+5. Usable capacity: 512 x 1.6875 GiB = 864 GiB (927.7 GB in decimal units).
+6. Unusable gap: 512 x (2 - 1.6875) GiB = 160 GiB of address space with no storage.
+7. Zone 3 start: 3 x 524,288 = 1,572,864 = 0x180000. In 512-byte sectors, x8 = 12,582,912 = 0xC00000. Zone 3 ends at LBA 2,097,151 by size, but its last usable LBA is 1,572,864 + 442,368 - 1 = 2,015,231 (0x1EBFFF).
+8. LBA 2,050,000: zone = 2,050,000 div 524,288 = 3. Offset = 2,050,000 - 1,572,864 = 477,136, which is at least 442,368, so the LBA is above the zone capacity.
+- **Linux view:** chunk_sectors and the zone length are 524,288 x 8 = 4,194,304 sectors. Each zone reports its capacity separately, so `blkzone report` shows both.
+- **Test use:** the first LBA beyond capacity and the last LBA of the zone are the natural boundary test points.
+FOLLOW:
+- The device is reformatted to 512-byte LBAs and the same ZSZE block count applies. What changes? => The zone becomes 256 MiB. ZSZE is reported per LBA format, so read the entry for the format in use and never assume a byte size.
+- How would a host find the zone of an LBA fast? => Divide by ZSZE, which is a shift when ZSZE is a power of two. That is why the zone size stays round and the capacity absorbs the odd geometry.
+PITFALL: Sizing a dataset from the address space (1 TiB) instead of the usable capacity (864 GiB), then running out of zones midway.
+VERIFY: The status a controller returns for a read or write that touches LBAs between ZCAP and ZSZE (module 7).
+
+@@ 2.08 | Intermediate | Concept | tags=commands,nvm-command-set,zone-append,opcodes
+Q: Which NVM commands remain valid on a zoned namespace, and which commands are new?
+SHORT: The zoned command set includes the NVM commands and adds three: Zone Management Send (79h), Zone Management Receive (7Ah) and Zone Append (7Dh). Read, Write and Flush are the core. Compare, Verify, Write Zeroes, Dataset Management and Copy are optional in the NVM command set, and a zoned drive advertises which it supports. The write-type commands are now subject to zone rules, so they must respect the write pointer and zone boundaries.
+DEEP:
+| Command | Opcode | On a zoned namespace |
+|---|---|---|
+| Flush | 00h | Same as NVM |
+| Write | 01h | Must start at the write pointer (outside a ZRWA), cannot cross the zone capacity, advances the WP |
+| Read | 02h | Allowed, with read rules (module 7) |
+| Compare | 05h | Read-like, optional |
+| Write Zeroes | 08h | Treated as a write, so write rules apply, optional |
+| Dataset Management | 09h | Optional, semantics differ (see below) |
+| Verify | 0Ch | Read-like, optional |
+| Zone Management Send | 79h | New: open, close, finish, reset, offline, set descriptor extension |
+| Zone Management Receive | 7Ah | New: report zones |
+| Zone Append | 7Dh | New: device-chosen write location, optional |
+
+- **Discovery:** do not assume. Read the Commands Supported and Effects log for CSI 02h and check the CSUPP bit for each opcode.
+- **Zone Append is optional in the spec.** Linux requires it: if the log does not show it as supported, the namespace is forced read-only.
+- **Deallocate:** how Dataset Management deallocate interacts with the write pointer and zone state is defined by the zoned spec. A validator should test it against the spec text, not assume it acts as a Reset.
+- **Same queue rules:** these are ordinary NVMe I/O commands with PRP or SGL data and standard status codes.
+FOLLOW:
+- Is a normal Write still allowed on a zoned namespace? => Yes. It succeeds only at the write pointer of a zone that can accept it, so the host must serialize writes to a zone.
+- Which commands can move a write pointer? => Write, Write Zeroes, Zone Append and a Copy destination, plus Zone Management Send actions such as Finish and Reset. Read, Compare, Verify and Flush do not.
+PITFALL: Concluding from the opcode table that Write Zeroes or Copy work everywhere. They are optional and follow the write rules, so check the effects log.
+VERIFY: Mandatory versus optional status of each command in the NVM and ZNS command set specifications, Dataset Management deallocate and Write Zeroes behavior on zoned namespaces, and the write-cannot-cross rules for Copy destinations.
+
+@@ 2.09 | Advanced | Debug | tags=nvme-cli,id-ns,zoc,linux,decode
+Q: `nvme zns id-ns` shows the values below, and Linux has no /dev/nvme0n1 block device for the namespace. Decode the output and explain why.
+SHORT: ZOC is 0x2, meaning Zone Active Excursions is supported. The Linux nvme driver, in the source I read, rejects a zoned namespace whenever ZOC is non-zero: it logs that the zone operations are not supported and hides the block device, leaving only passthrough access. The other fields are sane: MAR and MOR of 13 mean 14 zones, and zone size 0x80000 blocks is a power of two. The fix is on the device side (clear ZOC) or a host that supports excursions.
+DEEP:
+```
+# nvme zns id-ns /dev/nvme0 -n 1     (fields simplified, formatting varies by nvme-cli version)
+zoc     : 0x2
+ozcs    : 0x1
+mar     : 13
+mor     : 13
+rrl     : 0
+frl     : 0
+lbafe  0: zsze:0x80000 zdes:0 (in use)
+lbafe  1: zsze:0x10000 zdes:0
+
+# dmesg
+nvme nvme0: zone operations:2 not supported for namespace:1
+```
+- **ZOC = 0x2:** bit 1 is Zone Active Excursions. The controller may take a zone out of the active set on its own (module 6). Bit 0, Variable Zone Capacity, is clear.
+- **OZCS = 0x1:** Read Across Zone Boundaries is supported, so a read may span two zones.
+- **MAR = MOR = 13:** zeroes-based, 14 active and 14 open. MOR must not exceed MAR, which holds here.
+- **Which zsze applies:** the LBA format in use, from FLBAS in the plain Identify Namespace. Here entry 0 (0x80000 blocks). Entry 1 is for another LBA format and does not apply.
+- **Why Linux refuses:** the driver checks `id->zoc` and fails the probe with -ENODEV if any bit is set, since it does not implement variable capacity or excursion handling. The core then marks the block device hidden, so no /dev/nvme0n1 appears. Admin and passthrough access through the controller device (and usually a generic /dev/ng0n1 character device) still works, which is why the command above uses `/dev/nvme0 -n 1`.
+- **Debug method:** read dmesg first, then the raw Identify (CNS 05h, CSI 02h) to confirm the bits, then try a host that supports the feature (QEMU-based or SPDK). Compare against the spec's meaning of each bit before calling it a firmware bug.
+FOLLOW:
+- Is a non-zero ZOC a firmware bug? => Not by itself. It is a valid capability report. It becomes a compatibility issue with hosts that do not handle it.
+- How would you keep the test host and the drive aligned? => Record the ZOC and OZCS bits per firmware build, and add a gate that fails the run when a build changes them unexpectedly.
+PITFALL: Blaming the block layer or nvme-cli. The decision was made in the driver from an Identify bit, and the log line names it.
+VERIFY: The exact dmesg string and the ZOC rejection and hidden-disk behavior in the kernel version under test, whether /dev/ng0n1 appears, the nvme-cli display format, and the MOR versus MAR constraint.
+
+@@ 2.10 | Advanced | Numeric | tags=zasl,zone-append,mdts,page-size
+Q: ZASL is 4 and CAP.MPSMIN is 0. What is the largest Zone Append, how does it relate to MDTS, and how do you test the limit?
+SHORT: ZASL is a power-of-two exponent in units of the minimum memory page size. With MPSMIN=0 the page is 4 KiB, so the limit is 2^4 x 4 KiB = 64 KiB, or 16 blocks with 4 KiB LBAs (NLB field value 15, since it is zeroes-based). ZASL zero means the limit is MDTS. Filling a 442,368-block zone at 64 KiB per append takes 27,648 appends. Test the limit, one block above it, and the MDTS interaction.
+DEEP:
+1. Page size: 2^(12 + MPSMIN) = 4096 B for MPSMIN=0.
+2. Limit: 2^ZASL x page size = 16 x 4096 = 65,536 B = 64 KiB.
+3. Blocks: 65,536 / 4096 = 16 blocks, so NLB (zeroes-based) is 15.
+4. Appends to fill a zone with ZCAP 442,368 blocks: 442,368 / 16 = 27,648.
+5. In Linux, the limit is stored in 512-byte sectors as `1 << (zasl + 3)`, which is 128 sectors, 64 KiB. With ZASL zero it falls back to the transfer limit derived from MDTS.
+- **Relation to MDTS:** MDTS bounds all data transfers. A ZASL above MDTS would not be usable, so a sane controller keeps ZASL at or below MDTS. Check the spec for the rule.
+- **Non-zero MPSMIN:** the unit grows with the page size. The Linux expression assumes a 4 KiB unit, so a device with MPSMIN>0 needs the formula checked against the driver.
+- **Tests:** append of exactly the limit (must pass), limit plus one block (expect rejection), a limit-sized append at the last position of the zone, and a limit-sized append that would exceed zone capacity.
+- **Queue effect:** a small ZASL forces the host to split large writes, which raises the append count per zone and shapes throughput with QD.
+FOLLOW:
+- What happens when the host sends an append above ZASL? => The controller should reject it as an invalid field. Confirm the status and DNR in the spec. The block layer normally splits before sending.
+- Is ZASL the same as the maximum write size? => No. Normal Writes are limited by MDTS only. ZASL applies to Zone Append.
+PITFALL: Treating ZASL as a byte count or a block count. It is an exponent in units of the minimum page size.
+VERIFY: The relation between ZASL and MDTS, the unit definition (CAP.MPSMIN based), the status code for an oversized append, and the Linux handling of MPSMIN greater than 0.
+
+@@ 2.11 | Advanced | Trap | tags=zone-size,power-of-two,lba-format,linux
+Q: Trap: firmware wants zone size 0x60000 blocks to match a 3-die stripe. Is that legal, and what happens on Linux and on a 512B/4K reformat?
+SHORT: The spec does not appear to require a power-of-two zone size, but the Linux nvme driver, in the source I read, rejects one ("invalid zone size") and hides the block device. Many host tools shift instead of divide. ZSZE is also per LBA format, so a format change can change the zone size in bytes. Keep ZSZE a power of two and hide odd NAND geometry in ZCAP, which is what zone capacity is for.
+DEEP:
+- **Spec versus host:** zonedstorage.io states zone capacity exists so zone size can stay a power of two. QEMU accepts other sizes (it only computes a shift when the size is a power of two). The strict rule lives in host software.
+- **Linux check:** `is_power_of_2(zone_size)`, otherwise a warning and the probe fails, which hides the block device. Block-layer support for other zone sizes has been discussed and may exist in newer kernels, so re-check for the kernel in use.
+- **Consequences of 0x60000:** address math needs a real division, `chunk_sectors` handling and userspace tools built on masks all break or bail.
+- **Per-format zone size:** each LBA format entry has its own ZSZE. 0x80000 blocks is 2 GiB at 4 KiB but 256 MiB at 512 B. A Format NVM to another LBA format changes the zone geometry, so a validator must re-read Identify after every format.
+- **Alignment:** ZSLBA is a multiple of ZSZE, so a non-power-of-two size still aligns, but only to that size.
+- **Test:** for each LBA format, check ZSZE is constant across zones, ZSLBA(n) equals n x ZSZE, ZCAP is at most ZSZE, and the Linux block device still appears as zoned.
+FOLLOW:
+- Where should odd geometry go instead? => Into ZCAP. Three-die stripes of a given size become the capacity, and the rest of the power-of-two zone is unused address space.
+- Does the block layer need equal zones? => It has assumed power-of-two zone sizes, with a smaller last zone tolerated. Support for other sizes may be newer, so test on the kernel you ship.
+PITFALL: Validating on QEMU, which accepts odd zone sizes, and concluding a Linux host will accept them too.
+VERIFY: Whether the spec places any constraint on ZSZE, current kernel handling of non-power-of-two zone sizes, and how Format NVM interacts with zone state.
+
+@@ 2.12 | Advanced | Cross-layer | tags=linux,sysfs,queue-limits,discovery
+Q: How do the Identify fields turn into what Linux shows for a zoned NVMe namespace, and how do you use that in validation?
+SHORT: The driver maps ZSZE to the zone size (chunk_sectors), MOR plus 1 to max open zones, MAR plus 1 to max active zones, ZASL to the maximum zone append size, and CSI 02h to a host-managed zoned queue. Each shows in sysfs under queue/ and in `blkzone report` and `lsblk`. Comparing the sysfs values with the raw Identify data catches both firmware reporting errors and host translation errors.
+DEEP:
+| NVMe source | Linux attribute | Where to look |
+|---|---|---|
+| CSI = 02h | zoned = host-managed | `/sys/block/nvme0n1/queue/zoned` |
+| ZSZE (in-use LBA format) | chunk_sectors, zone size | `queue/chunk_sectors`, `blkzone report` |
+| MOR + 1 | max_open_zones | `queue/max_open_zones` |
+| MAR + 1 | max_active_zones | `queue/max_active_zones` |
+| ZASL | max zone append size | `queue/zone_append_max_bytes` |
+| Zone descriptors (ZT, ZS, ZCAP, ZSLBA, WP) | zone type, condition, capacity, start, wp | `blkzone report /dev/nvme0n1` |
+
+- **Sector units:** Linux converts LBAs to 512-byte sectors, so a 4 KiB-LBA zone of 524,288 blocks shows as 4,194,304 sectors.
+- **No-limit encoding:** MOR or MAR of FFFFFFFFh plus 1 wraps to 0 in the driver, and 0 means no limit in the block layer. A drive reporting 0 or 1 by mistake shows up as a tiny limit.
+- **Full zones:** the driver reports the write pointer of a Full zone as start plus zone length, ignoring the descriptor value.
+- **Method:** dump the raw Identify (`nvme zns id-ns`, `nvme zns id-ctrl`), compute the expected numbers, compare with sysfs and `blkzone report`. A mismatch tells you which layer to debug.
+- **Tools:** `nvme zns list`, `nvme zns report-zones`, `lsblk -z`, `blkzone report`, and libzbd's `zbd report`.
+FOLLOW:
+- Which value is not in sysfs from Identify at all? => Zone capacity per zone. It comes from Report Zones descriptors and shows in `blkzone report` output, not in a queue attribute.
+- What if there is no block device, or `queue/zoned` says none? => The driver hid the namespace or did not enable zoned mode, so look at dmesg for the reason (questions 2.09 and 2.15).
+PITFALL: Trusting sysfs as if it were the device. It is the driver's interpretation, after conversions and gating.
+VERIFY: The sysfs attribute names in the target kernel, and that nvme-cli subcommand names match the version in use (newer releases move some commands under `nvme id` and `nvme log`).
+
+@@ 2.13 | Advanced | Concept | tags=effects-log,csi,cel,conformance
+Q: How does the Commands Supported and Effects log relate to command sets, and how do you use it in validation?
+SHORT: Log page 05h lists, per opcode, whether a command is supported (CSUPP) and what it changes, such as logical block content (LBCC). It is per command set: the Get Log Page command carries a CSI, so ZNS opcodes 79h, 7Ah and 7Dh appear in the CSI 02h log. A validator can use it as the drive's own claim of what it implements, and test that every claim matches behavior.
+DEEP:
+- **Layout:** 4096 bytes: 256 admin opcode entries, 256 I/O opcode entries, then reserved. Each entry is 32 bits. Bit 0 is CSUPP and bit 1 is LBCC. Other bits cover namespace, controller and capability changes and command execution scope.
+- **CSI selection:** the Get Log Page command has a CSI field in CDW14 bits 31:24, so you can fetch the NVM view and the ZNS view of the I/O opcodes separately.
+- **Host use:** Linux fetches it per CSI and, for zoned namespaces, checks the Zone Append entry. No CSUPP means the namespace is forced read-only.
+- **Expected entries (QEMU as a reference implementation):** Zone Management Send and Zone Append have CSUPP and LBCC, since they change content. Zone Management Receive has CSUPP only.
+- **Conformance loop:** for each opcode with CSUPP set, send a valid command and expect success. For each opcode with CSUPP clear, send it and expect an Invalid Command Opcode style error.
+- **Regression use:** diff the log between firmware builds. An opcode disappearing, or a new one appearing without a release note, is a finding.
+FOLLOW:
+- Is the log reliable? => Only as far as you test it. Firmware sometimes advertises an optional command and returns an error on valid use.
+- Does it list per-namespace behavior? => No. It is per command set on the controller, so a feature limited to some namespaces needs Identify and direct testing.
+PITFALL: Sending a zoned opcode to an NVM namespace, getting an error, and blaming the command set log. The namespace CSI decides.
+VERIFY: The full effects bit layout (bits above LBCC), the log page's CSI field position, and the status for an unsupported opcode.
+
+@@ 2.14 | Principal | Scenario | tags=test-design,identify,conformance,automation
+Q: Design an Identify-level conformance suite for a new ZNS SSD. What do you check, how do you automate it, and how do you decide pass or fail?
+SHORT: Treat Identify data as a contract that everything else relies on. Read every structure across CSS modes, LBA formats and firmware builds, check internal invariants (ZSZE, ZCAP, MAR versus MOR, ZDES), cross-check against behavior (zone descriptors, the effects log, real commands) and against what Linux reports. Fail on a broken invariant or a claim that behavior contradicts. Store results per build so any change in a claimed value is visible.
+DEEP:
+1. **Enumerate:** for each CSS mode, controller and namespace, capture CNS 01h, 00h, 03h, 05h, 06h, 07h, 08h, and the effects logs for CSI 00h and 02h.
+2. **Invariants:** CSI descriptor present and equals 02h; ZSZE nonzero and identical for every zone; ZSLBA(n) equals n x ZSZE; ZCAP at most ZSZE; MOR at most MAR when both limited; ZDES consistent with the extension length returned by Report Zones; reserved fields zero; structures 4096 bytes.
+3. **Cross-checks against behavior:** Report Zones descriptors match ZSZE and ZCAP; the write pointer of an empty zone equals ZSLBA; MAR and MOR are enforced by opening zones until the limit trips; every effects-log CSUPP claim is tested.
+4. **Per LBA format:** for each LBA format that can be formatted, redo the checks, since ZSZE and ZDES are per format.
+5. **Negative tests:** unsupported CSS values, a wrong CSI in Identify, CNS 05h on an NVM namespace, and a zoned opcode on an NVM namespace, each with the expected status and DNR bit.
+6. **Host cross-check:** compare the raw values with sysfs and `blkzone report`, on at least two kernel versions.
+7. **Automation:** a script (Python with nvme-cli JSON output or ioctl passthrough) that dumps to a versioned JSON per firmware build, then a diff step. Run as a gate on every build, fast enough for pre-merge.
+8. **Decision criteria:** invariant failure is a defect. A claim that behavior contradicts is a defect. A value change between builds without a release note is a flagged regression. An allowed but unusual value (for example ZOC bits set) is a compatibility note, not a fail.
+FOLLOW:
+- How do you cover multiple namespaces cheaply? => Iterate over the active list and per-CSI list, and check counts match between CNS 02h and 07h.
+- What about SR-IOV or multi-controller drives? => Run per controller, and confirm shared namespaces report the same zone geometry through every controller.
+PITFALL: Checking only the default LBA format and the first namespace. Geometry bugs usually appear at the second format or the last zone.
+VERIFY: Which invariants are stated as requirements in the spec (ZSLBA spacing, MOR and MAR, reserved fields) and the expected status codes for each negative case.
+
+@@ 2.15 | Principal | Debug | tags=triage,linux,read-only,zone-append,firmware-update
+Q: After a firmware update, a ZNS SSD shows up on Linux read-only, or its block device disappears. Walk through the root-cause method.
+SHORT: Start from the driver's decision, not the workload. Read dmesg for the gating messages, then compare the Identify data, the effects log and the descriptor list before and after the update. The usual causes are: Zone Append not marked supported in the effects log (forced read-only), a non-zero ZOC or a non-power-of-two zone size (block device hidden), a missing CSI descriptor, or CC.CSS not reaching 110b. Confirm with a raw command capture, then decide firmware versus host.
+DEEP:
+1. **Collect:** dmesg since boot, `nvme list`, `nvme id-ns` and `nvme zns id-ns`, `nvme id ns-descs` (or `nvme ns-descs` on older nvme-cli), the effects log for CSI 02h, `/sys/block/nvme0n1/queue/zoned`.
+2. **Read the gating messages (strings from the source I read):**
+   - Forced read-only: a warning that Zone Append is not supported for the zoned namespace.
+   - Block device hidden or namespace skipped: "zone operations:%x not supported" (ZOC), "invalid zone size" (non power of two), or "Command set not reported" (no CSI descriptor in multiple-command-set mode).
+3. **Diff against the previous build:** the Identify structures and effects log. The change points to the field.
+4. **Rule out the host:** the same drive on a second kernel, and the previous firmware on the same host. If only the new build fails on both kernels, it is firmware.
+5. **Bus level if unclear:** analyzer or trace capture of the init sequence to see the actual CC write (CSS bits) and each Identify with its CSI.
+6. **Decide:** a real omission of Zone Append in the log is a firmware defect if the command works. A non-zero ZOC is a valid report that a given kernel may not accept, so the answer depends on the product's host support matrix.
+7. **Prevent:** add the identify diff and a Linux bring-up smoke test (zoned mode on, not read-only, limits match) as a gate.
+- **Evidence to keep:** raw Identify dumps, effects log, dmesg and the nvme-cli versions.
+FOLLOW:
+- Zone Append works if you send it by hand, but Linux still forces read-only. Why? => The driver decides from the effects log entry, not from trying the command. If CSUPP is clear, it never tries.
+- How do you tell a stale cached log from a real change? => Reload the driver or reset the controller, and re-read the log from the device.
+PITFALL: Fixing the symptom on the test host, such as forcing writable, instead of asking why the drive's claimed capabilities changed.
+VERIFY: The exact kernel messages and gating conditions in the version under test, and nvme-cli command names and options for that version.
+
+@@ 2.16 | Principal | Cross-layer | tags=compatibility,css,mixed-namespaces,test-matrix
+Q: A product ships both conventional and zoned namespaces on one controller for several host types. What is the design rationale for making ZNS a separate command set, and what does it force you to test?
+SHORT: A separate command set keeps existing NVM software working: a host that does not opt in to multiple command sets (CC.CSS not 110b) never sees zoned namespaces, and a namespace with an unknown CSI is not bound to a block driver. The cost is a compatibility matrix. You must test the opt-in path, CSI-aware discovery, mixed namespaces on one controller, opcode overlap between command sets, and how each host type behaves when it does not understand a command set.
+DEEP:
+- **Why not extend NVM:** changing Write semantics on an NVM namespace would break every existing host. A new command set with its own identify structures and opcodes isolates the change to namespaces that declare it.
+- **No conventional zones:** zoned namespaces contain only sequential-write-required zones, so a mixed workload uses two namespaces of two command sets on one controller.
+- **Test matrix:**
+  1. CC.CSS 000b, 110b and 111b enumeration on the same drive.
+  2. Identify and effects log per CSI, with NVM and ZNS namespaces both present.
+  3. Concurrent I/O on an NVM and a ZNS namespace, including Flush and Format on one while the other is busy.
+  4. Namespace create with each CSI where namespace management is supported, and attach and detach.
+  5. Opcode overlap: Write versus Key Value Store at 01h, and zoned opcodes sent to the wrong namespace type.
+  6. Host types: current kernel, an older kernel with no zoned support, a hypervisor or SPDK stack, and a Windows or vendor driver.
+- **Expected legacy behavior:** the old host either does not enable multiple command sets or skips namespaces it cannot classify, and is not affected. Verify this, do not assume it.
+- **Risk to cover:** shared controller resources (queues, cache, media bandwidth) between the two namespaces, so a zoned workload can add latency to the conventional one. Measure both together.
+FOLLOW:
+- How do you test the old-host case without an old kernel? => A small driver script or SPDK application that writes CC.CSS as 000b and issues Identify, plus a VM with an older guest kernel.
+- What is the one metric you would gate on? => No unintended change to what a legacy host sees: same namespace list and Identify data as before the zoned namespaces were added.
+PITFALL: Testing only the default configuration (110b, one zoned namespace). The compatibility risks are in the other modes and the mixed case.
+VERIFY: Exact controller behavior for zoned namespaces when CC.CSS is 000b, status codes for opcodes sent to the wrong namespace type, and whether the target product supports Namespace Management.

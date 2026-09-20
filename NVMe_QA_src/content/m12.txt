@@ -1,0 +1,359 @@
+# Module 12: Security & Data Sanitization
+
+@@ 12.01 | Basic | Concept | tags=security-send,security-receive,secp,tcg,discovery
+Q: What are the Security Send and Security Receive commands, and what do the fields in them mean?
+SHORT: They are admin commands (opcodes 81h and 82h) that tunnel a security protocol's own messages to the controller, so NVMe itself does not need to know what the messages mean. Command Dword 10 carries the Security Protocol (SECP), two protocol-specific bytes (SPSP) and an NVMe Security Specific Field (NSSF). Dword 11 carries the transfer or allocation length. Support is advertised by OACS bit 0.
+DEEP:
+The controller acts as a transport. The payload is defined by another standard: TCG Storage, RPMB, IEEE 1667, or SPDM. The host sends a request with Security Send and collects the reply with Security Receive.
+| Field | Where | Meaning |
+|---|---|---|
+| SECP | CDW10 bits 31:24 | Which security protocol the payload belongs to |
+| SPSP | CDW10 bits 23:8 | Protocol-specific value (for TCG this includes the ComID) |
+| NSSF | CDW10 bits 7:0 | NVMe-specific: for the NVMe-defined protocol EAh it selects the RPMB target |
+| TL / AL | CDW11 | Transfer length (Send) or allocation length (Receive), in bytes |
+
+- **Discovery:** Security Receive with SECP 00h asks which protocols are supported. It is how tools such as `sedutil` find out whether a drive speaks TCG.
+- **TCG:** protocols 01h and 02h carry TCG Storage traffic, and the drive-level features (Opal, Pyrite, Enterprise) are all reached this way.
+- **RPMB:** protocol EAh, see the RPMB question below.
+- **Linux:** the driver registers a security-send/receive callback when OACS bit 0 is set and `CONFIG_BLK_SED_OPAL` is built, which lets `sed-opal` unlock a drive on resume. `nvme security send` and `nvme security recv` issue raw commands.
+- **Send then Receive:** a reply is only valid for the matching Send. A validator must keep the pair together and must not interleave another host's session on the same protocol.
+FOLLOW:
+- Where do you check support before sending? => Identify Controller OACS bit 0 for the commands, then Security Receive with SECP 00h for the protocol list.
+- Does Security Send need a namespace? => Some protocols are per namespace, and the command's NSID field exists for that. Most drive-level TCG traffic is addressed to the controller.
+PITFALL: Treating Security Send as an erase or lock command. It only carries bytes, and the effect depends on what the protocol inside them says.
+VERIFY: SECP value assignments (00h, 01h, 02h, EAh) and which of them the NVMe specification defines itself, plus the NSSF and SPSP field positions in CDW10.
+
+@@ 12.02 | Basic | Concept | fig=eraseops | tags=format,sanitize,deallocate,crypto-erase,scope
+Q: Deallocate, Format NVM, Sanitize and crypto erase all "erase" a drive. How do they differ in scope and in what they guarantee?
+SHORT: Deallocate is a hint about specific LBAs and guarantees nothing about the media. Format NVM works per namespace (or on all of them) and only promises secure erase if you ask for it with SES. Sanitize works on the whole NVM subsystem, including caches and unattached namespaces, and survives power loss. Crypto erase destroys the encryption key, so the ciphertext is left in place but is useless.
+DEEP:
+| Operation | Scope | Physical guarantee | Survives power loss |
+|---|---|---|---|
+| Dataset Management deallocate | Listed LBA ranges | None, it is a hint | Not applicable |
+| Format NVM, SES=0 | One namespace (or all) | None: layout changes, data unreachable | Vendor specific |
+| Format NVM, SES=1 or 2 | One namespace (or all if FNA says so) | User data erased, including caches and deallocated LBAs | Test it, the spec is less explicit than for Sanitize |
+| Sanitize block erase or overwrite | Entire NVM subsystem | Media erased or overwritten | Yes, continues after reset |
+| Sanitize crypto erase, Opal Revert or GenKey | Subsystem, or one locking range | Key destroyed, ciphertext remains | Yes once the key change is committed |
+
+- **Scope is the first question:** Format can be limited to one namespace. Sanitize cannot. A Sanitize on a drive with two namespaces destroys both, attached or not.
+- **Guarantee is the second:** logical operations (Deallocate, Format SES=0) change the mapping. Physical ones (block erase, overwrite, key destruction) change the media or the key.
+- **Speed is the third:** crypto erase takes seconds, block erase takes seconds to minutes, and overwrite takes hours. That is why fleets prefer crypto erase on drives that encrypt everything.
+- **Reading back proves less than you think.** See the Trap question on zero reads.
+FOLLOW:
+- Which of them can a host abort once started? => None of the sanitize actions. Format NVM is a single command, and it too runs to completion or to an error.
+- Which is fastest on a self-encrypting drive? => Crypto erase, because it only replaces a key.
+PITFALL: Assuming `blkdiscard` or `mkfs` is secure erase. Discard is a Deallocate hint, and a filesystem format only rewrites metadata.
+VERIFY: Whether Format with SES=0 must change the readable contents, and the current wording for "secure erase" across Format and Sanitize in the NVM Command Set Specification.
+
+@@ 12.03 | Basic | Concept | tags=sanitize,sanact,sanicap,global,background
+Q: What does the Sanitize command do, which actions does it offer, and what stays the same across all of them?
+SHORT: Sanitize (admin opcode 84h) makes user data in the whole NVM subsystem unrecoverable. The actions are Block Erase, Overwrite and Crypto Erase, plus Exit Failure Mode, selected by SANACT. SANICAP in Identify Controller says which are supported. The command completes once the operation has started. Work continues in the background, survives power loss and resets, and progress is read from log page 81h.
+DEEP:
+- **Actions (SANACT, CDW10 bits 2:0):** 1 = Exit Failure Mode, 2 = Block Erase, 3 = Overwrite, 4 = Crypto Erase. Later revisions add 5 = Exit Media Verification State.
+- **SANICAP (Identify Controller):** bit 0 crypto erase, bit 1 block erase, bit 2 overwrite. Higher bits describe no-deallocate behavior.
+- **Scope:** every namespace in the NVM subsystem, attached or not, plus caches and other places user data can hide. A Persistent Memory Region must be disabled first, or the command fails with Sanitize Prohibited While Persistent Memory Region is Enabled (SCT 1, SC 23h).
+- **Asynchronous:** the completion means "accepted and started". Poll Sanitize Status (log 81h) or wait for the Sanitize Operation Completed event (NVM command set specific event, info 01h).
+- **While it runs:** commands that touch user data are aborted with Sanitize In Progress (SC 1Dh). A failed sanitize leaves the drive returning Sanitize Failed (SC 1Ch) to such commands until recovery.
+- **Not abortable:** there is no host command that cancels it. A reset does not stop it either.
+- **Tools:** `nvme sanitize /dev/nvme0 -a 2` starts a block erase, and `nvme sanitize-log /dev/nvme0` reads the status.
+FOLLOW:
+- Does Sanitize erase firmware or the SMART log? => Its promise is about user data. Firmware and wear history are not user data, so confirm in a test that, for example, Percentage Used does not reset.
+- Where is the Sanitize command's bit layout? => See the Numeric question on encoding CDW10 and CDW11.
+PITFALL: Treating the Success CQE as "sanitize done". The completion only says the operation began.
+VERIFY: SANICAP bits beyond 2 (no-deallocate fields), the Sanitize Operation Completed event type and info values, and whether a host can request a sanitize while a PMR is enabled on your revision.
+
+@@ 12.04 | Intermediate | Concept | tags=format-nvm,ses,fna,lbaf,pi
+Q: What does Format NVM do, what do its CDW10 fields mean, and how does FNA change its behavior?
+SHORT: Format NVM (admin opcode 80h) reformats a namespace. CDW10 selects the LBA format (LBAF), where metadata sits (MSET), whether and where protection information is used (PI, PIL), and the secure erase setting (SES: 0 none, 1 user data erase, 2 crypto erase). FNA in Identify Controller tells whether a format applies to all namespaces, whether SES applies to all, and whether crypto erase is supported.
+DEEP:
+| Field | CDW10 bits | Meaning |
+|---|---|---|
+| LBAF | 3:0 (upper bits at 13:12 in newer revisions) | Index into the LBA format table |
+| MSET | 4 | 0 separate metadata buffer, 1 extended LBA |
+| PI | 7:5 | 0 off, 1 to 3 = Type 1 to 3 |
+| PIL | 8 | 0 last bytes of metadata, 1 first bytes |
+| SES | 11:9 | 0 none, 1 user data erase, 2 cryptographic erase |
+
+- **FNA bit 0:** a format of any namespace formats all of them, so every namespace shares one format.
+- **FNA bit 1:** any secure erase in a Format applies to every namespace, so a SES=1 on NSID 1 wipes NSID 2 as well.
+- **FNA bit 2:** crypto erase is supported. SES=2 on a drive without it should fail as an invalid field.
+- **FNA bit 3:** Format does not accept NSID FFFFFFFFh (newer revisions).
+- **SES=1:** all user data erased, wherever it lives, including caches and deallocated space. The resulting contents are indeterminate (zeros, ones and so on). If all data is encrypted the controller may implement it as a crypto erase.
+- **SES=0:** no secure-erase promise. The old data is unreachable through the new format, and nothing more is guaranteed about the media.
+- **During the format:** I/O to the namespace returns Format In Progress (SC 84h). Identify Namespace FPI can report percent remaining if supported.
+- **Afterwards:** re-read Identify Namespace, because block size, NSZE, NCAP and FLBAS can change. See module 7 for the LBA format side.
+FOLLOW:
+- Does Format change the NSID? => No. NSID and identifiers stay, but data, format and sizes change.
+- What timeout should a script use? => A long one, measured on your largest capacity. The Linux admin timeout defaults to 60 s and nvme-cli has its own --timeout option, so check both before blaming the drive.
+PITFALL: Formatting "namespace 1" on a drive with FNA bit 0 or bit 1 set and losing the others too.
+VERIFY: CDW10 bit positions and the upper LBAF bits, the exact FNA bit list (bit 3 in particular), what SES=2 returns when unsupported, and the FPI encoding (bit 7 supported, low bits percent remaining).
+
+@@ 12.05 | Intermediate | Numeric | tags=cdw10,encoding,format,sanitize,nvme-cli
+Q: Encode Command Dword 10 and 11 for a Format NVM with LBA format 3, PI type 1 and user data erase, and for a Sanitize block erase with unrestricted exit and no deallocate. Then decode SCDW10 = 0x00000133.
+SHORT: Format: LBAF 3 gives 0x3, PI 1 in bits 7:5 gives 0x20, SES 1 in bits 11:9 gives 0x200, so CDW10 = 0x223. Sanitize block erase is SANACT 2, AUSE bit 3 gives 0x8, NDAS bit 9 gives 0x200, so CDW10 = 0x20A. SCDW10 0x133 decodes as Overwrite (3), pass count 3, invert pattern between passes set, restricted mode, deallocate allowed.
+DEEP:
+1. **Format:** LBAF = 3, MSET = 0 (bit 4), PI = 1 in bits 7:5 = 1 x 0x20 = 0x20, PIL = 0 (bit 8), SES = 1 in bits 11:9 = 1 x 0x200 = 0x200. Sum: 0x3 + 0x20 + 0x200 = 0x223.
+2. **Sanitize:** SANACT = 2 (bits 2:0) = 0x2, AUSE = 1 (bit 3) = 0x8, OWPASS ignored (bits 7:4), OIPBP ignored (bit 8), NDAS = 1 (bit 9) = 0x200. Sum: 0x20A. CDW11 (the overwrite pattern) is ignored for block erase.
+3. **Decode 0x133:** bits 2:0 = 3 (Overwrite), bit 3 = 0 (AUSE clear, restricted completion), bits 7:4 = 3 (three overwrite passes), bit 8 = 1 (invert pattern between passes), bit 9 = 0 (deallocate after sanitize allowed).
+4. **What it means:** the same command, sent with CDW11 = 0xDEADBEEF, writes that 32-bit pattern, then its inverse, then the pattern again.
+
+Command lines that produce these:
+```
+nvme format /dev/nvme0n1 --lbaf=3 --pi=1 --ses=1
+nvme sanitize /dev/nvme0 --sanact=2 --ause --no-dealloc
+nvme sanitize /dev/nvme0 --sanact=3 --owpass=3 --oipbp --ovrpat=0xDEADBEEF
+```
+- **Overwrite pass count:** a value of 0 means 16 passes, so a test that leaves OWPASS at 0 gets the slowest possible case.
+- **SCDW10 in the log:** it echoes the CDW10 that started the operation, so the log is proof of what was actually requested.
+FOLLOW:
+- What would 0x204 be? => SANACT 4 (crypto erase) with NDAS set.
+- Can you reuse Format's bit layout for Sanitize? => No. In Format bits 11:9 are SES. In Sanitize bit 9 is NDAS. Each command has its own layout.
+PITFALL: Copying one command's bit positions to the other. Format's SES starts at bit 9, while Sanitize's OIPBP is bit 8 and NDAS is bit 9.
+VERIFY: Sanitize CDW10 bits above 9 (Enter Media Verification State and Purge Request in recent revisions), and OWPASS = 0 meaning 16 passes in your spec revision.
+
+@@ 12.06 | Intermediate | Concept | tags=sanitize-status,log-81h,sprog,sstat,eto
+Q: What is in the Sanitize Status log page (81h), and how do you read progress, result and estimated times?
+SHORT: It is a 512-byte log. SPROG is the fraction complete over 65536, valid only while running (it reads FFFFh otherwise). SSTAT gives the status in bits 2:0 (0 never sanitized, 1 completed, 2 in progress, 3 failed, 4 completed with deallocation although no-deallocate was requested), completed overwrite passes in bits 7:3 and Global Data Erased in bit 8. SCDW10 echoes the command. ETO, ETBE and ETCE are estimated seconds for overwrite, block erase and crypto erase.
+DEEP:
+| Offset | Field | Meaning |
+|---|---|---|
+| 0 | SPROG (2 B) | Fraction complete out of 65536, FFFFh when nothing is running |
+| 2 | SSTAT (2 B) | Status, completed passes, Global Data Erased |
+| 4 | SCDW10 (4 B) | CDW10 of the command that started the last operation |
+| 8 | ETO (4 B) | Seconds for an overwrite (defined for 16 passes) |
+| 12 | ETBE (4 B) | Seconds for a block erase |
+| 16 | ETCE (4 B) | Seconds for a crypto erase |
+| 20 to 31 | ETOND, ETBEND, ETCEND | The same estimates when no-deallocate media modification applies |
+
+- **Reading SPROG:** 0x8000 is exactly 50 percent. Do not treat it as linear in time, since erase and write phases differ.
+- **Estimate encoding:** 0 means the operation is expected to be completed in the background by the time the Sanitize command completes, and FFFFFFFFh means no estimate is reported.
+- **Global Data Erased:** set when nothing has been written to the subsystem since manufacture or since the last successful sanitize. It is a claim worth testing: write one LBA and the bit must clear.
+- **Newer fields:** later revisions add a post-verification deallocation estimate and a Sanitize State Information byte for the media verification states.
+- **Reading it:** `nvme sanitize-log /dev/nvme0`. Reading with RAE clear can consume a pending event, as with other logs.
+FOLLOW:
+- SPROG reads FFFFh and SSTAT is 1. Is the drive 99.998 percent done? => No. FFFFh is the "not running" value, and SSTAT says it is complete.
+- Is ETO a limit? => No, it is an estimate. Use it for timeout design, not as a pass or fail limit.
+PITFALL: Trusting SPROG alone. Read SSTAT first, because SPROG is meaningless unless the status is "in progress".
+VERIFY: Field offsets and widths of the fields after ETCE, the exact SSTAT bit assignments in your revision, the ETO 16-pass definition, and whether reading the log clears the pending Sanitize Operation Completed event.
+
+@@ 12.07 | Intermediate | Concept | tags=tcg,opal,pyrite,enterprise,sed,psid,locking
+Q: What are TCG Opal, Pyrite and Enterprise, and how do they relate to NVMe security commands and crypto erase?
+SHORT: They are Security Subsystem Classes from the Trusted Computing Group, carried over Security Send and Receive. Opal covers self-encrypting drives with locking ranges, per-range keys, pre-boot MBR shadowing and authenticated users. Enterprise uses bands for datacenter drives. Pyrite offers similar access control without requiring encryption. Key destruction is what makes a revert or key regeneration a crypto erase.
+DEEP:
+- **Objects:** an Admin SP (owner, SID credential) and a Locking SP (users, locking ranges). A locking range covers an LBA span and, on Opal, is bound to a media encryption key.
+- **Locking:** a range can be read-locked and write-locked. On a power cycle it returns to its locked state, and the host must send a valid unlock before I/O to that range succeeds. A blocked access should fail with an error status (Access Denied, SCT 2 SC 86h, is the likely one) rather than return zeros.
+- **MBR shadowing:** a small shadow image is presented until the host authenticates, so a pre-boot loader can ask for a password.
+- **Opal vs Pyrite:** Opal ties locking to data encryption. Pyrite drives may not encrypt, so "locked" is an access control, and data removal uses another mechanism.
+- **Erase paths:** GenKey on a range regenerates its key, and Revert or RevertSP returns the SP to factory state and destroys keys. The PSID printed on the label allows a revert when the password is lost.
+- **Block SID:** a feature that lets platform firmware prevent the OS from taking ownership through SID authentication after boot.
+- **Validation view:** discovery data (Level 0), session start and authentication, unlock after each reset type, range boundaries, and the erase result. Compare with NVMe Sanitize crypto erase: same idea (destroy the key) through a different command.
+FOLLOW:
+- Does an unlocked range affect the Format or Sanitize path? => Locked ranges can make user data commands fail, so validate erase behavior with ranges both locked and unlocked, and confirm what the drive does.
+- How do you test key destruction? => Write a pattern, note the ciphertext bytes if you have a NAND-level view, run GenKey or crypto erase, and show reads no longer decode to the pattern.
+PITFALL: Calling a drive "encrypted" because it reports Opal. Many drives always encrypt, and some only encrypt when a range is enabled, so the erase guarantee differs.
+VERIFY: Which SSCs and versions your DUT claims (Opal 2.x, Pyrite 1.x or 2.x, Enterprise), the Block SID feature behavior, and how a locked range reports errors over NVMe.
+
+@@ 12.08 | Intermediate | Concept | tags=write-protect,fid-84h,nwpc,namespace,states
+Q: How does Namespace Write Protection work, and what does the host see when a namespace is protected?
+SHORT: The Namespace Write Protection Config feature (FID 84h) sets a per-namespace state: No Write Protect, Write Protect, Write Protect Until Power Cycle, or Permanent Write Protect. Identify Controller NWPC says which states the drive supports. While protected, commands that change user data fail with Namespace Is Write Protected (SC 20h), and Identify Namespace NSATTR bit 0 shows the current condition.
+DEEP:
+| State | Value | Behavior |
+|---|---|---|
+| No Write Protect | 0 | Normal |
+| Write Protect | 1 | Writes blocked until changed back |
+| Write Protect Until Power Cycle | 2 | Blocked until the next power cycle, then it clears |
+| Permanent Write Protect | 3 | Cannot be undone |
+
+- **Support:** NWPC bit 0 means No Write Protect and Write Protect are supported. Bit 1 adds "until power cycle", and bit 2 adds permanent.
+- **Set and read:** `nvme set-feature /dev/nvme0 -f 0x84 -n 1 -v 1` requests Write Protect on NSID 1, and `nvme get-feature` reads the current state.
+- **Blocked commands:** those that change data or the format: Write, Write Zeroes, Write Uncorrectable, Dataset Management deallocate, Copy (destination) and Format NVM. Reads and Identify keep working.
+- **Persistence:** the "until power cycle" state is dropped at the next power cycle by design. Check on the DUT whether plain Write Protect survives a power cycle and whether it needs the Save bit.
+- **Validation:** for each supported state, try every data-changing command and every read-type command, cycle power, and check the state again. The permanent state is a one-way test, so do it only on a sacrificial unit.
+FOLLOW:
+- How does this differ from an Opal write lock? => Write Protect is an NVMe feature on a namespace. An Opal lock is a TCG state on an LBA range, and the two can be combined.
+- Does Write Protect stop a Sanitize? => Do not assume. Sanitize acts on the subsystem, so test the interaction and read the spec before you rely on it.
+PITFALL: Testing only Write and forgetting Deallocate, Write Zeroes and Format, all of which change what a read returns.
+VERIFY: The exact list of commands blocked in each state, allowed state transitions (which states can move back to No Write Protect), whether SC 20h carries DNR, and the CDW11 field layout of FID 84h.
+
+@@ 12.09 | Advanced | Concept | tags=rpmb,replay-protected,hmac,write-counter,security-send
+Q: How does RPMB work over NVMe, and why is it replay protected?
+SHORT: A Replay Protected Memory Block is a small region only reachable through authenticated messages. The host programs a shared key once, then every write carries an HMAC (SHA-256 based) over the data and an incrementing write counter, and reads carry a nonce that the device signs back. A recorded write cannot be replayed because the counter has moved on. In NVMe the messages travel in Security Send and Receive using protocol EAh.
+DEEP:
+- **Discovery:** Identify Controller RPMBS reports the number of RPMB units (targets), the authentication method, the total size and the access size. NSSF in the command selects the target.
+- **Operations:** program the authentication key (one time and irreversible), read the write counter, authenticated data write, authenticated data read, and read the result of the previous operation.
+- **Freshness:** a nonce chosen by the host is returned inside the signed reply, so an old reply cannot be replayed. The write counter, included in the MAC, stops a captured write from being reapplied.
+- **Counter:** 32 bits. When it reaches its maximum the RPMB can no longer be written.
+- **Failure modes to test:** wrong key (authentication failure), stale counter, address out of range, a write torn by power loss, and operations before the key is programmed.
+- **Use:** boot-state anti-rollback, secure counters, and in some designs control of boot partition write protection.
+- **Validation trap:** key programming is one-way, so a test rig needs a policy: use a dedicated DUT, or accept that each unit gets programmed once.
+- **Power loss:** a sensible expectation is that a write interrupted by a power cut leaves either the old data with the old counter or the new data with the new counter, never a mix. Check by reading both after each cut, and confirm the drive's claim in its documentation.
+FOLLOW:
+- Why not just password protect the region? => A password can be sniffed and replayed. The counter and nonce make each message single-use.
+- Who holds the key? => The host side (often a secure element or trusted OS), and the device stores its copy. Anyone with the key can write, so key handling is the real security.
+PITFALL: Validating RPMB with a fixed nonce or ignoring the write counter. A test that never checks freshness cannot find a replay bug.
+VERIFY: RPMBS field encoding (units, authentication method values, total size in 128 KiB units, access size in 512 B units and whether they are zero based), the data frame layout, the result codes, and the counter width.
+
+@@ 12.10 | Advanced | Concept | tags=boot-partition,bpinfo,bprsel,bpmbl,firmware-commit
+Q: What are NVMe Boot Partitions, how does a host read one before the controller is enabled, and how are they written?
+SHORT: A controller can expose two small boot partitions (0 and 1) that hold a boot loader. A platform reads one through registers, with no queues needed: BPINFO (offset 40h) reports size, read status and the active partition, BPMBL (48h) gives a host buffer, and writing BPRSEL (44h) starts a read. The partitions are written with Firmware Image Download plus Firmware Commit actions 6 (replace) and 7 (mark active).
+DEEP:
+- **Registers:**
+  - BPINFO: bits 14:0 size in 128 KiB units, bits 25:24 read status (0 none, 1 in progress, 2 success, 3 error), bit 31 active partition ID.
+  - BPRSEL: read size (bits 9:0, 4 KiB units), read offset (bits 29:10, 4 KiB units) and partition ID (bit 31).
+  - BPMBL: 4 KiB aligned base of the host memory buffer that receives the data.
+- **Read flow:** set BPMBL, write BPRSEL, poll BPINFO.BRS for 2 (or 3 for error). Each read moves a limited number of 4 KiB units, so a large image takes a loop.
+- **Why it exists:** an embedded platform can boot from the drive before it has an NVMe driver or admin queues. The read mechanism is designed to work before the controller is enabled.
+- **Write flow:** Firmware Image Download into the controller, then Firmware Commit with CA = 6 and the Boot Partition ID, and later CA = 7 to make it the active one. BPINFO.ABPID shows the result.
+- **Protection:** the Boot Partition Write Protection Config feature (FID 85h) has states for unlocked, locked, locked until power cycle and control by RPMB. It is newer than the basic feature and needs a revision check.
+- **Tests:** size vs BPSZ, read status transitions, read of both partitions after each update, the active ID after a reset, and an interrupted update at every step.
+FOLLOW:
+- Does a boot partition appear as a namespace? => No. It is outside the namespace LBA space, so Format does not touch it. Whether Sanitize does is a spec question to check.
+- What if the two partitions differ? => The active partition is what the platform boots from, so validate that switching the active ID and resetting changes what is read.
+PITFALL: Testing the read path only once after a write. The state to check is the read after reset and power cycle, and the survivability of the inactive copy.
+VERIFY: Register offsets and bit fields, whether reads must happen with CC.EN = 0, whether a Sanitize leaves boot partitions untouched on your revision, the maximum read size semantics, and FID 85h states and revision.
+
+@@ 12.11 | Advanced | Trap | tags=trap,read-zeros,deallocate,dlfeat,ndas,crypto-erase
+Q: After a Sanitize completes, every LBA reads back as zeros and your colleague signs off "verified erased". What is wrong with that?
+SHORT: A read only tests the logical view. If the drive deallocates after sanitize, zeros come from the mapping table and DLFEAT, not from the media. With no-deallocate they come from whatever the media holds, which after a crypto erase is decrypted noise. Zero reads do not prove the old data is gone from over-provisioned space, retired blocks, caches or metadata, and they do not depend on the sanitize succeeding.
+DEEP:
+- **Deallocate after sanitize:** by default the controller may deallocate blocks. The read then follows the Deallocated or Unwritten Logical Block behavior in DLFEAT (zeros on many drives). Nothing was read from NAND.
+- **No-Deallocate After Sanitize (NDAS):** the drive keeps LBAs allocated. Reads now return the media state: the erased value after block erase, the pattern after overwrite, or garbage after crypto erase (old ciphertext decrypted with a new key). SSTAT status 4 means no-deallocate was requested but the drive deallocated all user data anyway, and the NODMMAS field of SANICAP says whether no-deallocate modifies the media.
+- **Sanitize config:** SANICAP NDI and the No-Deallocate Response Mode bit in the Sanitize Config feature (17h) control what happens when the host asks for no-deallocate and the drive cannot or will not honor it. Read the DUT's behavior instead of assuming.
+- **What zero reads cannot see:**
+  - Blocks holding stale copies (over-provisioning, blocks awaiting garbage collection).
+  - Retired or bad blocks that still contain readable data.
+  - Write buffers, PLP-backed caches and FTL journals.
+  - Unmapped namespaces and unattached namespaces.
+- **The right evidence:** status and log (SSTAT, SCDW10, SPROG), a host read of every LBA for a sanity check, and a physical-level check as described in the verification design question.
+FOLLOW:
+- Should reads return zeros after crypto erase? => Not necessarily. They may return garbage, zeros, or an error. The contents are indeterminate unless the LBA is deallocated.
+- Does SSTAT = 1 prove the erase? => It proves the drive believes it completed. It is a claim to test, not evidence.
+PITFALL: Writing a checker that requires zeros. It fails compliant drives on a no-deallocate run and passes broken drives on a deallocate run.
+VERIFY: The relation between NDAS, NODMMAS, NDI and the No-Deallocate Response Mode bit, the meaning of SSTAT value 4, and what DLFEAT says about the DUT.
+
+@@ 12.12 | Advanced | Debug | tags=sanitize-in-progress,1dh,power-cycle,sstat,sprog,recovery
+Q: After a power cycle in the lab, the SSD enumerates and Identify works, but every read and write fails and dmesg shows I/O errors. A CQE has DW3 = 0x003B0012. Decode it and find the cause.
+SHORT: DW3 = 0x003B0012: CID = 0x0012, phase bit 1, status field = 0x1D in bits 24:17, so SCT 0 and SC 1Dh, Sanitize In Progress. A sanitize started before the power cycle and is continuing. Read log page 81h: SSTAT status 2 (in progress) and SPROG tell how far. Wait for completion (or the completed event), then verify SSTAT = 1. Do not reset it.
+DEEP:
+1. **Decode:** DW3 bits 15:0 = 0x0012 (command ID). Bit 16 = 1 (phase tag). Bits 24:17 = 0x1D = status code. Bits 27:25 = 0 (status code type generic). Bits 31:28 (DNR, More and the retry delay field) are clear.
+2. **Interpret:** Sanitize In Progress means the function is prohibited while sanitize runs. Identify and log reads work because they are among the allowed commands.
+3. **Read the log:** an example dump:
+
+| Field | Value | Meaning |
+|---|---|---|
+| SPROG | 0x8000 | 50 percent |
+| SSTAT | 0x0012 | Status 2 (in progress), 2 overwrite passes complete |
+| SCDW10 | 0x00000043 | Overwrite, restricted mode, 4 passes |
+
+4. **Explain:** the previous test started an overwrite. The power cut did not cancel it, because sanitize is defined to continue across power cycles and resets.
+5. **Confirm:** repeat the log read until SSTAT changes to 1 and SPROG reads FFFFh. Check that the Persistent Event Log or the vendor log shows a matching start and completion.
+6. **Action:** wait. Resetting again does not stop it. If SSTAT reaches 3, use the failure-mode rules (see 12.14).
+- **Host side:** Linux sees the error, retries a command whose DNR is clear up to a configured limit, then fails the request. A test harness should treat 1Dh as "wait and poll", not as a device failure.
+- **What would be a bug:** a drive that forgets the operation after the power cycle and serves old data, or one that finishes and stays at SSTAT 2 forever.
+FOLLOW:
+- Why did Identify still work? => Commands that do not touch user data are allowed during a sanitize, including Identify and Get Log Page.
+- What if the log shows SSTAT 3? => The sanitize failed. Media commands then return Sanitize Failed (1Ch) until a new sanitize succeeds or the exit rules apply.
+PITFALL: Concluding the drive is bricked and power cycling repeatedly. Each cycle risks interrupting a long operation and adds nothing.
+VERIFY: The exact list of commands allowed and aborted during sanitize, whether DNR is set for 1Dh, and whether an interrupted overwrite resumes or restarts a pass.
+
+@@ 12.13 | Advanced | Numeric | tags=sanitize-time,overwrite,block-erase,crypto-erase,timeout,pe-cycles
+Q: Estimate how long overwrite, block erase and crypto erase sanitize should take on a 3.84 TB drive, what each costs in P/E cycles, and how to set a test timeout.
+SHORT: Assume 2.8 GB/s sequential write. One overwrite pass is 3.84e12 / 2.8e9 = about 1371 s (23 min), so 16 passes take about 6.1 hours and use about 16 P/E cycles per block. Block erase, at 4 TiB raw and 24 MiB blocks, is about 175k blocks: 14 s if all 128 planes erase together and about 55 s with a quarter of them. Crypto erase is seconds. Set the timeout from log page ETO, ETBE and ETCE with margin.
+DEEP:
+1. **Overwrite:** pass time = capacity / write bandwidth = 3.84e12 B / 2.8e9 B/s = 1371 s = 22.9 min. With OWPASS = 0 (16 passes): 16 x 1371 = 21,943 s = 6.1 h. Three passes: 68.6 min.
+2. **P/E cost:** every pass rewrites each block once, so 16 passes add about 16 cycles each. On a 3000-cycle TLC part that is 16 / 3000 = 0.53 percent of life. A block erase adds about 1 cycle (0.03 percent).
+3. **Block erase (assumptions):** raw NAND 4 TiB = 4.4e12 B, plane block 24 MiB. Blocks = 4,398,046,511,104 / 25,165,824 = about 174,763. Parallelism: 32 dies x 4 planes = 128 blocks per step, so about 1366 steps. With tBERS = 10 ms: 13.7 s. If the power budget lets only 8 dies erase at once, 32 planes per step, giving about 54.6 s.
+4. **Add fixed costs:** metadata reset, verification, and any deallocation phase. Expect a reported ETBE from tens of seconds to a few minutes for a drive like this, but that is an assumption to check against the DUT.
+5. **Crypto erase:** destroying and regenerating a key takes far less than a second in principle. Practical time is dominated by flushing and resetting mapping metadata, so expect seconds.
+6. **Timeout rule:** poll log 81h (for example every 5 seconds) and record SPROG against time. Expected time comes from ETO, ETBE or ETCE (0 = expected done in the background by command completion, FFFFFFFFh = no estimate). Fail on stalled SPROG or on a total time beyond a chosen multiple of the estimate, not on a fixed constant.
+- **Also check:** the estimate itself. If a drive reports ETBE of 10 s and takes 600 s, the field is wrong even if the erase worked.
+FOLLOW:
+- Which figure changes most with drive size? => Overwrite, because it scales with capacity over bandwidth. Block erase scales with block count over parallelism.
+- How do you use ETO for a 3-pass run? => The field is defined for 16 passes, so scale it by 3/16 as a first approximation and confirm against a measured pass time.
+PITFALL: Setting one timeout for all three actions. The spread is several orders of magnitude.
+VERIFY: The definitions of ETO, ETBE and ETCE (including the 16-pass basis), OWPASS = 0 meaning 16 passes, and the P/E rating of your NAND.
+
+@@ 12.14 | Advanced | Cross-layer | tags=firmware,nand,ftl,sanitize,failure-mode,ause,restricted
+Q: What must the firmware actually do for each sanitize action, and what do restricted mode, unrestricted mode and Exit Failure Mode mean at the interface?
+SHORT: Firmware must reach everything that can hold user data: mapped blocks, stale copies, over-provisioning, write caches and FTL structures that point at old data. Block erase erases the NAND, overwrite programs patterns into every physical page, and crypto erase destroys the media keys. AUSE picks restricted or unrestricted completion, which governs whether a failed sanitize can be exited without a successful one.
+DEEP:
+| Action | NAND and media work | Key point |
+|---|---|---|
+| Block erase | Erase every block that may hold user data, including OP and SLC cache | Erase failures must be handled, not skipped |
+| Overwrite | Program a pattern over every page, N passes, optionally inverting | Covers physical pages, not just logical LBAs |
+| Crypto erase | Replace media encryption keys and erase the old key store | Nothing else on NAND changes |
+
+- **Always:** flush and discard write buffers and power-loss-protected data, reset the L2P table, journals and any persistent copies, and record the sanitize state so a power cycle continues it.
+- **Bad and retired blocks:** blocks retired for wear may still hold readable data. A sound design erases them when possible, or the vendor documents why not.
+- **Restricted completion (AUSE = 0):** if the operation fails, the controller keeps refusing user data commands (Sanitize Failed, SC 1Ch) until a later sanitize succeeds. This protects data from being handed back while it may still exist.
+- **Unrestricted completion (AUSE = 1):** after a failure the host may issue Exit Failure Mode (SANACT 1) and return the drive to normal operation, accepting that the erase did not finish.
+- **Interface signals:** SSTAT 3 on failure, SC 1Ch on media commands, SC 1Dh during, and a completion event on success.
+- **Validation angle:** inject a NAND erase failure during block erase, and a program failure during overwrite, and check that the drive fails the sanitize instead of reporting success.
+FOLLOW:
+- Should Data Units Written rise during a sanitize? => Expect not, since it counts host writes. NAND-level erase and program counts, if a vendor log exposes them, should rise.
+- Does crypto erase clear the write cache? => It must. A cached copy of plaintext is user data, and the firmware has to drop it.
+PITFALL: Reporting success after erasing only the LBA-mapped blocks. Stale copies and OP are exactly where remnants live.
+VERIFY: The full state machine (restricted and unrestricted processing and failure states) and what Exit Failure Mode does in each, the treatment of retired blocks in the spec, and the exact SC for media commands in each failure state.
+
+@@ 12.15 | Principal | Scenario | tags=power-loss,sanitize,fault-injection,campaign,oracle
+Q: Design a power-loss test campaign for Sanitize. What do you cut, when, what may the drive legally do, and how many cuts do you run?
+SHORT: Cut power at controlled points: before the command is fetched, at fixed SPROG values, inside the final commit, and just after completion, for each action and for AUSE and NDAS variants. Legal outcomes after power-up are only two: the operation is continuing or complete (SSTAT 2 or 1) with no user data reachable at the end, or it never started with the old data intact. Illegal is a drive back in normal service holding part-erased or old data.
+DEEP:
+1. **Setup:** fill the drive with unique tagged data (LBA, generation, random salt), including overwrites to leave stale copies, deallocated ranges, and a second namespace. Record the map.
+2. **Cut points:**
+   - Before or during command fetch.
+   - At SPROG of 5, 25, 50, 75 and 95 percent (read SPROG, trigger the relay).
+   - During the final phase (key destruction, metadata commit, status update).
+   - Immediately after completion is posted.
+   - During Exit Failure Mode after an injected failure.
+3. **Expected results:**
+   - Cut before start: SSTAT unchanged, old data readable, no partial state.
+   - Cut mid-operation: after power-up SSTAT = 2, media commands return 1Dh, and the operation runs to SSTAT = 1.
+   - Cut after completion: SSTAT = 1 and no tagged data.
+4. **Oracle:** on completion, scan all LBAs for tags, and run the physical check from the verification question. For a crypto erase, confirm the old key is gone.
+5. **Reset variants:** also test CC.EN toggles, NSSR, PCIe hot reset and FLR during a sanitize. None may abort it.
+6. **Sample size:** showing a failure rate below 1 percent at 95 percent confidence needs about 300 clean cuts per configuration (rule of three, see module 20). Weight the runs to the phase boundaries.
+7. **Artifacts:** each cut saves SPROG at the cut, all log pages after boot, the Persistent Event Log, and a physical dump for any failure.
+- **Bugs this finds:** a sanitize flag that is not persisted, the old key erased before the new key is durable, leaving no valid key, status set to complete early, and stale FTL journal replay restoring old mappings.
+FOLLOW:
+- How do you cut at 50 percent? => Poll SPROG from a second path and trip the relay on threshold, then bin results by the actual SPROG at cut time.
+- Why include a namespace that is not attached? => Sanitize must cover it, and it is a classic omission.
+PITFALL: Running many random power cycles. They cluster in the long overwrite phase and rarely hit the commit steps where the bugs are.
+VERIFY: The spec's statement on what happens to a sanitize across power loss (continue vs restart of an overwrite pass), and the allowed SSTAT values immediately after power-up.
+
+@@ 12.16 | Principal | Scenario | tags=verification,forensics,unrecoverable,nist-800-88,ieee-2883
+Q: How would you prove that data is unrecoverable after a sanitize, given that host reads cannot show it?
+SHORT: Combine four kinds of evidence. Seed unique tagged data before the operation, including stale copies and hidden areas. Check the logical view with a full host read. Then use a vendor debug or NAND-level interface to search every physical location for the tags and for readable plaintext. For crypto erase, show the old key is gone and that old ciphertext cannot be decoded. Make the decision rule explicit: zero hits in a full search.
+DEEP:
+1. **Seed:** write a unique block-tagged pattern to all LBAs at least twice (to create stale copies), deallocate some ranges, write to a second and an unattached namespace, and leave some writes in flight. Keep a manifest.
+2. **Logical check:** after the sanitize, read all LBAs with each PI and format setting the DUT supports. Look for tags, not zeros (see the Trap question).
+3. **Physical check (block erase, overwrite):** use a vendor debug interface, a NAND test interface, or a chip-off dump. Read every page in every block, including OP, SLC cache, retired blocks and any reserved area. Descramble and ECC-decode as the firmware does, or search raw data too, since scramblers and ECC can hide a pattern. Search for tags and measure entropy or pattern statistics.
+4. **Crypto erase:** the NAND holds ciphertext, so tags will not appear either before or after. Instead prove the key change: the key store or key ID changed, the old key is erased, and a reread of old blocks does not decrypt to tags.
+5. **Non-media places:** write buffers, DRAM, FTL tables and journals, telemetry and debug logs that might capture payload, and firmware crash dumps.
+6. **Decision rule:** pass only on a full search with zero tag hits. Sampling proves nothing about a rare stale block.
+7. **Reference frameworks:** NIST SP 800-88 (Clear, Purge, Destroy) and IEEE 2883 (sanitizing storage) define what a purge should achieve. Map each test to a claim in them.
+8. **Regress:** repeat after every firmware change to the erase path, and across capacity and NAND configurations.
+- **Cost:** a full physical search is destructive and slow, so run it on a sample of drives per firmware release and use the cheaper logical check on all.
+FOLLOW:
+- What if you have no NAND-level access? => Use the firmware's own debug commands and a vendor-supplied verification build, and state the residual risk in the report. Pure host testing cannot close this gap.
+- Why check several units? => Bad-block maps and retired blocks differ per unit, so the hidden places are unit specific.
+PITFALL: Declaring pass from a host read and a fresh-looking SMART. Those cannot see the places where remnants live.
+VERIFY: The current text of the purge definitions in NIST SP 800-88 Rev. 1 and IEEE 2883, and whether the DUT supports a Purge Required request bit in your Sanitize revision.
+
+@@ 12.17 | Principal | Cross-layer | tags=secure-boot,firmware-signing,spdm,doe,attestation,rollback
+Q: How would you validate firmware signing, secure boot and device attestation (SPDM) for an SSD, and where do PCIe and NVMe meet in that?
+SHORT: Treat it as a chain of trust and test each link with tampered inputs. Boot ROM verifies the loader, the loader verifies firmware, and both refuse a bad signature, a truncated image or an older signed version. Over NVMe the update path must fail cleanly with the active slot unchanged. For attestation, SPDM lets a host authenticate the drive and read signed measurements, carried over PCIe DOE or over Security Send and Receive.
+DEEP:
+- **Chain of trust:** immutable ROM, keys or key hashes in fuses, a signature check on each stage, and an anti-rollback counter. Debug ports are locked in production lifecycle states.
+- **Negative tests:** flip one bit in each part of the image (header, body, signature, metadata), truncate it, sign it with a wrong key, replay an older validly signed image, mix a header from one image with a body from another.
+- **Expected NVMe behavior:** Firmware Commit or download fails with an image or slot error (for example Invalid Firmware Image, SCT 1 SC 07h), the Firmware Slot Information log is unchanged, and the drive keeps running its old firmware.
+- **Update robustness:** cut power during download, commit and activation (see module 5), and confirm the drive boots a valid image.
+- **SPDM concepts:** the requester negotiates version and algorithms, fetches the certificate chain, issues a challenge with a nonce, and requests measurements. Validate chain to a trusted root, signature over the nonce, measurement equal to the known firmware hash, and rejection of a wrong root or an expired certificate.
+- **Transports:** SPDM messages can ride PCIe Data Object Exchange (a mailbox in config space) or the storage binding over Security Send and Receive. Test both if the DUT claims them, and test that an unsupported transport is refused cleanly.
+- **Key management:** provisioning of device identity keys, certificate lifetimes and revocation, and what happens after RMA or firmware re-signing.
+- **Fault injection:** voltage or clock glitches on the verify step are a hardware-security topic and belong to a security lab, but a validation plan should list them as out of scope with an owner.
+FOLLOW:
+- How do you check anti-rollback without bricking units? => Use a unit with a spare counter range, or a lifecycle state that allows reset. Advance the counter only on dedicated DUTs.
+- Where does PCIe come in? => DOE is a PCIe capability, and PCIe link encryption features are a separate layer. See the PCIe page for the link side.
+PITFALL: Testing only that a valid image installs. Security bugs sit in the paths where an invalid image is accepted.
+VERIFY: DOE capability details and the SPDM version and transport binding your DUT claims, the exact status for a rejected image, OCP secure-boot and attestation requirements for your product class, and whether SPDM over Security Send uses its own protocol value.

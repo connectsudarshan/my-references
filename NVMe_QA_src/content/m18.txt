@@ -1,0 +1,417 @@
+# Module 18: Performance & QoS
+
+@@ 18.01 | Basic | Concept | tags=iops,bandwidth,latency,block-size
+Q: How are IOPS, bandwidth and latency related, and why can one number never stand in for the others?
+SHORT: Bandwidth equals IOPS times block size, and by Little's law outstanding commands equal IOPS times latency. So 1M IOPS of 4 KiB is 4.096 GB/s, while 7 GB/s of 128 KiB sequential is only about 53K IOPS. Small blocks stress per-command limits (firmware, NAND dies, host CPU), large blocks stress bandwidth limits (PCIe, NAND channels). Always quote IOPS with block size, queue depth and drive state.
+DEEP:
+| Workload | IOPS | Block size | Bandwidth |
+|---|---|---|---|
+| Random read | 1,000,000 | 4 KiB | 4.096 GB/s = 3,906 MiB/s |
+| Random read | 1,000,000 | 512 B | 0.512 GB/s |
+| Sequential read | 53,406 | 128 KiB | 7.0 GB/s |
+
+- **Two relations, three numbers:** BW = IOPS x block size. Outstanding commands N = IOPS x latency (see the queue depth question). Fix any one and the others move together.
+- **Which limit shows where:** per-command costs (firmware cycles, doorbells, interrupts, one die read per command) cap IOPS at small blocks. Bytes per second costs (PCIe link, NAND channels, DRAM) cap bandwidth at large blocks.
+- **Latency is a third axis:** QD1 latency tells you the raw service time of one read. Latency at high queue depth mostly measures queueing.
+- **What a complete claim looks like:** IOPS or MB/s, block size, read/write mix, random or sequential, queue depth and thread count, working set, and drive state (fresh or steady).
+- **Units:** fio prints both MiB/s and MB/s. 4.096 GB/s is 3,906 MiB/s, a 4.6 percent difference that matters when comparing against a data sheet.
+FOLLOW:
+- Why is 4 KiB the reference random block size? => It matches the host page size and the usual indirection unit of the flash translation layer, so it is the smallest size that does not trigger read-modify-write.
+- How do you get bandwidth from a mixed block size workload? => Sum IOPS_i x size_i over the block size distribution (fio `bssplit`), not IOPS x average size guessed from the label.
+PITFALL: Quoting an IOPS figure with no block size, queue depth or drive state, which makes it impossible to reproduce or compare.
+
+@@ 18.02 | Basic | Concept | tags=queue-depth,littles-law,scaling,parallelism
+Q: Why do IOPS rise with queue depth only up to a point, and what does latency do after that?
+SHORT: An SSD is a parallel machine (channels, dies, planes, firmware cores), and queue depth is the parallelism you offer it. Below the knee, latency stays near the QD1 value and IOPS grow linearly with QD. Past the knee the drive is saturated: IOPS stay flat and latency grows in proportion to QD, because latency equals QD divided by IOPS. The knee sits at QD equal to peak IOPS times QD1 latency.
+DEEP:
+Model with an 80 us QD1 read latency and a 1.0M IOPS ceiling. The knee is 1.0M x 80 us = 80 commands.
+
+| Total QD | IOPS | Latency |
+|---|---|---|
+| 1 | 12.5K | 80 us |
+| 8 | 100K | 80 us |
+| 32 | 400K | 80 us |
+| 64 | 800K | 80 us |
+| 80 | 1.0M | 80 us |
+| 256 | 1.0M | 256 us |
+
+- **Real curves are rounder:** random reads collide on dies. Dropping N random requests on N dies keeps about 1 - (1 - 1/N)^N = 63 percent of them busy, so for 64 dies you need roughly 2.3 x 64 = 147 outstanding commands for 90 percent utilization.
+- **In fio:** total depth is `numjobs` x `iodepth`. `iodepth` is per job, and synchronous engines (sync, psync) ignore it, so use `numjobs` or an async engine such as libaio with `direct=1` or io_uring.
+- **What sets the ceiling:** host CPU per thread, PCIe, controller firmware cores, NAND die parallelism, thermal or power limits.
+- **Why it matters for validation:** report a QD sweep (1, 2, 4 ... 256), not a single point. The shape of the curve is the diagnostic.
+FOLLOW:
+- Why does latency stay flat below the knee? => Commands find idle resources, so they are served immediately. Queueing delay appears only when arrivals exceed service capacity.
+- What does numjobs add compared with iodepth? => Independent threads with their own queue pairs, which spread host CPU work and doorbells. One thread with a deep queue often runs out of CPU first.
+PITFALL: Measuring one queue depth and reporting the number as "the drive's IOPS".
+
+@@ 18.03 | Basic | Concept | tags=steady-state,fob,preconditioning,snia-pts,purge
+Q: What is the difference between fresh-out-of-box and steady-state performance, and what does the SNIA PTS method do about it?
+SHORT: A fresh or freshly erased SSD has plenty of free blocks and an unused write cache, so writes are fast and there is no garbage collection. After the drive fills and rewrites, GC runs, write amplification rises, and throughput settles lower. That steady state is what a deployed drive delivers. The SNIA PTS method purges the drive, preconditions it, and measures only inside a window where results have stopped drifting.
+DEEP:
+- **Fresh-out-of-box (FOB):** all blocks free, no GC, the whole SLC or write cache available. Reads of never-written LBAs can return zeros without touching NAND (see DLFEAT in the Namespaces module), so read tests on a blank drive can be inflated.
+- **Transition:** as free blocks run out, GC copies valid pages to make space, write amplification rises above 1, and random write throughput drops, from a modest amount to several times depending on the design and over-provisioning.
+- **Steady state:** write amplification and throughput are stable. This is the number that matters for enterprise data sheets and for fleet planning.
+- **PTS-style sequence:**
+  1. Purge to a known state: `nvme format /dev/nvme0n1 --ses=1` or `nvme sanitize /dev/nvme0 --sanact=2`.
+  2. Workload-independent preconditioning: write the drive with large sequential blocks, a multiple of its capacity.
+  3. Workload-dependent preconditioning: run the target workload in fixed rounds until steady state is reached.
+  4. Measure over a defined window of rounds, and report the average of that window.
+- **Report both:** FOB (peak, burst) and steady state, clearly labeled. Never compare across states.
+FOLLOW:
+- Why not just run fio for a long time? => Runtime alone does not guarantee steady state. The drive can still be converging (see the steady-state window question), and the starting state is unknown.
+- Does Format NVM restore a drive to FOB behavior? => It resets the mapping, but wear state and firmware policy remain. Behavior after format is close to FOB, not identical.
+PITFALL: Comparing a fresh-drive run of one firmware version with a steady-state run of another.
+VERIFY: The purge, preconditioning amount and round definitions in the SNIA Solid State Storage Performance Test Specification version you follow.
+
+@@ 18.04 | Intermediate | Numeric | tags=pcie,ceiling,iops,bandwidth,nand
+Q: What are the IOPS and bandwidth ceilings that PCIe alone imposes on an SSD, and how do you compare them with NAND and firmware limits?
+SHORT: A Gen4 x4 link carries 7.88 GB/s per direction. With 256-byte TLPs and about 24 bytes of overhead each, 128 KiB sequential tops out near 7.2 GB/s, and 4 KiB reads near 1.72M IOPS (about 4,572 upstream bytes per command). Gen3 x4 and Gen4 x2 give 861K IOPS, Gen5 x4 gives 3.45M. The drive delivers the minimum of PCIe, NAND and firmware ceilings.
+DEEP:
+1. **Raw link:** GT/s x lanes x 128/130 / 8. Gen4 x4 = 16 x 4 x 0.9846 / 8 = 7.88 GB/s per direction (same as the PCIe page, Physical Layer module).
+2. **Large blocks:** a 256 B payload with about 24 B overhead is 91.4 percent efficient, so 7.88 x 0.914 = 7.20 GB/s.
+3. **One 4 KiB read, upstream (device to host):** 16 memory-write TLPs x 280 B = 4,480 B, plus the CQE write (16 + 24 = 40 B), the SQE fetch request (24 B) and one MSI-X write (28 B) = 4,572 B. Downstream carries only the SQE completion (88 B) and two doorbell writes (56 B), so upstream is the busy direction.
+4. **IOPS ceiling:** link bytes per second / 4,572.
+
+| Link | Raw GB/s per direction | 128 KiB sequential | 4 KiB read IOPS |
+|---|---|---|---|
+| Gen3 x4 | 3.94 | 3.60 GB/s | 861K |
+| Gen4 x2 | 3.94 | 3.60 GB/s | 861K |
+| Gen4 x4 | 7.88 | 7.20 GB/s | 1.72M |
+| Gen5 x4 | 15.75 | 14.40 GB/s | 3.45M |
+
+Other ceilings (assumed geometry): 64 dies with a 60 us read time and one 4 KiB read per die read give 64 / 60 us = 1.07M IOPS. Eight channels at 1.2 GB/s moving about 4.3 KB per read give 8 / 3.6 us = 2.2M IOPS. So a Gen4 x4 drive at 4 KiB random read is NAND-die bound (1.07M, well under 1.72M), while 128 KiB sequential read is PCIe bound (7.2 GB/s). DLLPs and flow control updates cost a few percent more, doorbell batching and interrupt coalescing recover a little.
+FOLLOW:
+- Does a 4 KiB write reach the same ceiling? => Roughly. The device issues read requests upstream and receives about 4,480 B of completions downstream, so downstream becomes the loaded direction.
+- What if the drive trains at Gen3 x4 by mistake? => The 4 KiB read ceiling halves to 861K and sequential to 3.6 GB/s. Check `LnkSta` first when a result is exactly half of the spec.
+PITFALL: Doubling the link rate to "16 GB/s" for both directions, or treating raw link bandwidth as the achievable sequential number.
+VERIFY: Framing and DLLP overhead for your generation, and the platform's MPS and MRRS settings.
+
+@@ 18.05 | Intermediate | Numeric | tags=littles-law,fio,iodepth,numjobs,rate-limit
+Q: You must show 800K IOPS of 4 KiB random reads at about 90 us average latency. Choose numjobs, iodepth and a rate limit, and say what each number means.
+SHORT: Little's law gives the concurrency: 800K x 90 us = 72 commands outstanding. If one fio thread sustains about 300K IOPS (assumed, measure it), you need at least 3 threads, so use 4 with `rate_iops=200000` each. With a rate limit `iodepth` is only a ceiling, and the actual concurrency is rate x latency, 18 per job. Without the rate limit a deeper queue simply drives the drive to saturation.
+DEEP:
+1. **Concurrency:** N = 800,000 x 90e-6 = 72 total, or 18 per job with 4 jobs.
+2. **Threads:** per-thread CPU limits IOPS, and 800 / 300 = 2.7, so 3 is the minimum and 4 leaves headroom. Measure the per-thread limit on your host first.
+3. **Depth:** set `iodepth=32` per job. It is a headroom ceiling, as the average will sit near 18.
+4. **Rate:** `rate_iops=200000` applies per job, so 4 jobs give 800K.
+5. **Check:** fio's "IO depths" histogram should show most I/O at 16 to 32, not pinned at 32. Pinned at 32 means the drive cannot keep up and you are measuring saturation.
+
+```
+[qos800k]
+ioengine=io_uring
+direct=1
+filename=/dev/nvme0n1
+rw=randread
+bs=4k
+numjobs=4
+iodepth=32
+rate_iops=200000
+time_based=1
+ramp_time=30
+runtime=300
+group_reporting=1
+```
+
+- **Why not just run unthrottled at QD128?** If the drive peaks at 1.0M IOPS, QD128 gives 128 / 1.0M = 128 us. That is a saturation number, not the latency at the 800K operating point you were asked about.
+- **Sanity check the answer:** 4 jobs x 200K x 90 us = 72. If fio reports a different mean latency, recompute the concurrency from it.
+FOLLOW:
+- What if the measured latency at 800K is 140 us? => Then concurrency is 112 and the drive is near saturation. Latency grows quickly there, so the operating point is too close to the knee.
+- Why is a rate limit useful in validation at all? => It measures latency at a fixed offered load and it holds load constant across firmware builds, which makes latency comparable.
+PITFALL: Treating `iodepth` as the concurrency. With a rate limit, or with a slow drive, actual depth is set by the rate and latency.
+VERIFY: That `rate_iops` applies per job clone when `numjobs` is set (fio HOWTO), on the fio version you use.
+
+@@ 18.06 | Intermediate | Concept | tags=percentiles,tail-latency,fio,histogram
+Q: Why are latency percentiles the right way to report SSD latency, and how do you read p99 and p99.99?
+SHORT: Mean latency hides rare slow commands. A percentile such as p99.99 is the latency that all but 0.01 percent of commands beat. Tails matter because applications fan out: if a request needs 100 parallel reads, 63 percent of requests see at least one p99 event, and 1 percent see a p99.99 event. Percentiles cannot be averaged across jobs or runs, so merge histograms instead.
+DEEP:
+- **Fan-out arithmetic:** the chance that at least one of N reads is slower than its p99 is 1 - 0.99^N, which is 63.4 percent for N = 100. At p99.99 it is 1 - 0.9999^100 = 0.99 percent.
+- **What fio gives you:** `slat` (submission), `clat` (submit to completion) and `lat` (total). Completion latency percentiles are printed by default, from 1st to 99.99th. `percentile_list=50:99:99.9:99.99:99.999` changes the list (up to 20 values), and `lat_percentiles=1` adds percentiles on total latency.
+- **Averaging is wrong:** the mean of four jobs' p99 is not the p99 of the four jobs together. `group_reporting` merges them. For time series use `write_hist_log` with `log_hist_msec`, because percentiles computed from `log_avg_msec` averages are inaccurate (per the fio HOWTO).
+- **For automation:** `--output-format=json+` includes the full completion latency bin counts, so you can recompute any percentile, or merge runs, offline.
+- **Reading a tail:** compare p50, p99 and p99.99. A ratio of 2x to 3x from p50 to p99 is normal for flash. A jump of 100x at p99.99 means discrete events (GC, retries, housekeeping, link retrain), not a wide distribution.
+FOLLOW:
+- Which fio latency do you quote for an SSD? => Completion latency (clat) with `direct=1`, or total latency if you want to include submission. Say which one, and keep it constant across runs.
+- Why can identical runs give different p99.99? => Few samples sit in that tail (see the sample-count question), and real events such as GC are intermittent.
+PITFALL: Averaging percentiles from separate jobs or runs and calling the result the percentile of the whole.
+
+@@ 18.07 | Intermediate | Concept | tags=fio,job-design,validation,ioengine,precondition
+Q: Which fio options make a performance job valid and repeatable for SSD validation, and how would you lay out a job file?
+SHORT: Use `direct=1` on the raw namespace with an async engine (`io_uring` or `libaio`), set `iodepth` and `numjobs` explicitly, and separate ramp-up from measurement with `ramp_time`, `runtime` and `time_based`. Serialize preconditioning and measurement with `stonewall`. Record `randseed`, use `group_reporting`, choose a `percentile_list`, and log histograms over time. Verify the achieved depth and the drive state in the output.
+DEEP:
+```
+[global]
+filename=/dev/nvme0n1
+ioengine=io_uring
+direct=1
+group_reporting=1
+percentile_list=50:90:99:99.9:99.99:99.999
+
+[precondition]
+rw=write
+bs=128k
+iodepth=32
+loops=2
+
+[randrw70]
+stonewall
+rw=randrw
+rwmixread=70
+bs=4k
+iodepth=16
+numjobs=4
+norandommap=1
+time_based=1
+ramp_time=60
+runtime=600
+write_hist_log=randrw70
+log_hist_msec=1000
+```
+- **Engine and direct I/O:** `direct=1` bypasses the page cache. libaio is only asynchronous with direct I/O, and buffered I/O gives cache hits, not device numbers.
+- **Preconditioning:** `loops=2` writes the device twice, sequentially with 128 KiB blocks, as a workload-independent fill.
+- **Mix and pattern:** `rwmixread`, `percentage_random`, `bssplit` and `blockalign` describe the workload. Set `bs` to a multiple of the logical block size, and keep offsets aligned to 4 KiB.
+- **Timing:** `ramp_time` discards the warm-up, `runtime` with `time_based` fixes the measured length.
+- **Repeatability:** `randrepeat` is on by default, so offset sequences repeat. Record `randseed` and fio's version with the result.
+- **Safety:** a raw device job destroys data. Guard the script so the target is the intended DUT, for example by checking the serial number.
+FOLLOW:
+- When would you add `cpus_allowed`? => To pin jobs to the drive's NUMA node and stabilize results, and to test how cross-socket access changes latency.
+- Why `norandommap`? => It skips the bookkeeping that covers each block exactly once, which saves memory and CPU at high IOPS. Do not use it if a job depends on that coverage, and note it disables some verify header checks.
+PITFALL: Running a fio job with `iodepth=32` but a synchronous engine or buffered I/O, and believing you tested queue depth 32.
+VERIFY: Option names and defaults against the fio version on your lab hosts (`fio --cmdhelp`).
+
+@@ 18.08 | Intermediate | Numeric | tags=steady-state,snia-pts,window,slope,excursion
+Q: A random-write test logs 1-minute rounds of 148, 121, 96, 79, 68, 61, 57.5, 55.6, 54.7, 54.2, 53.9 and 53.8 K IOPS. In which window is the drive in steady state, and what number do you report?
+SHORT: Apply the PTS style test to every 5-round window: the spread (max minus min) must be within 20 percent of the window average, and the best-fit line must change by no more than 10 percent of the average across the window. Rounds 1-5 to 6-10 fail, mainly on the slope. Rounds 7-11 pass (spread 6.5 percent, slope 6.2 percent), so you report the 7-11 average of 55.2K IOPS, not the 148K of round 1.
+DEEP:
+1. For each window compute the mean, the excursion (max - min) / mean, and the least-squares slope per round. The line moves by slope x 4 across 5 rounds, so slope excursion = |slope| x 4 / mean.
+2. Results, computed in python:
+
+| Window | Mean (K) | Data excursion | Slope excursion | Verdict |
+|---|---|---|---|---|
+| Rounds 1-5 | 102.4 | 78.1 percent | 78.9 percent | fail |
+| Rounds 4-8 | 64.2 | 36.4 percent | 35.7 percent | fail |
+| Rounds 5-9 | 59.4 | 22.4 percent | 21.6 percent | fail |
+| Rounds 6-10 | 56.6 | 12.0 percent | 11.6 percent | fail (slope) |
+| Rounds 7-11 | 55.2 | 6.5 percent | 6.2 percent | pass |
+| Rounds 8-12 | 54.4 | 3.3 percent | 3.2 percent | pass |
+
+3. **Report:** the first passing window, 7-11: 55.2K IOPS. The round 1 value is 2.7x higher (148 / 55.2), which is the FOB inflation.
+4. **Not converging:** if no window passes within the round limit, report the drive as not reaching steady state and keep the plot. That is a finding, often a firmware policy oscillating (background GC, thermal).
+- **Why both tests:** a small spread can hide a steady trend (slope), and a flat average can hide big swings (spread).
+- **Dependence on the test:** convergence depends on workload, block size and span, so the window must be re-established for each.
+FOLLOW:
+- Should preconditioning already have reached steady state before the window? => Yes, and the rounds you plot are the workload-dependent phase. If you are still on the slope at the start, add preconditioning.
+- Why round-based rather than continuous? => Fixed rounds give comparable data points, so the slope and the excursion can be computed and the report can be reproduced.
+PITFALL: Reporting the average of all rounds, which blends transient and steady behavior.
+VERIFY: The exact steady-state definitions (window length, 20 percent and 10 percent limits, round length, maximum rounds) in the PTS version you follow.
+
+@@ 18.09 | Advanced | Trap | tags=coordinated-omission,tail-latency,open-loop,closed-loop
+Q: A drive freezes for 1 second during a QD1 fio run, yet fio's p99.99 stays at 100 us. What went wrong, and how do you measure the tail correctly?
+SHORT: Closed-loop load generators wait for each completion before issuing the next request. During a stall they stop generating load, so only the requests actually in flight record the delay. This is coordinated omission. A real client at a fixed arrival rate would have queued thousands of requests behind the freeze. Use an open-loop or rate-driven generator, and compare against a time-based view of stalls.
+DEEP:
+Assume 100 us per read, a QD1 closed loop of 10K IOPS for 100 s (1M samples), and one 1 s freeze.
+
+- **Closed loop:** one sample takes 1 s, and the other 999,999 are 100 us. p99.99 is 100 us, and the mean rises only to 101 us. The freeze is 1 sample in a million.
+- **Open loop at 10K arrivals per second:** 10,000 requests arrive during the freeze (1 percent of all), each delayed by 0 to 1 s. Measured from intended start time: p99 is about 100 us, p99.5 is about 500 ms, p99.9 is about 900 ms, p99.99 is about 990 ms, and the mean is about 5.1 ms.
+- **Same fault, 50 times worse in the mean:** the fault is the same, but the report differs by orders of magnitude at the tail.
+
+- **What fio does:** it starts timing when it submits, so a generator that is itself blocked does not add its own wait. With higher queue depth, all outstanding requests stall together, so QD32 records 32 slow samples, still only a small fraction. `rate_iops` with `rate_process=poisson` drives arrivals from a random process, which approximates an open-loop client but does not charge the missed arrivals as latency.
+- **Countermeasures:** log per-second min, max and IOPS (`write_iops_log`, `write_lat_log`) and alert on any second with IOPS collapse. Report max latency and stall counts next to percentiles. Use a generator that computes latency from the intended send time if you need a client-view percentile.
+FOLLOW:
+- Is deeper queue depth a fix? => Partly. More requests are recorded as slow, but the generator still stops issuing during the freeze, so the tail remains understated.
+- How would you catch this in a regression? => A per-second IOPS series, where a 1 s freeze shows as a zero, and a maximum-latency threshold.
+PITFALL: Quoting p99.99 from a QD1 closed-loop run as a proof of "no stalls".
+VERIFY: How your fio version reports latency under `rate_iops` and `rate_process=poisson` (whether it measures from the actual submit time).
+
+@@ 18.10 | Advanced | Cross-layer | fig=latstack | tags=latency-budget,4k-read,pcie,firmware,nand
+Q: Build a latency budget for one 4 KiB random read at QD1 and say where each layer contributes.
+SHORT: An illustrative TLC drive on Gen4 x4 totals about 82 us: host software about 6 us, PCIe transport about 3 us, controller firmware and hardware about 7 us, and NAND (read time, channel transfer, ECC) about 66 us. NAND is about 80 percent of the budget, so at QD1 the media dominates. The tail comes from events that add whole NAND operations, such as retries or a read stuck behind a program or erase.
+DEEP:
+| Layer | What happens | Assumed time |
+|---|---|---|
+| Host software | fio, io_uring, blk-mq and NVMe driver submit; interrupt, softirq and wake-up on completion | 6 us |
+| PCIe | SQ doorbell write, SQE fetch round trip, 4 KiB data write (4,480 B / 7.88 GB/s = 0.57 us), CQE write, MSI-X write | 3 us |
+| Controller firmware and hardware | command parse, L2P lookup, NAND command scheduling, completion posting | 7 us |
+| NAND | tR about 60 us, channel transfer of about 4.3 KB at 1.2 GB/s (3.6 us), ECC decode about 2.5 us | 66 us |
+| Total | | about 82 us |
+
+These are orders of magnitude for one plausible design, not a spec. Measure your own.
+
+- **Tail contributors, per layer:**
+  - NAND: read retry adds another read time (about 60 us) per attempt, and soft-decision decoding adds more. A read that lands on a die doing a program (hundreds of microseconds to over a millisecond for TLC) or erase (several milliseconds) waits, unless program or erase suspend is used.
+  - Firmware: housekeeping, GC scheduling, journal or checkpoint work, error handling.
+  - PCIe: a replay or a retrain adds microseconds to milliseconds (see the PCIe Data Link module).
+  - Host: interrupt moderation, CPU C-states, softirq scheduling.
+- **How to measure the layers:** fio clat for the whole, blktrace or eBPF for the block layer, a PCIe analyzer for doorbell to CQE write, and firmware or OCP latency counters for time inside the device.
+FOLLOW:
+- Where does the budget change on a low-latency SLC or Optane-class drive? => The media drops to about 10 us or less, so host software and PCIe become a large share, and polling then pays off (see the Interrupts module).
+- What does a Gen5 link change? => Serialization of the 4 KiB halves (about 0.28 us), a negligible part of 82 us. Link speed matters for bandwidth, not for QD1 read latency.
+PITFALL: Attributing QD1 latency to "the PCIe link" or "the driver" without checking that NAND tR is about 80 percent of it.
+VERIFY: Typical tR, tPROG and tERS for your NAND generation, from the vendor data sheet.
+
+@@ 18.11 | Advanced | Numeric | tags=sample-size,p9999,confidence,test-duration
+Q: How many I/Os do you need to measure p99.99 latency, and how long does that take at QD1 and at high load?
+SHORT: To have about 100 samples beyond the percentile you need 100 / (1 - p). For p99.99 that is 1 million I/Os, and for p99.999 it is 10 million. At 100K IOPS that is 10 s and 100 s. At QD1 with 80 us latency (12.5K IOPS) it is 80 s and 800 s. A tail count of 100 has a relative 95 percent uncertainty of about 20 percent, and a count of 10 about 60 percent.
+DEEP:
+1. **Tail count:** N x (1 - p). For p99.99 with N = 1,000,000 the expected number of samples in the tail is 100.
+2. **Statistical noise:** the tail count is roughly Poisson, so sd = sqrt(count). At 100: sd = 10, relative 95 percent interval = 1.96 x 10 / 100 = 19.6 percent. At 10: 1.96 x 3.16 / 10 = 62 percent.
+
+| Percentile | I/Os for 100 tail samples | At 100K IOPS | At QD1 (12.5K IOPS) |
+|---|---|---|---|
+| p99 | 10,000 | 0.1 s | 0.8 s |
+| p99.9 | 100,000 | 1 s | 8 s |
+| p99.99 | 1,000,000 | 10 s | 80 s |
+| p99.999 | 10,000,000 | 100 s | 800 s |
+
+3. **Real tails are clustered:** events such as GC or a stall produce many slow I/Os at once, so the effective number of independent events is smaller. Ten events of 100 slow samples each behave like a count of 10, not 1,000. Count events, not samples.
+4. **Practical rules:**
+   - Run at least the times above, and preferably 10 times longer for the tail you will assert in a pass or fail decision.
+   - Repeat the run and compare the spread of p99.99 across runs.
+   - Log the maximum and the number of I/Os above a threshold as stable companion metrics.
+FOLLOW:
+- Why is p99.99 from a 30 s QD1 run unreliable? => 30 s at 12.5K IOPS is only 375,000 I/Os, so the tail has about 37 samples, and one GC event can change it by a factor of 10.
+- Would a longer run also catch rare firmware events? => Only if the event rate is high enough. Hourly housekeeping needs a soak longer than its period, with the max and timestamp logged.
+PITFALL: Setting a p99.99 pass criterion from a run too short to contain even 100 tail samples.
+
+@@ 18.12 | Advanced | Concept | tags=slc-cache,gc,write-amplification,thermal,write-performance
+Q: How do the SLC cache, garbage collection and write amplification shape write performance over time, and how do you expose each regime?
+SHORT: A sustained write typically shows three phases. First a burst into an SLC-mode cache at the highest rate. Then, when the cache is full, a direct-to-TLC rate limited by NAND program speed. Finally, once the drive is full, a steady rate limited by NAND program bandwidth divided by write amplification. Expose each with a long, full-span write at controlled temperature, logging throughput once per second.
+DEEP:
+Illustrative drive: 1 TB, 100 GB SLC cache, 5 GB/s into SLC, 2 GB/s direct to TLC, 2.4 GB/s aggregate NAND program bandwidth.
+
+| Phase | Limit | Rate | Duration |
+|---|---|---|---|
+| SLC burst | SLC program speed | 5 GB/s | 100 GB / 5 = 20 s |
+| Direct to TLC | TLC program speed | 2 GB/s | 900 GB / 2 = 450 s |
+| Steady state, WA = 3 | NAND bandwidth / WA | 2.4 / 3 = 0.8 GB/s | indefinite |
+
+- **Write amplification effect:** host bandwidth equals NAND program bandwidth / WA. At WA 1 that is 2.4 GB/s, at WA 3 0.8 GB/s (195K 4 KiB IOPS), at WA 6 0.4 GB/s (98K). The Internals module covers why random writes and low over-provisioning raise WA.
+- **Reads suffer too:** a read waiting for a die that is programming or erasing sees hundreds of microseconds to milliseconds, so a 70/30 mix has a much worse read p99 than a pure read run.
+- **Thermal:** a fourth cause of falling throughput, telling it apart from the above is covered in the Power and Thermal module.
+- **How to expose each:**
+  - Fill level: run the same write at 10, 50 and 100 percent used (`size` or a partitioned span) to see the cache boundary.
+  - Rate: throttle with `rate` to see whether the drop happens at the same total bytes written, which points to the cache.
+  - Log: `write_bw_log` plus `log_avg_msec=1000` gives the time series, and compare the drop point with GB written.
+  - WA: compute NAND writes / host writes from the SMART or vendor log before and after.
+FOLLOW:
+- Does a longer idle period restore the SLC cache? => Often, since the firmware migrates the cache to TLC in the background, but the time needed and the policy vary by drive. Measure idle-then-burst recovery for your product.
+- Why does write latency spike during GC while read latency also rises? => Both compete for the same dies and channels, and GC reads and programs pages in the background.
+PITFALL: Judging a drive on its first 20 seconds of writes.
+VERIFY: SLC cache sizing, migration policy and WA counters (SMART or OCP log fields) for your product.
+
+@@ 18.13 | Advanced | Trap | tags=fio,traps,alignment,page-cache,unmapped-reads,sync-engine
+Q: Your test script reports 1.4M IOPS from a drive rated at 1.0M. List the ways a fio test can produce false performance numbers.
+SHORT: Frequent causes are buffered I/O hitting the page cache (missing `direct=1`), reads of never-written LBAs that return zeros without NAND access, a synchronous engine or buffered libaio that ignores the requested depth, a working set that fits in a cache, misaligned or sub-4 KiB blocks, and incompressible-data assumptions broken by repeating data. Check the output rather than trusting the job file.
+DEEP:
+- **Page cache:** without `direct=1` reads come from RAM, and writes complete before reaching the device. Check the disk utilization and the per-device I/O counters.
+- **Unmapped reads:** on a fresh or trimmed namespace, many drives return zeros for unwritten LBAs without reading NAND (see the DLFEAT question in the Namespaces module). Precondition the read span, and read only what was written.
+- **Depth not achieved:** `iodepth` has no effect on sync or psync, and libaio without `direct=1` is not asynchronous. The fio "IO depths" line shows what you got.
+- **Small working set:** reading 1 GiB repeatedly can be served from a controller cache or a few dies. Use the whole span for a full-drive spec.
+- **Alignment and format:** a 512 B or misaligned 4 KiB write on a 4 KiB-indirection drive causes read-modify-write, cutting write IOPS and raising WA. Check the namespace's LBA format (`nvme id-ns`) and your `bs` and `offset`.
+- **Data pattern:** repeating or zero buffers can be compressed or deduplicated by some controllers, so use `refill_buffers` and control `buffer_compress_percentage`.
+- **Host effects:** CPU frequency scaling, IRQ affinity and NUMA distance change results by tens of percent.
+- **Wrong denominator:** MB/s versus MiB/s, or a 1 s sample that includes ramp-up.
+FOLLOW:
+- How do you detect the unmapped-read effect quickly? => Run the same read job before and after filling the span. If IOPS drop sharply or latency rises to NAND-like values, the first run was reading unmapped zeros.
+- What confirms the drive really saw the I/O? => Compare fio's issued bytes with the drive's host-read counters in the SMART log and, ideally, PCIe analyzer traffic.
+PITFALL: Trusting the job file instead of the achieved queue depth, and never checking the drive-side counters.
+VERIFY: Which fio version changed defaults for percentiles and buffer handling, and the DLFEAT bits of the drive under test.
+
+@@ 18.14 | Advanced | Debug | tags=fio,output,tail-latency,stall,triage
+Q: Read this fio output. The average looks fine and IOPS are within 3 percent of expectation, yet a customer complains of latency spikes. What does the output tell you, and what do you do next?
+SHORT: The mean and p99 are healthy, but p99.99 is 37.7 ms (260x the median), the maximum is 212 ms, and the standard deviation is four times the mean. That signature means rare device-wide stalls, not a slow distribution. The arithmetic (0.01 percent of 12.4M I/Os is about 1,236 slow I/Os, or about 39 events of 32) points at a stall about every 1.5 seconds. Time-align the stalls before blaming a layer.
+DEEP:
+```
+randread: (groupid=0, jobs=1): err= 0: pid=4121
+  read: IOPS=206k, BW=805MiB/s (844MB/s)(47.1GiB/60001msec)
+    slat (nsec): min=1210, max=2081k, avg=2334.10, stdev=1105.45
+    clat (usec): min=41, max=212040, avg=153.01, stdev=640.87
+     lat (usec): min=44, max=212045, avg=155.34, stdev=640.90
+    clat percentiles (usec):
+     |  1.00th=[   84],  5.00th=[   95], 10.00th=[  102], 20.00th=[  115],
+     | 30.00th=[  126], 40.00th=[  135], 50.00th=[  145], 60.00th=[  155],
+     | 70.00th=[  167], 80.00th=[  182], 90.00th=[  204], 95.00th=[  222],
+     | 99.00th=[  253], 99.50th=[  416], 99.90th=[ 1614], 99.95th=[ 4817],
+     | 99.99th=[37749]
+   iops        : min=188120, max=211304, avg=205930.4, stdev=6123.7, samples=119
+  IO depths    : 1=0.1%, 2=0.1%, 4=0.1%, 8=0.1%, 16=0.1%, 32=100.0%, >=64=0.0%
+```
+(job: `rw=randread bs=4k iodepth=32 ioengine=io_uring direct=1`)
+
+1. **Check the basics with Little's law:** 32 / 206K = 155.3 us, matching the reported mean total latency. The run is sound and the depth was achieved.
+2. **Spot the tail:** p50 = 145 us and p99 = 253 us, so the body is tight. The tail starts at p99.5 and jumps at p99.95 (4.8 ms) and p99.99 (37.7 ms). Standard deviation 641 us against a mean of 153 us is the giveaway.
+3. **Count events:** 206K x 60 s = 12.36M I/Os. 0.01 percent is 1,236 I/Os beyond 37.7 ms. With 32 in flight stalling together, that is about 1,236 / 32 = 39 stalls, roughly one per 60 / 39 = 1.5 s.
+4. **Cross-check the IOPS:** 39 stalls x about 40 ms = 1.5 s, or 2.6 percent of the run. 206K / (1 - 0.026) = 211.5K, matching the maximum per-interval IOPS (211,304). The stalls explain the entire IOPS shortfall.
+5. **Next steps:** enable `write_hist_log` and `log_hist_msec=100`, or `write_lat_log`, to find timestamps and periodicity. Check the drive (SMART, OCP latency log, telemetry, thermal), then the PCIe link (AER counters, Recovery events), then the host (dmesg, IRQ affinity, CPU migration, timer or C-state effects, `cpus_allowed`). Repeat at QD1, on another host, and with polled completions (`hipri`). Correlate with an analyzer trace, where a gap between SQ doorbell and CQE write of tens of ms places the fault in the device.
+FOLLOW:
+- Why does the p99 look fine while the customer complains? => A percentile only bounds the fraction of I/Os. If a request fans out to many reads, or a service has a hard timeout, the rare stall dominates.
+- The stall period is exactly 1.5 s on the log. What does that suggest? => A periodic mechanism: a firmware timer or checkpoint, a thermal or telemetry poll, or a host timer. Vary temperature, load and the host to see which one moves the period.
+PITFALL: Accepting a run because mean and IOPS match the target.
+
+@@ 18.15 | Principal | Scenario | tags=regression,automation,statistics,noise,pass-criteria
+Q: Design an automated performance regression system for SSD firmware that reliably catches a 3 percent IOPS loss and a doubling of p99.99 latency, without drowning the team in false alarms.
+SHORT: Control the drive state and environment, measure noise first, and choose the run count from that noise. Purge and precondition to steady state, run a fixed workload matrix with a measurement window, record link, thermal and firmware metadata, and compare to a baseline with a statistical test. For IOPS with a 1.5 percent run-to-run CV, 6 runs per side detect 3 percent. Alert on the tail with counts and maxima, not p99.99 alone.
+DEEP:
+1. **State control:** purge, workload-independent preconditioning, workload-dependent rounds until a steady-state window passes, then measure. Same span, same OP, same firmware configuration, same capacity.
+2. **Environment control:** fixed host, BIOS, kernel, CPU governor and IRQ affinity. Record `LnkSta`, drive temperature and airflow, and abort the run if the link is downtrained or temperature is outside the range.
+3. **Workload matrix:** 4 KiB random read, write and 70/30, 128 KiB sequential read and write, at QD1 and at the operating QD, plus a mixed block size run.
+4. **Measure the noise first:** run the baseline N times on the same drive. Compute the CV for IOPS and for each percentile. Suppose CV is 1.5 percent.
+5. **Choose the number of runs:** a two-sample t-test at 5 percent significance and 80 percent power needs effect size d = shift / sigma. For a 3 percent shift with 1.5 percent CV, d = 2, so 6 runs per side. For p99.99 with 10 percent CV, detecting 10 percent needs 17 per side, and detecting 100 percent (a doubling) needs only a handful.
+6. **Decision rules:**
+   - Throughput: fail if the confidence interval of the difference excludes zero and the loss exceeds 3 percent.
+   - Tail: fail on a doubling of p99.99 or on the number of I/Os above a fixed latency threshold, and log the maximum.
+   - Stability: fail on any per-second IOPS collapse in the time series.
+7. **Triage support:** store the raw fio json+ histograms, the SMART and vendor logs, the time series and the environment, so a failure comes with data.
+8. **Trend guard:** a slow 0.5 percent per build drift passes each pairwise test, so also chart against a fixed baseline.
+FOLLOW:
+- How do you handle drive-to-drive variation? => Compare like with like: the same drive before and after (paired), or use a sample of drives and include the drive as a factor. Do not mix them.
+- What do you do when the noise itself exceeds the effect you must detect? => Fix the noise source (temperature, host interference, unstable steady state) before running more repeats. More runs help only as the square root of the count.
+PITFALL: Comparing a single new run against a single old run and calling any difference a regression.
+VERIFY: Sample size figures assume roughly normal run-to-run variation, so check it with your own baseline data.
+
+@@ 18.16 | Principal | Scenario | tags=triage,bottleneck,bs-sweep,pcie,host-cpu,firmware
+Q: A drive rated at 1.0M 4 KiB random read IOPS delivers 620K on a Gen4 x4 test platform. How do you find out whether the limit is the host, PCIe, the controller firmware or the NAND?
+SHORT: First prove the test is valid and the link is Gen4 x4. Then sweep queue depth and threads to see whether IOPS still scale, sweep block size to see whether the limit is per command or per byte, check host CPU and NUMA, and finally use device-side counters and data placement to separate firmware from NAND. Each experiment splits the candidate set in half.
+DEEP:
+1. **Validate the test:** `LnkSta` shows 16 GT/s and x4, the read span was written, direct I/O is used, and fio's "IO depths" line shows the requested depth. 620K x 4 KiB = 2.54 GB/s, only 32 percent of the 7.88 GB/s link, so PCIe is not the cap unless the link is downtrained. For reference the 4 KiB read ceiling is 861K at Gen3 x4 and 431K at Gen3 x2 (see the ceilings question).
+2. **Scale the load:** raise `numjobs` first, then `iodepth`. If IOPS still rise, the test was under-driving the drive. If flat while latency grows as QD / IOPS, you have reached a saturating resource.
+3. **Block-size sweep (512 B to 128 KiB):**
+
+| IOPS behavior | Meaning | Suspects |
+|---|---|---|
+| Flat across small sizes, then falling | Limit per command | Host CPU, firmware cores, doorbells and interrupts, one NAND read per command |
+| Falls as 1/size (bandwidth constant) | Limit per byte | PCIe link, NAND channels, internal DRAM |
+
+4. **Host:** per-core utilization while running. A fio thread at 100 percent means host-bound, so add jobs, check IRQ affinity, run on the drive's NUMA node, try `hipri` polling.
+5. **Device:**
+   - Read SMART and vendor counters for temperature and throttling.
+   - Compare data written recently (in SLC or fresh blocks) with data migrated to TLC. A 2x difference in IOPS points at NAND read time.
+   - Compare read spans of 1 GiB and the full drive to see die-collision and cache effects.
+   - Use firmware debug counters (core utilization, die busy time) if you have access.
+6. **Decide and record:** write the finding as a limit and a proof, for example "flat at 620K from QD64 to QD512, IOPS constant at 4 to 16 KiB, all firmware cores at 100 percent".
+FOLLOW:
+- IOPS are identical for 4 KiB and 16 KiB reads. What does that tell you? => The limit is per command: a die read of a whole page, or the firmware cores, not bytes moved. The same numbers at 512 B point to firmware or host rather than NAND.
+- The same drive reaches 1.0M on another server. Now what? => Compare platform differences: link and MPS, root port, NUMA, CPU generation, BIOS power settings and IRQ behavior. That points to a host-side or link cause.
+PITFALL: Raising only `iodepth` on one thread and concluding the drive saturates at 620K.
+
+@@ 18.17 | Principal | Cross-layer | tags=qos,latency-monitor,ocp,predictable-latency,measurement
+Q: How do you define and validate a QoS claim such as "read p99.99 under 2 ms", and which vantage points do you use to attribute a miss to a layer?
+SHORT: A QoS claim is a latency percentile bound plus its conditions: block size, queue depth, mix, span and drive state, and often IOPS consistency over one-second windows. Validate by measuring from several vantage points and subtracting: application (fio), block layer, PCIe analyzer (doorbell to CQE write) and the drive's own latency monitor (OCP Datacenter NVMe SSD specification). Each difference attributes time to a layer.
+DEEP:
+- **Full statement of a claim:** "4 KiB random read, 70/30 mix, QD32, steady state, 100 percent span: p99 below 500 us, p99.99 below 2 ms, and at least 99 percent of one-second IOPS samples above 90 percent of the mean". IOPS consistency has several definitions, so state yours.
+- **Vantage points:**
+
+| Vantage | Measures | Subtract from the one above it to get |
+|---|---|---|
+| fio clat | Submit to completion at the application | Total |
+| blktrace or eBPF (block layer) | Queue to completion at the block layer | Syscall, io_uring, scheduling |
+| PCIe analyzer | SQ doorbell write to CQE write | Driver, interrupt and host queueing |
+| Device latency monitor | Time inside the controller | PCIe, SQE fetch and posting delays |
+
+- **Method:** timestamp all sources against one clock, compare histograms, not means, and study the tail buckets. A device-internal p99.99 of 1.8 ms with a host p99.99 of 6 ms points at the host or PCIe, not the firmware.
+- **Device latency monitoring:** the OCP Datacenter NVMe SSD specification defines a feature and log page that count commands over configurable latency thresholds, per read, write and trim class, inside the controller. Validate it by injecting a known delay and checking that the buckets and the host histogram agree within tolerance.
+- **Predictable latency:** NVMe defined Predictable Latency Mode with deterministic and non-deterministic windows on NVM Sets. Validate that reads in the deterministic window meet the bound and that GC is deferred to the other window.
+FOLLOW:
+- Why is the device monitor not enough on its own? => It cannot see delay before the controller fetches the command or after it posts the completion, such as a delayed doorbell or a late interrupt.
+- How do you validate the monitor itself? => Inject a controlled stall (firmware hook, throttle or analyzer-side delay), then compare bucket counts with host-side histograms of the same window.
+PITFALL: Quoting a QoS number with no drive state, queue depth or window, which makes the claim unfalsifiable.
+VERIFY: OCP Datacenter NVMe SSD specification revision, the latency monitor feature ID and log page ID (believed to be log page C3h), its bucket layout, and NVMe Predictable Latency Mode requirements (feature, log pages and NVM Set behavior) in the NVMe Base Specification revision you target.

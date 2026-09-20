@@ -1,0 +1,62 @@
+[
+ {
+  "id": 1,
+  "title": "Why Zoned Storage",
+  "desc": "The problem with conventional SSDs (write amplification, over-provisioning, tail latency), the zoned model, SMR heritage, host-managed vs device-managed, and what ZNS trades away."
+ },
+ {
+  "id": 2,
+  "title": "ZNS Architecture & Command Set Basics",
+  "desc": "Where ZNS sits in the NVMe 2.x command-set architecture: Command Set Identifier, the Zoned Namespace Command Set, Identify structures, and how the LBA space is divided."
+ },
+ {
+  "id": 3,
+  "title": "Zones, States & the Write Pointer",
+  "desc": "Zone types, the write pointer, zone descriptor contents, the state machine (Empty, Open, Closed, Full, Read Only, Offline) and every transition that matters."
+ },
+ {
+  "id": 4,
+  "title": "Zone Management Commands",
+  "desc": "Zone Management Send actions (Open, Close, Finish, Reset, Offline, Set Zone Descriptor Extension, Flush) and Zone Management Receive (Report Zones, filters), including Select All semantics."
+ },
+ {
+  "id": 5,
+  "title": "Zone Append",
+  "desc": "Zone Append semantics: device-chosen placement, returned LBA, ZASL, concurrency and ordering, how it removes the single-writer-per-zone constraint, and its interaction with PI and metadata."
+ },
+ {
+  "id": 6,
+  "title": "Zone Resources: Active, Open & Excursions",
+  "desc": "MAR and MOR limits, implicit open eviction, zone active excursions, zone information changed events, and how the host must budget resources."
+ },
+ {
+  "id": 7,
+  "title": "Errors, Status Codes & Read Rules",
+  "desc": "Zone-specific status codes, read-above-write-pointer behaviour, boundary errors, read-only/offline zones, and how the host and a validator should react."
+ },
+ {
+  "id": 8,
+  "title": "ZNS Firmware & FTL Design",
+  "desc": "How a ZNS controller maps zones to NAND, buffers writes, handles zone reset, finish, power loss and wear, and how much FTL complexity remains."
+ },
+ {
+  "id": 9,
+  "title": "Host Software Stack for Zoned Storage",
+  "desc": "Linux zoned block layer, zone write plugging, filesystems and databases that use zones, libzbd, nvme-cli zns support, fio zbd mode, SPDK and xNVMe."
+ },
+ {
+  "id": 10,
+  "title": "ZNS Validation & Test Design",
+  "desc": "Designing a ZNS test plan: state-machine coverage, boundary and resource tests, concurrency with Zone Append, power-loss and reset testing, data integrity and tooling."
+ },
+ {
+  "id": 11,
+  "title": "ZRWA, Simple Copy & Related Features",
+  "desc": "Zone Random Write Area, explicit vs implicit flush, Simple Copy, zone descriptor extensions, and how ZNS compares with FDP and conventional namespaces."
+ },
+ {
+  "id": 12,
+  "title": "ZNS Scenarios & System Design",
+  "desc": "Principal-level design and debug scenarios: host GC design, capacity planning, migration from conventional, failure recovery, and full-stack triage of zoned workloads."
+ }
+]

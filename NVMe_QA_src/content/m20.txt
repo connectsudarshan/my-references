@@ -1,0 +1,378 @@
+# Module 20: Validation Methodology & Test Design
+
+@@ 20.01 | Basic | Concept | fig=valpyramid | tags=pyramid,layers,shift-left,simulation,fpga,silicon
+Q: What are the layers of an SSD firmware validation strategy, from unit test to system test, and what does each layer catch?
+SHORT: Use a pyramid: many fast tests near the code, few slow tests on real systems. Unit tests check firmware logic on a host. Simulation runs the firmware against models of the controller and NAND. Emulation or FPGA runs it on real RTL. Silicon characterization exposes timing, NAND and PHY behavior. System tests add real hosts, OSes and workloads. Each layer catches a class of bug the others cannot, and each finds it cheaper than the next.
+DEEP:
+| Layer | Turn time | Catches | Blind to |
+|---|---|---|---|
+| Unit (host-compiled firmware, mocked HW) | seconds, every commit | Logic and boundary bugs in parsers, FTL algorithms, ECC math, state machines | Timing, real HW registers, concurrency across cores |
+| FW simulation (virtual controller and NAND model) | minutes | Command flow, FTL and GC logic, exhaustive power-cut points, cheap error injection, deterministic replay | Real latencies, HW quirks, NAND analog behavior |
+| Emulation or FPGA with RTL | hours, MHz-class speed | HW/FW interface bugs, DMA and doorbell races, register semantics, PCIe MAC behavior | Real NAND, real PHY, full-speed performance |
+| Silicon characterization | days | PHY and link margin, NAND timing and error rates, power, thermal, ECC margin | Rare host behaviors you have not plugged in |
+| System and platform | days to weeks | Interop with real BIOS, OS, drivers, RAID and HBAs, long soak, compliance | Root cause: it shows the symptom, not the layer |
+
+- **Rule:** push every bug to the lowest layer that can reproduce it. A bug found on a customer platform earns a simulation or unit regression.
+- **Turn time is the real cost:** a silicon bug costs a rig, a debug build and a day, while a simulation bug costs a rerun.
+FOLLOW:
+- Why not just test everything on silicon? => You cannot inject a power cut at every NAND operation, replay deterministically or run 10,000 seeds per night there. Simulation gives control, silicon gives truth.
+- What does the top layer add that the lower ones cannot? => Real host stacks and timing. Interop and timing-dependent bugs only appear with real BIOS, drivers, PCIe topology and workloads.
+PITFALL: Treating simulation results as proof about silicon. A model encodes what you believe about the hardware, so an assumption error passes every simulated test.
+
+@@ 20.02 | Basic | Concept | tags=traceability,requirements,spec,capability-gating,matrix
+Q: How do you make a test plan traceable to the NVMe specification, and why does it matter?
+SHORT: Extract every testable requirement from the pinned spec revision (the "shall" statements and the field and status tables), give each an ID, and link each ID to one or more test cases and results. Gate tests by what the drive advertises in Identify and CAP, so an unsupported optional feature is tested for correct rejection rather than skipped. Traceability shows coverage gaps, justifies pass claims and survives spec revisions.
+DEEP:
+1. **Pin the inputs:** Base Specification revision, the command set specs in use (NVM, ZNS) and the transport spec, plus the OCP or customer requirements document if one applies.
+2. **Mine requirements:** one row per testable statement, with ID, spec section, text, mandatory or optional or conditional, and the capability that enables it.
+3. **Link tests:** each requirement maps to at least one positive test and, where behavior is defined for bad input, one negative test.
+4. **Store results per requirement:** pass, fail, not applicable (with the capability bit that made it so), or blocked.
+5. **Track interpretation:** where the spec is ambiguous, log the reading you adopted, who agreed and the clarification you asked for. That log is what settles arguments with firmware.
+
+- **Capability gating:** read ONCS, OACS, CAP and the Identify fields first. If the drive does not claim Write Zeroes, the test is that Write Zeroes fails with Invalid Command Opcode, not that the test is skipped.
+- **Coverage question it answers:** "which requirements have no test" and "which tests trace to nothing", which is usually dead weight.
+FOLLOW:
+- What do you do when the drive supports something it does not advertise? => File it as a finding. Either the Identify data is wrong or the feature is partly implemented, and a host driver trusting Identify will behave differently.
+- How do you handle spec revisions? => Diff the revisions, mark changed requirements, and re-run only the linked tests. That is the payoff of IDs.
+PITFALL: Counting tests instead of requirements. 5,000 tests that all touch the same twenty requirements is not coverage.
+VERIFY: Names of the optional support fields (ONCS for NVM commands, OACS for admin commands) and their bit meanings in the Identify Controller structure for your revision.
+
+@@ 20.03 | Basic | Concept | tags=conformance,unh-iol,integrators-list,ocp,interoperability,compliance
+Q: What do NVMe conformance and interoperability programs (UNH-IOL, OCP requirements, vendor suites) tell you, and what do they not tell you?
+SHORT: The NVMe Integrator's List program, run by the UNH-IOL lab, tests conformance and interoperability against a versioned test plan, and passing devices are listed publicly. The OCP Datacenter NVMe SSD Specification is a requirements document for hyperscale drives, and commercial suites exist to test against it. A pass means the drive met a defined test plan at a revision. It says nothing about power loss, endurance, performance or your host.
+DEEP:
+- **UNH-IOL NVMe testing:** a vendor-neutral lab tests SSDs and hosts for conformance (does the device follow the spec) and interoperability (does it work with other implementations). Devices must pass the mandatory tests of the current test plan, which is revised a few times a year, and group test events are held. The lab's public registry is the NVMe Integrator's List. Related programs cover NVMe over Fabrics and NVMe-MI.
+- **OCP Datacenter NVMe SSD Specification:** an Open Compute Project document that layers datacenter requirements on top of the NVMe standard: mandatory features, specific log pages and telemetry, error and reset behavior, latency monitoring and similar. It has had several revisions. Vendors and test companies sell suites that check a drive against it, and customers may ask for a compliance report.
+- **In-house suites:** cover what neither program does, such as your own firmware's risks, longer duration and your customers' hosts.
+- **What a pass does not cover:** power-loss safety, data integrity under stress, tail latency, endurance, firmware update robustness, and any host stack not in the lab's setup.
+- **How to use it:** treat certification as an entry gate that is cheaper to fail early, and treat your own plan as the actual sign-off.
+FOLLOW:
+- Is a listed drive interoperable with our platform? => Not proven. The lab tests specific hosts and configurations, so run your own platform matrix.
+- Should the in-house suite copy the conformance suite? => Run it as a regression baseline, but spend your effort where it is silent: stress, faults, power and long duration.
+PITFALL: Quoting "NVMe compliant" as if it meant "validated". The pass is against one test plan version and one spec revision.
+VERIFY: Current names and scope of the UNH-IOL NVMe testing service and Integrator's List (test plan version, event schedule), the current OCP Datacenter NVMe SSD Specification revision and its test requirement IDs, and which commercial suites cover it.
+
+@@ 20.04 | Intermediate | Concept | tags=positive,negative,boundary,equivalence,expected-status,side-effects
+Q: How do you design positive, negative and boundary tests for one NVMe command, and what is the oracle?
+SHORT: Split each input field into equivalence classes (valid, boundary, invalid), pick values at every edge, and write the expected outcome from the spec before running: Success or one specific status code. The oracle also checks side effects. A rejected command must not change data or state, and the controller must remain healthy and answer the next good command.
+DEEP:
+Take a Write with SLBA and NLB on a namespace of NSZE blocks. NLB is zero-based, so NLB = 0 means one block.
+
+| Case | SLBA / blocks | Expected |
+|---|---|---|
+| Last block | NSZE-1 / 1 | Success |
+| Tail of namespace | NSZE-8 / 8 | Success |
+| One past the end | NSZE / 1 | LBA Out of Range (generic 80h) |
+| Straddles the end | NSZE-4 / 8 | LBA Out of Range |
+| 64-bit wrap | FFFFFFFFFFFFFFFFh / 2 | LBA Out of Range, no wraparound |
+| Exactly MDTS | max size the drive allows | Success |
+| One block over MDTS | max + 1 block | Invalid Field in Command (02h) |
+| NSID inactive or above NN | any | Invalid Namespace or Format (0Bh). NSID 0 and FFFFFFFFh vary by command, see VERIFY |
+
+- **Side-effect oracle:** after every rejected write, read the target range and its neighbors and confirm no change. Read the error log to see whether the failure was recorded (implementation dependent, see VERIFY), and send a good command to prove the queue still works.
+- **Interactions:** fields combine. Test the boundary of one field while a second sits at its own edge, for example a maximum-size transfer that ends exactly on the last LBA.
+- **Expected results are data:** keep them in a table the test reads. Then a spec clarification changes one row, not fifty scripts.
+FOLLOW:
+- Where do you get the expected status when the spec allows more than one? => Encode a set of allowed codes and record which one this firmware returns, so a change of behavior in a later build is flagged even though both are legal.
+- Why include the 64-bit wrap case? => A firmware that computes SLBA + NLB in 64 bits can wrap to a small number and accept a request that should be rejected, writing to LBA 0 or corrupting metadata.
+PITFALL: Checking only that a bad command "fails". A validator that accepts any error hides drives that return the wrong error, which host drivers act on differently.
+VERIFY: Exact status returned for NSID 0 and for a broadcast NSID on Read and Write in your spec revision, and whether the Error Information log must record every failed command.
+
+@@ 20.05 | Intermediate | Concept | tags=fuzzing,mutation,stateful,oracle,seed,minimization
+Q: How do you fuzz an NVMe controller in a way that produces reproducible, meaningful failures instead of noise?
+SHORT: Generate commands structurally (a valid skeleton with fields mutated toward boundary values) and also fuzz sequences and states, not just single commands. Define oracles: the controller stays ready, every command completes with a permitted status in bounded time, nothing else changes, and a known-good command still works afterward. Log the seed and the command sequence so any failure replays and shrinks to a minimal case.
+DEEP:
+- **Levels:**
+  - Field fuzzing: opcode over all 256 values, NSID, flags such as fused and PSDT, every CDW at 0, 1, max, max minus 1 and all ones, unaligned PRPs, wrong data length.
+  - Sequence fuzzing: random valid commands in random legal and illegal order (delete a queue with commands in flight, Format during I/O, Set Features while a Get is outstanding).
+  - Timing fuzzing: vary doorbell delay, interleave admin and I/O, hit resets at random points.
+- **Oracles, in order of value:**
+  1. No CSTS.CFS, controller stays ready, no reset needed.
+  2. Every command completes within its timeout with a status in the allowed set.
+  3. No unintended side effects: data in other ranges and namespaces, Get Features results and log pages do not change after a rejected command.
+  4. A known-good command still succeeds after the batch.
+- **Safety:** destructive commands (Format, Sanitize, firmware commit, namespace management, Security Send) go on an allowlist run only on a designated DUT with the data expendable.
+- **Reproducibility:** derive all randomness from one logged seed, record each SQE and CQE, and shrink a failing sequence by removing commands until the fault disappears (delta debugging).
+- **Tools:** raw submission via `nvme admin-passthru` and `nvme io-passthru`, the kernel passthrough ioctls, or SPDK. The bulk of the value comes from the oracle, not the generator.
+FOLLOW:
+- Two consecutive timeouts after a fuzz batch, and the drive recovers on reset. Is that a finding? => Yes. A hang triggered by any host-visible input is a robustness defect, even if the input was illegal. Save the sequence and the controller's debug state before resetting.
+- How do you get a differential oracle? => Run the same commands against a software model or a reference drive and compare status and data. Differences are either a firmware bug or a spec ambiguity to log.
+PITFALL: Fuzzing with random bytes. Almost every command dies at the first field check and the deep paths never run, so keep the structure valid except for the fields you are attacking.
+VERIFY: nvme-cli passthrough option names on your version (opcode, cdw10 to cdw15, data-len, read or write direction).
+
+@@ 20.06 | Intermediate | Cross-layer | tags=fault-injection,taxonomy,link,nand,reset,spdk,debugfs
+Q: What kinds of faults should you inject into an NVMe SSD, at which layer, and how do you decide the expected behavior?
+SHORT: Inject at the layer where the fault really occurs: host software (fake errors, dropped submissions), PCIe (poisoned or malformed TLPs, link drop and retrain), reset and power (every reset type and power cut), firmware and NAND (program, erase and read failures, uncorrectable ECC, bad blocks, temperature). For each fault write the expected outcome first: which status or event, what recovery, and what data must survive.
+DEEP:
+| Layer | Fault | How to inject | What you check |
+|---|---|---|---|
+| Host software | Forced error status, command never submitted | Linux `fault_inject` in debugfs; SPDK `spdk_nvme_qpair_add_cmd_error_injection` | Host handling: retries, timeouts, failover (tests the host, not the SSD) |
+| PCIe | Poisoned TLP, ECRC error, link down, bad DLLP | Exerciser or analyzer with injection, Link Disable or secondary bus reset from software | AER logging, controller recovery, no data corruption |
+| Reset and power | CC.EN, NSSR, FLR, hot reset, PERST#, power cut | Register writes, sysfs reset, programmable supply or relay | Recovery time, state preserved or cleared as specified |
+| Firmware and NAND | Program or erase fail, uncorrectable read, bad block, read disturb | Debug or manufacturing commands, error-injection build, NAND-level tester or emulator | Retire and relocate, error log and SMART counters, correct status, zero silent corruption |
+| Environment | Over and under temperature, sensor override | Thermal chamber, debug sensor override | Throttle, Asynchronous Event, shutdown at critical |
+
+- **The contract:** each fault has an expected reaction written before the test. Without one the run produces an observation, not a verdict.
+- **Injection must be off in production builds:** state which hooks exist, and validate on the shipping image where you can.
+- **Escalate slowly:** single fault at idle, then under load, then combined with a second fault (a reset while the first error is being handled).
+FOLLOW:
+- Does Linux fault_inject test the SSD? => No. It rewrites the completion status inside the driver, so it exercises host error handling. To test the SSD you need the fault to originate in the device or on the wire.
+- Why combine faults? => Recovery code paths often assume a healthy system. A power cut during error recovery or a reset during a UECC relocation finds the bugs that single faults miss.
+PITFALL: Calling a run a pass because the drive survived. The pass criteria are the specified reaction, the logged evidence and intact data.
+VERIFY: Linux nvme fault_inject debugfs attributes on your kernel, SPDK error-injection API signature on your release, and vendor-specific NAND fault hooks available to you.
+
+@@ 20.07 | Intermediate | Cross-layer | tags=analyzer,exerciser,protocol,tlp,timing,visibility
+Q: Where do a PCIe protocol analyzer and a host exerciser fit into an NVMe validation strategy, and what should you not use them for?
+SHORT: Use the analyzer as an independent observer of what really crossed the wire: ordering, timing, TLP contents and what the device did after an event. Use an exerciser as a host that can do what no driver would: illegal or reordered traffic, poisoned TLPs, doorbell abuse. Use software tools for volume and soak, since captures are short and expensive. Confirm with a clean-versus-interposer comparison before trusting a Gen4 or Gen5 trace.
+DEEP:
+- **Analyzer strengths:**
+  - Measures true doorbell-to-SQE-fetch, fetch-to-CQE and CQE-to-interrupt gaps, independent of host software timestamps.
+  - Verifies ordering claims, such as the CQE write reaching the host before the interrupt message.
+  - Decodes PRP list fetches, payload, and completion splitting to show how the firmware really moved data.
+- **Exerciser strengths:** generates stimuli a real driver never sends, at exact times: a stale CQ Head write, PRP pointing at an invalid address, unsupported request TLPs, completion timeouts on the host side. It is the way to run a completion-timeout or poisoned-TLP test with controlled timing.
+- **Limits:**
+  - Capture depth is short at full rate and filtering can drop the very event you need.
+  - Interposers alter the channel, so the failure or the pass may be an artifact.
+  - It sees the wire, not firmware state, so pair it with SSD-side logs and a shared marker.
+- **Use rule:** turn to these when host tools cannot separate the hypotheses or when the stimulus is impossible from software. Run the long regressions with fio, SPDK and nvme-cli. See the PCIe page, Debug module, for connection methods and trigger setup.
+FOLLOW:
+- Which NVMe checks are natural for an analyzer? => Latency decomposition of one command, doorbell write coalescing behavior, MSI-X write order versus CQE write, and PRP-list fetch patterns.
+- How do you correlate a trace with firmware logs? => Use a shared marker: a unique LBA or command ID that appears in both, or a firmware GPIO that triggers the analyzer.
+PITFALL: Concluding "the SSD is not at fault" from a clean capture. A capture with an interposer in place shows the wire under changed conditions, and cannot show the device's internal state.
+VERIFY: Which analyzer and exerciser products the UNH-IOL and your lab use, and whether your analyzer decodes NVMe command structures natively.
+
+@@ 20.08 | Intermediate | Debug | tags=flaky,regression,triage,statistics,fisher,signature
+Q: A nightly test fails 21 times in 600 runs. The team wants to mark it flaky. Use the table to decide.
+SHORT: Do not quarantine it. Compare failure rates across the variables, with a significance check. Firmware 1.0.4 fails 17 of 300 runs against 4 of 300 for 1.0.3, and host H3 carries 14 of the 21 failures. Only on H3 is the firmware effect clear (12 of 100 versus 2 of 100, p about 0.01), which points to a real, timing-sensitive regression in 1.0.4 that H3's platform exposes.
+DEEP:
+| Firmware | H1 | H2 | H3 | Total |
+|---|---|---|---|---|
+| 1.0.3 | 1 of 100 | 1 of 100 | 2 of 100 | 4 of 300 |
+| 1.0.4 | 3 of 100 | 2 of 100 | 12 of 100 | 17 of 300 |
+
+Two-sided Fisher exact tests, computed from these counts:
+- Firmware, all hosts: 17/300 against 4/300, p about 0.006.
+- Host, H3 against the rest: 14/200 against 7/400, p about 0.002.
+- On 1.0.4 only, H3 against H1 and H2: 12/100 against 5/200, p about 0.002.
+- On H3 only, 1.0.4 against 1.0.3: 12/100 against 2/100, p about 0.01.
+- On H1 and H2 only, 1.0.4 against 1.0.3: 5/200 against 2/200, p about 0.45. Not significant, but at these counts the test has almost no power, so it does not prove the firmware is fine there.
+
+Next steps: check whether all 17 failures share one signature (for example `I/O timeout` and controller reset in dmesg after a reset test step), diff H3's platform (CPU, PCIe generation, slot), then reproduce on H3 with a bisect over firmware commits.
+- **Flaky means nondeterministic with no correlate.** Here there is a correlate, so it is a defect with a probability.
+- **Retries:** rerun failures to classify them, never to turn them green.
+FOLLOW:
+- What if all failures had a different signature? => Then suspect the test or the environment (power, network, rig health), and check that failures cluster by rig or time. Sort by signature first, then by variable.
+- How many more runs to confirm the fix? => At the failure rate seen on H3 (12 percent), about 24 clean runs gives 95 percent confidence the rate is now under that, but a fix needs a tighter target, see the statistics question.
+PITFALL: Treating "not significant" as "no effect". Small counts cannot rule anything out, so collect more runs where the effect is suspected.
+VERIFY: None for the arithmetic. The counts are illustrative, so replace them with your own data.
+
+@@ 20.09 | Advanced | Concept | tags=data-integrity,pattern,lba-encoded,ledger,miscompare,torn-write
+Q: How do you design a data pattern and checker that can tell you not just that a read miscompared but why?
+SHORT: Write self-describing blocks: each carries its own LBA, a per-write generation number, a run ID and a CRC, with the rest of the block generated from those by a PRNG. Keep a ledger of the last acknowledged generation per LBA. On read, the mismatch type identifies the fault: wrong LBA (misdirected), older generation (lost or stale), newer or impossible generation, half-old half-new (torn), or good header with bad payload (corruption).
+DEEP:
+- **Block layout (4 KiB example):** header with magic, LBA, generation, run ID and seed; payload filled by a PRNG seeded from (run ID, LBA, generation); trailing CRC32C over the block. Any block can be regenerated and verified from its header alone.
+- **Ledger:** last acknowledged generation per LBA. For a 1.92 TB drive with 4 KiB blocks (468,843,606 LBAs) a 4-byte ledger entry costs about 1.9 GB of host RAM, so use region-level generations or a sparse ledger for larger drives.
+- **Classification on read:**
+
+| Observation | Meaning |
+|---|---|
+| Header LBA differs from the LBA read | Misdirected write or L2P mapping error |
+| Generation below ledger | Lost or stale data (FTL rollback, dropped write, missed flush) |
+| Generation above anything issued | Phantom data, header corruption or cross-run leftover |
+| First part new generation, rest old | Torn write, check against the atomicity claim |
+| Header valid, payload or CRC bad | Data path or media corruption after ECC |
+| All zeros or all ones | Unmapped, deallocated or raw erased read |
+
+- **After a power cut:** generation may be the last acknowledged or any later in-flight one. Anything older, or mixed within an atomic unit, is a failure.
+- **Portability:** the same block format works for fio-style tools, SPDK and custom harnesses, and it survives moving data between hosts.
+FOLLOW:
+- Why not rely on `fio --verify`? => It is good for volume, but its pattern checks answer "match or not". A tailored header lets you separate misdirected from stale from torn without guessing from a hexdump.
+- How does PI change this? => PI gives the drive a per-block check. Keep the host-side pattern anyway, because PI does not catch stale but self-consistent data. See the Data Protection module.
+PITFALL: Reading back through the page cache. Without direct I/O the verify may never touch the SSD, so use O_DIRECT and confirm at the device with the SMART data units read counters.
+VERIFY: Exact 4 KiB block count of your DUT from NSZE and the LBA format, and how your fio version's verify header records offset and checksum.
+
+@@ 20.10 | Advanced | Numeric | tags=statistics,sample-size,rule-of-three,confidence,poisson,power-cycle
+Q: How many clean cycles do you need to claim a power-loss or reset bug is fixed, and what does a campaign of a given size tell you?
+SHORT: If a bug hits with probability p per cycle, you need n = ln(0.05) / ln(1 - p) clean cycles for 95 percent confidence that the rate is below p, about 3 / p. For p = 1 percent that is 299 cycles, for 0.1 percent 2,995, for 0.01 percent 29,956. A 500-cycle campaign has only a 39 percent chance to ever see a 1-in-1000 bug. Ten clean runs prove almost nothing.
+DEEP:
+1. **Setup:** independent cycles under identical conditions, each hitting the bug with probability p. Probability of n clean cycles is (1 - p)^n. Set that to 0.05 and solve.
+
+| Target rate p | Clean cycles n (exact) | Rule of three (3/p) |
+|---|---|---|
+| 1 in 100 | 299 | 300 |
+| 1 in 200 | 598 | 600 |
+| 1 in 1,000 | 2,995 | 3,000 |
+| 1 in 10,000 | 29,956 | 30,000 |
+
+2. **99 percent confidence at 1 in 200:** ln(0.01) / ln(0.995) = 919 cycles.
+3. **Rig time (assume 3 minutes per cycle):** 2,995 cycles is 149.75 h, 6.2 days on one rig or 18.7 h on 8. The 29,956-cycle case is 62 days on one rig, 7.8 days on 8.
+4. **Detection chance:** probability of at least one hit in n cycles is 1 - (1 - p)^n. At p = 0.001, n = 500 gives 39.4 percent, n = 2,995 gives 95 percent.
+5. **When failures do appear:** the exact 95 percent upper bound on the event count is 3.00 for 0 events, 4.74 for 1 and 6.30 for 2. Two failures in 1,000 cycles is an observed 0.2 percent but the true rate could be up to 0.63 percent.
+
+- **Assumptions:** identical, independent cycles. A bug that only occurs on one NAND lot or one drive is invisible to a hundred cycles on another, so spread cycles across drives.
+- **Use it to plan:** rig count and time follow directly from the target rate.
+FOLLOW:
+- The original failure was 1 in 200. How many clean cycles clear the fix at 95 percent? => 598 (600 by the rule of three), and at 99 percent 919.
+- Does 10,000 clean cycles on one drive validate the fix for the product? => No. It bounds the rate for that drive and configuration only. Pool across drives, NAND lots and hosts.
+PITFALL: Declaring success after a few clean runs of a rare bug. A 1 percent bug survives 10 runs 90 percent of the time.
+
+@@ 20.11 | Advanced | Cross-layer | tags=power-loss,spor,coverage,cut-points,nand,plp,recovery
+Q: How do you get real coverage of power-loss windows, rather than just a large number of power cycles?
+SHORT: Random cuts mostly land in long idle or streaming phases. To cover the risky windows, trigger cuts from firmware state or NAND operation events, enumerate every cut point in simulation, vary the power fall profile, and include nested cuts during recovery. Verify each cut happened using SMART unsafe-shutdown counts, and measure coverage as the fraction of distinct windows hit, not cycle count.
+DEEP:
+- **Risky windows in SSD firmware:**
+  - L2P journal or checkpoint writes and superblock updates.
+  - A NAND program in progress, especially an upper-page program on multi-level NAND that can disturb data already acknowledged on the paired lower page.
+  - Garbage collection relocation, and erase in progress.
+  - Format, Sanitize, namespace management and firmware commit.
+  - The recovery itself: power lost again while rebuilding.
+- **Cut strategies:**
+  1. Random time: cheap, biased to long operations, needed as background.
+  2. Event triggered: firmware raises a GPIO or debug marker at a state, and the supply cuts after a programmable delay (0 to the event duration in steps).
+  3. NAND-operation triggered: cut on the Nth program or erase, using a NAND bus monitor, a debug hook or a simulator.
+  4. Exhaustive in simulation: run a scenario with K NAND operations K times, cutting at each. No silicon rig can do this.
+  5. Nested: cut during recovery, several times in a row.
+- **Fall profile:** an instant relay cut and a slow ramp or brown-out are different tests. Use a programmable supply, and record hold-up behavior for drives with power-loss protection.
+- **Oracles:** the data ledger from the integrity question, plus the recovery contract: CSTS.RDY within the limit, no fatal status, Unsafe Shutdowns incremented by exactly one, no leftover error log entries, and a bounded time to first I/O.
+- **Coverage report:** window by window with counts and the minimum hits per window, not a global number of cycles.
+FOLLOW:
+- How do you know a cut really happened at the intended point? => Log the marker and its timestamp, compare Unsafe Shutdowns and Power Cycles in SMART before and after, and keep the analyzer or scope capture for a sample.
+- What is different for a drive with power-loss protection? => Acknowledged cached data is expected to survive, so the oracle is stricter. Without PLP only flushed or FUA data is guaranteed. See the NVM Command Set module for the legal post-cut states.
+PITFALL: Reporting "10,000 power cycles, zero failures" with no cut-point distribution. Most of those cycles may have hit the same idle window.
+VERIFY: SMART field names and update timing for Unsafe Shutdowns and Power Cycles, and the multi-level NAND page-pair behavior with your NAND vendor.
+
+@@ 20.12 | Advanced | Concept | tags=reset,matrix,pairwise,combinatorial,invariants,power-cycle
+Q: How do you build a reset and power-cycle test matrix that is complete enough to trust and small enough to run?
+SHORT: List the factors: reset or power event type, what the device was doing, queue and feature configuration, link power state, and whether a shutdown notification preceded it. The full product is hundreds of cases, so use pairwise (or higher strength for suspect factors) to cut it by an order of magnitude, keep single-factor edge cases, and define post-reset invariants that every case must satisfy.
+DEEP:
+- **Factors (example):**
+  - Event (6): CC.EN 1 to 0, NVM Subsystem Reset, PCIe FLR, hot reset, PERST# warm, PERST# with power cut.
+  - Activity (5): idle, sequential write, random write with GC running, Format or Sanitize in progress, firmware commit in progress.
+  - Queue and feature setup (3): one queue, many queues, interrupt coalescing and non-default features.
+  - Link state (3): active, L1 with ASPM, L1.2 substate.
+  - Shutdown notice (2): none, normal shutdown first.
+- **Size:** 6 x 5 x 3 x 3 x 2 = 540 cases. At 2 minutes each that is 18 hours. A pairwise set covers every pair of values across every two factors in about 30 rows in a quick greedy generation (1 hour). Higher-strength coverage for the suspect pair (event by activity) costs a few more.
+- **Always add single-factor extremes:** reset during the first admin command, reset while the controller is still initializing, back-to-back resets.
+- **Invariants after every case:**
+  1. CSTS.RDY within the CAP.TO limit, no fatal status.
+  2. Identify data, namespace attachment and persistent configuration as specified for that reset class.
+  3. Volatile features return to default or saved values as specified.
+  4. Data written and flushed before the event is intact, anything else legal per the atomicity rules.
+  5. No completions arrive for commands that the reset discarded, and no stale interrupts.
+  6. SMART counters moved by the expected amounts.
+FOLLOW:
+- Why is pairwise enough? => Most interaction bugs involve two factors. It is a heuristic, so raise the strength or add explicit cases where triage history shows three-way interactions.
+- What do you do about state that differs by reset class? => Table it from the spec, per class, and let the invariant checker read the table. See the Status Codes module for the reset hierarchy and the Registers module for CC.EN and NSSR.
+PITFALL: Testing each reset only from idle. Resets during Format, GC and firmware commit are where the state machines diverge.
+VERIFY: What each reset class (controller level, NVM subsystem, PCIe function level, fundamental) preserves and clears for features, queues and namespace attachment in your spec revisions.
+
+@@ 20.13 | Advanced | Concept | tags=soak,stress,long-duration,wraparound,endurance,leaks
+Q: What does a soak or stress test find that short tests cannot, and how do you test long-duration bugs without waiting months?
+SHORT: Soak finds leaks and drift (resources, memory, free-block pool), thermal steady state, GC and wear-level interactions, background task behavior and counter wraparound. Do not wait for wrap: preload or time-warp the counters near the boundary. Assert invariants continuously (latency percentile drift, counter monotonicity, error-free logs) instead of checking only at the end.
+DEEP:
+- **What only long runs expose:**
+  - Firmware memory or command-slot leaks and fragmentation.
+  - Free-block pool and GC steady state, background scrub and refresh, wear leveling migrations.
+  - Thermal steady state and throttle oscillation.
+  - Log and telemetry buffer wrap, timers and sequence counters.
+- **Wraparound arithmetic:** a 32-bit millisecond tick wraps after 2^32 ms = 49.7 days (the signed boundary at 24.9 days). A 32-bit counter incremented per host write at 500K writes per second wraps after 2^32 / 500,000 = 8,590 s = 2.4 hours, inside a normal soak. A 32-bit microsecond timer wraps in 71.6 minutes.
+- **Endurance run:** a 3.84 TB drive rated at 1 drive write per day for 5 years takes 3.84 TB x 365 x 5 = 7.0 PB. At a sustained 2 GB/s that is 3.5 million seconds, about 40.6 days per drive, so use many drives in parallel and elevated temperature where the qualification plan allows.
+- **Design:**
+  1. Mixed workload with randomized phases (sequential, random, trim, flush, resets at intervals).
+  2. Continuous monitors: SMART, error log, temperature, latency percentiles, vendor memory stats.
+  3. Invariants as assertions, with a hard stop and preserved state at first violation.
+  4. Time-warp or counter-preload debug commands to hit wrap points early.
+- **Report:** throughput and p99.9 latency over time, not one number, so drift is visible.
+FOLLOW:
+- The soak shows p99.9 latency drifting up 3 percent per day. Is that a fail? => It is a finding even when no error appears. Correlate with free-block count, memory and background activity to separate leak from steady-state effects.
+- Why not just run longer? => Time-to-find is the cost. A preloaded counter finds a wrap bug in minutes, and running 50 days finds it only once.
+PITFALL: A soak that only checks for errors at the end. It hides intermittent failures that self-healed and drifts that turned back.
+VERIFY: SMART fields available for firmware memory or vendor statistics, and endurance test conditions allowed by your qualification standard (for example JEDEC client and enterprise SSD endurance methods).
+
+@@ 20.14 | Principal | Concept | tags=metrics,coverage,escape-rate,mtbf,ddp,goodhart
+Q: Which metrics do you use to judge validation quality and release readiness, and how can they mislead?
+SHORT: Track requirement coverage, functional cross-coverage, firmware code coverage (especially error paths), defect escape rate and defect detection percentage, test-suite health (flake rate, kill rate on seeded bugs), and reliability figures with their confidence bounds. Each is necessary and none sufficient, so read them together and turn every field escape into a new regression test with a root-cause of why validation missed it.
+DEEP:
+- **Requirement coverage:** share of spec requirements with a linked passing test, positive and negative. Shows gaps, not test strength.
+- **Functional coverage:** cross of commands, field classes, drive states and configurations that were actually exercised, with holes listed.
+- **Firmware code coverage:** line and branch coverage from simulation or instrumented builds. The uncovered error-handling paths are your fault-injection to-do list.
+- **Escape rate and DDP:** defect detection percentage = found before release / (found before + found after). Example: 180 pre-release and 12 post-release defects give 180/192 = 93.75 percent, an escape rate of 6.25 percent. Split by severity and by the layer that should have caught it.
+- **Suite health:** flake rate, median time to triage, and the seeded-bug kill rate (see the question on proving the suite can fail).
+- **Reliability figures:** validation cannot demonstrate an MTBF claim. With zero failures in T device-hours, the 95 percent lower bound on MTBF is T / 3.0, so 1,000 drive-hours give only 334 hours. Even the commonly used 60 percent confidence needs T = 0.916 x 2,000,000 h = 1.83 million device-hours (about 209 drive-years) to support a 2 million hour MTBF. So combine accelerated tests, component data and field data.
+- **How they mislead:** Goodhart's law. Coverage at 100 percent with a weak oracle, a low escape rate because nobody reports field bugs, an MTBF quoted without its confidence level.
+FOLLOW:
+- What do you do with a field escape? => Reproduce it, find the lowest layer that could have caught it, add the regression there, and ask why the plan missed it (untested feature combination, weak oracle, unrealistic host).
+- What is a good release gate? => Explicit criteria: all mandatory conformance passing, zero open critical defects, no unexplained failures in the last N days of soak at the statistical target, coverage holes reviewed and signed.
+PITFALL: Reporting one number. A single pass percentage hides a red critical test behind a thousand green trivial ones.
+VERIFY: The confidence-level convention your customers use for reliability claims, and the chi-square factors for your failure model.
+
+@@ 20.15 | Principal | Concept | tags=automation,framework,yaml,plugins,artifacts,ci,orchestration
+Q: How would you design an automation framework and CI pipeline for SSD firmware validation that scales across rigs and teams?
+SHORT: Separate what a test does from where and how it runs: test code written against a device abstraction (passthrough, SPDK, register access, power and reset control), data-driven parameters in YAML, plugins for monitors and fault injectors, a resource manager for rigs, a structured artifact store with a full evidence bundle on every run, and tiered CI (per-commit smoke, nightly, weekly soak, release gate). Seeds, versions and configuration are always recorded.
+DEEP:
+- **Layers:**
+  1. **Device abstraction:** admin and I/O passthrough, register access, power and reset control, analyzer control. Tests never call a tool directly.
+  2. **Test definitions:** code for logic, YAML for parameters and matrices, so a coverage matrix expands without new scripts.
+  3. **Plugins and fixtures:** preconditioning, monitors (SMART, AER, dmesg, temperature), fault injectors.
+  4. **Orchestrator:** rig inventory, locking, health check and a known state before each test.
+  5. **Artifact store and results:** structured records that can be queried.
+- **Sample test definition:**
+
+```
+test: zns_state_machine_random
+dut_profile: zns_1.92tb
+params:
+  seed: 0            # 0 = draw a new seed and log it
+  steps: 20000
+  fault: {type: spor, trigger: fw_event:zone_finish, delay_us: [0, 200]}
+pass: [no_cfs, model_match, {recovery_time_s: {max: 5}}]
+artifacts: [dmesg, nvme_logs, cmd_ring, analyzer_trigger]
+```
+
+- **Evidence bundle on every run:** test and framework commit, firmware build, DUT serial, host and BIOS versions, seed, the SQE and CQE ring, dmesg, before and after logs, tool JSON, and a pointer to the analyzer capture.
+- **CI tiers:** per-commit smoke on simulation, nightly on silicon, weekly soak and fault campaigns, release gate with the traceability and statistics criteria.
+- **Failure handling:** classify infrastructure failures separately from product failures, retry only the former, and bucket product failures by signature (status codes, CSTS, dmesg patterns) to link to open defects.
+FOLLOW:
+- What goes wrong as the framework grows? => YAML turns into a programming language and the tests cannot be debugged. Keep logic in code and data in YAML.
+- How do you keep runs reproducible? => The test picks and records its own seed, pins tool versions, and the orchestrator restores the DUT to a defined state. Determinism is a requirement.
+PITFALL: Building for the passing case. The framework earns its keep on failures, so design the evidence capture and signature triage first. See the PCIe page, Debug module, for triage pipelines.
+
+@@ 20.16 | Principal | Scenario | tags=test-plan,zns,state-machine,model-based,new-feature,exit-criteria
+Q: Firmware adds Zoned Namespace support to an existing conventional SSD. Design the validation plan.
+SHORT: Pin the specs and read the capability profile, build a reference model of the zone state machine, drive it with random sequences and compare zone reports after every step, add negative tests for every specific status code, then power loss, NAND failure and host-stack tests, with exit criteria tied to the transition table and statistical targets. Reuse the existing integrity, reset and soak infrastructure.
+DEEP:
+1. **Inputs:** NVMe Base, NVM and Zoned Namespace Command Set specs at fixed revisions. Read Identify Namespace zoned data (zone operation characteristics, optional zoned command support, max active and open resources, reset and finish recommended limits), the controller's zone append size limit, and zone size and capacity from Report Zones.
+2. **Risk ranking:** state machine and resource limits, write pointer rules, Zone Append, zone capacity versus zone size, power-loss write pointer recovery, firmware-initiated Read Only or Offline transitions on NAND failures, coexistence with conventional namespaces, host compatibility.
+3. **Oracle:** a Python reference model of zone state (Empty, Implicitly Opened, Explicitly Opened, Closed, Full, Read Only, Offline), write pointer, and active and open counts. Random sequences of Open, Close, Finish, Reset, Offline, Write and Append. After each command compare status and the zone report with the model. Invariants: write pointer moves forward until Reset, open and active counts stay within limits, Append returns the assigned LBA in the completion and data reads back there.
+4. **Negative tests (command-specific status, SCT 1):** Zone Boundary Error (B8h), Zone Is Full (B9h), Zone Is Read Only (BAh), Zone Is Offline (BBh), Zone Invalid Write (BCh, write not at the write pointer), Too Many Active Zones (BDh), Too Many Open Zones (BEh), Invalid Zone State Transition (BFh).
+5. **Transition table:** 7 states x 7 actions is 49 cells, each with an expected outcome. Exit criterion: every cell exercised at least N times.
+6. **Power loss and reset:** cut at write, append, finish and reset boundaries, check write pointer recovery against the acknowledged and flushed data, and the state of open zones after a reset.
+7. **Fault injection:** NAND program or erase failure mid-zone should produce a defined Read Only or Offline transition with correct reports and no data loss below the write pointer.
+8. **Host stack:** `nvme zns` commands, fio with `--zonemode=zbd`, and the Linux zoned block layer tools.
+9. **Exit criteria:** transition table complete, requirement traceability, statistical clean-cycle target for power loss (see the sample-size question), soak with mixed sequential zone workloads, no open critical defects.
+FOLLOW:
+- What do you reuse from conventional-namespace validation? => Self-describing data pattern (with generation per LBA range), reset matrix, soak monitors and evidence bundle. New work is the zone model and negative status coverage.
+- What is the hardest bug class here? => State divergence after a power cut or NAND failure: the drive reports a zone state or write pointer that disagrees with the data on media.
+PITFALL: Testing only the happy path of sequential writes. Most bugs live in the transitions and the resource limits.
+VERIFY: Status code values, zone state transitions after a controller reset (open zones to Closed), the encoding of max active and open resources (zero-based, all ones for no limit), and Append completion field layout in the NVMe Zoned Namespace Command Set Specification.
+
+@@ 20.17 | Principal | Trap | tags=oracle,mutation,false-pass,seeded-bugs,test-quality,page-cache
+Q: A nightly suite has been green for three months, yet a data-loss bug reaches the field. In how many ways can a test pass without testing, and how do you prove the suite can fail?
+SHORT: A test can pass vacuously: skipped as unsupported and counted as green, zero I/Os issued, reads served from the host page cache, checking only that status is Success, a verifier bug, or a weak oracle. Prove the suite can fail by seeding known bugs into firmware or a model and measuring how many the suite kills, and by running negative controls on the checker itself.
+DEEP:
+- **Ways to pass without testing:**
+  - Skipped or not-applicable results counted as pass, or a capability check that hides a missing feature.
+  - The workload never ran (fio exit code ignored, zero bytes moved).
+  - Reads served from the page cache or a volatile write cache, so the SSD never saw them. No O_DIRECT, or verify data still in host memory.
+  - Checking Success status only, not data, not the specific error, not side effects.
+  - Comparing against data that the same buggy code produced.
+  - A drive that never reached the risky state (GC not running, drive not full, no queue pressure).
+- **Prove the checker works (negative controls):** flip a bit in the read buffer inside the harness, swap two blocks, return an old generation, and confirm the verifier flags each. Also confirm the run asserted its own preconditions and reports counts (I/Os, bytes, checks made).
+- **Seed known bugs (mutation testing):** in simulation or a test-only build inject realistic faults: off-by-one on the last LBA, missing L2P update on deallocate, dropped flush, wrong PI reference tag increment, stale write pointer after reset. Run the suite against each mutant. Kill rate = mutants detected / mutants injected. Survivors show a gap in the tests or in the oracle.
+- **Also:** replay old field escapes as permanent mutants, and review the last ten real bugs found and ask which test found each, and how.
+- **Report:** suite kill rate by area, alongside pass rate, so a green board means something.
+FOLLOW:
+- The kill rate is 70 percent. What do you do with the survivors? => Classify each: undetectable by design (equivalent mutant), missing test, or weak oracle. Fix the last two and re-run until the rate on critical areas is where you need it.
+- How do you protect against the harness and firmware sharing one wrong assumption? => Use an independent oracle (spec-derived model, reference drive, host-side pattern) and have different people write the check and the feature.
+PITFALL: Trusting green. A suite has value only in proportion to the bugs it can demonstrably detect.
+VERIFY: Which fault-seeding hooks your firmware team can provide on a test build, and how your fio version reports zero-byte or early-terminated jobs.

@@ -1,0 +1,484 @@
+# Module 12: ZNS Scenarios & System Design
+
+@@ 12.01 | Basic | Concept | tags=log-structured,design,ftl,host-gc,components
+Q: What must a host-managed log-structured store on ZNS implement that a conventional SSD's FTL did for it?
+SHORT: The host takes over every placement job: choosing the zone for each write, remembering where objects landed, reclaiming space with its own GC, rebuilding state after a crash, and staying within the active and open zone limits. The device keeps media management: ECC, bad blocks, wear inside a zone, and the write pointer. Design the components together, because the record format and index decide whether GC and recovery are possible.
+DEEP:
+| Job on a conventional SSD (FTL) | Host equivalent on ZNS | State the host must keep |
+|---|---|---|
+| L2P mapping | Index from object or logical block to (zone, offset, length) | In memory, plus checkpoint or self-describing records |
+| Free block pool | Zone allocator with a pool of Empty zones | Derivable from Report Zones |
+| Garbage collection | Host GC: pick victim zone, copy live data, Reset | Live and dead bytes per zone |
+| Power-fail recovery | Checkpoint plus scan of each zone up to its write pointer | Sequence numbers, CRCs, checkpoint pointer |
+| No equivalent | Active and open zone budget (module 6) | Writers per stream, reserved slots for GC |
+| Bad block handling | Device does it inside a zone. The host reacts to Read Only and Offline zones | Zone health list, spare zone reserve |
+
+- **Write path:** one writer per zone with in-order Writes, or Zone Append with completion-time indexing (12.04).
+- **Placement policy:** separate streams by expected lifetime (write-ahead log, hot, cold, GC output) so zones die together. Lifetime alignment is what keeps host GC cheap (see module 1).
+- **Metadata zones:** the store needs a place for its own superblock and checkpoints. Sequential-only zones force these to be logs too (a few zones used as a ring), which is why many designs keep a small conventional zone or a second device for metadata.
+- **What the device still does:** internal parity and ECC, bad block replacement, background refresh, wear leveling across the zones it holds. The host does not see any of that (module 8).
+FOLLOW:
+- Which component is hardest to get right? => Recovery, because it must be correct at every possible cut point. GC is second, because it couples the index update to the zone Reset (12.15).
+- Can a store skip GC? => Only when data is deleted whole-zone in write order, such as a time-series ring buffer, where Reset alone reclaims space.
+PITFALL: Designing the write path first and bolting on GC and recovery later. The record header and index format decide whether either can be built.
+
+@@ 12.02 | Basic | Numeric | tags=capacity,zcap,zsze,op,bad-zones,planning
+Q: A namespace reports 1,024 zones with ZSZE = 0x100000 and ZCAP = 0xE0000 on 4 KiB LBAs. How much can the host actually store, and how do you plan spare zones?
+SHORT: Zone size is 4 GiB and capacity is 3.5 GiB, so the LBA space is 4 TiB but at most 3.5 TiB can hold data (87.5 percent). After reserving 4 metadata zones, 21 spare zones (about 2 percent for zones that go Read Only or Offline) and 8 free zones as GC headroom, 991 zones remain for live data. Sizing sellable capacity at 900 zones (3,150 GiB) leaves about 10 percent host-chosen over-provisioning.
+DEEP:
+Assumptions: 4 KiB LBAs, uniform zones, no variable zone capacity, and reserve sizes chosen by the store, not by the spec.
+1. Zone size = 0x100000 x 4,096 B = 1,048,576 x 4,096 = 4 GiB. Zone capacity = 0xE0000 x 4,096 = 917,504 x 4,096 = 3.5 GiB. Ratio = 0.875.
+2. LBA space = 1,024 x 4 GiB = 4 TiB. Writable capacity = 1,024 x 3.5 GiB = 3.5 TiB. The last 0.5 GiB of each zone is address space that can never hold data (module 3).
+3. Reserves (all host policy):
+   - Metadata and checkpoint zones: 4.
+   - Bad zone spares: 2 percent of 1,024 = 20.5, round to 21. These cover zones that turn Read Only or Offline in service (module 3).
+   - GC headroom: 8 Empty zones that foreground writers never consume, so GC always has somewhere to write.
+4. Zones for live data = 1,024 - 4 - 21 - 8 = 991 zones = 3,468.5 GiB (3.39 TiB).
+5. Sellable capacity: choose 900 zones x 3.5 GiB = 3,150 GiB (3.08 TiB). That is 76.9 percent of the LBA space and 87.9 percent of the zone count.
+6. Host-chosen OP = (991 - 900) / 900 = 10.1 percent. This buffer controls GC cost (12.10). Spare zones are separate from it, and they shrink your data zones as zones fail.
+
+Conventional comparison: the device hides its OP and you cannot change it. Here the OP is explicit and yours, so it is a tunable in the capacity plan, not a constant.
+- **Tracking:** count zones by state at start-up and after every Zone Descriptor Changed event, and re-run the plan when spares drop below the reserve.
+- **Test hook:** fill the namespace to the sellable limit with a realistic overwrite pattern and confirm GC keeps the free pool above 8 zones.
+FOLLOW:
+- What if Identify reports a variable zone capacity? => Plan per zone from Report Zones, not from a single ZCAP value, and recompute after each Reset (module 3).
+- Does the drive also keep hidden spare NAND? => Yes, for bad blocks and internal metadata, and that is one reason ZCAP is below ZSZE. The size of it is vendor-specific.
+PITFALL: Quoting capacity from the LBA space (ZSZE x zones). Capacity is ZCAP x zones, and then minus your own reserves.
+VERIFY: Whether the specification requires the namespace size to be an exact multiple of the zone size, and whether spare zones are ever pre-marked Offline at format time on your product.
+
+@@ 12.03 | Basic | Trap | tags=trap,reset,trim,delete,space-reclaim
+Q: Trap: "when the application deletes an object, the store just issues Reset Zone on its zone, like TRIM." What is wrong with this?
+SHORT: Reset Zone works on a whole zone and discards everything in it. Objects are far smaller than a zone, so a delete rarely empties one. Resetting a zone that still holds live data destroys it. Resetting only when nothing live remains means deletes reclaim no space until a zone is entirely dead, or until GC copies the survivors out. Reset is also a NAND erase, so it is an expensive operation to batch and throttle.
+DEEP:
+- **Granularity:** TRIM (Dataset Management deallocate) frees LBA ranges of any size and the FTL's own GC pays for the compaction. On ZNS, only Reset Zone (and Finish, which does not free anything) changes space accounting, and it works on a whole zone.
+- **The correct rule:** keep a live-byte counter per zone. A delete decrements it. A zone with live = 0 is Reset immediately (after any reader referencing it has finished, see 12.15). A zone with a low live fraction becomes a GC victim.
+- **Why lifetime matters:** if objects written together die together (same TTL, same table, same compaction generation), the counter reaches zero on its own and reclaim costs one Reset and no copying. Mixed lifetimes leave zones partly live and force relocation.
+- **Cost:** a Reset erases every block of the zone (see 4.14 for the timing model). A reset storm after a bulk delete competes with foreground I/O, so queue resets and rate-limit them.
+- **Related trap:** a block-layer discard (REQ_OP_DISCARD) is not a Reset Zone. Space reclaim on zoned storage is a store or filesystem job that issues explicit zone resets. f2fs and btrfs zoned mode do this themselves, and f2fs turns its section-sized discards into resets (9.09).
+FOLLOW:
+- Can a host use Dataset Management deallocate on a ZNS namespace? => Support and effect are command-set and product dependent, and it does not move a write pointer. Do not rely on it for space accounting. VERIFY it in the ZNS spec.
+- How do you validate the live-byte accounting? => After a random delete and write workload, walk the index, sum live bytes per zone, and compare with the counters. Any drift eventually causes a wrong Reset (data loss) or a leaked zone (capacity loss).
+PITFALL: Resetting a zone based on the counter without waiting for outstanding readers and relocations. That converts an accounting bug into data loss.
+VERIFY: How Dataset Management deallocate behaves on zoned namespaces in the NVM and ZNS command set specifications, and whether your kernel forwards block-layer discard to zoned NVMe devices.
+
+@@ 12.04 | Intermediate | Scenario | tags=write,append,design,queue-depth,ordering
+Q: You are designing the write path of a log-structured store. How do you decide between Write and Zone Append, and how many zones do you keep open?
+SHORT: Choose by who owns ordering. If one thread owns each zone and you can reach the target bandwidth with a few zones open at QD 1 each, plain Write keeps addresses predictable and the design simple. If many producers share a zone or you need QD greater than 1 per zone, use Zone Append and build the index from completions. The open zone count follows from bandwidth per zone and the resource budget, not from thread count.
+DEEP:
+| Question | Points to Write | Points to Zone Append |
+|---|---|---|
+| Who orders writes? | One owner per zone | Many producers per zone |
+| Bandwidth per zone needed | Below one zone's QD 1 rate | Above it (see 5.09) |
+| Address needed before completion? | Yes (embedded pointers, PI reference tags) | No, index at completion |
+| Zones you can afford to open | Many | Few |
+| Device support | Always | Optional command, and ZASL caps the size |
+| Recovery | Simple: WP is the append point | Needs self-describing records (5.07) |
+
+Worked sizing (assumptions): 2 GB/s target, 409.6 MB/s per zone at QD 1 (16 KiB records at 40 us, from 5.09), 8 open zone limit with 2 reserved for GC.
+1. Write path: 2,000 / 409.6 = 4.9, so 5 zones written in parallel, each with a single owner. That uses 5 of the 6 remaining open slots and splits the log into 5 lanes that no longer follow lifetimes.
+2. Append path: one hot zone at QD 5 gives about the same bandwidth. That frees 4 open slots for hot/cold separation or for more GC writers.
+
+- **Decision rule I use:** start with Write and per-zone owners. Move to Append when the open budget or a shared log forces it, and pay for it with self-describing records and an in-flight table.
+- **Keep both paths behind one interface** so the tests can run either, and so a device without append (or a kernel that emulates it, 5.08) still works.
+- **Validate at the boundary:** run the same workload in both modes and compare the final index and zone contents byte for byte.
+FOLLOW:
+- Does Linux change the answer? => The block layer serializes plain Writes per zone (zone write plugging), so ordering is safe there but adds CPU and limits per-zone QD. Passthrough and SPDK give you no such protection (5.03).
+- Which mode is easier to fault-inject? => Write, because the outcome is deterministic. Append needs a completion-time oracle (5.14).
+PITFALL: Choosing Append to raise QD, then forgetting that the resource budget and PI reference tags now depend on addresses you only learn at completion.
+VERIFY: That Zone Append is optional and how support is advertised on your product (Commands Supported and Effects log), plus the current Linux zone write plugging behavior for your kernel.
+
+@@ 12.05 | Intermediate | Scenario | tags=gc,victim,hot-cold,throttle,policy
+Q: Design the garbage collection policy for a host log-structured store on ZNS. What do you decide, and what can go wrong?
+SHORT: Decide when to start (free zone pool below a watermark), which victim (greedy by lowest live fraction, or cost-benefit that also weighs age), where to write the survivors (a separate cold stream), how fast (throttled so foreground p99 stays within budget) and how to make relocation crash-safe (copy, index update, then Reset, in that order). Keep GC's own open and active slots reserved.
+DEEP:
+1. **Trigger:** start when the free pool falls below a high watermark (for example 8 zones in 12.02), stop above a low one. A watermark based on time-to-exhaustion (free bytes / user write rate) is more robust than a fixed count.
+2. **Victim selection:**
+   - Greedy: lowest live fraction u, cheapest copy per byte freed. Bad for data that is about to die anyway.
+   - Cost-benefit: weigh (1 - u) against u and against the age of the data, so old cold zones are not left forever and hot zones get time to die.
+3. **Placement of survivors:** write them to a cold-stream zone. Data that survived a GC pass is likely long-lived, and mixing it back with hot data recreates the problem GC is fixing.
+4. **Relocation protocol:** read live objects, append or write them to a destination zone, wait for completion (and durability if your rules require it), update the index, and only then let the victim's live counter reach zero and Reset it.
+5. **Rate limit:** GC bandwidth is stolen from foreground bandwidth (12.10). Use a controller loop on the free pool level with a floor (never starve GC) and a ceiling (protect p99).
+6. **Resources:** reserve at least one open and one active slot for GC writers, or GC deadlocks the moment user writers use them all (12.12).
+7. **Failure modes:**
+   - Free pool exhaustion: writers stall or fail, and GC needs free zones to make free zones.
+   - Livelock at high utilization: victims all have u near 1, so GC moves data forever for little gain.
+   - Reset before the last reader is done (12.15).
+   - GC reading a zone that has gone Read Only: it can still read, but it must copy everything out.
+FOLLOW:
+- How do you tune it? => Measure the victim live-fraction distribution and the free-pool time series under a replay of the real workload, then adjust watermarks and cold-stream separation. Do not tune on uniform random writes.
+- How is this different from device GC? => Same idea, but the host knows object lifetimes and can align zones to them. The device cannot, which is the reason for ZNS (module 1).
+PITFALL: Tuning GC on a fresh, mostly empty drive. The policy only shows its cost near the sellable capacity limit.
+VERIFY: None for the method. Simple Copy (module 11) may offload relocation on some devices, so check its status on your product before assuming host reads and writes.
+
+@@ 12.06 | Intermediate | Cross-layer | tags=migration,conventional,trim,random-write,assumptions
+Q: An application runs on a conventional NVMe SSD and must move to a ZNS SSD. What breaks first, and how do you find each problem before production?
+SHORT: Every assumption that the device accepts random overwrites and unrestricted I/O. The application overwrites in place, updates metadata at fixed addresses, relies on TRIM to free space, reads unwritten areas and expects a normal block device. On ZNS, overwrites fail with Zone Invalid Write, space returns only through Reset Zone, and Linux may not expose the namespace. Find them with an assumption inventory, an emulated zoned device and fio in zbd mode.
+DEEP:
+| Assumption on a conventional SSD | What ZNS does | How to detect it |
+|---|---|---|
+| Overwrite any LBA in place | Write must be at the write pointer: Zone Invalid Write | Run the app on an emulated zoned device (null_blk or QEMU) |
+| Random small writes (journal, superblock) | Sequential-only zones | Trace writes and look for LBA going backwards |
+| TRIM frees space at any granularity | Only Reset Zone frees, per zone (12.03) | Watch free-zone count under a delete workload |
+| Read anything, always | Reads above the WP return the DLFEAT value, and with DULBE enabled may fail with Deallocated or Unwritten Logical Block (module 3) | Sparse-file and pre-read tests |
+| Unbounded open files or streams | MAR and MOR limits (module 6) | Scale concurrency up and watch for Too Many Active or Open Zones |
+| Any I/O size | Append limited by ZASL, and MDTS applies | Sweep sizes above 128 KiB |
+| Block device always present | Namespace can be hidden or read-only if requirements are not met (2.09, 2.15) | Check sysfs and dmesg at boot |
+| Alignment of writes to 4 KiB | Same, plus zone start alignment | Fuzz odd sizes |
+
+- **Method:** (1) inventory write patterns with `blktrace` or the NVMe tracepoints, (2) run the workload on QEMU or null_blk in zoned mode to catch failures for free, (3) run on the real drive with error injection (Read Only zone, timeout mid-zone), (4) repeat under power-cycle tests.
+- **Options for the application:** move to a zoned-aware filesystem or store (f2fs, btrfs zoned, ZenFS), adopt an intermediate layer (dm-zoned era is legacy, see module 9), or keep the application unchanged behind a translation layer that costs you a host FTL.
+- **Data migration:** copy at zone granularity, verify checksums per zone, keep a rollback path, and dual-write until the first GC cycle completes.
+FOLLOW:
+- Can you run the old application on a ZNS SSD unchanged? => Only through a translation layer that presents a random-write block device, which reintroduces mapping tables, GC and OP on the host.
+- What is the most common first failure? => Metadata or journal updates at a fixed address. They appear in the first minute as Zone Invalid Write.
+PITFALL: Validating on a conventional SSD with zone emulation only. Emulators do not have resource limits, resets that take time, or media faults unless you add them.
+VERIFY: Linux discard handling for zoned block devices, kernel behavior for read-above-WP through the block layer, and current filesystem zoned-mode requirements (module 9).
+
+@@ 12.07 | Intermediate | Scenario | tags=recovery,crash,report-zones,checkpoint,tail-scan
+Q: After a host crash or power loss, how does the store rebuild its zone map and index from Report Zones, and what does each mismatch mean?
+SHORT: Read Identify for the limits, Report Zones for every zone, then the newest valid checkpoint. Compare each zone's device write pointer with the checkpoint's. Equal means nothing to do. A higher device pointer means records were written after the checkpoint, so scan and validate them up to the pointer. A lower pointer, an unexpected Empty zone or an unexpected state is a device or host integrity bug, not something to repair silently.
+DEEP:
+1. **Identify and sanity:** namespace identity, ZSZE, ZCAP, MAR and MOR unchanged from the superblock. A changed geometry means a different device or a reformat.
+2. **Report Zones, all zones, paged** (4.11): build a table of state, write pointer and attributes. Open zones came back Closed (3.09), so the active count is the number of Closed zones.
+3. **Checkpoint:** two alternating slots with sequence number and CRC, pick the newest valid one. It supplies the index snapshot and the expected write pointer per zone.
+4. **Reconcile each zone:**
+
+| Device vs checkpoint | Meaning | Action |
+|---|---|---|
+| WP equal | Nothing written since | Resume or Finish |
+| WP higher | Records after the checkpoint | Tail-scan from the checkpoint WP, validate header, sequence and CRC, replay valid records |
+| WP lower | Data the checkpoint called durable is gone | Integrity bug: stop, capture, report (3.15) |
+| Empty but checkpoint has data | Lost zone mapping or an external Reset | Same, and check for a second writer |
+| Read Only or Offline unexpected | Media event during the outage | Evacuate what is readable (12.15) |
+
+5. **Torn tail:** the write pointer can land inside a record or after an incomplete one. Everything after the last valid record is dead space that cannot be truncated. Count it as dead bytes, then Finish the zone or continue after it, but never assume it is data.
+6. **Half-done operations:** a relocation whose index update did not persist is harmless, because the victim was not yet Reset. A Reset that may have been in flight is re-issued if the log says the zone was retired.
+7. **Reserve:** verify active zones are within MAR before opening new writers (6.08).
+
+Recovery time is bounded by checkpoint interval times write rate. Assumption: 2 GiB written between checkpoints and a 3 GB/s scan gives about 0.7 s, independent of capacity.
+FOLLOW:
+- How do you test recovery? => Power-cut at every operation type (append, Finish, Reset, checkpoint write, GC copy) with a programmable switch, then compare the recovered index with a model of durable operations.
+- Why two checkpoint slots? => A torn checkpoint write must not destroy the previous good one, and sequential-only zones cannot overwrite it, so it rotates through a small zone ring.
+PITFALL: Assuming the device write pointer is the end of valid data. It is the end of what the device accepted, and the last record may be torn.
+VERIFY: Zone state and write pointer after a controller reset and after unexpected power loss, and the durability rules for the write pointer, in the ZNS and NVM Command Set specifications.
+
+@@ 12.08 | Intermediate | Debug | tags=write-pointer,mismatch,timeout,shadow-state,report-zones
+Q: The store's in-memory write pointer for a zone is 8 blocks behind what Report Zones returns. How do you find out who is right?
+SHORT: Do not guess. Quiesce all I/O, then apply one invariant: device WP must equal the start WP plus the blocks of every Write that completed successfully. Compare the device pointer with that sum. If it matches, the host shadow is wrong. If the device is higher, a command executed without a CQE the host used, or another writer touched the zone. If the device is lower, a success was returned for data not accepted.
+DEEP:
+Host log for zone at ZSLBA 0x39C00 (starting WP 0x39C00, 8-block writes):
+```
+t(ms)   event
+0.00    submit W cid=21 slba=39C00 nlb=7
+0.02    submit W cid=22 slba=39C08 nlb=7
+0.04    submit W cid=23 slba=39C10 nlb=7
+0.90    CQE cid=22 status=OK    -> completed 8 blocks
+1.10    CQE cid=23 status=OK    -> completed 16 blocks, shadow WP = 39C10
+30.00   timeout cid=21          -> no CQE ever seen, host marks it failed
+        Report Zones: WP = 39C18
+```
+Successful CQEs cover 16 blocks (cid 22 and 23), so the shadow says 39C10, but the device WP 39C18 is 24 blocks past the start. Cid 22 succeeded at SLBA 39C08, and a Write only succeeds when the pointer equals its SLBA, so cid 21 must already have executed. The device is right, and the missing CQE for cid 21 is a second finding to chase (lost completion, interrupt or CQ handling).
+
+Ranked causes:
+1. **Timed-out or aborted command that executed**, or a CQE the host dropped. Most common by far.
+2. **Another writer** (a stale process, a second host on a shared namespace, a test tool left running) wrote to the zone.
+3. **Report Zones read while I/O was in flight**, so the pointer already includes commands whose CQE the host had not processed. Benign, and disappears when quiesced.
+4. **Host bookkeeping bug**: a failed Write (for example Zone Invalid Write) counted as advanced, or a retry counted twice, or unit confusion between 512-byte sectors and LBAs (3.12).
+5. **Firmware bug**: WP advanced by a Write that returned an error, or not advanced by one that succeeded. Rank low until the first four are excluded.
+
+Discriminating experiment:
+1. Stop all writers and confirm nothing else has the device open (`fuser -v /dev/nvme0n1`, check other hosts).
+2. Read Report Zones twice, a second apart, and confirm the WP is stable.
+3. Log every CQE (sqid, cid, status, nlb) and compute the sum. Compare.
+4. Repeat with a single-writer, QD 1 script and an injected timeout, so the executed-but-timed-out case is reproduced on demand.
+5. If needed, capture the SQEs and CQEs on the wire or with the kernel tracepoints and check whether cid 21 executed.
+
+**Host fix:** after a timeout, treat the zone's write pointer as unknown, stop submitting to the zone, and resynchronize with Report Zones before the next write (module 7).
+FOLLOW:
+- Could the mismatch be a firmware bug even when a timeout happened? => Yes, but the timeout explains it fully. Prove or refute it by reproducing without a timeout.
+- Why is the write pointer the reliable side? => It is the device's own state and it only advances when it accepted data. Host shadow state is derived from messages that can be lost.
+PITFALL: Adjusting the host shadow to match Report Zones without finding which command caused the difference. The next mismatch will then be a data loss you cannot explain.
+VERIFY: Whether a Report Zones write pointer can include commands the host has not yet seen complete, and that a failed Write leaves the write pointer unchanged.
+
+@@ 12.09 | Advanced | Debug | tags=open,stuck,implicit-open,explicit-open,close,resources
+Q: Report Zones shows several zones Open long after the workload stopped, and later a new writer fails. Are the zones stuck, and how do you decide whether it is a host or a firmware problem?
+SHORT: Usually it is expected. Zone state belongs to the device, not to a process. Stopping or crashing the application leaves its zones Open until something Closes, Finishes or Resets them, until resource pressure implicitly closes an implicit one, or until a reset or power cycle that clears open state. Explicitly opened zones are never evicted, so they do hold open slots. It is a firmware bug only if state contradicts the rules, such as an Open zone with the write pointer at capacity.
+DEEP:
+Observation (illustrative, 8 open and 14 active allowed):
+```
+$ blkzone report /dev/nvme0n1 | grep -cE 'zcond: [0-9]+\((oi|oe)\)'   # implicit or explicit open
+6
+```
+Ranked causes:
+1. **Expected persistence:** the application exited or crashed and the controller kept running, so the zones remain Open. Implicitly open zones may be closed by the controller under pressure. The base model gives the host no idle-timeout guarantee, so the absence of an automatic Close proves nothing.
+2. **Explicit opens leaked on an error path:** the host opened a zone explicitly and never closed it. Explicit zones stay Open and consume an open slot until the host acts.
+3. **Zombie writer:** a process that is stopped or hung, not dead, still owns the zones.
+4. **Firmware state bug:** the zone should have changed state and did not. Checks that identify it:
+   - WP equals ZSLBA + ZCAP but state is Open (should be Full).
+   - Zone Open after a successful Finish or Reset.
+   - Open count from a resource probe does not match Report Zones (6.16).
+
+Discriminating experiment:
+1. Snapshot Report Zones with attributes and record each zone's state, WP and ZCAP. Apply the state rules (3.05, 3.06) and mark contradictions.
+2. Stop every process that has the device open, then issue Close to each Open zone. Expect Closed, which keeps the active slot and frees the open one.
+3. Open MOR fresh Empty zones. If it succeeds and the next open fails at exactly MOR, the counts are honest.
+4. Do a controller reset (CC.EN cycle) and check that previously Open zones are Closed, or Empty if nothing was written (3.09 marks this as unconfirmed for a controller-only reset, so a power cycle is the firm case). Compare with the model.
+
+**Host policy:** an application that stops writing to a zone for more than a few seconds should Close it. The store should also Close all its open zones on clean shutdown, and reconcile leftovers on start-up (12.07).
+FOLLOW:
+- Does Close free an active slot? => No. A Closed zone stays active and holds the active resource until it is Finished or Reset (6.04).
+- Why can a stuck Open zone block a new writer that uses implicit open? => It usually cannot, since the controller may close an implicit zone to make room. If it does, the firmware refuses to evict, which is worth a bug report (6.06).
+PITFALL: Treating Open zones after a crash as corruption and Resetting them. Their data may be the only copy. Reconcile first.
+VERIFY: Zone condition labels printed by blkzone on your util-linux version (oi for implicit open, oe for explicit open), whether a controller-only reset closes open zones, and whether the ZNS specification requires the controller to implicitly close before returning Too Many Open Zones.
+
+@@ 12.10 | Advanced | Numeric | tags=gc,waf,bandwidth,budget,victim,free-pool
+Q: A store writes 500 MB/s of user data to a ZNS SSD that can sustain 2 GB/s of sequential writes. What does host GC cost at different victim utilizations, and how much user bandwidth is left?
+SHORT: If a victim zone has live fraction u, freeing it costs u of a zone in copies for (1 - u) of a zone freed, so host write amplification is 1 / (1 - u). At u = 0.5 the drive writes 1,000 MB/s and reads 500 MB/s for GC. At u = 0.85 the store wants 3,333 MB/s of writes, more than the drive can do, so the sustainable user rate falls to 300 MB/s. Device WAF stays near 1, so this is the whole cost.
+DEEP:
+Assumptions: user write rate R = 500 MB/s, drive sequential write ceiling W = 2,000 MB/s (writes to open zones in parallel), zone capacity 3.5 GiB = 3.758 GB, device WAF about 1, reads do not compete with writes for the ceiling, victim live fraction u is constant.
+1. Per zone reclaimed: copy u x Z live bytes, free Z bytes, net gain (1 - u) x Z.
+2. Relocation per user byte = u / (1 - u). Total writes per user byte = 1 + u / (1 - u) = 1 / (1 - u).
+3. Table (computed):
+
+| u | Host WAF | Total writes at 500 MB/s | GC reads | Max user rate at W = 2,000 |
+|---|---|---|---|---|
+| 0.30 | 1.43 | 714 MB/s | 214 MB/s | 1,400 MB/s |
+| 0.50 | 2.00 | 1,000 MB/s | 500 MB/s | 1,000 MB/s |
+| 0.70 | 3.33 | 1,667 MB/s | 1,167 MB/s | 600 MB/s |
+| 0.85 | 6.67 | 3,333 MB/s | 2,833 MB/s | 300 MB/s |
+
+4. **Victim rate at u = 0.5:** each victim nets 0.5 x 3.758 GB = 1.879 GB, so 500 MB/s needs 0.266 victims/s, one Reset every 3.8 s.
+5. **Free pool runway:** if GC stops with 8 free zones (30 GB), the user drains them in 8 x 3.758 GB / 0.5 GB/s = 60 s. GC must start well before that.
+6. **What u is in practice:** it is not the same as overall space utilization. With hot and cold separation the victims are the cold-dead zones with low u. Measure the victim distribution (12.05) instead of assuming it.
+
+Device side: verify the assumption of WAF near 1 with the drive's own counters, not the host's (see the fair-benchmark method in module 1).
+FOLLOW:
+- What do you do when u is high? => Increase host OP (fewer sellable zones, 12.02), improve stream separation, or lower the user rate. Adding GC threads only steals foreground bandwidth.
+- Does Simple Copy change the bandwidth? => It can remove the host PCIe and DRAM traffic for GC, but the NAND still programs the copies, so the write budget is unchanged (module 11).
+PITFALL: Reporting WAF from a fresh drive. Steady-state u only appears after the sellable capacity has been filled and overwritten.
+VERIFY: The zone capacity and write ceiling are assumptions, so replace them with values measured on the target drive, and check that the device write counters are exposed (for example in the OCP SMART log).
+
+@@ 12.11 | Advanced | Debug | tags=zone-append,alba,cqe,cid,ioctl,units
+Q: Zone Append completions carry addresses the host does not expect: one outside the zone it addressed, one duplicated, one truncated. How do you decide whether it is decoding, bookkeeping or firmware?
+SHORT: Treat every ALBA as a claim to verify with four invariants: it lies inside the addressed zone's writable range, no two appends overlap, the zone's WP advances by the sum of successful lengths, and reading the returned LBA yields the payload you sent. Then split by evidence. A CQE that matches the right SQID and CID but breaks an invariant is firmware. A wrong SQID/CID pairing, a 32-bit result or a wrong unit is the host.
+DEEP:
+Trace, ZSZE = 0x40000, ZCAP = 0x3C000, 16-block appends (illustrative):
+```
+sqid cid  ZSLBA      CQE dw0    dw1        status
+1    0x11 0x00300000 0x00300000 0x00000000 OK
+1    0x12 0x00300000 0x00300010 0x00000000 OK
+2    0x11 0x00300000 0x00300020 0x00000000 OK
+3    0x21 0x00340000 0x00300030 0x00000000 OK      # outside zone 0x340000
+```
+Ranked causes:
+1. **CQE-to-command mapping error (host):** cid is unique only within a queue. If the host keys its table on cid alone, sqid 1 and 2 collide (both 0x11). Use (sqid, cid) taken from CQE dword 2 bits 31:16 and dword 3 bits 15:0.
+2. **Truncation (host):** ALBA is 64 bits across dwords 0 and 1. A legacy 32-bit passthrough result field or a 32-bit variable loses the upper half, visible on large namespaces or 512 B LBAs. Use the 64-bit passthrough interface.
+3. **Unit confusion (host):** Linux block layer uses 512-byte sectors. On 4 KiB LBAs, sector = LBA x 8. An ALBA that is exactly one eighth or eight times the expected value is this.
+4. **Wrong namespace (host):** two namespaces on one controller can have zones at the same LBAs.
+5. **Firmware:** returns the address after the data (start + length instead of start), returns a stale address when two appends merge in the write buffer, or misroutes a completion under queue load. The last trace row is this only if causes 1 to 4 are cleared and the SQID and CID pairing checks out.
+
+Discriminating experiments:
+1. Quiet zone, one append with a unique pattern. ALBA must equal ZSLBA. Read that LBA back and compare.
+2. Two appends: ALBAs must be ZSLBA and ZSLBA + 16 in either order, WP must be ZSLBA + 32.
+3. If the failure needs load, capture SQEs and CQEs with the kernel tracepoints (`events/nvme`) or an analyzer and check dword 2 and 3 for the failing command.
+4. Add an invariant checker to the harness (below), so every future run tests the same four properties.
+
+| Invariant | Violation implies |
+|---|---|
+| ZSLBA <= ALBA and ALBA + nlb <= ZSLBA + ZCAP | Firmware, or host decoding |
+| No two appends overlap | Firmware, or host mapping |
+| WP delta = sum of successful lengths | Lost or extra append (12.08) |
+| Read at ALBA returns the sent payload | Address correct only if this holds |
+FOLLOW:
+- Can ALBA go backwards within one queue? => Yes. Placement order is not submission order across or within queues, so only overlap and containment are invariants (5.05).
+- Is an ALBA on a failed append meaningful? => No. Ignore the result field on any non-success status.
+PITFALL: Concluding the firmware is at fault from the ALBA alone. First prove the CQE belongs to the command you think.
+VERIFY: The CQE dword layout for Zone Append (result in dwords 0 and 1), that the passthrough ioctl in use returns 64 bits, and the nvme tracepoint field names on your kernel.
+
+@@ 12.12 | Advanced | Debug | tags=too-many-open,under-load,gc,rollover,arbiter,resources
+Q: The store sees Too Many Open Zones only under heavy load, about once an hour, and a retry a millisecond later works. How do you find the cause and fix it?
+SHORT: Peak demand, not steady demand, exceeds MOR. Rollover of several streams at once, GC writers and a retry that opens a second zone can briefly hold more zones open than the host thinks. Capture Report Zones at the failure instant and compare with the host's count. More open than the host thinks means a host accounting race. At most MOR minus 1 means the firmware refused, for example because a zone had commands in flight, or leaked a slot.
+DEEP:
+Setup: MOR = 8, MAR = 14. The store has 4 user streams and 2 GC writers, so 6 steady, with 2 spare. Explicit open is used so every zone is reserved (6.07).
+
+Ranked causes:
+1. **Rollover overlap (host):** a stream opens its next zone before the old one has become Full or been Closed, for example because the last write to the old zone is still in flight, or the host stops early and forgets to Close. Four streams rolling together hold 8 zones, and with 2 GC writers that is 10 opens for a short window.
+2. **Timeout retry (host):** a slow write is given up on, the stream moves to a new zone, and the old zone stays open with the original write possibly still queued.
+3. **Firmware refusal to evict:** with implicit opens, the controller normally closes an idle implicit zone. If each candidate has commands in flight, a firmware may return Too Many Open Zones. Whether that is allowed depends on the spec wording (VERIFY).
+4. **Leaked open slot (firmware):** an error or abort path leaves the internal count too high (6.16).
+5. **Another user of the namespace:** a monitor, a second fio job or a second host.
+
+Discriminating experiment:
+1. Log every open, close, finish, full transition and reset in the host with timestamps and stream ids, and compute the peak of the host's own open count over time.
+2. On the failure, immediately Report Zones filtered to open states (or unfiltered) and count, then compare with the host peak.
+3. Force a deterministic repro: set the host budget cap to MOR - 1 (a semaphore). If failures vanish, host peak was the cause. Then set it to MOR + 1 and confirm you can reproduce on demand, which also proves the firmware limit is enforced at exactly MOR.
+4. If Report Zones shows fewer than MOR open, run the leak probe (6.16) and the in-flight test: quiesce, then repeat.
+
+**Fix:** a single resource arbiter in the store that owns open and active slots: acquire before opening, release on Full, Close, Finish, Reset or Read Only, reserve slots for GC (12.05), and treat Too Many Open Zones as a retriable condition with backoff and never as a fatal error.
+FOLLOW:
+- Should Too Many Open Zones be retried? => Yes with backoff, since it usually clears when another zone closes. Do not retry Too Many Active Zones without freeing a zone (6.05).
+- How do you keep the regression test cheap? => Model the peak open count in the harness and inject rollovers on all streams at once.
+PITFALL: Budgeting for the steady state. Failures happen at the peak: rollover, GC bursts and retries.
+VERIFY: Whether the specification allows or requires implicit close when an implicit zone has commands in flight, and whether Too Many Open Zones may carry DNR.
+
+@@ 12.13 | Advanced | Debug | tags=reset,latency,stall,erase,gc,queues
+Q: Foreground write latency jumps from 200 us to tens of milliseconds whenever GC resets a zone, and some Reset Zone commands take 400 ms. How do you triage it?
+SHORT: Measure before theorizing. Time Reset Zone versus zone fill level, versus concurrent I/O and versus how many resets are in flight, and log the latency of writes to other zones during each reset. Reset time growing with fill points at a synchronous erase. Neighbor stalls point at erase competing for the same dies. Stalls that disappear on a separate queue point at head-of-line blocking in the controller. Then throttle and spread resets on the host.
+DEEP:
+Ranked causes:
+1. **Synchronous erase in Reset:** the command completes only after the zone's blocks are erased, so latency is proportional to how much of the zone was written (4.14 has the timing model).
+2. **Erase and program contend for dies:** a zone striped over all dies means a reset keeps every die busy, so writes to other zones wait. Erase suspend helps but does not remove it.
+3. **Reset storm:** GC or a bulk delete issues many resets back to back, and each waits behind the previous one.
+4. **Head-of-line blocking:** Reset Zone is an I/O command, so it shares a submission queue with writes. If the controller serializes a long command, everything behind it on that queue waits.
+5. **Firmware metadata work per reset:** journaling or flushing the zone table to NAND on every reset, adding a fixed cost that does not scale with fill.
+
+Experiment matrix (one variable at a time, others idle):
+
+| Run | Vary | What a stall pattern means |
+|---|---|---|
+| A | Reset latency at fill 0, 25, 50, 100 percent, no other I/O | Growing with fill: erase time. Flat: fixed metadata cost |
+| B | Same, with a writer on another zone | Higher latency: shared die or firmware time |
+| C | Log write latency (10 ms windows) on another zone during one reset | A spike aligned with the reset: neighbors are blocked |
+| D | Resets on their own queue versus the writers' queue | Stall goes away: queue serialization |
+| E | 1, 2, 4, 8 resets in flight | Linear growth: resets are serialized in the device |
+
+```
+fio --name=nbr --filename=/dev/nvme0n1 --zonemode=zbd --rw=write --bs=64k --direct=1 \
+    --iodepth=4 --max_open_zones=1 --write_lat_log=nbr --log_avg_msec=10
+blkzone reset -o <zone start> -c 1 /dev/nvme0n1     # timed with date +%s.%N around it
+```
+- **Host mitigations:** at most one or two resets in flight, pace them, reset from the GC queue, prefer partly-written zones later, and raise the I/O timeout if a large Reset-all is unavoidable.
+- **Firmware asks:** a bounded worst-case reset latency in the datasheet, background erase with deterministic behavior for the next write to that zone, and a counter of erase time.
+FOLLOW:
+- The Reset returns in microseconds but later writes stall. What happened? => The erase was deferred, and its cost moved to the next allocation of those blocks. Measure write throughput in the minute after a reset storm, not only reset latency (4.15).
+- What is the timeout risk? => A Reset-all on thousands of full zones exceeds the Linux default I/O timeout of 30 s if erase is synchronous (4.14).
+PITFALL: Tuning the store's GC to avoid resets without measuring, when the stall came from queue placement or the firmware's per-reset metadata cost.
+VERIFY: The default value of nvme_core.io_timeout on your kernel, whether Zone Management Send is allowed to execute concurrently with writes to other zones in your controller, and erase suspend behavior of your NAND.
+
+@@ 12.14 | Advanced | Debug | tags=performance,cliff,thermal,gc,slc,steady-state
+Q: A store benchmark writes 2.6 GB/s for four minutes, then drops to 1.1 GB/s and stays there. How do you find out whether it is host GC, the device, or the platform?
+SHORT: Line up four time series: user bytes per second, device-written bytes per second, GC bytes per second, and drive temperature with link state. Host GC predicts the number: 2.6 / 1.1 gives an implied write amplification of 2.36, so a victim live fraction of about 0.58. If the GC counters disagree, run raw zone-sequential I/O on an all-Empty drive. A cliff at the same byte count points to the device, and at a temperature crossing to the platform.
+DEEP:
+Ranked causes:
+1. **Host GC engaged:** free pool crossed the watermark at about 624 GB (2.6 GB/s x 240 s). Every user byte now costs 1/(1-u) device writes (12.10). Prediction: implied WAF = 2.6 / 1.1 = 2.36, so u = 1 - 1/2.36 = 0.58. If the store's own GC counters show 0.58 of the relocation, it is fully explained.
+2. **Device write buffer or fast-region exhaustion:** if the product uses a fast write region (for example pseudo-SLC), throughput falls once it fills, regardless of host behavior. The cliff sits at a fixed byte count.
+3. **Erase cost begins:** on a fresh drive the first pass writes Empty zones with no erase. Later zones need Reset first. The cliff appears near one full drive write.
+4. **Thermal throttling:** aligned with a temperature threshold crossing, and it recovers when the drive cools.
+5. **Fewer effective streams or a link problem:** GC took open slots from user streams (fewer zones written in parallel), or the PCIe link retrained to a lower speed. Check LnkSta and AER counters (see the PCIe page).
+
+Discrimination:
+
+| Evidence | Points to |
+|---|---|
+| GC bytes rise exactly at the cliff, device bytes total stay at 2.6 GB/s | Host GC |
+| Raw fio zbd sequential on an all-Empty drive drops at the same byte count | Device buffer or media |
+| Cliff at about one drive fill, second pass slower than first | Erase cost (cause 3) |
+| SMART composite temperature or warning temperature time counters rise at the cliff | Thermal |
+| LnkSta shows a lower speed or width, or corrected error counts climb | Link |
+
+```
+fio --name=raw --filename=/dev/nvme0n1 --zonemode=zbd --rw=write --bs=128k --direct=1 \
+    --ioengine=io_uring --iodepth=16 --max_open_zones=8 --write_bw_log=raw --log_avg_msec=1000
+nvme smart-log /dev/nvme0 | grep -i temp        # sample every second alongside
+```
+Run it twice: once on a freshly reset drive (all Empty) and once with a full second pass. Repeat the store benchmark with the working set held to 50 percent, so GC never starts. If the cliff disappears, GC caused it.
+FOLLOW:
+- The drop matches GC but the device total also fell. What now? => Two causes overlap. Remove GC first by shrinking the working set, then look at the device-only curve.
+- How do you report it? => Show the four aligned plots and the predicted-versus-measured WAF. An unexplained gap is the finding.
+PITFALL: Blaming the SSD because it slowed down after four minutes. Half of these cliffs are the store's own GC arriving on schedule.
+VERIFY: Field names for temperature time counters in nvme smart-log on your nvme-cli version, and whether your product has a fast write region and how it is reported (OCP log, vendor log).
+
+@@ 12.15 | Principal | Debug | tags=gc,reset,race,stale-read,epoch,corruption
+Q: A soak test occasionally reads zeros, or another object's data, from a location the store believed was live. It happens only during GC. How do you decide whether the store or the SSD is at fault?
+SHORT: Timestamp every step and test one ordering: was the reader's index lookup older than the index update that moved the object, and did the read execute after the Reset of the victim zone? If yes, it is the classic host race, where the zone was reset and possibly rewritten under an in-flight reader. If the index version was current when the read ran, the device returned wrong data for live blocks, for example a deferred erase destroying freshly written data.
+DEEP:
+Failing pattern: reader looks up (zone Z, offset), GC relocates the object, updates the index, resets Z, Z is reallocated and written, then the reader's read executes.
+```
+t(ms)  actor   event
+0.0    reader  index lookup obj 7 -> (Z, 0x1200), index version 41
+0.1    gc      copy obj 7 to zone Y, index update -> (Y, 0x0040), version 42
+0.5    gc      Reset Z completes
+0.6    writer  new data written into Z at 0x1000..0x1FFF
+0.9    reader  Read Z 0x1200 completes -> wrong object, CRC fails
+```
+Ranked causes:
+1. **Host race (most likely):** no protection between readers of the old location and the Reset. Missing per-zone reader count, epoch or grace period.
+2. **Early Reset:** the live counter reached zero before a relocation's read finished (12.03), or the Reset was issued before the index update was visible to all threads.
+3. **Device deferred-erase race:** Reset returns, a new write lands, and a background erase then destroys it. That gives zeros in data written after the Reset, and is a firmware bug (4.15).
+4. **Device stale data:** a read of a Reset zone returns pre-Reset data that is neither the declared unwritten value nor an error. That is a data-leak defect (4.12).
+5. **Cache in the host:** a page cache or buffer holds an old copy of a location that was reused.
+
+Discriminating analysis:
+1. For each failing read, record the index version the reader used, when the read was submitted and completed, and the Reset and rewrite times for that zone.
+2. Host race is proven when lookup version < current version for that object and the read completed after the Reset completed. Every failure fitting that pattern is the host.
+3. If a failing read used the current index version, the location was live and the zone was not reset since the object was written, so the device is at fault. Then check for zeros in a fresh write after Reset: run a targeted loop (Reset, write pattern, read back after 0, 10, 100, 1000 ms, verify) on the same drive.
+4. For a stale-data result, compare against DLFEAT and the zone state at read time (3.11).
+
+**Fixes on the host:** epoch-based reclamation or per-zone reader reference counts so a Reset waits for readers that could hold an old location. A short quarantine before a reset zone is reallocated. Put a zone generation number in every record header and reject records from an older generation.
+FOLLOW:
+- Why does the CRC not fully protect you? => It detects the wrong data but not the cause. It can also pass if a reused location holds a valid record of another object with the same size, so bind the header to the object id and generation.
+- How does this differ from a conventional SSD? => There, a stale read returns old data of the same LBA, which is a stable, if wrong, value. Here Reset makes the location unwritten or reuses it, so the race is louder and cheaper to catch.
+PITFALL: Assuming the drive is at fault because it returned zeros. A returned unwritten value after a Reset is what the device is supposed to do.
+VERIFY: The values a read returns after Reset Zone (DLFEAT), whether reads of an Empty zone above the write pointer fail or return data (DLFEAT and DULBE), and whether the specification allows deferred erase to complete after the Reset completion.
+
+@@ 12.16 | Principal | Cross-layer | tags=evidence,triage,host-logs,firmware-logs,analyzer,bug-report
+Q: A customer reports data errors and write failures on a ZNS SSD in their store. What evidence do you collect from the host, the firmware and the analyzer, in what order, so that the firmware team can act on it?
+SHORT: Non-intrusive and volatile first, intrusive last, and nothing before the reset that would erase it. Snapshot host state (kernel log, Identify, logs, a full Report Zones dump, per-command records with SQID, CID, status and ALBA), then pull the device's own view (telemetry, vendor logs, event log), then correlate with a bus capture on a reproduction. Package it as an invariant violated, the minimal sequence, and the environment, not as a log dump.
+DEEP:
+| Layer | Artifact | How | Why |
+|---|---|---|---|
+| Host | Kernel log, driver messages, controller resets | `dmesg`, `journalctl -k` for the run and the previous boot | Timeouts, resets, zone errors |
+| Host | Identify, zoned Identify, effects log, limits | `nvme id-ctrl`, `nvme zns id-ns`, `nvme effects-log`, sysfs `queue/` files | Geometry, MAR and MOR, ZASL, supported commands |
+| Host | Zone map with timestamp | `nvme zns report-zones` or `blkzone report`, before and after any recovery | State and WP evidence, taken before anything changes it |
+| Host | Health and error logs, Changed Zone List | `nvme smart-log`, `nvme error-log`, zone changed log | Media events, Read Only, temperature |
+| Host | Command records | store trace: SQID, CID, opcode, SLBA, length, status, ALBA, times | Ground truth for what the host asked and saw |
+| Host | Kernel tracepoints | `events/nvme` in tracefs | Ties store operations to NVMe commands |
+| Firmware | Telemetry, vendor log pages, assert dump | `nvme telemetry-log`, vendor tool | Internal zone table, resource counters, reset history |
+| Firmware | Firmware and configuration versions, feature settings | `nvme fw-log`, `nvme get-feature` | Rules out version and config drift |
+| Analyzer | PCIe capture around a triggered event | Trigger on a command with non-zero status, or a timeout | Proves what was on the wire, and detects link issues |
+
+Order:
+1. Preserve first: copy the zone map, logs and telemetry before any controller reset, format or reboot.
+2. Read-only host commands next. Then the store's own records.
+3. Only then reproduce with the analyzer and debug firmware. Match clocks with a marker (a unique LBA or a GPIO).
+4. Save the store's shadow state at the failure too, so the model versus device diff can be reconstructed.
+
+**Report format:** (1) the invariant violated, in one sentence ("device WP is 24 blocks past the sum of successful completions"), (2) minimal command sequence and zone state before and after, (3) rate and conditions, (4) what was ruled out (host race, decoding, second writer), (5) attachments with checksums. Firmware acts on invariants and sequences, not on 40 GB of logs.
+FOLLOW:
+- The device hung and the logs are unreadable. What now? => Use the persisted or controller-initiated telemetry and the UART or debug interface, and check whether the host preserved the zone map earlier. The bus capture then says whether the device stopped responding.
+- What do you refuse to send? => Data without the customer's agreement. Sanitize payloads and keep addresses, lengths, states and statuses.
+PITFALL: Restarting the host to "clear" the problem before capturing the zone map. The most valuable evidence, the device's state at failure, is gone.
+VERIFY: nvme-cli subcommand names and options in your version (for example `zns changed-zone-list`, `telemetry-log`), which log page IDs your product supports, and the vendor tool for internal state.
+
+@@ 12.17 | Principal | Scenario | tags=validation,system-test,fault-injection,soak,oracle,exit-criteria
+Q: Design the system-level validation campaign for a host log-structured store on a new ZNS firmware. How do you inject faults, decide host bug from device bug, and set exit criteria?
+SHORT: Use three oracles: a zone-state model checked at every completion, the store's own invariants (index versus zones versus live counters), and end-to-end checksums per object. Cross a workload matrix with a fault matrix (power cuts at every operation type, timeouts, media faults, resets under load, resource pressure). Replay each failure on an emulated zoned device: if it reproduces there, the host is at fault. Exit on coverage plus statistical bounds.
+DEEP:
+1. **Oracles:**
+   - Device oracle: the zone model of module 3 and 10, checked against Report Zones and status codes.
+   - Store oracle: every index entry points into a zone below its write pointer, live bytes per zone match, no location is claimed twice.
+   - End-to-end oracle: each object carries id, generation and CRC, verified on every read and in a full scan after each fault.
+2. **Workloads:** append-heavy, overwrite-heavy with GC at the sellable limit, delete-heavy, mixed read/write, many small versus few large objects, single versus many streams.
+3. **Fault matrix (cross with workloads):**
+
+| Fault | Where injected | Expected outcome |
+|---|---|---|
+| Power cut | During append, Finish, Reset, checkpoint, GC copy, GC Reset | Recovery per 12.07, no acknowledged data lost |
+| Command timeout, dropped CQE | Random writes and resets | WP resync per module 7, no duplicates |
+| Media fault: zone goes Read Only or Offline | Mid-fill, during GC read | Store evacuates, capacity plan holds (12.02) |
+| Controller reset under load | With many open zones | State per 3.09, resources reconciled |
+| Resource pressure | Rollover on all streams, GC burst | Retry and backoff, no data loss (12.12) |
+| Firmware update in field | Between runs | Zones and WP preserved |
+
+4. **Host versus device:** replay the captured command trace against an emulated zoned device (QEMU or null_blk, extended with the same limits and injected errors). Reproduces on the emulator: host bug. Only on hardware: device bug, or a timing issue the emulator lacks. Then compare with a second SSD on the same host.
+5. **Exit criteria (examples):**
+   - Coverage: every operation type by every fault type, and every zone state at the cut, at least once.
+   - Statistics: with zero failures in n trials, the 95 percent upper bound is 3/n (rule of three). 300 clean power cycles bound the failure rate below 1 percent, 3,000 below 0.1 percent.
+   - Soak: 72 h at 2 GB/s writes is about 518 TB, roughly 135 fills of the 3.5 TiB writable capacity (assumed drive), with GC active.
+   - Zero silent data corruption, zero unexplained state divergence, and every failure classified host or device.
+6. **Automation:** the store's trace and the model checker are the product of the campaign. Make every failure a replayable trace, and every trace a regression test.
+FOLLOW:
+- What do you prioritize when time is short? => Data integrity after power cuts, then recovery correctness, then state machine agreement, then resources, then performance.
+- What does the device suite (module 10) add? => Per-command conformance and boundary cases without a store on top. This campaign asks whether a real host survives the device, which finds different bugs.
+PITFALL: Counting hours of soak instead of covering fault points. A week of quiet writes never cuts power during a Reset.
+VERIFY: How your power-cut rig and firmware error-injection interface work, and the NVMe zone attribute and state behavior after resets in your revision, which decide the pass criteria for those rows.

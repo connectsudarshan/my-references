@@ -1,0 +1,364 @@
+# Module 17: SSD Internals Behind NVMe
+
+@@ 17.01 | Basic | Concept | tags=pipeline,front-end,ftl,back-end,firmware
+Q: What does SSD firmware do between the doorbell write and the NAND program, and between a read command and the data reaching the host?
+SHORT: The controller fetches the SQE, validates it, and for a write DMAs the data into a write buffer. The FTL then picks a physical location, updates the logical-to-physical (L2P) map and journals the change, and the back end programs NAND across channels and dies. A read looks up the L2P map, senses NAND, runs ECC decode, then DMAs the data to the host. Garbage collection and other background jobs compete for the same NAND time.
+DEEP:
+1. **Front end:** doorbell, SQE fetch by DMA, arbitration, command parse and validation (NSID, LBA range, PRP/SGL sanity). Errors are completed here without touching NAND.
+2. **Write path:** data DMA from host memory into the write buffer (DRAM or SRAM), then the completion policy runs (see the power-loss protection question). The FTL allocates the next page in an open block, records the mapping, and queues a program.
+3. **Read path:** L2P lookup (a DRAM hit, or a NAND read of the map page on a miss), NAND read (tR plus the channel transfer), ECC decode, DMA to host, CQE, interrupt.
+4. **Back end:** a flash interface per channel queues read, program and erase operations to dies and planes and interleaves them so channels stay busy.
+5. **Background work:** garbage collection, wear leveling, read-disturb and retention refresh, journal checkpoints, thermal management, telemetry. All of it shares NAND, channel and ECC bandwidth with host I/O.
+
+- **Implementation:** many controllers split these roles across several CPU cores plus hardware engines for DMA, ECC and channel control. The exact split is vendor specific.
+- **Validation view:** the host only sees latency, throughput, status codes and log counters. Every internal stage has to be inferred from those, which is why the rest of this module maps each mechanism to a host-visible symptom.
+FOLLOW:
+- Where can a command fail without touching NAND? => In the front end: bad opcode, invalid field, LBA out of range, or a data transfer error. The FTL is never involved.
+- Which stage limits a 4 KiB random read at high queue depth? => Usually NAND read parallelism (dies and planes) or ECC throughput, not the front end. Measure before assuming.
+PITFALL: Treating the SSD as a black box with fixed latency. The same command can take 80 us or 20 ms depending on what the back end and background jobs are doing.
+
+@@ 17.02 | Basic | Concept | tags=nand,page,block,plane,die,channel,superblock
+Q: Explain the NAND hierarchy (cell, page, block, plane, die, channel) and why NAND can be programmed by page but only erased by block.
+SHORT: Pages are the unit of read and program, blocks are the unit of erase, and a block holds many pages that must be programmed in order. A plane is a set of blocks a die can operate on in parallel, a die has several planes, and a channel connects several dies to the controller. Erase-before-program is physical: raising cell charge is done per page, but lowering it is only possible for a whole block.
+DEEP:
+- **Page:** the unit of read and program, for example 16 KiB of data plus a spare area for ECC parity and metadata. Illustrative, the size varies by NAND generation.
+- **Block:** the unit of erase. It holds hundreds to thousands of pages. Pages are programmed in sequence, and a programmed page cannot be rewritten until the whole block is erased.
+- **Plane and die:** planes in one die can run multi-plane operations together. Each die is an independent unit that executes one command at a time (with limited suspend features on some parts).
+- **Channel:** a bus shared by several dies. Data transfer occupies the channel, while array operations (tR, tPROG, tBERS) occupy only the die, so the controller interleaves dies to hide array time.
+- **Superblock (or stripe):** firmware groups one block per plane and die into a write unit so that a stream of writes spreads over every die and channel at once. Also a common unit of GC and erase.
+- **Relative cost (order of magnitude, vendor and generation dependent):** read tens of microseconds, program hundreds of microseconds to milliseconds, erase several milliseconds. This asymmetry is behind most performance behavior in this module.
+- **Consequences:** no in-place overwrite, so an FTL is needed. Erase wears the cell, so blocks have a finite P/E cycle budget. Programming order matters, so writes are appended.
+FOLLOW:
+- Why do firmware designers stripe over dies and channels? => One die is slow (program takes hundreds of microseconds), so bandwidth comes from parallelism across many dies. Striping also lets a superblock be erased as one unit.
+- Why is program suspend or erase suspend useful? => It lets a read jump ahead of a long program or erase on the same die, which reduces read tail latency. Support and policy are NAND and vendor specific.
+PITFALL: Mixing up page and block. Reading and programming are page operations, and only erase is a block operation.
+VERIFY: Page, block and plane counts and timing figures for the NAND part in use come from the NAND datasheet, not from this page.
+
+@@ 17.03 | Basic | Concept | fig=ftl | tags=ftl,l2p,mapping,out-of-place,invalid
+Q: What is the FTL, and how does the logical-to-physical map turn a host write into "write somewhere else and invalidate the old copy"?
+SHORT: The Flash Translation Layer hides the erase-before-write rule. It keeps an L2P table that maps each host LBA, in mapping units (commonly 4 KiB), to a physical NAND location. A write goes to a new page and the table entry is updated, which marks the old page invalid. A read looks up the entry first. The table is held in DRAM, and its size is why DRAM capacity scales with drive capacity.
+DEEP:
+1. Host writes LBA 100. The FTL picks the next free page P1 in the open block and programs the data there.
+2. It sets L2P[100] = P1 and marks the previous location P0 as invalid in the block's valid-page bookkeeping.
+3. P0 stays physically in place. Nothing is erased. The block will be reclaimed later by garbage collection once enough of its pages are invalid.
+4. A read of LBA 100 uses L2P[100] to find P1. An unmapped entry (never written, or deallocated) returns the deallocated-block behavior without reading NAND.
+
+- **Mapping unit vs LBA size:** if the mapping unit is 4 KiB and the host uses 512-byte LBAs, small or misaligned writes need read-modify-write inside the SSD. NVMe reports the preferred write granularity and alignment fields in Identify Namespace (NPWG, NPWA and related) for that reason.
+- **Reverse map:** each physical page also stores its LBA (in the spare area or block metadata) so GC and recovery can tell whether a page is still valid by comparing it with the L2P entry.
+- **Where valid is decided:** a page is valid only if the L2P entry still points at it. The stored LBA alone proves nothing.
+- **Trade-off:** a finer mapping unit gives better small-write behavior and more DRAM. A coarser one saves DRAM and hurts small random writes. Numbers in the next question.
+FOLLOW:
+- Why is the FTL not "just a hash table"? => It must be persistent, crash consistent, fast to rebuild, and cooperate with GC, wear leveling and bad-block handling, all at line rate.
+- What does an unmapped LBA read return? => Whatever the controller reports for deallocated blocks (see DLFEAT in the NVM command set module). It is not read from NAND.
+PITFALL: Believing an old page is erased when its data is overwritten. It remains in NAND, valid-looking to a chip reader, until the block is erased.
+VERIFY: NPWG, NPWA, NPDG, NPDA and NOWS field names and the controller version that introduced them in the NVM Command Set Specification (Identify Namespace).
+
+@@ 17.04 | Intermediate | Numeric | tags=l2p,dram,sizing,mapping-unit
+Q: How large is the L2P table for a 3.84 TB drive, and how does the mapping unit change the DRAM requirement?
+SHORT: With 4 KiB mapping units and 4-byte entries the table is 937.5 million entries, or 3.75 GB, about 0.098 percent of capacity (about 1 GB per TB). A 512-byte mapping unit needs 30 GB. A 16 KiB unit needs about 0.94 GB. That ratio is why DRAM is sized near 1 GB per TB and why mapping granularity is a core design choice.
+DEEP:
+Assumptions: 3.84 TB = 3.84e12 bytes of user capacity, 4-byte entries.
+1. Entries at 4 KiB: 3.84e12 / 4096 = 937,500,000.
+2. Table size: 937,500,000 x 4 B = 3.75e9 B = 3.75 GB (3.49 GiB).
+3. Ratio: 4 B per 4096 B = 0.0977 percent, so about 0.98 GB per TB.
+4. 512-byte unit: 3.84e12 / 512 x 4 B = 30 GB. 16 KiB unit: 3.84e12 / 16384 x 4 B = 0.94 GB.
+5. Does a 4-byte entry fit? Raw NAND of 4 TiB divided into 4 KiB units is 2^30 physical units, which needs 30 bits, so 32 bits is enough with room for flags. Larger raw capacity would need wider entries and a bigger table.
+
+| Mapping unit | Entries | Table size | Small-write cost |
+|---|---|---|---|
+| 512 B | 7.5e9 | 30 GB | none for 512 B writes |
+| 4 KiB | 9.4e8 | 3.75 GB | RMW below 4 KiB |
+| 16 KiB | 2.3e8 | 0.94 GB | RMW below 16 KiB, high WAF for 4 KiB random |
+
+- **One map page covers a lot:** a 4 KiB page of entries holds 1024 entries and maps 4 MiB of LBAs. Sequential access reuses map pages heavily, while random access over the full span does not.
+- **Entry width:** a 512-byte unit on 4 TiB of NAND needs 33-bit physical addresses, so real entries would be wider than 4 bytes and 30 GB is a floor.
+- **Real designs differ:** many add flags, per-entry metadata or a two-level table, so treat 1 GB per TB as the floor.
+FOLLOW:
+- What if the drive reports 512-byte LBAs but maps at 4 KiB? => Sub-4 KiB and misaligned writes trigger RMW and raise WAF. Validation should test 512 B writes and 4 KiB-misaligned writes for latency and WAF.
+- How does the table cost change for a QLC drive with 16 KiB units? => Much less DRAM, but 4 KiB random write WAF is much higher, so the design usually needs extra buffering or a small SLC region for small writes.
+PITFALL: Forgetting that the table also has to be persisted. The DRAM copy is only one of two copies.
+VERIFY: Mapping unit and table layout are vendor specific. Confirm any drive-specific figure with the vendor.
+
+@@ 17.05 | Intermediate | Concept | tags=journal,checkpoint,recovery,power-loss,cap-to
+Q: How does the FTL keep the L2P map consistent across power loss, and how does recovery show up at the NVMe interface?
+SHORT: The map lives in volatile DRAM, so the FTL records every update in a journal in NAND and periodically writes a checkpoint of the map. After power loss it loads the latest checkpoint, replays the journal, and scans blocks that were open at the crash to recover writes newer than the journal. Long recovery appears as slow controller readiness after power up, and bugs appear as stale or lost data.
+DEEP:
+- **Journal:** an append-only log of mapping changes (LBA to new location, with a sequence number). Small records are batched into a page and programmed periodically.
+- **Checkpoint:** a snapshot of the map, or of the dirty parts of it, written from time to time so the journal that has to be replayed stays short.
+- **Recovery, roughly:** (1) find the newest valid checkpoint, (2) replay journal records in sequence order, (3) scan the open blocks and use the LBA and sequence metadata stored with the data to recover writes that are newer than the last journal entry, (4) discard partially programmed pages, (5) rebuild valid-page counts and free lists.
+- **Trade-off:** journal frequency versus write overhead. More frequent journal writes lower the data at risk and raise WAF. Less frequent ones raise recovery time and loss.
+- **What the host sees:** after an unsafe shutdown, CSTS.RDY may take longer to set. The controller must set it within the worst case reported in CAP.TO (500 ms units). A recovery that outlasts CAP.TO looks like a stuck drive. Also the Unsafe Shutdowns counter increments and the first I/Os may be slow while background rebuild continues.
+- **Failure symptoms:** an LBA returns older data (journal entry lost), zeros or an error (map entry lost), or data belonging to another LBA (map corruption). The last is the most serious.
+FOLLOW:
+- Which data may a drive legally lose in a power cut? => Writes whose completion was posted while data was still only in a volatile cache without a Flush or FUA, when the volatile write cache is enabled. Everything flushed or written with FUA must survive.
+- How would you find how long recovery takes? => Cut power under load, repeat power up, and measure the time to CSTS.RDY = 1 and to first successful admin and I/O command. Compare against CAP.TO and the vendor's stated limit.
+PITFALL: Only checking that data is correct after recovery. Check the time to ready too. Recovery time grows with journal length and drive fill.
+VERIFY: CAP.TO units (500 ms) and CSTS.RDY behavior in the NVMe Base Specification, and how the Unsafe Shutdowns counter is defined in the SMART / Health log.
+
+@@ 17.06 | Intermediate | Concept | tags=gc,victim,foreground,background,pacing
+Q: How does garbage collection work, when does it run, and why does it affect host latency?
+SHORT: GC reclaims blocks by choosing a victim with many invalid pages, copying its still-valid pages elsewhere, then erasing it. It runs in the background while there is idle time, and becomes foreground work that slows or stalls host writes when the free-block pool gets low. Every valid page copied is an extra NAND read and program, which is where write amplification comes from.
+DEEP:
+1. **Trigger:** free block count drops below a threshold (background GC starts) or a critical threshold (foreground GC, host writes are throttled or blocked).
+2. **Victim selection:** greedy (fewest valid pages, best payoff), cost-benefit (weighs age against valid ratio, to avoid churning hot data), or a mix. Wear can also enter the choice.
+3. **Copy:** read the valid pages (with ECC decode), program them into a GC write stream, and update the L2P entries. Keeping GC data in a separate stream from new host data helps separate cold from hot.
+4. **Erase:** erase the victim and add it to the free pool.
+5. **Pacing:** firmware interleaves GC with host I/O in a ratio, for example a number of GC page moves per host page written. The ratio has to keep up with the host write rate or the free pool empties.
+
+- **Why latency suffers:** GC uses the same dies, channels and ECC engines. A read landing on a die that is programming or erasing waits, and if the free pool hits its minimum the host write waits for GC.
+- **What predicts the bill:** GC cost per host page is tied to the valid fraction of victims (see the WAF question), which depends on OP, fill level and how random the writes are.
+- **Sequential writes:** blocks fill and invalidate together, so victims are almost fully invalid and GC is nearly free.
+FOLLOW:
+- Does GC only run when the drive is full? => No. It runs whenever free blocks fall low, and a fresh drive with little written data has plenty of free blocks and so almost no GC. The rate depends on fill, OP and pattern.
+- What does idle time do? => Background GC and refresh work continues, so the drive recovers free blocks and, for SLC-cache designs, folds cached data. A test that idles between rounds measures a better drive than a continuous one.
+PITFALL: Attributing every write slowdown to GC. Thermal throttling, SLC cache exhaustion and host-side limits look the same in a bandwidth graph.
+
+@@ 17.07 | Advanced | Numeric | fig=gc | tags=waf,valid-ratio,gc,derive
+Q: Define write amplification, derive WAF from the valid fraction of the GC victim blocks, and work an example.
+SHORT: WAF = NAND bytes written / host bytes written. If GC victims average a fraction u of valid pages, freeing one block costs u x N page copies and yields (1 - u) x N pages of room for host data, so WAF = N / ((1 - u) x N) = 1 / (1 - u). At u = 0.5 WAF is 2, at u = 0.75 it is 4, and at u = 0.9 it is 10.
+DEEP:
+Take a block of N = 8 pages, 6 valid and 2 invalid (u = 0.75).
+1. GC copies the 6 valid pages to a new block. That is 6 NAND page writes with no host data.
+2. The victim is erased. Net free space gained: 8 - 6 = 2 pages.
+3. Those 2 pages take 2 pages of host writes. Total NAND writes to accept 2 host pages = 6 + 2 = 8.
+4. WAF = 8 / 2 = 4 = 1 / (1 - 0.75).
+
+| u (victim valid fraction) | WAF = 1/(1-u) |
+|---|---|
+| 0.00 | 1.0 |
+| 0.50 | 2.0 |
+| 0.75 | 4.0 |
+| 0.90 | 10.0 |
+
+- **Other write sources:** WAF also counts journal and metadata pages, wear-leveling moves, refresh writes, SLC-to-TLC folding and any parity. Real WAF is GC WAF plus these.
+- **Steady-state versus average:** u is the victim's valid fraction, not the drive's fill. Greedy GC picks the emptiest blocks, so u is lower than average fill. At 14.5 percent OP the average valid fraction is 87 percent, yet a random workload gives a victim u of roughly 75 percent, WAF near 4 (see the OP question).
+- **Measuring it:** take the ratio of the media-written counter to the host-written counter over the same interval (see the Reliability module for the log fields), never over the whole life.
+FOLLOW:
+- What is the best case? => 1.0 for sequential overwrite, where whole blocks become invalid together. With compression or dedup in the controller, the ratio can go below 1, but that is not typical in NVMe SSDs.
+- Why does WAF matter for endurance? => NAND wear scales with NAND writes, so drive life is inversely proportional to WAF for the same host writes.
+PITFALL: Computing WAF from host bytes given to fio. Use the drive's own counters for the numerator and denominator over a steady-state interval, otherwise cache, trim and file system overhead pollute it.
+VERIFY: Which log page and field pair your drive uses for host and media writes (standard Endurance Group log, OCP datacenter log or a vendor log).
+
+@@ 17.08 | Advanced | Numeric | tags=op,spare-factor,ncap,capacity,waf,idema
+Q: A 960 GB SSD has 1024 GiB of NAND. Compute its over-provisioning, the LBA counts the host sees, and how a smaller namespace changes the picture.
+SHORT: Raw is 1024 x 2^30 = 1.0995e12 bytes, user capacity 960e9 bytes, so OP = (raw - user) / user = 14.5 percent (spare factor (raw - user) / raw = 12.7 percent). A 960 GB drive reports 1,875,385,008 512-byte LBAs. Shrinking the namespace to 800 GB and leaving the rest unwritten raises OP to 37.4 percent and roughly halves greedy random-write WAF, from about 3.9 to about 1.8.
+DEEP:
+1. Raw NAND: 1024 GiB = 1024 x 2^30 = 1,099,511,627,776 B.
+2. OP = (1.0995e12 - 960e9) / 960e9 = 0.1453 = 14.5 percent. Spare factor = 0.1453 / 1.1453 = 12.7 percent.
+3. Part of that OP is "free" from the decimal/binary difference: 2^30 / 10^9 = 1.0737, so a GiB versus GB gap alone gives 7.4 percent. A drive that ships 1 TB on 1024 GiB gets only 9.95 percent.
+4. LBA count: a widely used industry rule for 512-byte sectors is LBA count = 97,696,368 + 1,953,504 x (GB - 50). For 960 GB: 97,696,368 + 1,953,504 x 910 = 1,875,385,008 LBAs, or 960.197e9 bytes. For 1000 GB it gives 1,953,525,168. Vendors follow it commonly, but not always. In 4 KiB format the count is 1,875,385,008 / 8 = 234,423,126.
+5. Rule of thumb for greedy GC under uniform random writes: WAF is about (1 + OP) / (2 x OP) (large-block approximation, OP = spare / user). At 14.5 percent that is 3.95. At 7 percent it is 7.6. At 28 percent it is 2.3. A toy simulation of greedy GC on 300 blocks gave 4.1 at 14.5 percent, 7.8 at 7 percent and 2.5 at 28 percent, so the formula is a fair estimate but not exact.
+6. Shrink to an 800 GB namespace (never written outside it, or deallocated): OP = (1.0995e12 - 800e9) / 800e9 = 37.4 percent, WAF approx 1.84.
+
+- **NCAP vs raw:** NCAP, NSZE and TNVMCAP describe user-visible capacity. They exclude OP, bad-block reserves, system areas, ECC parity and metadata. The raw NAND count is never reported by NVMe.
+- **User-configurable OP:** unallocated capacity (through Namespace Management) or an unwritten partition acts as OP only if the FTL knows it is unused, that is, it is deallocated or never written.
+FOLLOW:
+- Does reducing the namespace always lower WAF? => Only if the hidden LBAs are truly unused. If the host later fills the space, or if old data was never deallocated, the FTL still treats it as valid.
+- Why can two 960 GB drives have very different steady-state performance? => They may have different raw NAND and reserved space, different mapping and GC policies, and a different SLC cache.
+PITFALL: Mixing OP definitions. OP as spare over user (14.5 percent) and spare factor as spare over raw (12.7 percent) are both used. Always state which one.
+VERIFY: The IDEMA LBA-count formula for your sector size, and the approximation for WAF against OP, which depends on uniform random writes, greedy GC and large blocks.
+
+@@ 17.09 | Intermediate | Trap | tags=deallocate,trim,gc,waf,fresh-out-of-box
+Q: You deallocate the entire namespace and start a random-write test. Do you get fresh-out-of-box performance, and what do you need to check?
+SHORT: Mostly, but not guaranteed. Deallocate (Dataset Management) is a hint that lets the FTL drop L2P entries, so pages become invalid and GC victims have little or nothing to copy, which pushes WAF toward 1. But it does not erase NAND by itself, the FTL may process it lazily, and the SLC cache and free-block pool need time to recover. Check the state with counters and latency, not by assumption.
+DEEP:
+- **What deallocate does:** it removes mappings and marks the physical pages invalid. It does not erase NAND at once. A block becomes free only after GC or a bulk-invalid fast path erases it.
+- **Why it helps:** the more of the data set is invalid before the test, the fewer valid pages GC must copy, and the lower the effective fill and WAF.
+- **Why it may not look fresh:**
+  - It is a hint. The controller may ignore or partially honor ranges (see the NVM command set module).
+  - Processing may be lazy. Large deallocations can take seconds to minutes in the background, and the first writes may run slower until it finishes.
+  - Blocks still need erase time, and the SLC cache refills only as free blocks appear.
+  - Wear state, temperature and any remaining internal metadata stay as they were.
+- **Format and Sanitize:** these are more thorough resets of drive state (see the Security module) and do not depend on the hint behavior.
+- **How to test:** run the deallocate, idle for a set time, then compare the first minutes of a random write test against a first-time result. Read the host and media write counters to compute WAF for the interval. Repeat with different idle lengths to see how long recovery takes.
+FOLLOW:
+- Does fstrim or a mount discard achieve the same thing? => It issues Dataset Management deallocate ranges for free filesystem space, with the same hint semantics. Coalescing and timing differ from a whole-namespace trim.
+- What happens to the L2P table? => Entries become unmapped. Reads then return the deallocated-block behavior without touching NAND, so a read latency test right after deallocate measures the map only, not the NAND.
+PITFALL: Assuming deallocate equals erase. It changes mapping state, and NAND cleanup happens later.
+VERIFY: DLFEAT and the Dataset Management deallocate semantics in the NVM Command Set Specification.
+
+@@ 17.10 | Intermediate | Concept | tags=wear-leveling,bad-block,percentage-used,available-spare,critical-warning
+Q: How do wear leveling and bad-block management work, and where do they show up in Percentage Used, Available Spare and Critical Warning?
+SHORT: Wear leveling spreads erases evenly: dynamic leveling directs new writes to low-wear blocks, and static leveling moves cold data off low-wear blocks so they can share the load. Bad-block management retires blocks that fail to program, erase or read, and replaces them from a spare pool. Percentage Used is the vendor's estimate of life consumed, Available Spare is the remaining reserve, and Critical Warning flags when spare or reliability runs low.
+DEEP:
+| Mechanism | What firmware does | Host-visible effect |
+|---|---|---|
+| Dynamic wear leveling | Picks free blocks with lower erase counts for new writes | Even wear, nothing directly visible |
+| Static wear leveling | Relocates cold data so low-wear blocks re-enter circulation | Extra NAND writes, small WAF increase and background activity |
+| Factory bad blocks | Marks and skips blocks that failed at the factory | Reduces raw capacity, invisible after shipping |
+| Grown bad blocks | Retires blocks after program, erase or uncorrectable read failures | Available Spare falls, OP shrinks, WAF rises |
+| Spare exhausted | Cannot replace more blocks | Critical Warning bits set, drive may go read-only |
+
+- **Percentage Used:** a vendor's prediction based on actual usage (typically related to erase counts against rated cycles). It may exceed 100. It is not the same as remaining spare.
+- **Available Spare and its threshold:** a percentage of remaining spare capacity plus a threshold below which Critical Warning bit 0 is set. How the vendor computes it is not standardized.
+- **Critical Warning:** also has bits for a reliability degradation, a read-only media state and a volatile-memory-backup failure.
+- **Why not just wear blocks evenly?** Pure leveling would churn cold data constantly. Firmware balances evenness against extra writes.
+- **Validation angle:** vendor telemetry usually exposes erase count min, average and max. The spread max - min is the measure of leveling quality, and a widening spread under a hot/cold workload indicates a leveling bug.
+FOLLOW:
+- Do grown bad blocks reduce user capacity? => No, NCAP does not change. They eat into reserve and OP, so performance and endurance suffer first.
+- Why is retention relevant to wear leveling? => Worn blocks lose charge faster, so cold data in high-wear blocks needs earlier refresh. Placement decisions consider it.
+PITFALL: Reading Percentage Used as remaining spare or remaining time. It is a prediction based on rated cycles, not a measurement of cell health.
+VERIFY: Critical Warning bit assignments and the exact definitions of Percentage Used and Available Spare in the SMART / Health log (NVMe Base Specification).
+
+@@ 17.11 | Advanced | Concept | tags=retention,read-disturb,read-retry,pe-cycles,refresh
+Q: Which NAND error mechanisms raise the raw bit error rate over time, and what do read-retry and refresh do about them?
+SHORT: Wear (P/E cycling) damages cells and widens their voltage distributions. Retention lets charge leak with time, faster at high temperature and high wear. Read disturb shifts unread cells in a block as its neighbors are read. Programming causes disturb and cell-to-cell interference. Firmware responds with stronger ECC, read-retry (re-reading with shifted reference voltages), and refresh (rewriting data to a fresh block before it becomes uncorrectable).
+DEEP:
+| Mechanism | Cause | Grows with | Firmware response |
+|---|---|---|---|
+| Wear | P/E cycles degrade oxide or charge storage | Erase count | Wear leveling, retire worn blocks |
+| Retention | Charge leakage over time | Time, temperature, wear | Refresh, adjusted read voltage |
+| Read disturb | Reads stress other pages in the block | Reads since erase, worse with wear | Per-block read counters, relocate above a threshold |
+| Program disturb and interference | Programming neighbors shifts states | Density, program order | Program schemes, ECC |
+| Temperature cross | Programmed hot, read cold, or the reverse | Temperature difference | Voltage tracking |
+
+- **Read-retry:** on an ECC failure the controller re-reads with a different read reference voltage (from a table or from tracked offsets) and decodes again. Each attempt costs a read plus a decode, so latency adds up.
+- **Background scan:** firmware also reads pages periodically to measure error rates, learn better voltage offsets and refresh blocks whose margin is small. This uses read bandwidth and sometimes shows up as periodic latency.
+- **Failure:** if the decode never succeeds the read completes with an unrecovered read error (media and data integrity status), the media error counter increases, and the log entry appears in the Error Information log.
+- **Validation views:**
+  - Read disturb: hammer reads on a small region, watch for latency changes, ECC counters, and refresh activity, then verify the data.
+  - Retention: write data at known wear, bake at elevated temperature (an accelerated model), then read back and compare.
+  - Cross-temperature: program at one temperature extreme and read at the other.
+FOLLOW:
+- Why are read-only workloads not safe from wear-related problems? => Read disturb and retention affect data even with no writes. A read-heavy hot region must be refreshed.
+- Which counters would you check after a hammer test? => Media and Data Integrity Errors, latency percentiles, any vendor ECC histogram or refresh counter, and the data compare result.
+PITFALL: Treating "no uncorrectable errors" as proof of health. Correctable error rate and retry counts show the margin used up long before a failure.
+VERIFY: Unrecovered Read Error status (SCT 2h, SC 81h) and the Error Information log fields in the NVMe Base and NVM Command Set Specifications. Acceleration models for bake tests come from JEDEC JESD218 and JESD47 and the vendor.
+
+@@ 17.12 | Advanced | Cross-layer | tags=ldpc,ecc,soft-decode,read-latency,tail
+Q: How does LDPC decoding escalate as errors grow, and why does a worn drive show its problems in p99.99 latency before it shows them in the average?
+SHORT: A page is read once and decoded with hard decisions, which is fast and handles most reads. If that fails, the controller retries with shifted voltages, then does soft-decision decoding, which needs several extra reads and more decoder iterations, and finally may rebuild from parity on other dies if the design has it. Each step costs more time, so a small share of reads becoming slow moves the far tail long before the average.
+DEEP:
+1. **Hard decode:** one sense, one LDPC decode. Latency is the base read time plus a small decode cost.
+2. **Read-retry:** another sense at a shifted voltage plus decode. It may repeat several times.
+3. **Soft decode:** several senses around the read threshold give reliability information (log-likelihood ratios), and the decoder iterates more. Each of these senses costs another tR and channel transfer, so latency can be several times the base value (order of a few hundred microseconds to milliseconds, vendor and generation dependent).
+4. **Parity rebuild (if present):** many designs also keep a cross-die or stripe parity to rebuild a page when the on-page ECC fails. Vendor specific.
+5. **Failure:** uncorrectable, error status to the host.
+
+- **Why the tail moves first:** as RBER rises with wear and retention time, the fraction f of reads needing step 3 grows from near zero. Say f = 0.05 percent of reads take a soft decode. The 99.9th percentile still lies within normal reads, because the slowest 0.1 percent includes only 0.05 percent slow ones plus normal-tail reads. The 99.99th percentile lies inside the 0.05 percent, so it jumps to the soft-decode latency.
+- **Bandwidth effect:** soft decode consumes decoder throughput, and worst-case decode load can throttle read bandwidth on an aged drive at high queue depth.
+- **Validation approach:** age blocks to specific P/E levels, bake for retention, then read old data at QD1 and high depth with full latency logging, and compare against fresh data at the same span. Track p99, p99.9, p99.99 and max together with any ECC statistics from telemetry.
+FOLLOW:
+- Why is QD1 useful here? => It removes queueing, so each slow read shows up as its own latency, which makes the mapping of latency to decode step clearer.
+- What would you expect to see in the host's view of soft-decode events? => Nothing in the standard logs unless they fail. The evidence is latency histograms and vendor telemetry.
+PITFALL: Reporting only average and p99 read latency on an aged drive. The signature of ECC escalation is the far tail.
+VERIFY: Decode escalation stages and latency figures are vendor and NAND specific. Use vendor documentation for the actual ladder.
+
+@@ 17.13 | Advanced | Cross-layer | tags=plp,capacitor,unsafe-shutdown,vwc,flush,hold-up
+Q: How does power-loss protection work inside an SSD, how do you size the capacitor energy, and where does it show up at the NVMe interface?
+SHORT: A power-fail detector tells the controller that input power is falling. The controller stops accepting new commands, uses energy stored in capacitors to program the dirty write buffer, the journal and open-block metadata to NAND, and shuts down. Drives without it have a volatile write cache and lose unflushed data on power cut. The host sees this in the volatile write cache field, in Flush cost, in the Unsafe Shutdowns counter and in a capacitor health warning.
+DEEP:
+1. **Detect:** a voltage monitor trips when the input rail falls below a threshold.
+2. **Quiesce:** stop fetching commands, stop or suspend background jobs and any long erase, and finish or abandon operations in progress.
+3. **Flush:** program the dirty user data plus L2P journal and metadata to NAND, often in a faster mode, and close the open pages or blocks so recovery is defined.
+4. **Power down** with a consistent state, or recover on next boot by journal replay.
+
+Energy sizing (illustrative assumptions): dirty data 64 MiB plus 8 MiB of metadata, aggregate flush rate 2 GB/s, flush power 8 W, capacitors discharging from 12 V to a 6 V converter cutoff, 1.5x margin for aging.
+- Flush time = 72 MiB / 2 GB/s = 75.5e6 B / 2e9 B/s = about 37.7 ms.
+- Energy = 8 W x 0.0377 s = 0.30 J. With 1.5x margin: 0.45 J.
+- Usable energy = 0.5 x C x (12^2 - 6^2) = 54 x C joules, so C = 0.45 / 54 = 8.4 mF.
+- Real designs choose their own rail voltages and capacitor types, and worst case includes dies in the middle of an erase.
+
+- **NVMe interface:**
+  - Identify Controller reports whether a volatile write cache exists (VWC field). PLP drives may report none, so Flush is close to free. Without PLP, Flush or FUA must push data to NAND, costing latency.
+  - SMART: Unsafe Shutdowns increments when power is lost without a shutdown notification.
+  - Critical Warning has a bit for a failed volatile memory backup device, which is where a capacitor failure is reported.
+- **Aging:** capacitance falls with temperature and time, so good designs test the bank at power-up or periodically.
+- **Validation:** cut power at random points under write load, then verify that every write completed before the cut (and, for PLP drives, every completed write, flushed or not) is present. Log the unsafe shutdown delta, and scope the rail to measure hold-up time against the flush time.
+FOLLOW:
+- What does the completion of a write mean on a PLP drive? => The data is in the protected buffer, so the drive is committed to persist it. It is the drive's promise, not a fact about NAND.
+- Can PLP protect against partial page programming? => That depends on the design. Some multi-pass programming schemes can disturb earlier data if power is lost mid-program, so firmware and capacitor sizing have to allow the pass to finish or keep the earlier data available elsewhere.
+PITFALL: Trusting the VWC field alone. Test it: a drive that claims no volatile cache but loses acknowledged data after a cut is a bug.
+VERIFY: VWC field, Volatile Write Cache feature (06h), Unsafe Shutdowns definition, and Critical Warning bit 4 in the NVMe Base Specification. Power-fail flush details are vendor specific.
+
+@@ 17.14 | Advanced | Debug | tags=slc-cache,fio,performance-cliff,fold,dynamic-cache
+Q: A 1 TB TLC drive writes sequentially at 3.3 GB/s and then drops to about 1.05 GB/s. Use the log to estimate the SLC cache size, the post-cliff rate and the recovery time, and say what else you must check.
+SHORT: Cache size is the burst rate times its duration, 3.3 GB/s x 36 s = about 119 GB. The post-cliff 1.05 GB/s is roughly the rate at which the drive can program TLC while also folding data out of SLC. If the burst length shrinks with fill level and recovers with idle time, the cause is a dynamic SLC cache. A thermal cliff would follow temperature instead.
+DEEP:
+| Run | Condition | Result |
+|---|---|---|
+| A | Drive 10 percent full, sustained 128 KiB sequential writes | 3.3 GB/s for 36 s, then 1.05 GB/s |
+| B | Same, drive 90 percent full | 3.3 GB/s for 12 s, then about 0.9 GB/s |
+| C | Run A again after 60 s of idle following run A | Burst lasts about 22 s |
+
+1. **Cache size:** A: 3.3 x 36 = 118.8 GB. B: 3.3 x 12 = 39.6 GB. The cache is smaller when the drive is fuller, so the cache is built from free blocks (dynamic) and not fixed.
+2. **Recovery:** folding 118.8 GB out of SLC at a TLC program rate of about 1.2 GB/s takes 99 s. After 60 s idle about 60 x 1.2 = 72 GB is folded, so the burst is 72 / 3.3 = 21.8 s (ignoring folding during the burst). That matches run C, which supports the fold-rate estimate.
+3. **Post-cliff rate:** with the cache full, writes go direct to TLC and any remaining fold competes for the same dies. The measured 1.05 GB/s is close to the assumed direct TLC rate of 1.2 GB/s, reduced by the fold traffic.
+4. **Why SLC mode stores less:** a block used in SLC mode holds one bit per cell, so it holds about one third of its TLC capacity, and costs P/E life on the same block. The drive spends more NAND writes per host byte in this mode (SLC write plus later TLC write).
+- **Rule out other causes:**
+  - Thermal: log composite temperature during the run (`nvme smart-log` or a sensor log). A thermal cliff correlates with a temperature threshold, not with data written or free space.
+  - GC: after the cliff with a sequential workload GC should be light. Repeat with random writes to see whether the rate falls further.
+  - Host: check that the file system or page cache does not cause the change (use direct I/O).
+FOLLOW:
+- Would a static SLC cache behave differently? => Its size would not vary with fill. The burst length would be the same at 10 and 90 percent full, but recovery would still depend on fold speed.
+- What does TBW accounting say about SLC cache? => Wear is counted in physical cycles of the blocks used, so caching costs endurance. Vendors account for it in the rated life.
+PITFALL: Naming the cache size from a data sheet and ignoring fill. Cache size, fold rate and post-cliff rate are all state dependent.
+VERIFY: Cache design (static or dynamic, sizes, fold policy) is vendor specific. Confirm with vendor documents or telemetry.
+
+@@ 17.15 | Principal | Cross-layer | tags=dram-less,hmb,mapping-cache,random-read,latency
+Q: How does a DRAM-less SSD differ from one with DRAM, what does it do to read latency and write amplification, and how would you test the difference?
+SHORT: With no DRAM the full L2P table cannot be held near the controller, so it stays in NAND and only a small part is cached in controller SRAM and, if the host grants it, in Host Memory Buffer. A map miss costs an extra NAND read before the data read, and map updates are written to NAND more often. Random-read latency and IOPS suffer once the working set exceeds the cache, while sequential access barely notices.
+DEEP:
+- **Cache reach:** with 4 KiB units and 4-byte entries, 64 MiB of cache holds 16.8 million entries and covers 64 GiB of LBAs. On a 3.84 TB drive, that is 1.8 percent of the span. A random read over the whole drive misses about 98 percent of the time.
+- **Latency effect:** a miss needs one NAND read for the map page, then a second read for the data. If one NAND read costs about 80 us, the average of 0.018 x 80 + 0.982 x 160 = about 159 us, twice the hit-only latency. IOPS at the NAND limit roughly halve, because each host read now needs about two NAND reads.
+- **Sequential access:** one 4 KiB map page maps 4 MiB, so a sequential stream needs one map fetch per 1024 pages. The cost is negligible.
+- **Write side:** map updates must reach NAND without a DRAM copy to batch them, so they are written through or journaled more often, and the mapping metadata itself adds to WAF.
+- **HMB (see the Advanced NVMe Features module):** the host lends memory, which is volatile and owned by the host. After a controller reset or power cycle the contents must be treated as lost, and the drive has to work when the host does not grant HMB, with lower performance.
+- **Test method:**
+  1. Random read with fio at QD1 and at high depth, limiting the span with `--size` (or `--offset` and `--size`) to 1 GiB, 16 GiB, 64 GiB, 256 GiB and the full drive.
+  2. Plot latency and IOPS against span. A knee at the cache reach shows the cache size. A flat line means DRAM or a big cache.
+  3. Repeat with HMB disabled and enabled (on Linux, the `nvme` module parameter `max_host_mem_size_mb` limits HMB size, or use the platform setting) to measure its effect.
+  4. Repeat with random 4 KiB writes over the same spans and compute WAF from the host and media write counters.
+FOLLOW:
+- Why do DRAM-less drives sometimes look fine in benchmarks? => Many benchmarks use a small test file, so the working set fits in the cache. Full-span random tests expose the difference.
+- What extra power-loss risk exists without DRAM? => Less than one might expect, since a DRAM copy is only a cache. The risk is that map updates in HMB or SRAM are not yet in NAND, so the journal discipline is the point to test.
+PITFALL: Concluding that a DRAM-less drive is slower everywhere. The penalty appears for random access over a large span, and design details (cache policy, map page size) change it a lot.
+VERIFY: HMB negotiation fields (HMPRE, HMMIN, HMMINDS) and the host driver behavior when HMB is refused, in the NVMe Base Specification. Also confirm the Linux module parameter name and that 0 disables HMB on your kernel.
+
+@@ 17.16 | Principal | Debug | tags=latency-spike,fingerprint,fio,journal,gc,thermal,scrub
+Q: A drive shows latency spikes under a steady write workload. How do you use timing, byte counts and counters to work out which internal mechanism causes them?
+SHORT: Log every I/O with timestamps, then look at when the spikes occur in time and in cumulative bytes written. Spikes at a fixed byte interval that scale with write rate point to data-driven events such as journal or checkpoint writes, superblock changes and GC cycles. Spikes at a fixed time interval regardless of rate point to timers such as thermal sampling or background scans. Then vary fill, OP, read/write mix and temperature to confirm.
+DEEP:
+1. **Capture:** run fio with per-I/O latency logging (`--write_lat_log`, leave `log_avg_msec` unset to get every I/O) at QD1 so a spike is an I/O, not a queue. Record host time, SMART and temperature.
+2. **Get the period:** compute the gaps between spikes in time and in cumulative bytes.
+3. **Change the rate:** at 400 MiB/s spikes come every 10.24 s, at 800 MiB/s every 5.12 s. Both are 4096 MiB (4 GiB) of writes. The constant is in bytes, so the trigger is data-driven, and firmware should be asked what happens every 4 GiB (a superblock close, a checkpoint, a GC cycle boundary).
+4. **Use the table to hypothesize, then run one confirming experiment per row.**
+
+| Signature | Likely internal cause | Confirming experiment |
+|---|---|---|
+| Fixed bytes between spikes | Journal or checkpoint, superblock close and open | Change block size and rate, compare the period against internal geometry |
+| Fixed time between spikes, also when idle | Timer: thermal sampling, background scan, telemetry snapshot | Run at low rate and idle, look for the same period |
+| Tens to hundreds of ms, only near full drive with random writes | Foreground GC | Lower fill or deallocate first, expect spikes to vanish |
+| Read spikes on old data that worsen with age | Read-retry or soft decode | Read data written days ago versus fresh data |
+| Spikes follow a temperature crossing | Thermal throttle | Change cooling, compare with temperature logs |
+| Reads slow only when writes run at the same time | Program or erase blocking reads | Compare pure read with mixed workload |
+
+- **Evidence to collect:** raw latency log, SMART before and after, temperature trace, vendor telemetry snapshots taken around a spike, and fio job files, so firmware can replay the same pattern.
+- **Decision:** the confirming experiment must be able to make the spike disappear. A hypothesis that survives every change is probably wrong.
+FOLLOW:
+- Why QD1? => Queued I/O hides which command was delayed. At QD1 the delay maps to one command and its LBA.
+- What if the period does not scale with anything you change? => It may come from the host (timer interrupts, power management, a competing process) or from wall-clock effects such as temperature. Check the host side with the drive idle.
+PITFALL: Using one-second averaged logs. A 10 ms stall inside a one-second average is invisible. Log every I/O.
+
+@@ 17.17 | Principal | Scenario | tags=endurance,wear,percentage-used,accelerated-test,tbw,retention
+Q: How would you validate a drive's endurance claim and the accuracy of Percentage Used without waiting five years, and what do you do about the numbers?
+SHORT: Convert the rating into NAND cycles (rated host writes x WAF / raw capacity), run a worst-case write workload continuously so the drive consumes that budget in weeks, and checkpoint at fixed life fractions: log Percentage Used against media writes, erase-count spread, spare, latency, errors and a retention test. The drive passes if wear tracks writes linearly, spare stays in budget and data remains readable through and beyond rated life.
+DEEP:
+Example: 960 GB, 1 DWPD, 5 years, on 1024 GiB of NAND.
+1. Rated host writes: 960 GB x 365 x 5 = 1,752 TB.
+2. Cycles needed: host TB x WAF / raw TB. Raw = 1.0995 TB. At WAF 2 that is 1,752 x 2 / 1.0995 = 3,187 cycles. At WAF 1.5 it is 2,390. At WAF 4 it is 6,374 (a drive rated for the JEDEC-style enterprise workload assumes the WAF of that workload, not of random 4 KiB).
+3. Time to reach 3,187 cycles: at 2 GB/s sequential (WAF near 1), each day adds 2e9 x 86,400 / 1.0995e12 = 157 cycles, so 20.3 days, and the host writes total 3,504 TB. That is twice the rated 1,752 TB, because a sequential workload ages the NAND half as fast per host byte. At 200 MB/s random with WAF 4 the rate is 200e6 x 4 x 86,400 / 1.0995e12 = 62.9 cycles a day, so 51 days.
+4. So an accelerated program takes weeks, not years, provided throttling, thermal state and the host can sustain the rate.
+
+- **Method:**
+  - Precondition, then run the workload in fixed blocks of life (for example every 5 percent of rated writes), pausing to capture data.
+  - At each checkpoint capture: Percentage Used, Available Spare, host and media units written (compute WAF for the interval), erase count min, average and max from vendor telemetry, bad-block count, latency percentiles, ECC or error counters, and a functional check.
+  - Run a retention test at chosen life points: write a pattern, bake at elevated temperature for a time set by an acceleration model, read it back and compare.
+  - Continue past 100 percent Percentage Used to see what happens at end of life: read-only mode or warnings, and data still readable.
+- **Pass criteria:** Percentage Used is monotonic and linear against media writes within a tolerance you agree with the vendor, erase-count spread stays within bound, spare consumption is on budget, no data loss or uncorrectable errors within rated life, and the end-of-life behavior is documented behavior.
+- **Sample size:** one drive is an anecdote. Use several units and drives from different lots, since wear-out varies with NAND lots.
+FOLLOW:
+- What if Percentage Used reaches 100 at 60 percent of the rated writes? => Either the counter or the WAF differs from the design. Compare interval WAF to the rating assumption, check erase counts, then the vendor formula.
+- How does temperature enter? => Endurance testing runs at the rated operating temperature. Retention is accelerated with elevated temperature and depends on the model, which the vendor must supply.
+PITFALL: Running the most convenient workload (sequential) and reading the result as if it applied to random writes. Wear depends on NAND writes, so the WAF of the workload sets how fast the drive ages.
+VERIFY: JEDEC JESD218 (endurance and retention requirements and test methods) and JESD219 (enterprise workload) for the qualification criteria, and Percentage Used behavior above 100 in the SMART / Health log.

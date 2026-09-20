@@ -1,0 +1,107 @@
+[
+ {
+  "id": 1,
+  "title": "NVMe Fundamentals & Architecture",
+  "desc": "Why NVMe replaced AHCI/SATA, the host, NVM subsystem, controller and namespace model, the NVMe specification family, and a first tour of queues and commands."
+ },
+ {
+  "id": 2,
+  "title": "Controller Registers & Initialization",
+  "desc": "BAR0 register map, CAP/VS/CC/CSTS, the enable and ready handshake, admin queue setup, shutdown and reset, NSSR, CMB and PMR."
+ },
+ {
+  "id": 3,
+  "title": "Queues, Doorbells & Command Flow",
+  "desc": "Submission and completion queues as rings, doorbells, phase tags, command identifiers, the 64-byte SQE and 16-byte CQE, arbitration and the life of one command."
+ },
+ {
+  "id": 4,
+  "title": "PRPs, SGLs & Data Transfer",
+  "desc": "How the controller finds host memory: PRP entries and lists, chaining, alignment rules, SGL descriptor types, MDTS and the numbers you should derive by hand."
+ },
+ {
+  "id": 5,
+  "title": "Admin Command Set",
+  "desc": "Identify (CNS values), Create/Delete I/O queues, Get/Set Features, Get Log Page, Abort, Async Event Request, firmware commands and the admin queue's role."
+ },
+ {
+  "id": 6,
+  "title": "NVM Command Set (I/O Commands)",
+  "desc": "Read, Write, Flush, Compare, Write Zeroes, Dataset Management, Verify, Copy, Write Uncorrectable and the semantics that matter for data integrity."
+ },
+ {
+  "id": 7,
+  "title": "Namespaces & Identify Structures",
+  "desc": "NSIDs, private and shared namespaces, namespace management and attachment, NSZE/NCAP/NUSE, LBA formats, identifiers and thin provisioning."
+ },
+ {
+  "id": 8,
+  "title": "End-to-End Data Protection & Metadata",
+  "desc": "LBA metadata, extended vs separate metadata, Protection Information types 1 to 3, guard/app/reference tags, PRACT and PRCHK, and how validators exploit them."
+ },
+ {
+  "id": 9,
+  "title": "Status Codes, Errors & Recovery",
+  "desc": "The CQE status field, generic and command-specific codes, error and timeout handling, abort, controller reset hierarchy, and what a robust host or validator does on failure."
+ },
+ {
+  "id": 10,
+  "title": "Interrupts, Coalescing & Polling",
+  "desc": "How completions reach the host: MSI-X vector mapping to CQs, vector 0, interrupt coalescing, INTMS/INTMC, masking, and polled I/O."
+ },
+ {
+  "id": 11,
+  "title": "Power Management & Thermal",
+  "desc": "NVMe power states, APST, non-operational states, thermal throttling and thresholds, how they interact with PCIe ASPM/L1 substates and D-states, and how to validate them."
+ },
+ {
+  "id": 12,
+  "title": "Security & Data Sanitization",
+  "desc": "Security Send/Receive and TCG, Format NVM and Sanitize semantics, crypto erase, write protection, boot partitions, RPMB, and how to validate erase guarantees."
+ },
+ {
+  "id": 13,
+  "title": "Reliability, Logs & Telemetry",
+  "desc": "SMART/Health, Error, Firmware Slot and Persistent Event logs, telemetry, endurance reporting, self-test, and turning log fields into numbers."
+ },
+ {
+  "id": 14,
+  "title": "Multi-Controller, Multipath & Virtualization",
+  "desc": "Multi-controller NVM subsystems, dual-port SSDs, namespace sharing, ANA, reservations, SR-IOV virtualization support and NVMe-MI basics."
+ },
+ {
+  "id": 15,
+  "title": "NVMe over Fabrics",
+  "desc": "Fabrics architecture: capsules, transports (RDMA, TCP, FC), Connect and discovery, queues over fabrics, keep-alive and multipath, and what changes versus PCIe."
+ },
+ {
+  "id": 16,
+  "title": "Advanced NVMe Features",
+  "desc": "HMB, CMB/PMR, Streams and Directives, Flexible Data Placement, Key Value and other command sets, Copy, Computational Storage and the 2.x command-set architecture."
+ },
+ {
+  "id": 17,
+  "title": "SSD Internals Behind NVMe",
+  "desc": "What the firmware does between a doorbell and NAND: FTL mapping, garbage collection, write amplification, over-provisioning, wear leveling, ECC, power-loss protection and how each shows up at the NVMe interface."
+ },
+ {
+  "id": 18,
+  "title": "Performance & QoS",
+  "desc": "IOPS, bandwidth and latency relationships, queue depth and Little's law, steady state and preconditioning, tail latency, fio design, and where PCIe/firmware/NAND each cost time."
+ },
+ {
+  "id": 19,
+  "title": "Host Software Stack & Tools",
+  "desc": "Linux and Windows NVMe drivers, blk-mq and multipath, nvme-cli, sysfs, tracing, SPDK, io_uring passthrough and the tools a validation engineer scripts against."
+ },
+ {
+  "id": 20,
+  "title": "Validation Methodology & Test Design",
+  "desc": "How to design a principal-level validation strategy: protocol conformance, negative and stress tests, fault injection, power-loss testing, data integrity, automation and metrics."
+ },
+ {
+  "id": 21,
+  "title": "Debug & Triage Scenarios",
+  "desc": "Principal-level end-to-end scenarios: controller fatal status, timeouts, hangs, data miscompares, performance regressions, link and reset problems, and how to structure the investigation."
+ }
+]

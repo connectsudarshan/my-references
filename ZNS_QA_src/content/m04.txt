@@ -1,0 +1,358 @@
+# Module 4: Zone Management Commands
+
+@@ 4.01 | Basic | Concept | tags=zone-mgmt-send,zsa,opcode,select-all
+Q: What does Zone Management Send do, and which actions does it carry?
+SHORT: Zone Management Send (opcode 79h) changes the state of a zone. CDW10-11 carry the SLBA, which must be the first LBA of the target zone. CDW13 carries the Zone Send Action (ZSA) in bits 7:0 and the Select All bit in bit 8. The actions are Close 01h, Finish 02h, Open 03h, Reset 04h, Offline 05h and Set Zone Descriptor Extension 10h. Only Set Zone Descriptor Extension moves data.
+DEEP:
+It is an I/O command of the Zoned Namespace Command Set, so it goes to an I/O queue with a valid NSID. The controller answers with a normal CQE, and the host tracks the new state by sending a Zone Management Receive afterwards.
+
+| ZSA | Action | Short effect |
+|---|---|---|
+| 01h | Close Zone | Open (implicit or explicit) to Closed |
+| 02h | Finish Zone | Empty, Open or Closed to Full |
+| 03h | Open Zone | Empty, Implicitly Open or Closed to Explicitly Open |
+| 04h | Reset Zone | Open, Closed or Full to Empty, WP back to start |
+| 05h | Offline Zone | Read Only to Offline |
+| 10h | Set Zone Descriptor Extension | Empty to Closed, attaches extension data |
+| 11h | Flush Explicit ZRWA | Commits ZRWA contents up to an LBA (see the ZRWA module) |
+
+- **SLBA rule:** for the state actions it must equal a zone's start LBA. A value inside a zone gives Invalid Field in Command. Flush is the exception, because its SLBA names the LBA to flush up to.
+- **Select All:** bit 8 makes the command act on every eligible zone and ignores SLBA (see the Select All question).
+- **Action Specific option:** bit 9 of CDW13 is used by Open to ask for a ZRWA. It belongs to the ZRWA module.
+- **Who uses what:** Linux issues Open, Close, Finish and Reset from the block layer, and uses Select All only for Reset-all.
+FOLLOW:
+- Why does the SLBA have to be a zone start? => The action applies to a whole zone. A mid-zone address is ambiguous, so the controller rejects it rather than rounding.
+- Is Zone Management Send an admin command? => No. It is an I/O command. Do not confuse it with nvme-cli's admin passthrough wording.
+PITFALL: Passing any LBA inside the zone and assuming the controller will round down. It rejects it.
+VERIFY: ZSA 11h (Flush Explicit ZRWA) and the CDW13 bit 9 option name and meaning in the NVMe Zoned Namespace Command Set Specification 1.1; the exact status returned for a misaligned SLBA.
+
+@@ 4.02 | Basic | Concept | tags=zone-mgmt-recv,report-zones,zra,zrasf,partial
+Q: What does Zone Management Receive do, and how is a Report Zones command built?
+SHORT: Zone Management Receive (opcode 7Ah) returns zone information to a host buffer. CDW10-11 hold the SLBA, CDW12 holds NUMD (the buffer size in dwords, zero-based), and CDW13 holds the Zone Receive Action ZRA (bits 7:0, 00h Report Zones, 01h Extended Report Zones), the action specific filter ZRASF (bits 15:8) and the Partial Report bit (bit 16). The buffer is a 64-byte header followed by 64-byte descriptors.
+DEEP:
+- **Header:** the first 8 bytes are the Number of Zones. The remaining 56 bytes are reserved.
+- **Descriptors:** one 64-byte zone descriptor per reported zone, in ascending LBA order. Extended Report Zones appends the zone descriptor extension (ZDES bytes) to every descriptor.
+- **SLBA:** the report starts at the zone that contains SLBA. Hosts pass a zone start LBA.
+- **NUMD:** a 4 KiB buffer is NUMD = 1023 (4096 / 4 - 1). The buffer must fit the header, so 64 bytes is the smallest useful size. Also observe MDTS.
+- **Filter (ZRASF):** 00h reports every zone, 01h to 07h select by state (details in the descriptor question).
+- **Partial Report:** it changes what the header count means (see the batching question). Linux always sets it.
+- **No side effects:** the command changes no zone state.
+```
+/* what Linux sends for one chunk */
+opcode = 0x7a; nsid = N; slba = zone_start;
+numd = bytes/4 - 1; zra = 0; zrasf = 0; partial = 1;
+```
+FOLLOW:
+- What happens if the buffer holds fewer descriptors than zones match? => The controller fills what fits. The host repeats from the next zone. See the batching question.
+- Which value in the header do you trust? => Number of Zones, interpreted according to the Partial Report bit you sent.
+PITFALL: Setting NUMD to the byte count instead of dwords minus one. The controller then reports a buffer four times too large, or you overrun your own allocation.
+VERIFY: Whether SLBA may point inside a zone for Report Zones (report starts at that zone) or must be a zone start, and the exact ZRA reserved-value status.
+
+@@ 4.03 | Basic | Concept | tags=reset-zone,erase,write-pointer,empty
+Q: What does Reset Zone do, and how is it different from an erase or a TRIM?
+SHORT: Reset Zone (ZSA 04h) takes an Open, Closed or Full zone to Empty and moves the write pointer back to the zone's start LBA. The old data is logically gone, and the host may write the zone again from the start. It is a logical operation. The controller decides when the NAND blocks are actually erased. Unlike TRIM it is exact and whole-zone, and it is the only way to reuse a zone.
+DEEP:
+- **Result:** state Empty, WP = ZSLBA, the zone's open and active resources released, and the data treated as unwritten.
+- **Reset of an Empty zone:** a successful no-op. Reset of a Read Only or Offline zone fails with Invalid Zone State Transition.
+- **Not TRIM:** a deallocate hint may be ignored and leaves the zone's state alone, so the FTL still has to garbage-collect. Reset is a mandatory, whole-zone state change, so the device knows every block in the zone is dead and can erase without moving any data.
+- **Not an immediate erase:** the controller may return success before the NAND blocks are erased, as long as the zone now behaves as Empty. Latency therefore depends on the implementation and how much data the zone held.
+- **CQE feedback:** bit 0 of completion dword 0 reports whether the zone capacity changed (ZCAPC) for namespaces with variable zone capacity.
+- **Host consequence:** the write amplification of a zoned workload is decided by how often the host resets live data, not by device-side GC.
+FOLLOW:
+- Can Reset be used as a secure erase? => No. See the trap question on Reset and stale data. Use Sanitize or a crypto erase for that.
+- Why is Reset on an Empty zone not an error? => Idempotent actions succeed when the zone is already in the target state. That lets hosts retry safely after an unknown outcome.
+PITFALL: Assuming a reset that returned success has erased flash. The zone is logically Empty, and the erase may still be queued.
+VERIFY: Which zone attributes (ZFC, FZR, RZR, ZDEV) Reset clears, and bit 0 of completion dword 0 (Zone Capacity Changed) for Reset in the ZNS spec.
+
+@@ 4.04 | Intermediate | Concept | tags=finish-zone,full,write-pointer,resources
+Q: What does Finish Zone do, and why would a host use it?
+SHORT: Finish Zone (ZSA 02h) moves an Empty, Open or Closed zone to Full without writing the rest of the zone. The write pointer is no longer valid, no more writes or appends are accepted, and the zone's open and active resources are released. The unwritten LBAs between the old write pointer and the zone capacity keep their unwritten status. Finish on a Full zone succeeds as a no-op. On Read Only or Offline it fails.
+DEEP:
+- **Why finish:** the active zone limit (MAR) is small, so a host that has stopped filling a zone but does not want to wait for capacity to run out must Finish it to free an active slot. Databases and filesystems do this for partially filled zones.
+- **Empty to Full:** legal. The zone becomes Full with no data, useful to retire a zone on purpose.
+- **WP:** the Full-state WP is not meaningful. Linux computes start + length itself for Full zones. Do not read data expecting a value there.
+- **Cost:** the controller must close out the open NAND stripe, flush buffered writes, and may have to pad the last partially programmed page or wordline. The latency is proportional to what is buffered, and it is implementation-specific.
+- **Read of the gap:** the LBAs from the old WP to the zone capacity were never written. Their read data follows the namespace's rule for unwritten blocks, not host data. Never treat them as valid.
+- **Controller-initiated finish:** a controller may finish a zone itself, and then sets the Zone Finished by Controller attribute. It may also set Finish Zone Recommended to ask the host to do it.
+FOLLOW:
+- Does Finish free the capacity of the zone? => No. Only Reset does. A Full zone still holds its data and only its resources are freed.
+- Is a Finish on a Full zone an error? => No, it is a successful no-op.
+PITFALL: Reading Finish as "fill the zone with zeros". The gap is never written, and its content is not host data.
+VERIFY: The value returned when reading LBAs between the old WP and the end of capacity after Finish; the names and timing of the Finish/Reset Recommended limits and attribute bits (FZR, RZR, ZFC) in the ZNS Identify Namespace.
+
+@@ 4.05 | Intermediate | Concept | tags=state-machine,transitions,matrix,invalid-zone-state-transition
+Q: For each zone management action, which source states are legal and what does the zone become?
+SHORT: Open works from Empty, Implicitly Open and Closed. Close works from Implicitly and Explicitly Open. Finish works from Empty, Open and Closed. Reset works from Open, Closed and Full. Offline works only from Read Only. Repeating an action on a zone already in its target state succeeds. Every other combination fails with Invalid Zone State Transition, and Read Only and Offline zones accept almost nothing.
+DEEP:
+| Source state | Open | Close | Finish | Reset | Offline |
+|---|---|---|---|---|---|
+| Empty | Exp Open | error | Full | no-op | error |
+| Implicitly Open | Exp Open | Closed | Full | Empty | error |
+| Explicitly Open | no-op | Closed | Full | Empty | error |
+| Closed | Exp Open | no-op | Full | Empty | error |
+| Full | error | error | no-op | Empty | error |
+| Read Only | error | error | error | error | Offline |
+| Offline | error | error | error | error | no-op |
+
+- **Pattern 1:** an action is idempotent on its target state (Open on Explicitly Open, Close on Closed, Finish on Full, Reset on Empty, Offline on Offline).
+- **Pattern 2:** Read Only takes only Offline. Offline takes nothing. These are terminal states from the host's view.
+- **Pattern 3:** Reset is the only way out of Full. Open and Close never touch a Full zone.
+- **Resources:** Open from Empty needs both an active and an open slot, and from Closed needs an open slot. It can fail with Too Many Active Zones or Too Many Open Zones instead of a transition error. Set Zone Descriptor Extension is covered in its own question.
+- **Validator tip:** encode this table once as data, and use it as the oracle for every test.
+FOLLOW:
+- Is Close on an Empty zone an error? => Yes. The ZNS spec text I retrieved lists Close on Empty, Full, Read Only and Offline as Invalid Zone State Transition, and QEMU agrees. Some SMR standards treat it as a no-op, so do not port that oracle.
+- What state does Open on an Implicitly Open zone give? => Explicitly Open, with no resource change.
+PITFALL: Learning the matrix from Linux behavior. Linux never issues most of these on its own, so the kernel will not show you the error cases.
+VERIFY: Every cell of this table against the zone state figures in the NVMe Zoned Namespace Command Set Specification, especially Close on Empty, Open on Full, and the effect of Reset and Finish on Read Only zones.
+
+@@ 4.06 | Intermediate | Concept | tags=select-all,bulk,reset-all
+Q: What does the Select All bit do, and which zones does each action touch?
+SHORT: With Select All set (CDW13 bit 8), the controller applies the action to every zone in the action's source states and ignores SLBA. Open acts on Closed zones, Close on Open zones, Finish on Open and Closed zones, Reset on Open, Closed and Full zones, and Offline on Read Only zones. Zones in other states are skipped and are not an error. Set Zone Descriptor Extension does not accept Select All.
+DEEP:
+| Action | Zones affected by Select All |
+|---|---|
+| Open | Closed |
+| Close | Implicitly Open, Explicitly Open |
+| Finish | Implicitly Open, Explicitly Open, Closed |
+| Reset | Implicitly Open, Explicitly Open, Closed, Full |
+| Offline | Read Only |
+
+- **Skip, not fail:** Empty zones for Reset, Full zones for Finish, and so on are ignored. A Select All on a namespace with no eligible zone still succeeds.
+- **Empty is never selected:** Open-all does not open Empty zones, which would burn active resources. Finish-all does not fill the empty zones.
+- **Resources:** Open-all is limited by the open and active limits. Whether it stops with an error part-way, and how many zones stay opened, is a behavior to test rather than assume.
+- **Cost:** Reset-all is one command but one erase per eligible zone. It is the longest-running zone command by far (see the Reset-all numeric question).
+- **Atomicity:** do not assume a bulk operation is all-or-nothing. If a zone fails part-way, earlier zones may already have changed.
+- **Linux:** the block layer sets Select All only for a Reset-all request. Open-all, Close-all and Finish-all are sent as individual zone commands.
+FOLLOW:
+- What is in the SLBA field with Select All? => It is ignored, so the host normally sends 0.
+- What does a Reset-all do to zones that are Read Only? => Nothing. They are skipped and stay Read Only.
+PITFALL: Expecting Select All to fail when a zone is in the wrong state. It silently skips those zones, so success does not mean every zone changed.
+VERIFY: The exact zone set for each Select All action (especially Finish and Reset), whether SLBA must be zero, and the partial-completion behavior on error, in the ZNS Command Set Specification.
+
+@@ 4.07 | Intermediate | Concept | tags=nvme-cli,blkzone,passthru,tools
+Q: How do you issue and read zone management commands from nvme-cli and Linux?
+SHORT: nvme-cli has a zns plugin: nvme zns report-zones, open-zone, close-zone, finish-zone, reset-zone, offline-zone, set-zone-desc, zone-mgmt-send and zone-mgmt-recv. The state commands take -s for the zone start LBA and -a for Select All. blkzone from util-linux drives the kernel zoned block layer with report, reset, open, close and finish. For raw control, nvme io-passthru with opcode 0x79 or 0x7a lets you build any CDW13, including illegal ones.
+DEEP:
+```
+nvme zns id-ns /dev/nvme0n1                     # zone size, MAR, MOR, ZDES
+nvme zns report-zones /dev/nvme0n1 -s 0 -d 8    # first 8 zones
+nvme zns open-zone   /dev/nvme0n1 -s 0x100000
+nvme zns close-zone  /dev/nvme0n1 -s 0x100000
+nvme zns finish-zone /dev/nvme0n1 -s 0x100000
+nvme zns reset-zone  /dev/nvme0n1 -a            # Select All
+nvme zns zone-mgmt-send /dev/nvme0n1 -s 0x100000 -z 0x04   # any ZSA byte
+blkzone report -o 0 -c 4 /dev/nvme0n1
+```
+- **Illegal commands:** the state commands send what you ask without checking the zone's state. That makes them the right tool to provoke Invalid Zone State Transition.
+- **Raw ZSA:** `zone-mgmt-send -z` accepts any ZSA byte, so reserved values and Select All with Set Zone Descriptor Extension can be tested.
+- **Passthrough:** for example `nvme io-passthru /dev/nvme0n1 --opcode=0x79 --namespace-id=1 --cdw10=0x100000 --cdw13=0x104` builds a Select All Reset.
+- **Kernel path:** blkzone, filesystems and fio go through the block layer, so the kernel's cached view can differ from the device. The nvme-cli plugin talks to the device directly.
+- **Report loop:** nvme-cli's report-zones reads in chunks of up to 1024 descriptors (64 KiB) and continues from the last ZSLBA plus zone size.
+FOLLOW:
+- Why use nvme-cli instead of blkzone for conformance tests? => It reaches the controller without the kernel's zone state cache or command validation, so illegal actions actually arrive.
+- How do you see the raw status of a failed command? => Read the error nvme-cli prints (status name and code), use nvme io-passthru, or enable the kernel nvme tracepoints, which log the completion status.
+PITFALL: Testing illegal transitions through blkzone. The block layer may reject or cache-fix the request before it ever reaches the SSD.
+VERIFY: Exact subcommand names and option letters on your nvme-cli version (nvme zns help, nvme zns report-zones --help), and io-passthru flag names.
+
+@@ 4.08 | Intermediate | Concept | tags=zone-descriptor,report-zones,zrasf,write-pointer,attributes
+Q: How do you decode a zone descriptor from Report Zones, and what do the filter values mean?
+SHORT: A descriptor is 64 bytes. Byte 0 holds the zone type (2h = Sequential Write Required), byte 1 bits 7:4 the zone state, byte 2 the zone attributes. Bytes 8 to 15 are Zone Capacity, 16 to 23 the Zone Start LBA and 24 to 31 the Write Pointer, all in LBAs and little-endian. The ZRASF filter selects zones by state: 00h all, 01h Empty, 02h Implicitly Open, 03h Explicitly Open, 04h Closed, 05h Full, 06h Read Only, 07h Offline.
+DEEP:
+State codes in byte 1 (bits 7:4): 1 Empty, 2 Implicitly Open, 3 Explicitly Open, 4 Closed, Dh Read Only, Eh Full, Fh Offline. Attributes in byte 2: bit 0 ZFC (finished by controller), bit 1 FZR (finish recommended), bit 2 RZR (reset recommended), bit 3 ZRWAV, bit 7 ZDEV (extension valid).
+
+Worked decode, with LBA size 4 KiB:
+```
+00: 02 20 00 00 00 00 00 00  00 00 04 00 00 00 00 00
+10: 00 00 10 00 00 00 00 00  00 08 10 00 00 00 00 00
+```
+1. Byte 0 = 02h: Sequential Write Required.
+2. Byte 1 = 20h: state 2, Implicitly Open. Byte 2 = 00h: no attributes.
+3. ZCAP = 0x00040000 = 262,144 LBAs = 1 GiB.
+4. ZSLBA = 0x00100000.
+5. WP = 0x00100800, so 0x800 = 2048 LBAs written (8 MiB), and the next write must start there.
+
+- **WP validity:** the WP is meaningful for Empty, Open and Closed zones. For Full, Read Only and Offline it is not (QEMU returns all ones, and Linux substitutes start + length for Full).
+- **Filter caveat:** 05h = Full and 06h = Read Only, in the spec table as I retrieved it and in libnvme, SPDK and QEMU. Linux nvme.h names 05h Read Only and 06h Full (swapped, as of the source I read), and the Linux nvmet target filters with that enum. The Linux host only ever sends 00h, so only a target or a validator that sends 05h or 06h sees the difference.
+FOLLOW:
+- Does ZCAP change with the zone state? => Not normally. For namespaces with variable capacity it can change on a Reset.
+- Why can ZSLBA plus ZCAP be less than the next zone's start? => Zone size can exceed zone capacity. The LBAs in between exist but are not usable.
+PITFALL: Reading the state from the whole byte. The state is the top nibble, so Implicitly Open shows up as 20h, not 02h.
+VERIFY: ZRASF 05h = Full and 06h = Read Only (libnvme, SPDK, QEMU and the spec table agree, Linux nvme.h and nvmet disagree; test the actual drive with both values), whether newer revisions add filter codes above 07h (QEMU rejects them), the ZS and ZT bit positions, and the WP contents for Full, Read Only and Offline zones against the ZNS Command Set Specification.
+
+@@ 4.09 | Advanced | Debug | tags=status-codes,cqe,invalid-zone-state-transition,dnr,too-many-open
+Q: A Reset Zone completes with a CQE status field of 0x837F (dword 3 bits 31:16). Decode it and say what it tells you about the zone.
+SHORT: Bit 0 is the phase tag (1). SC = 0xBF (bits 8:1), SCT = 1 (bits 11:9, command specific), CRD = 0, More = 0 and DNR = 1 (bit 15). That is Invalid Zone State Transition with Do Not Retry. For Reset it means the zone was Read Only or Offline, since every other state can be reset. Read the descriptor with Report Zones to see which, then look for a media or firmware event that put it there.
+DEEP:
+Decode of the 16-bit status field 0x837F (the upper half of CQE dword 3, with the command ID in the lower half):
+| Bits | Field | Value |
+|---|---|---|
+| 0 | Phase tag | 1 |
+| 8:1 | Status Code | 0xBF |
+| 11:9 | Status Code Type | 1 (command specific) |
+| 13:12 | CRD | 0 |
+| 14 | More | 0 |
+| 15 | DNR | 1 |
+
+The zone specific status codes (SCT 1) are BFh Invalid Zone State Transition, BDh Too Many Active Zones and BEh Too Many Open Zones. The I/O status codes B8h to BCh belong to reads and writes (see the Errors module).
+
+Related failures to tell apart:
+- **Invalid Field in Command (SCT 0, SC 02h):** SLBA not at a zone start, a reserved ZSA or ZRA, or Select All with Set Zone Descriptor Extension.
+- **LBA Out of Range (SCT 0, SC 80h):** SLBA beyond the namespace.
+- **Too Many Active/Open Zones:** the transition itself was legal, but a resource limit blocked it (Open and Set Zone Descriptor Extension).
+
+Triage of the 0xBF: (1) Report the zone and check ZS. (2) If it is Read Only or Offline, this is not a bad host command. Check the SMART/health log and vendor logs for a media event. (3) If it is in any other state, a Reset must succeed, so the device is wrong. Capture the CQE, the report and a trace.
+Linux turns this status into BLK_STS_IOERR, which appears as a plain I/O error, and the too-many statuses get their own block status.
+FOLLOW:
+- Why is DNR set? => The command cannot succeed until the zone state changes, so retrying does the same thing. A host that retries in a loop is wrong.
+- What would Finish return on the same zone? => The same Invalid Zone State Transition, since Read Only takes only Offline.
+PITFALL: Reading 0x837F as a generic command failure, or reading it as all of dword 3. SCT 1 plus SC BFh names the exact reason, and it narrows the zone's state to two possibilities for Reset.
+VERIFY: Whether the controller must set DNR for Invalid Zone State Transition, and the SC values BDh, BEh and BFh in the NVMe ZNS Command Set Specification (they match Linux include/linux/nvme.h, where they appear as 0x1bd to 0x1bf).
+
+@@ 4.10 | Advanced | Debug | tags=state-machine,sequence,prediction,select-all,oracle
+Q: Given six zones in known states and a command sequence, predict every completion status and the final states.
+SHORT: Walk each command against the legal-transition table. Illegal transitions fail with Invalid Zone State Transition and change nothing, idempotent actions succeed without change, and Select All skips zones outside its source set. Here the result is: six commands succeed, five fail, and at the end zones 0 to 4 are Empty and zone 5 is Offline.
+DEEP:
+Start: Z0 Empty, Z1 Implicitly Open, Z2 Explicitly Open, Z3 Closed, Z4 Full, Z5 Read Only. Resource limits are large enough not to matter.
+
+| Step | Command | Result | State afterwards |
+|---|---|---|---|
+| 1 | Close Z0 | Invalid Zone State Transition | Z0 Empty |
+| 2 | Finish Z0 | Success | Z0 Full |
+| 3 | Open Z4 | Invalid Zone State Transition | Z4 Full |
+| 4 | Reset Z4 | Success | Z4 Empty, WP = ZSLBA |
+| 5 | Offline Z4 | Invalid Zone State Transition | Z4 Empty |
+| 6 | Open Z1 | Success | Z1 Explicitly Open |
+| 7 | Close, Select All | Success | Z1, Z2 Closed. Z3 (already Closed), Z0 (Full), Z4 (Empty), Z5 skipped |
+| 8 | Finish Z5 | Invalid Zone State Transition | Z5 Read Only |
+| 9 | Reset, Select All | Success | Z0, Z1, Z2, Z3 Empty. Z5 skipped |
+| 10 | Offline Z5 | Success | Z5 Offline |
+| 11 | Reset Z5 | Invalid Zone State Transition | Z5 Offline |
+
+- **Write pointers:** the table tracks state only. In a real test, read the WP after each step: Reset returns it to ZSLBA, Finish makes it invalid, and Close and Open leave it alone.
+- **Step 7:** Close-all must not touch Full or Empty zones. A device that returns an error here is wrong.
+- **Step 9:** it must leave Z5 alone, and the command still succeeds.
+- **Use as a test:** encode the table as a model, run random sequences, and diff status and Report Zones after every command.
+FOLLOW:
+- Which extra step would test idempotency? => Repeat step 10 (Offline on an Offline zone). It must succeed with no change.
+- How would you catch a device that fails Select All half way? => Compare the Report Zones state of every zone to the model after each bulk command.
+PITFALL: Predicting Select All by looking only at the zone the SLBA points to. The SLBA is ignored, and every eligible zone changes.
+VERIFY: Step 1 (Close on Empty) and step 3 (Open on Full) against the ZNS spec transition figures.
+
+@@ 4.11 | Advanced | Numeric | tags=report-zones,batching,mdts,numd,partial-report
+Q: How many Report Zones commands are needed to read all zones of a namespace with 65,536 zones, and how do you loop safely?
+SHORT: Assume MDTS allows 512 KiB per command. The 64-byte header leaves (524,288 - 64) / 64 = 8,191 descriptors per command, so 65,536 zones need 9 commands (about 4 MiB in total). With Extended Report Zones and a 64-byte extension each entry is 128 bytes, giving 4,095 per command and 17 commands. The loop restarts each time from the last returned ZSLBA plus the zone size.
+DEEP:
+Assumptions: 65,536 zones (for example 16 TiB with 256 MiB zones), MDTS = 512 KiB, no filter.
+1. NUMD for 512 KiB = 524,288 / 4 - 1 = 131,071 (0x1FFFF).
+2. Descriptors per command = (524,288 - 64) / 64 = 8,191.
+3. Commands = ceil(65,536 / 8,191) = 9.
+4. Data = 65,536 x 64 B = 4 MiB, plus 9 headers.
+5. Extended, ZDES = 64 B: entry = 128 B, (524,288 - 64) / 128 = 4,095 per command, ceil(65,536 / 4,095) = 17 commands.
+6. nvme-cli uses 1,024 descriptors (64 KiB) per command, which is 64 commands.
+
+Header count: with Partial Report = 1 the Number of Zones is how many descriptors were written into your buffer. With Partial Report = 0 it is how many zones match the filter starting from SLBA, which can exceed what fits.
+
+Loop rules:
+- Next SLBA = last returned ZSLBA + zone size (from Identify), not + zone capacity.
+- Stop when the returned count is zero or SLBA reaches the namespace size.
+- With a filter, zones are not contiguous, but the same rule still works because the report only lists zones at or after SLBA.
+- The report is not a snapshot. Zones can change between batches (see the Zone Information Changed event in the resources module), so re-report suspect zones.
+FOLLOW:
+- Why not one big buffer? => MDTS limits the transfer, and a large physically contiguous buffer is harder to allocate.
+- How do you get the zone count without reading every descriptor? => Send one Report Zones with Partial Report = 0 and only a header-sized buffer, and read Number of Zones.
+PITFALL: Advancing by ZCAP. When capacity is smaller than the zone size, the loop lands inside a zone and either skips or repeats one.
+VERIFY: The exact meaning of Number of Zones for Partial Report = 0 and 1, and whether a Report Zones SLBA inside a zone is accepted.
+
+@@ 4.12 | Advanced | Trap | tags=reset-zone,dlfeat,secure-erase,stale-data,read
+Q: After Reset Zone, a test reads the zone and expects zeros. It passes on drive A and fails on drive B. Is drive B broken?
+SHORT: Not necessarily. Reset makes the zone Empty and its data logically unwritten, but it does not say what a read returns, and it is not a secure erase. The read data for unwritten blocks is set by the namespace's deallocated or unwritten block behavior (DLFEAT in Identify Namespace: zeroes, all ones, or not reported). A validator must check DLFEAT, and fail only on old host data or on a leak of another zone's data.
+DEEP:
+- **What Reset promises:** state Empty, WP = ZSLBA, and old host data no longer returned as valid data.
+- **What it does not promise:** zeros, or that the flash was erased. The NAND may hold the old data until the next erase, and other copies may exist in buffers or overwritten but not yet erased blocks.
+- **How to test correctly:**
+  1. Read DLFEAT from Identify Namespace. If it says zeroes, expect zeroes. If it says all ones, expect all ones. If it does not report a value, expect only that data is not the old data.
+  2. Stamp every LBA with a generation number and the zone ID before the Reset. After Reset, read every LBA and assert that no old stamp appears.
+  3. With protection information, check that the read either errors as unwritten or returns consistent protection data.
+- **What is a real bug:** stale host data after Reset (a security bug), data from another zone (a mapping bug), a hang, or a zone that reports Empty but rejects the first write at ZSLBA.
+- **Secure erase:** use Sanitize, or a Format NVM with a secure erase setting, and verify it separately. Reset is not part of that.
+FOLLOW:
+- Should the read of an Empty zone succeed at all? => Reads of unwritten LBAs within the zone are governed by the read rules in the Errors module, so cross-check both.
+- How does this show up as a customer bug? => A reused zone returning the previous tenant's data. That is a data confidentiality failure.
+PITFALL: Hard-coding "reset then read returns zeros" in a test. It passes on one controller and fails on another for a valid reason.
+VERIFY: DLFEAT Read Behavior encodings (001b zeroes, 010b all bytes FFh) and whether ZNS reads of Empty-zone LBAs follow DLFEAT or return an error, in the NVM Command Set and ZNS specifications.
+
+@@ 4.13 | Advanced | Concept | tags=set-zone-descriptor-extension,zdes,zdev,extended-report
+Q: What is the Set Zone Descriptor Extension action for, and what are its rules?
+SHORT: Set Zone Descriptor Extension (ZSA 10h) attaches host-defined metadata to a zone. It is legal only on an Empty zone. The host sends a buffer of ZDES bytes, the zone moves from Empty to Closed, and the Zone Descriptor Extension Valid attribute is set. Extended Report Zones returns the bytes after each descriptor. Because Empty to Closed takes an active zone slot, it can fail with Too Many Active Zones, and Select All is not allowed.
+DEEP:
+- **Size:** ZDES comes from the ZNS Identify Namespace, per LBA format, in units of 64 bytes. nvme-cli computes bytes as ZDES shifted left by 6. A ZDES of zero means the namespace has no extensions, so the command is invalid.
+- **State effect:** Empty to Closed. It uses an active resource (not an open one), so the host can run out of active zones with no data written.
+- **Legality:** any state other than Empty gives Invalid Zone State Transition. Select All is invalid. To change an extension, Reset the zone and set it again.
+- **Reading it back:** ZDEV (attribute bit 7) is visible in a normal Report Zones. The bytes come only with ZRA = 01h Extended Report Zones, where each descriptor is followed by ZDES x 64 bytes.
+- **Uses:** a filesystem or ZNS-aware database tags a zone with its owner, generation or stream, so recovery after a crash can rebuild its map from the device.
+- **Test ideas:** set a random pattern and read it back byte for byte, set on a non-Empty zone, set on a zone when the active limit is reached, set with a wrong length, Reset and check ZDEV clears, and check whether the extension survives a power cycle.
+FOLLOW:
+- Does Set Zone Descriptor Extension count as writing to the zone? => No. It writes no zone data and leaves WP alone. It still leaves the zone Closed.
+- How does an Empty zone with an extension differ from one without? => It is Closed, not Empty, so it counts as an active zone.
+PITFALL: Setting extensions on many Empty zones ahead of time. Each one takes an active slot, and a host can hit the active limit before writing a byte.
+VERIFY: Whether Reset clears the extension and ZDEV, whether the extension is persistent across power cycles, and the ZDES units and the ZDES = 0 behavior in the ZNS Identify Namespace data structure.
+
+@@ 4.14 | Principal | Numeric | tags=reset-all,latency,timeout,nand-erase,parallelism
+Q: Estimate how long a Reset-all takes on a full namespace, and when does it trigger a host timeout?
+SHORT: Assume 512 MiB zones, 16 MiB NAND blocks, 16 dies and a 10 ms block erase. A zone is 32 blocks, or 2 per die, so one full zone resets in about 20 ms if every die is free. Reset-all is bounded by aggregate erase throughput, not by command count: 1,000 zones take about 20 s and 4,096 zones about 82 s. With Linux's 30 s I/O timeout, a large Reset-all on a synchronous-erase design can time out the controller.
+DEEP:
+Assumptions (all illustrative): zone capacity 512 MiB, erase unit 16 MiB per die, 16 dies, tBERS = 10 ms, erase not overlapped with other work, zones striped evenly over all dies.
+1. Blocks per zone = 512 / 16 = 32.
+2. Blocks per die per zone = 32 / 16 = 2, so one zone takes 2 x 10 ms = 20 ms.
+3. N full zones: N x 32 x 10 ms / 16 dies = N x 20 ms (all dies busy).
+4. N = 1,000: 20 s. N = 4,096 (2 TiB of zones): 81.9 s. N = 8,192 (4 TiB): 163.8 s.
+5. Linux default nvme_core.io_timeout is 30 s, so anything above about 1,500 full zones (30 s / 20 ms) exceeds it.
+
+Reality check:
+- **Deferral:** a controller that only unmaps and erases in the background answers in microseconds. Then the cost moves to the next write and shows up as a write stall or a throughput dip.
+- **Multi-plane erase and erase suspend** change tBERS and the effective rate. Partially filled zones erase fewer blocks, and Empty zones cost nothing.
+- **Host side:** raise the I/O timeout for lab tools, or reset zones individually with a bounded queue depth, and time each.
+FOLLOW:
+- What is the validation metric? => Reset latency versus zone fill level and versus parallel resets, and the write throughput in the minute after a reset storm.
+- Why does the timeout matter? => A timed-out Reset-all makes the driver abort and reset the controller, which turns a slow command into an outage and can hide the real cause.
+PITFALL: Timing a Reset-all on a mostly empty device and extrapolating. Latency scales with the data present, so test with full zones.
+VERIFY: The Linux default I/O timeout on your kernel (nvme_core.io_timeout), and whether your controller erases synchronously or defers.
+
+@@ 4.15 | Principal | Cross-layer | tags=reset,ftl,power-loss,fault-injection,latency,stale-data
+Q: How would you validate the firmware side of Reset Zone: latency, background erase and power-loss behavior?
+SHORT: Treat Reset as a small transaction across the host state, the FTL mapping and the NAND. Measure completion latency by zone fill and concurrency. Run write and read workloads on other zones during resets to look for tail latency and starvation. Cut power at many points inside a reset and check after recovery that the zone is either fully Empty or fully intact, and that no old data ever reads back. Compare against the design's promises.
+DEEP:
+1. **Latency profile:** reset zones filled to 0, 25, 50, 100 percent, at queue depth 1 and at depth N, and record the distribution, not the mean. An Empty zone should be near free. A large jump above 100 percent fill points to synchronous erase.
+2. **Interference:** run steady random reads and sequential writes on other zones while resetting. Look for read tail latency and write stalls. Compare against the same run with no resets to quantify the impact.
+3. **Deferred erase backlog:** issue a Reset storm, then write to the reset zones at once. If free erased blocks run out, writes stall. Record how long the recovery takes.
+4. **Reuse correctness:** after each reset, write a new generation pattern and read it all. Any old generation is a bug (stale mapping or an unerased block).
+5. **Power loss:** inject power loss at points: command received, mapping updated, erase issued, erase half done, completion sent, and just after. After boot, Report Zones must show Empty (WP = ZSLBA) or the old state with all old data readable. For every reset whose CQE the host had already received, the zone must be Empty after recovery.
+6. **Other events:** thermal throttling during a reset, and a controller reset issued in the middle of a Reset. Record what the design promises for each.
+7. **Observability:** read vendor logs or telemetry for erase counts and the blocks in the free pool, and for PE-cycle wear after thousands of Reset cycles.
+
+Decision criteria to agree with the firmware team: a latency ceiling per fill level, the allowed state after power loss (which of "old" or "Empty" is acceptable, never half), and a maximum write stall after a reset storm.
+FOLLOW:
+- How do you inject power loss at a precise point? => Use firmware debug hooks or a test build that halts at labelled points, or a programmable power switch triggered by a trace event.
+- What is the worst reset bug? => A zone that reports Empty but reads back a previous tenant's data.
+PITFALL: Checking only the CQE. The bugs live in what a later read or a later write returns, so every reset test needs a read-back and a write-back.
+VERIFY: What the ZNS specification and the product requirements say about the state of a zone after power loss during Reset, since atomicity may be vendor-defined.
+
+@@ 4.16 | Principal | Scenario | tags=conformance,test-design,oracle,fault-injection,read-only,offline
+Q: Design a conformance test suite for the zone management commands. How do you cover the state machine, reach Read Only and Offline zones, and decide it is enough?
+SHORT: Build an executable model of zone state, write pointers, attributes and resource counts, and drive the device and the model with the same commands. Cover every source state times every action, single and Select All, plus bad-field cases. Reach Read Only and Offline through fault injection or vendor commands. After every command compare the CQE status and a full Report Zones against the model, and repeat around power cycles and under concurrent I/O.
+DEEP:
+1. **Model:** per zone: state, WP, capacity, attributes, extension. Namespace: open and active counts against MOR and MAR. The transition table in this module is its core.
+2. **Matrix:** 6 actions x 7 states for single-zone commands (42 cells), 5 Select All actions over mixed populations, and each cell checked for the exact SCT/SC and for no side effects on other zones.
+3. **Field cases:** SLBA inside a zone, at the last LBA of the namespace, past it, reserved ZSA and ZRA values, Select All with Set Zone Descriptor Extension, a wrong data length for Set Zone Descriptor Extension, and NUMD too small.
+4. **Reaching Read Only and Offline:** they need media faults. Use an emulator (QEMU ZNS) for the model itself, and on real hardware use a vendor fault-injection command or NAND error injection. If neither exists, record the two rows as not covered instead of skipping them silently.
+5. **Resources:** fill up to MOR and MAR, then Open, Set Zone Descriptor Extension and implicit open by write. Check the exact errors and that a failed Open leaves no half-open state.
+6. **Sequences:** random command sequences (seeded, logged) with a diff against the model after each step, and shrink a failing sequence to a minimal one.
+7. **Environment:** repeat after power cycles (open zones are expected to come back Closed, or Empty if nothing was written) and after controller resets and shutdowns (record what the drive does, VERIFY), and with concurrent reads, writes and appends to other zones.
+8. **Data:** write patterns with a stamp, so Finish and Reset are checked by what a later read returns.
+
+Done means: every cell hit at least once with pass or a recorded waiver, no unexplained model diffs across a long randomized soak, and the injection and power-loss tests repeated across firmware builds.
+FOLLOW:
+- Model and device disagree. Who is right? => Neither by default. Check the specification text, decide, and record it as a model bug, a device bug or a spec ambiguity to raise with the vendor.
+- How does this run in CI? => The model and matrix run against QEMU or an emulator on every change, and a smaller smoke set plus randomized soak runs on real drives nightly.
+PITFALL: Testing only single-zone commands with the happy states. Most escapes are in Select All side effects, resource edge cases and the Read Only and Offline rows.
+VERIFY: The state after NVM Subsystem Reset, shutdown and Controller Level Reset for Open zones (Closed or Empty) and the per-state behavior in the ZNS specification, and confirm the model's transition table against the spec figures before using it as an oracle.

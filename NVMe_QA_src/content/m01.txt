@@ -1,0 +1,370 @@
+# Module 1: NVMe Fundamentals & Architecture
+
+@@ 1.01 | Basic | Concept | fig=nvmearch | tags=architecture,stack,nvm-subsystem,controller
+Q: Draw the NVMe architecture from the application down to the NAND. What lives where?
+SHORT: An application calls the OS block layer, and the host NVMe driver builds 64-byte commands in queues in host memory. PCIe carries doorbell writes, DMA and interrupts. On the device, an NVM subsystem holds controllers (each with an admin queue pair, I/O queue pairs and registers) and namespaces, backed by firmware and NAND. NVMe defines the host-to-controller interface, not the media behind it.
+DEEP:
+1. **Host software:** application, filesystem, block layer (blk-mq on Linux), NVMe driver. The driver owns queue memory, doorbell writes and interrupt handlers.
+2. **Transport:** PCIe for a local SSD, where commands and completions are ordinary memory transactions (see the PCIe page, NVMe over PCIe module). NVMe over Fabrics replaces this layer with RDMA, TCP or FC.
+3. **NVM subsystem:** the whole device as the host sees it: controllers, namespaces, ports and the storage media.
+4. **Controller:** registers in BAR0, exactly one admin queue pair, up to thousands of I/O queue pairs, and the engine that fetches, executes and completes commands.
+5. **Namespaces:** the LBA address spaces the controller exposes. Firmware maps them onto NAND through the FTL.
+
+- **Where NVMe stops:** at the controller interface. The FTL, garbage collection, wear leveling and ECC are firmware internals, visible to the host only through their effects (latency, write amplification, log pages).
+- **Validation view:** every boundary in this stack is an observation or injection point: driver traces, PCIe analyzer, controller registers and logs, vendor debug (see the layered-observability question later in this module).
+FOLLOW:
+- Where does the FTL fit in the specification? => It does not. NVMe defines only the logical interface, so drives with very different FTLs conform to the same commands.
+- Which side is the bus master on PCIe? => The controller. It DMAs queue entries and data to and from host memory, while the host does only small MMIO writes such as doorbells.
+PITFALL: Treating the physical SSD controller chip and the NVMe controller as the same thing. The NVMe controller is a logical interface entity that the chip implements, and one subsystem may contain several.
+
+@@ 1.02 | Basic | Concept | tags=ahci,sata,sas,parallelism,history
+Q: Why did NVMe replace AHCI and SATA for SSDs?
+SHORT: AHCI was designed for spinning disks: one command queue of 32 slots per port, per-command register accesses over uncached MMIO, effectively one interrupt, and a 6 Gb/s SATA link that tops out near 600 MB/s. NVMe was designed for flash and PCIe: up to 65,535 I/O queues of up to 65,536 entries each, no register reads in the I/O path, an MSI-X vector per completion queue, and bandwidth that scales with PCIe lanes and generation.
+DEEP:
+| Aspect | AHCI over SATA | NVMe over PCIe |
+|---|---|---|
+| Queues | 1 command list per port | 1 admin pair plus up to 65,535 I/O pairs |
+| Depth | 32 slots (NCQ) | Up to 65,536 entries per queue |
+| Submit | Set a bit in a port register (MMIO) | Write a 64-byte entry in memory, one doorbell write |
+| Completion | Interrupt, then read status registers | 16-byte entry in memory, MSI-X per CQ |
+| Link | 6 Gb/s, 8b/10b, about 600 MB/s | Gen4 x4 is about 7.9 GB/s |
+
+- **Software cost:** register reads over MMIO are non-posted and stall the core for a round trip. NVMe removed them from the I/O path, and per-CPU queues remove the locks.
+- **Media fit:** flash reads take tens of microseconds and NAND has many dies working in parallel. A 32-deep single queue cannot keep them busy, while thousands of outstanding commands can.
+- **SAS:** faster than SATA (12 Gb/s and 24 Gb/s lanes) but still a SCSI command set behind an HBA, so it keeps the translation layer that NVMe dropped.
+- **New for validation:** many queues bring new failure classes: cross-queue ordering, arbitration, per-queue state, and doorbell races. AHCI never had these.
+FOLLOW:
+- Is NVMe faster than SATA on the same NAND? => Not by itself. NVMe removes the interface limits, so media, firmware and PCIe become the limit. Latency floors still come from NAND and the FTL.
+- Why do SATA and SAS still exist? => Cost per terabyte for HDDs, a huge installed base, and HBA plus expander topologies for many drives per host. HDDs do not need the parallelism.
+PITFALL: Saying NVMe is faster simply because PCIe is faster. PCIe-attached AHCI SSDs existed and did not get the queueing and per-command MMIO savings.
+
+@@ 1.03 | Basic | Concept | tags=nvm-subsystem,controller,namespace,port,nqn,nsid
+Q: Define NVM subsystem, controller, namespace and port, and explain how they relate.
+SHORT: An NVM subsystem is the whole storage device as the host sees it: controllers, namespaces, ports and the NVM media, identified by an NVMe Qualified Name (NQN). A controller is the host-facing interface that owns registers and queues. A namespace is an addressable set of logical blocks identified by an NSID. A port is the physical or fabric connection. Controllers and namespaces relate many to many through attachment.
+DEEP:
+| Entity | Identity | Consumer SSD (typical) | Enterprise SSD (typical) |
+|---|---|---|---|
+| Subsystem | NQN (Identify Controller SUBNQN, 256 bytes) | 1 | 1 |
+| Port | PCIe port or fabric address | 1 | 1 or 2 |
+| Controller | CNTLID (16 bits, unique in the subsystem) | 1 | 1 to many |
+| Namespace | NSID (32 bits) | 1 | 1 to many |
+
+- **Controller types:** Identify Controller has a controller type field: I/O controller (1), Discovery controller (2), Administrative controller (3). A plain SSD exposes I/O controllers.
+- **Namespace:** has its own size, LBA format, and protection settings. A **private** namespace is attached to one controller, a **shared** one to several.
+- **NSID values:** 0 is never valid. FFFFFFFFh is the broadcast value ("all namespaces") for the commands that define it.
+- **Reset scope:** NVM Subsystem Reset resets every controller in the subsystem, while CC.EN=0 resets one controller.
+- **Port:** a dual-port SSD has two PCIe ports in one subsystem. On fabrics, a port is a transport address such as an IP and TCP port.
+FOLLOW:
+- Can two controllers see the same namespace? => Yes, if it is a shared namespace attached to both. The host then coordinates with reservations, ANA and multipath (module 14).
+- Where is a namespace listed for a controller? => Identify with the active namespace list CNS returns the NSIDs attached to that controller (module 7 has the CNS values).
+PITFALL: Equating a namespace with a partition. A namespace is defined and formatted by the controller, has its own LBA format and metadata setup, and is not a host filesystem concept.
+VERIFY: Controller type encodings and which revisions define Discovery and Administrative controllers, and which commands accept NSID FFFFFFFFh.
+
+@@ 1.04 | Basic | Trap | tags=form-factor,m.2,u.2,sata,protocol,class-code
+Q: Is NVMe a form factor or a connector? What does an M.2 slot tell you about the protocol?
+SHORT: Neither. NVMe is a protocol (a register interface, queueing model and command sets) that runs over PCIe or a fabric. M.2, U.2, U.3, E1.S, E3.S and add-in cards are packaging. An M.2 module can be a PCIe NVMe SSD or a SATA SSD, so the slot alone does not tell you the protocol. Check the PCI class code, `lsblk` or `nvme list`.
+DEEP:
+- **M.2:** the connector can carry PCIe or SATA, and modules of both kinds exist. The key notches (B, M, B+M) describe what lanes the module can use, not which protocol it speaks.
+- **U.2 and U.3:** the 2.5-inch drive connector family, mostly used for NVMe over x4 PCIe. U.3 adds tri-mode backplane support (NVMe, SATA, SAS on one bay). Details are in the PCIe page form factor module.
+- **EDSFF (E1.S, E3.S):** built for PCIe and NVMe, with hot-plug and thermal design for servers.
+- **How to tell on a live host:**
+
+```
+$ lspci -nn -s 01:00.0        # class [0108] = NVM controller, prog-if 02 = NVM Express
+$ lsblk -d -o NAME,TRAN,MODEL # TRAN column: nvme, sata, sas
+$ sudo nvme list              # only NVMe namespaces appear
+```
+
+- **PCIe is not NVMe:** the class code 0108h with programming interface 02h means NVMe. A PCIe SSD with an AHCI interface uses the SATA/AHCI class instead.
+FOLLOW:
+- Someone says "PCIe SSD" in a bug report. Is it NVMe? => Very likely, but confirm with the class code. 0108h/02h is NVMe, and 0106h/01h is AHCI.
+- What does NVMe over Fabrics do to the form factor question? => Nothing physical. The host speaks the same protocol over RDMA, TCP or FC to a remote subsystem, and no local PCIe device is involved.
+PITFALL: Writing "M.2 drive" in a test plan or bug report when you mean "NVMe drive". They are different axes, and results for one do not transfer to the other.
+VERIFY: Programming interface values 02h (NVM Express) and 01h (AHCI 1.0) in the PCI code and ID assignment specification.
+
+@@ 1.05 | Intermediate | Concept | tags=spec-family,nvme-2.0,command-sets,transports,nvme-mi
+Q: Which documents make up the NVMe specification family, and what changed with the 2.0 restructuring?
+SHORT: Through the 1.4 line NVMe was one monolithic Base specification, with NVMe over Fabrics and NVMe-MI as separate documents. NVMe 2.0 (June 2021) split it into a Base specification (architecture, queueing, Admin commands, Fabrics), separate command set specifications (NVM, ZNS, Key Value, and later ones), transport specifications (PCIe, RDMA, TCP) and the Management Interface. Each document now revises on its own schedule.
+DEEP:
+| Document | What it owns |
+|---|---|
+| Base | Architecture, controller properties, queueing model, Admin command set, Identify, features, log pages, Fabrics commands |
+| NVM Command Set | Read, Write, Flush, Compare, Dataset Management, Copy, protection information, LBA formats |
+| ZNS Command Set | Zones, Zone Append, Zone Management Send and Receive |
+| Key Value Command Set | Store, Retrieve, List, Delete on keys instead of LBAs |
+| PCIe transport | How the controller registers map into BAR0, doorbells, MSI-X, PCIe-specific behavior |
+| RDMA and TCP transports | How capsules and data map onto each fabric |
+| NVMe-MI | Out-of-band management over SMBus or I2C, and MCTP over PCIe |
+
+- **Newer command sets:** the current family also lists command sets such as Subsystem Local Memory and Computational Programs, added in later 2.x revisions.
+- **Fibre Channel:** the FC mapping is defined by the FC-NVMe standards from INCITS T11 rather than by an NVMe transport document.
+- **Revisions:** 2.0 was released in June 2021. Base 2.1 came in 2024, and 2.2 and 2.3 followed in 2025. Check nvmexpress.org for the current revision, since ECNs and TPs are folded in over time.
+- **Practical effect:** a requirement about Read lives in the NVM Command Set specification, one about Create I/O Queue in Base, and one about doorbell layout in the PCIe transport specification. Cite the right document and revision in every test.
+FOLLOW:
+- Where would you find the Zone Append opcode? => In the ZNS Command Set specification. It is an I/O opcode (7Dh) that exists only in a ZNS namespace.
+- Where are the Fabrics commands, such as Connect, defined in 2.x? => In the Base specification, with the transport bindings in the RDMA and TCP transport specifications. Before 2.0 they lived in the separate NVMe over Fabrics specification.
+PITFALL: Citing "NVMe 1.4 section X" for a 2.x feature, or hunting for command-set details in Base. Under 2.x the same question may be split across two or three documents.
+VERIFY: Whether register definitions sit in Base (as "properties") with the BAR0 mapping in the PCIe transport spec, the release dates of 2.1 to 2.3, and which command sets the current revision lists.
+
+@@ 1.06 | Intermediate | Concept | tags=host,controller,roles,command-flow,pull-model
+Q: Walk through the roles of host and controller for one I/O command at a high level.
+SHORT: The host owns the queues in its memory. It writes a 64-byte command into a submission queue slot and rings the SQ tail doorbell with a posted MMIO write. The controller, as bus master, fetches the command by DMA, executes it, moves data by DMA, writes a 16-byte completion into the paired completion queue, and raises an MSI-X interrupt. The host reads the completion and writes the CQ head doorbell to free the slot. Module 3 has the details.
+DEEP:
+1. **Host builds the command:** opcode, NSID, command identifier, PRP or SGL pointers, and LBA and length in the command dwords, placed at the SQ tail.
+2. **Host rings the doorbell:** a 4-byte write of the new tail index to the SQ tail doorbell register in BAR0.
+3. **Controller fetches:** DMA read of the entry (or several) from host memory. It decides when to fetch, and arbitration picks between queues.
+4. **Controller executes:** a Read gets data from NAND through the FTL and DMAs it to the host buffer. A Write DMAs host data in and programs NAND, possibly after acknowledging from a write cache or buffer.
+5. **Controller completes:** it writes the CQE (result, SQ head pointer, SQ ID, command ID, phase bit, status) at the CQ tail, then sends an MSI-X message.
+6. **Host reaps:** the interrupt handler or a polling loop reads the CQE, matches the command ID to its request, finishes it, and writes the CQ head doorbell.
+
+- **Pull model:** the doorbell carries only an index. The controller pulls commands, so it can apply backpressure by fetching more slowly.
+- **Unordered completion:** commands may complete in any order, even within one queue, and the command identifier ties each completion back to its request.
+- **Where firmware fits:** in many designs hardware handles fetch, parsing and completion posting, and firmware handles the FTL, errors and background work. That split is implementation specific.
+FOLLOW:
+- How does the controller know how many commands to fetch? => The tail doorbell index minus its own head tells it how many entries are valid. It may fetch in batches.
+- Are completions returned in submission order? => No. Only the command identifier links a completion to its command, and ordering across commands is not guaranteed unless the host enforces it.
+PITFALL: Believing the doorbell carries the command or the number of commands. It is only the queue index, and writing a wrong index corrupts the queue.
+
+@@ 1.07 | Intermediate | Concept | tags=admin-queue,io-queue,queue-pair,create-io-queue,number-of-queues
+Q: How do the admin queue and I/O queues differ, and how does a host end up with N I/O queues?
+SHORT: Each controller has exactly one admin queue pair (queue ID 0) for management commands such as Identify, Create and Delete I/O queues, Get and Set Features, Get Log Page and Abort. I/O queue pairs (IDs 1 and up) carry NVM commands like Read and Write. The host programs the admin pair through registers, negotiates a queue count with Set Features Number of Queues (feature ID 07h), then creates each I/O CQ before its SQ with admin commands.
+DEEP:
+| Admin command | Opcode |
+|---|---|
+| Delete I/O Submission Queue | 00h |
+| Create I/O Submission Queue | 01h |
+| Get Log Page | 02h |
+| Delete I/O Completion Queue | 04h |
+| Create I/O Completion Queue | 05h |
+| Identify | 06h |
+| Abort | 08h |
+| Set Features | 09h |
+| Get Features | 0Ah |
+| Asynchronous Event Request | 0Ch |
+
+The I/O opcodes are Flush 00h, Write 01h and Read 02h. Admin and I/O are separate opcode spaces, so opcode 01h means Create I/O SQ on the admin queue and Write on an I/O queue.
+
+- **Admin queue:** size comes from AQA (12-bit fields, so up to 4096 entries), base addresses from ASQ and ACQ. It is set up before CC.EN is set to 1 (module 2).
+- **Why separate:** management keeps working when I/O queues are full, stuck or torn down. The admin queue creates and deletes I/O queues, aborts stuck commands and delivers asynchronous events.
+- **Queue count:** Set Features Number of Queues carries the requested counts in CDW11 (0-based). The completion returns the allocated counts in dword 0, which the host must read rather than assume.
+- **Create order:** the CQ comes first because an SQ names the CQ it completes into. Creating the SQ first fails with Completion Queue Invalid.
+- **Linux:** the driver logs the outcome, for example `nvme nvme0: 16/0/0 default/read/poll queues`.
+FOLLOW:
+- Can one CQ serve several SQs? => Yes. Each SQ is bound to exactly one CQ, but a CQ may collect completions from many SQs. Linux normally uses one CQ per SQ.
+- What if the host asks for more queues than the controller supports? => The controller grants fewer and reports the granted counts in the completion. The host must size its queue set from that result.
+PITFALL: Assuming the requested queue count was granted. The driver or test must read the allocated counts from the completion.
+VERIFY: Whether Set Features Number of Queues is rejected (Command Sequence Error) once I/O queues exist, and the full opcode list against the Base specification.
+
+@@ 1.08 | Intermediate | Debug | tags=identify,nvme-cli,id-ctrl,cmic,mdts,sqes,version
+Q: You run `nvme id-ctrl` on a new SSD and see the output below. What can you conclude about its architecture?
+SHORT: The version field 0x20000 decodes to NVMe 2.0.0. CMIC 0x3 says the subsystem has multiple ports and multiple controllers, so expect a dual-port style drive. CNTLID 1 is this controller's identity, and the controller type says I/O controller. MDTS 5 limits transfers to 128 KiB with 4 KiB pages. SQES and CQES 0x66 and 0x44 mean fixed 64-byte commands and 16-byte completions. NN is an NSID upper bound, not a count of namespaces.
+DEEP:
+```
+$ sudo nvme id-ctrl /dev/nvme0 | egrep "^(vid|mn|fr|cmic|mdts|cntlid|ver|cntrltype|sqes|cqes|nn|subnqn) "
+vid       : 0x1234
+mn        : EXAMPLE-SSD-3840G
+fr        : EX010200
+cmic      : 0x3
+mdts      : 5
+cntlid    : 0x1
+ver       : 0x20000
+cntrltype : 1
+sqes      : 0x66
+cqes      : 0x44
+nn        : 32
+subnqn    : nqn.2019-01.com.example:ssd:SN0001
+```
+| Field | Value | Meaning |
+|---|---|---|
+| ver | 0x20000 | Major in bits 31:16, minor in 15:8, tertiary in 7:0, so 2.0.0 |
+| cmic | 0x3 | Bit 0: multiple PCIe ports. Bit 1: multiple controllers. Shared namespaces and multipath are possible |
+| cntlid | 1 | Controller ID within the subsystem. It does not prove other controllers exist, CMIC bit 1 says that |
+| cntrltype | 1 | I/O controller |
+| mdts | 5 | 2^5 times the minimum page size (CAP.MPSMIN, 4 KiB if 0) = 128 KiB. A value of 0 means no limit reported |
+| sqes, cqes | 0x66, 0x44 | Low nibble is the required size and high nibble the maximum, as powers of two: 2^6 = 64 B and 2^4 = 16 B |
+| nn | 32 | Largest valid NSID, not the number of namespaces that exist |
+
+- **Next commands:** `nvme list-subsys` to see the controllers and paths, `nvme id-ns /dev/nvme0n1` for the namespace, `nvme id-ctrl -H` for decoded bits.
+- **Log it:** record vid, mn, sn, fr, ver, cmic, mdts, oacs, oncs and subnqn at the start of every test run. They explain results and gate which tests apply.
+FOLLOW:
+- The same output shows `mdts : 0`. What does that mean for a test? => The controller reports no transfer limit. The practical limit is then set by the host driver or vendor documentation, so probe with large I/O instead of assuming.
+- Why print sqes and cqes at all? => A device with a different required or maximum entry size breaks a host that assumes 64 and 16 bytes. Sizes are chosen by the host in CC.
+PITFALL: Reading nn as the number of namespaces present. Use the active namespace list from Identify to count them.
+VERIFY: NN wording in the current Base revision, the SQES and CQES nibble meaning, and the CMIC bit assignments (bit 2 relates to SR-IOV).
+
+@@ 1.09 | Advanced | Concept | tags=command-set,css,csi,zns,key-value,cc-css
+Q: How does a controller advertise, and a host select, command sets, and how does ZNS relate to the NVM command set?
+SHORT: CAP.CSS advertises support: one bit for the NVM command set, one for "one or more I/O command sets", one for admin-only. Software selects with CC.CSS before enabling the controller. Each namespace then reports a Command Set Identifier (CSI): 0 for NVM, 1 for Key Value, 2 for Zoned Namespace. The same opcode number can mean different commands in different command sets, so the namespace's CSI decides the interpretation.
+DEEP:
+| Field | Value | Meaning |
+|---|---|---|
+| CAP.CSS bit 0 (CAP bit 37) | 1 | NVM command set supported |
+| CAP.CSS bit 6 (CAP bit 43) | 1 | One or more I/O command sets supported |
+| CAP.CSS bit 7 (CAP bit 44) | 1 | No I/O command set (admin only) |
+| CC.CSS (bits 6:4) | 000b, 110b, 111b | NVM only, all supported I/O command sets, admin only |
+| CSI | 0, 1, 2 | NVM, Key Value, Zoned Namespace |
+
+- **Host sequence:** read CAP.CSS. If the I/O command sets bit is set, write CC.CSS=110b with CC.EN=0, enable, then read namespace descriptors (the CSI descriptor) and the command-set-specific Identify structures.
+- **ZNS:** a CSI 2 namespace reuses Read and Write semantics from the NVM command set and adds zones: Zone Management Send (79h), Zone Management Receive (7Ah), and Zone Append (7Dh). Writes must land at the zone's write pointer.
+- **Key Value:** opcode 01h is Write in the NVM command set but Store in the KV command set. Only the namespace's command set tells you which.
+- **Linux:** the kernel selects CSI-aware setup automatically and exposes zoned namespaces through the zoned block layer (`blkzone`, `nvme zns` in nvme-cli).
+- **Validation angle:** test each opcode against a namespace of the wrong command set, and check that a host that selected NVM only never gets to see a ZNS namespace.
+FOLLOW:
+- Can one controller expose an NVM namespace and a ZNS namespace at once? => Yes, when CC.CSS selects all supported I/O command sets. Each namespace carries its own CSI.
+- When can CC.CSS change? => Only while CC.EN is 0, together with the other configuration fields such as the page size and arbitration mechanism. Change it and re-enable.
+PITFALL: Assuming an I/O opcode value has one meaning everywhere. Decode opcodes with the namespace's CSI.
+VERIFY: CAP.CSS and CC.CSS encodings, the CSI descriptor type in the namespace identification list, whether namespaces of unselected command sets are hidden, and the rule that CC.CSS is writable only while CC.EN is 0.
+
+@@ 1.10 | Advanced | Scenario | tags=dual-port,multipath,nqn,nguid,nsid,duplicate-identity
+Q: After connecting a second path to a dual-port SSD, the same 3.84 TB namespace shows up twice, as /dev/nvme0n1 and /dev/nvme1n1. Is it a bug, and what could go wrong?
+SHORT: It is expected if this is one dual-port drive: two controllers in one subsystem, with the same NQN, NSID and NGUID or EUI-64. Linux native multipath normally hides the two paths behind one block device, so two devices mean multipath is disabled or failed to recognize them. The danger is two writers through separate paths (a filesystem mounted twice). If two physical drives claim the same NQN or NGUID, that is a firmware identity bug.
+DEEP:
+1. **Collect identity:** `nvme list-subsys`, `cat /sys/class/nvme/nvme*/subsysnqn`, `cat /sys/class/nvme/nvme*/cntlid`, and `nvme id-ctrl` for the CMIC bits.
+2. **Compare namespace identity:** `nvme id-ns` and `nvme ns-descs` give NGUID, EUI-64 and UUID. NSID alone is meaningless, since NSID 1 exists on every drive.
+3. **Check the host setting:** `cat /sys/module/nvme_core/parameters/multipath` shows whether native multipath is on.
+4. **Decide:**
+
+| Evidence | Conclusion | Action |
+|---|---|---|
+| Same NQN, different CNTLID, same NGUID, CMIC multi-controller | One drive, two paths | Enable multipath, use only the merged device |
+| Same NQN and same NGUID on two different drives | Duplicated identity in firmware or manufacturing | Log a defect, expect the host to reject or merge namespaces wrongly |
+| Different NQN, same NGUID | Namespace identifier not unique | Defect |
+| Two devices, CMIC says single controller | Not multipath | Check whether the drive has SR-IOV functions or a second physical drive |
+
+- **What goes wrong:** two block devices over one namespace bypass the host's cache coherence and can corrupt a filesystem. Failover tests (path down, ANA state changes) are then invalid too.
+- **Where it goes deeper:** ANA, reservations and path failover are in module 14.
+FOLLOW:
+- What identifies the same namespace across controllers? => The subsystem NQN together with the NSID, and the globally unique identifiers (NGUID, EUI-64, UUID) in the namespace descriptors.
+- Would a single-port SSD ever show two controllers? => Yes, if it exposes multiple functions, for example SR-IOV virtual functions or several physical functions. Each function is its own controller.
+PITFALL: Concluding "same NSID, same namespace". NSIDs are unique only inside one subsystem, and two drives both start at NSID 1.
+VERIFY: sysfs attribute names on the target kernel and how the kernel reports duplicate namespace identifiers.
+
+@@ 1.11 | Advanced | Numeric | tags=littles-law,queue-depth,sata-ceiling,ahci,parallelism
+Q: A drive can complete a 4 KiB read in 80 microseconds and sustain 1.5 million IOPS. What queue depth does it need, and why can AHCI not reach that?
+SHORT: Little's law says outstanding commands equal IOPS times latency: 1.5M x 80 us = 120 commands in flight. AHCI allows 32 per port, capping at 32 / 80 us = 400K IOPS, and SATA's 600 MB/s caps 4 KiB transfers near 146K IOPS regardless. NVMe holds 120 easily, for example 8 queues of depth 16, with no shared lock.
+DEEP:
+1. **Little's law:** N = X x R, where N is outstanding commands, X is throughput and R is latency at the host. N = 1.5e6 x 80e-6 = 120.
+2. **AHCI queue limit:** N_max = 32, so X_max = 32 / 80e-6 = 400,000 IOPS.
+3. **SATA III bandwidth:** 6 Gb/s x 8/10 = 4.8 Gb/s = 600 MB/s. A 4096-byte I/O gives 600e6 / 4096 = 146,484 IOPS. Real drives see about 550 MB/s, or about 134K IOPS, because of protocol overhead (assumed).
+4. **NVMe over Gen4 x4:** 16 GT/s x 4 lanes x 128/130 = 7.88 GB/s per direction, so 7.88e9 / 4096 = 1.92M IOPS raw. The real ceiling is lower after TLP overhead (see the PCIe page, NVMe over PCIe module).
+5. **Spread the depth:** 8 queues x 16 entries = 128 outstanding, at least the 120 needed.
+
+- **Assumptions:** closed-loop workload, constant service time R before saturation, 4 KiB with no metadata, decimal MB/s.
+- **The knee:** below N* = X_max x R_min the device is latency bound, and IOPS grows with depth. Above it, IOPS is flat and latency grows as R = N / X.
+- **Use in a test:** sweep depth from 1 to 256, plot IOPS against latency, and find the knee. It shows how much internal parallelism the firmware and NAND can actually use.
+FOLLOW:
+- Why does IOPS flatten after the knee while latency keeps climbing? => Capacity is the limit, so extra commands wait in the SQ or the controller, and latency becomes N / X.
+- Does depth 120 mean one queue with 120 entries? => No. It is total outstanding commands. Spread across per-CPU queues, each queue only needs enough entries for its share.
+PITFALL: Plugging in device service time rather than latency measured at the host, or mixing decimal MB/s with KiB.
+
+@@ 1.12 | Advanced | Trap | tags=compliance,version,vs-register,capabilities,oacs,oncs
+Q: A vendor says "this drive is NVMe 2.0 compliant". What does that tell you, where do you read the version, and what does it not tell you?
+SHORT: It tells you the base level the controller claims to follow. The version is in the VS register (major in bits 31:16, minor in 15:8, tertiary in 7:0, so 0x00020000 is 2.0.0) and in the Identify Controller VER field. It does not tell you which optional features, command sets and log pages exist, or whether unimplemented ones fail cleanly. Features are discovered through capability fields, not implied by version.
+DEEP:
+| VS value | Version |
+|---|---|
+| 0x00010300 | 1.3.0 |
+| 0x00010400 | 1.4.0 |
+| 0x00020000 | 2.0.0 |
+| 0x00020100 | 2.1.0 |
+
+- **Two places:** the VS register in BAR0 is readable before the controller is enabled, and Identify Controller VER is read later. They should agree, and a mismatch is a defect.
+- **Capability fields:** CAP (page sizes, command sets, timeouts), Identify Controller OACS (optional admin commands), ONCS (optional NVM commands such as Compare, Write Zeroes, Dataset Management, Verify, Copy), LPA (log page attributes), and the Commands Supported and Effects log page (LID 05h).
+- **Unsupported behavior:** an unsupported opcode should complete with Invalid Command Opcode (generic status 01h) and an unsupported field with Invalid Field in Command (02h), and neither should change device state.
+- **Validation approach:** build a capability vector from these sources and gate tests on it. Verify both directions: what is advertised must work, and what is not advertised must fail cleanly.
+- **Host behavior:** Linux reads VS during controller init and uses it for some feature decisions, so a wrong VS changes host behavior.
+FOLLOW:
+- Can a drive report VS 2.0 and still lack the Copy command? => Yes. Copy is optional and is advertised in ONCS.
+- What do you do about a VS and VER mismatch? => File it as a defect, and find out which value each host stack keys off (Linux reads VS at init) so you know which hosts are affected.
+PITFALL: Treating "NVMe 2.0" as an implicit feature checklist. Even mandatory items changed between revisions, so discover, then test.
+VERIFY: ONCS and OACS bit positions, the LID for Commands Supported and Effects, and which features became mandatory in which revision.
+
+@@ 1.13 | Advanced | Cross-layer | tags=pcie,failure-ownership,csts,all-ones,timeouts,triage
+Q: Which failures are reported by PCIe and which by NVMe, and how do you tell from the host which layer failed?
+SHORT: PCIe reports link and transaction problems: AER bits, retrains, completion timeouts, and reads returning all ones when the function is gone. NVMe reports controller and command problems: CQE status codes, the CSTS.CFS fatal bit, async events and log pages. The layers interact, because a PCIe fault usually surfaces as NVMe command timeouts. An MMIO read of all ones means the device is off the bus, not that the controller declared itself fatal.
+DEEP:
+| Symptom at the host | Layer | Evidence to read |
+|---|---|---|
+| CQE with non-zero status | NVMe, command failed cleanly | SCT and SC, DNR bit, Error Information log |
+| CSTS.CFS is 1 | NVMe, controller declares fatal | CSTS, vendor logs, then controller reset |
+| MMIO read returns FFFFFFFFh | PCIe, link down or device gone | `lspci` output, AER, DPC status, slot state |
+| Command timeout, no CQE | Either | CSTS first, then link state, then AER |
+| Bad TLP counts rising, no NVMe error | PCIe, link quality | AER counters, throughput loss |
+| Miscompare with clean status | NVMe, firmware or media (or undetected transport corruption) | PI check, analyzer capture |
+
+- **Triage order:** (1) is the function still present, (2) read CSTS (RDY, CFS), (3) AER and link state, (4) Error and SMART log pages, (5) analyzer.
+- **What Linux prints:** on a dead device the driver logs a line such as `nvme nvme0: controller is down; will reset: CSTS=0xffffffff, PCI_STATUS=0xffff`. All ones in both registers means the config and MMIO reads are failing, so it is the link.
+- **Timeout defaults:** the driver's `nvme_core.io_timeout` is 30 seconds and the admin timeout is 60 seconds, so a link problem can look like a long silent hang before anything is logged.
+- **Cross-layer trap:** CC.EN=0 resets the controller but does not fix a dead link, so a reset loop that never recovers points below NVMe.
+FOLLOW:
+- Why is a timeout the usual symptom of a link problem? => The doorbell or the completion is lost, so the driver only sees a command that did not finish within the timeout.
+- Can NVMe report a PCIe problem? => Only indirectly. Some vendor or OCP log pages carry PCIe error counters, and CSTS.CFS may be set when the controller detects its own fault, but the host cannot rely on either.
+PITFALL: Assuming a timeout is always a firmware hang. Link, power and reset events produce the same symptom.
+VERIFY: The exact Linux log message text, which varies by kernel version, and the default timeout values on your target kernel.
+
+@@ 1.14 | Principal | Cross-layer | tags=observability,fault-injection,layers,test-strategy,linux
+Q: How would you place observation and fault-injection points across the NVMe stack layers for a validation environment?
+SHORT: For each layer pick a way to observe and a way to inject: fio and verification at the workload, tracing and the Linux nvme fault-injection interface at the driver, an analyzer and AER or link injection at PCIe, registers and log pages at the controller, and vendor debug or media fault hooks at firmware. The rule is that every injected fault has an expected observable at two layers or more, and no single vantage is trusted.
+DEEP:
+| Layer | Observe | Inject |
+|---|---|---|
+| Workload | fio logs, latency histograms, data verify | Pattern, alignment, depth, mix |
+| Block and driver | `nvme` trace events, `blktrace`, dmesg | Linux `fault_inject` in debugfs (forces an error status on completion), `nvme admin-passthru` and `nvme io-passthru` with malformed commands |
+| PCIe | Analyzer, AER counters, LTSSM logs | Retrain link, FLR or reset via sysfs `reset`, `remove`, AER injection on kernels that build it |
+| NVMe controller | CSTS, Error and SMART logs, async events | Invalid fields, out-of-range LBA, Abort, `nvme reset`, `nvme subsystem-reset` |
+| Firmware and media | Vendor logs, telemetry, UART | Vendor error injection (bad block, ECC error), programmable power cut |
+
+1. **Expectation first:** write down what each fault should produce at every layer before running it. For an injected uncorrectable NAND read error: status SCT 2h, SC 81h (Unrecovered Read Error) on the CQE, an Error log entry, a media error count in SMART, and no silent success.
+2. **Independence:** kernel injection replaces the status after the device completed, so it proves host handling only. Inject at the controller and media as well to exercise the SSD's own error paths.
+3. **Time alignment:** synchronize analyzer, kernel trace and device logs with a marker, for example a distinctive command or a vendor log entry, so events line up.
+4. **Metric:** a fault-coverage matrix showing, for each fault class and layer, whether the reporting was correct at all layers.
+FOLLOW:
+- Why inject at the controller if the kernel can inject for you? => The kernel changes the completion status after the drive finished. The drive's error handling, retries and logging are never exercised.
+- How do you know an injected fault is the cause of an observed failure? => Compare with a control run without injection, and check that the failure signature at every layer matches the expectation you wrote down.
+PITFALL: Relying only on host-side injection, then concluding the SSD firmware handles errors well.
+VERIFY: Availability of AER injection and the `fault_inject` debugfs interface in your kernel build, and vendor support for media error injection.
+
+@@ 1.15 | Principal | Scenario | tags=conformance,traceability,test-plan,spec-revisions,capability-gating
+Q: You inherit a validation suite written against NVMe 1.3, and the drive now claims 2.0 with ZNS. How do you re-baseline the test plan across the split specification family?
+SHORT: Build a requirements traceability matrix keyed by document, revision and section (Base, NVM Command Set, ZNS Command Set, PCIe transport). Map every existing test to requirements. Gate tests on discovered capabilities, not on a hard-coded version. Add negative tests for reserved and unsupported fields, and new coverage for command-set selection and CSI. Report coverage per requirement, not per test.
+DEEP:
+1. **Inventory:** list each requirement per document, tagged mandatory, optional, or conditional on a capability.
+2. **Map:** link tests to requirement IDs. Find uncovered mandatory items and orphan tests that check nothing in the spec.
+3. **Capability layer:** read VS, CAP, Identify (OACS, ONCS, CSI), and log pages. Tests declare what they need, for example `requires: oncs.copy`. A missing capability produces "not applicable" with a reason, reported separately from pass.
+4. **Behavior deltas:** command-set selection and CSI, changed Identify structures, namespace types, and any field that became reserved or deprecated. Old tests that assert an error for an opcode that is now valid become wrong.
+5. **Negative and boundary:** reserved bits set, invalid NSID, unsupported CSI, unsupported opcode in each command set, with the expected status (Invalid Field, Invalid Namespace or Format, Invalid Command Opcode) and the DNR bit.
+6. **Revision watch:** tag each test with the spec revision and re-run the coverage diff whenever the drive or the spec revision changes.
+
+- **Metrics:** requirement coverage, capability-skip rate, defects per requirement, and for each escape found after release, which requirement was missing.
+- **Ambiguity:** when the spec text is unclear, record the interpretation in the test, and raise it with the vendor or the NVMe technical channels rather than deciding silently.
+FOLLOW:
+- A legacy test expects Invalid Opcode for an opcode that 2.0 defines. What is the defect? => The test. Gate it on the capability, and file it as a plan bug, not a drive bug.
+- How do you keep the matrix from rotting? => Generate it from requirement IDs in test metadata and have CI fail if a mandatory requirement has no test or a test references an unknown ID.
+PITFALL: Counting tests instead of requirements, or gating on the version number, which fails for optional features.
+
+@@ 1.16 | Principal | Numeric | tags=limits,queues,memory,boundary-tests,spdk
+Q: Design boundary tests for the architectural queue limits, and quantify what "maximum" means in memory and in commands.
+SHORT: The spec ceilings are 65,535 I/O queue pairs, 65,536 entries per queue (CAP.MQES is a 16-bit 0-based field), and 4096 entries for the admin queue. A full set of 65,535 SQs of 65,536 entries needs 256 GiB of host memory, plus 64 GiB for CQs, so no real system goes near it. Test what the device advertises: MQES, granted queue counts, and the status returned exactly at and beyond each boundary.
+DEEP:
+1. **Queue ceiling:** QIDs 1 to 65,535 give 65,535 I/O queues. The Number of Queues result is 0-based, so the largest usable value is 65,534.
+2. **SQ memory:** 65,535 x 65,536 x 64 B = 274,873,712,640 B, which is 256.0 GiB.
+3. **CQ memory:** the same count and depth at 16 B is about 64 GiB.
+4. **Realistic:** 64 queues x 1024 entries gives 64 x 1024 x 64 B = 4 MiB of SQ and 1 MiB of CQ. Linux defaults to a depth of 1024 (`io_queue_depth`) and about one queue per CPU.
+5. **Commands in flight:** the command identifier is 16 bits, so at most 65,536 distinct CIDs per SQ (fewer if a value is reserved). The device's own resource limit is usually far lower.
+
+| Boundary test | Expected result |
+|---|---|
+| Request more queues than the device supports | Success, granted count is clipped and never above the request |
+| Create queue with the largest legal size (MQES) | Success |
+| Create queue one entry above MQES | Invalid Queue Size (command-specific status 02h) |
+| Create SQ with a QID beyond the granted count, or a duplicate QID | Invalid Queue Identifier (command-specific status 01h) |
+| Create SQ referencing a CQ that does not exist | Completion Queue Invalid (command-specific status 00h) |
+| Fill every SQ with distinct command IDs | All complete, none lost, no CQ overwrite |
+| Stop consuming a CQ (no head doorbell update) | Controller stops posting and does not overwrite unread entries |
+
+- **Tooling:** the kernel driver never asks for extreme values, so use SPDK, a custom userspace driver or a bare-metal host to reach these corners.
+FOLLOW:
+- Why cannot you reach these corners with the Linux driver? => It requests min(CPUs, controller limits) queues at a fixed default depth. Corner values need a driver you control.
+- What if the host writes a doorbell index outside the queue? => The behavior is a robustness area to check against the spec. The controller may report an error through an asynchronous event, so test it as a negative case and confirm the drive does not hang.
+PITFALL: Testing only the values Linux uses, so the boundary handling in firmware is never run.
+VERIFY: Status names and values for queue creation failures, the maximum granted queue count rule, whether any CID value (for example FFFFh) is reserved, and the controller's required behavior on a full CQ and on an out-of-range doorbell write.

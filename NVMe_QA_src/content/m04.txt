@@ -1,0 +1,385 @@
+# Module 4: PRPs, SGLs & Data Transfer
+
+@@ 4.01 | Basic | Concept | tags=dptr,psdt,mptr,dma
+Q: How does an NVMe command tell the controller where its data buffer is in host memory?
+SHORT: Every command that moves data carries a 16-byte Data Pointer (DPTR, bytes 24 to 39 of the 64-byte SQE). The PSDT field in CDW0 says whether DPTR holds two PRP entries (PRP1 and PRP2) or one SGL descriptor. The controller then acts as a PCIe bus master and reads (for writes) or writes (for reads) host memory at those addresses. A separate Metadata Pointer (MPTR) covers a metadata buffer.
+DEEP:
+- **SQE layout:** CDW0 (opcode, FUSE, PSDT, command ID), NSID, CDW2 and CDW3, MPTR (bytes 16 to 23), DPTR (bytes 24 to 39), then CDW10 to CDW15 for command-specific fields such as SLBA and NLB.
+- **PSDT (CDW0 bits 15:14):** 00b means PRPs, 01b means SGLs with MPTR as one contiguous metadata buffer, 10b means SGLs with MPTR pointing to an SGL segment, 11b is reserved.
+- **Addresses:** they are bus addresses as the SSD sees them. With an IOMMU these are IOVAs, so a "physical address" in a trace is not necessarily a physical address.
+- **Direction:** the host never pushes data. For a Write the controller issues memory reads to the host, for a Read it issues memory writes. This is why the SSD is a bus master and needs Bus Master Enable in the PCIe Command register (see the PCIe page, Configuration Space module).
+- **Support:** PRPs are mandatory. SGLs are optional and advertised in Identify Controller (question 4.07).
+FOLLOW:
+- Are PRPs used only for I/O data? => No. Admin commands such as Identify and Get Log Page use them for their data buffers, and Create I/O SQ/CQ uses PRP1 as the queue base address when the queue is physically contiguous.
+- Can PRP and SGL be mixed inside one command? => No. PSDT is per command and selects one scheme for the data buffer.
+PITFALL: Picturing the host pushing data to the SSD. Every data transfer is initiated by the controller as a PCIe requester, which is why address, IOMMU and completion problems show up on the device side.
+VERIFY: PSDT bit positions and the MPTR meaning for each PSDT value, and whether Admin commands may use SGLs on the PCIe transport, in the NVMe Base Specification (Submission Queue Entry section).
+
+@@ 4.02 | Basic | Concept | fig=prp | tags=prp1,prp2,prp-list,chaining
+Q: How do PRP1, PRP2 and a PRP list describe a buffer, and how does chaining work?
+SHORT: A PRP entry is a 64-bit address of one memory page. PRP1 points to the first page and may carry a non-zero offset. If the transfer fits in that page, PRP2 is unused. If it needs exactly two pages, PRP2 is the second page. If it needs more, PRP2 points to a PRP list of 8-byte entries, one per remaining page, and when a list page runs out, its last entry points to the next list page.
+DEEP:
+| Pages touched | PRP1 | PRP2 |
+|---|---|---|
+| 1 | Data, may have an offset | Unused (reserved) |
+| 2 | Data, may have an offset | Second data page, offset 0 |
+| 3 or more | Data, may have an offset | Pointer to a PRP list |
+
+- **List contents:** one entry per page after the first, in order, each page aligned (offset 0). At 4 KiB pages one list page holds 512 entries.
+- **Chaining:** if more entries are needed than remain in the list page, the last slot of that page is a link to the next list page, and the data entry it displaces moves to slot 0 of the next page. The final list page may use every slot for data.
+- **Who decides:** the controller works out how many pages the transfer touches from the command (length and PRP1 offset). It never guesses from the value in PRP2.
+- **What Linux does:** it builds exactly this, with the link placed only when more data entries follow.
+FOLLOW:
+- Which entries may have a non-zero offset? => Only PRP1. PRP2 as a data pointer and every list entry must be page aligned.
+- How does the controller know PRP2 is a list and not a page? => From the transfer size: more than two pages means a list. It does not inspect the address.
+PITFALL: Treating the last slot of a full list page as data. When another list page follows, that slot is a link and the data entry moves to the next page.
+VERIFY: The exact PRP list chaining wording and alignment rules in the NVMe Base Specification (PRP Entry and List section).
+
+@@ 4.03 | Basic | Concept | tags=cc.mps,mpsmin,mpsmax,page-size,prp-format
+Q: What is the NVMe memory page size, who sets it, and what does a PRP entry look like?
+SHORT: NVMe has its own page size, 2^(12 + CC.MPS) bytes. The controller advertises its range in CAP.MPSMIN (bits 51:48) and CAP.MPSMAX (bits 55:52), and the host picks a value in that range in CC.MPS (bits 10:7) before setting CC.EN. Linux uses 4 KiB (MPS = 0). All PRP page boundaries and list sizes follow this size, not the host CPU page size.
+DEEP:
+| CC.MPS | Page size | PRP list slots per page |
+|---|---|---|
+| 0 | 4 KiB | 512 |
+| 1 | 8 KiB | 1024 |
+| 2 | 16 KiB | 2048 |
+| 4 | 64 KiB | 8192 |
+
+- **PRP entry format:** a 64-bit value. The upper bits are the page base address and the low bits are the byte offset inside the page. Bits 1:0 must be zero, so every pointer is dword aligned. In a list entry, the offset field must be zero.
+- **When it is set:** the host writes CC.MPS together with the other CC fields while the controller is disabled, then sets EN. It is not changed while enabled (see Controller Registers & Initialization).
+- **Host page mismatch:** a host with 64 KiB CPU pages can still use 4 KiB NVMe pages, because any 64 KiB aligned buffer is also 4 KiB aligned. The reverse is the problem: a controller whose MPSMIN is above what the host driver supports cannot be used. Linux prints "Minimum device page size ... too large for host" and refuses to enable it.
+- **Validation angle:** a test that changes CC.MPS to a non-default supported value re-derives every PRP size, list size and MDTS byte count. Most tests never do this.
+FOLLOW:
+- What happens if CC.MPS is outside the MPSMIN to MPSMAX range? => It is not a legal setting. Check the specification for the required response; a robust controller must not corrupt data, and it may simply refuse to become ready.
+- Do PRPs care about the LBA size? => No. LBA size and NLB give the byte count, and PRPs only carve those bytes into pages.
+PITFALL: Hard-coding 4096 in a checker's PRP math. It is right only while CC.MPS is 0.
+VERIFY: CAP.MPSMIN, CAP.MPSMAX and CC.MPS bit positions, the PRP entry bit layout, and the required controller behavior for an unsupported CC.MPS, in the NVMe Base Specification.
+
+@@ 4.04 | Intermediate | Numeric | tags=prp-count,list-pages,offset,chaining
+Q: How many PRP entries and PRP list pages does a transfer need? Work 4 KiB, 128 KiB, 128 KiB at an offset, 2 MiB and larger.
+SHORT: Count the pages the buffer touches: pages = ceil((offset + length) / page size). PRP1 covers the first page. Two pages need no list (PRP2 is data). Otherwise the list needs pages minus 1 entries. At 4 KiB pages a list page has 512 slots, so up to 513 pages fit without chaining. So 128 KiB aligned is 32 pages and 31 entries (248 B), and 128 KiB at offset 0x200 is 33 pages and 32 entries (256 B).
+DEEP:
+Assumptions: 4 KiB pages (CC.MPS = 0), list pages fully available to the list (page-aligned list), 512 B or 4 KiB LBAs (they do not matter), no metadata unless stated.
+
+1. pages = ceil((offset + length) / 4096).
+2. If pages = 1, PRP2 is unused. If pages = 2, PRP2 is the second data page. Otherwise E = pages - 1 list entries.
+3. Slots per list page S = 4096 / 8 = 512. If E <= S, one list page and no link.
+4. Otherwise each full list page holds S - 1 = 511 data entries plus a link, and the last page holds the rest, so list pages L = 1 + ceil((E - S) / (S - 1)). Slots used in total = E + (L - 1).
+
+| Transfer (4 KiB pages) | Pages | List entries E | List pages |
+|---|---|---|---|
+| 4 KiB, aligned | 1 | 0 (PRP2 unused) | 0 |
+| 4 KiB at offset 0x200 | 2 | 0 (PRP2 is data) | 0 |
+| 12 KiB, aligned | 3 | 2 | 1 |
+| 128 KiB, aligned | 32 | 31 (248 B) | 1 |
+| 128 KiB at offset 0x200 | 33 | 32 (256 B) | 1 |
+| 1 MiB, aligned | 256 | 255 (2040 B) | 1 |
+| 2 MiB, aligned | 512 | 511 | 1 |
+| 2 MiB + 4 KiB, aligned | 513 | 512 | 1, exactly full, no link |
+| 2 MiB + 8 KiB, aligned | 514 | 513 | 2 (511 + link, then 2) |
+| 4 MiB, aligned | 1024 | 1023 | 2 (511 + link, then 512) |
+
+- **Extended LBA:** 32 LBAs of 4096 + 8 bytes is 131,328 B, which is 33 pages even at offset 0, so E = 32 rather than 31.
+- **Larger pages:** at 8 KiB pages, a list page has 1024 slots, and 1 MiB is 128 pages with E = 127.
+FOLLOW:
+- Why does an offset add an entry? => The buffer straddles one more page boundary, so it touches one more page. Counting length / page alone is the classic off-by-one.
+- What is the largest transfer one list page can describe? => 513 pages: 2 MiB + 4 KiB when aligned at 4 KiB pages, and only a little over 2 MiB at the worst offset, since the offset eats into the first page.
+PITFALL: Reading "the last list entry is a link" as always true. A list page that holds the final entries uses all 512 slots for data, and only a page that is followed by another one ends in a link.
+VERIFY: The chaining rule (link only when more entries follow) and the rule for where a list may start, in the NVMe Base Specification PRP List section.
+
+@@ 4.05 | Intermediate | Concept | tags=mdts,mpsmin,max-transfer,split
+Q: What is MDTS, what unit is it in, and what happens when a command exceeds it?
+SHORT: MDTS is a byte in Identify Controller (byte 77) giving the maximum data transfer size of one command as a power of two in units of the minimum memory page size: max bytes = 2^MDTS x 2^(12 + CAP.MPSMIN). A value of 0 means the controller reports no limit. With MPSMIN = 0 (4 KiB), MDTS 5 is 128 KiB and MDTS 9 is 2 MiB. A command over the limit is failed, normally with Invalid Field in Command, and hosts split larger requests.
+DEEP:
+| MDTS | Max transfer at MPSMIN = 0 (4 KiB) | at MPSMIN = 1 (8 KiB) |
+|---|---|---|
+| 0 | No limit reported | No limit reported |
+| 5 | 128 KiB | 256 KiB |
+| 7 | 512 KiB | 1 MiB |
+| 9 | 2 MiB | 4 MiB |
+| 10 | 4 MiB | 8 MiB |
+
+- **Unit is MPSMIN, not CC.MPS:** the unit does not change with the page size the host chose.
+- **Linux:** max_hw_sectors = 2^(MDTS + MPSMIN + 12 - 9), visible as `/sys/block/nvme0n1/queue/max_hw_sectors_kb`. A large `fio` block size is silently split by the block layer into commands no bigger than that, so it never exercises the limit.
+- **Chaining link to MDTS:** at 4 KiB pages, MDTS 9 means at most 2 MiB, which is at most 513 pages even with an offset, so one page-aligned list page always suffices. The chained-list path in firmware becomes reachable only at MDTS 10 or higher.
+- **Validation:** send a command at exactly the MDTS byte count (must succeed), then one LBA over (expect an error), with aligned and offset buffers. This needs an NVMe passthrough or user-space driver, since the kernel will split or refuse.
+- **Metadata:** whether extended-LBA metadata bytes count toward the limit depends on the spec revision and a controller attribute (see VERIFY).
+FOLLOW:
+- Why is MDTS an exponent and not a byte count? => It is an 8-bit field, and a power of two of pages covers 4 KiB up to enormous sizes in one byte.
+- Does MDTS limit the length of a PRP list? => Indirectly. It caps the page count, so at MDTS 9 and 4 KiB pages no chaining is ever needed.
+PITFALL: Computing the limit with the current CC.MPS or in LBAs. The unit is MPSMIN pages, whatever the host configured.
+VERIFY: Which commands MDTS applies to, the status code for exceeding it (Invalid Field in Command is expected), and the newer controller attribute (MEM in CTRATT, NVMe 2.1 era) saying MDTS excludes metadata.
+
+@@ 4.06 | Intermediate | Concept | tags=sgl,descriptor,segment,bit-bucket,keyed
+Q: What does an SGL descriptor look like, and what are the descriptor types?
+SHORT: An SGL descriptor is 16 bytes: an 8-byte address, a 4-byte length, 3 reserved bytes, and a last byte with the type in bits 7:4 and the subtype in bits 3:0. Types are Data Block (0h), Bit Bucket (1h), Segment (2h), Last Segment (3h) and Keyed Data Block (4h, fabrics). DPTR holds the first descriptor, and Segment descriptors point to arrays of more descriptors in host memory. Lengths are in bytes with no page rules.
+DEEP:
+| Type | Name | Meaning |
+|---|---|---|
+| 0h | Data Block | Address and byte length of one buffer fragment |
+| 1h | Bit Bucket | Length of read data to discard; the address is not used |
+| 2h | Segment | Address and size of the next array of descriptors; more segments follow |
+| 3h | Last Segment | Same, but no further Segment descriptor follows |
+| 4h | Keyed Data Block | Address, 24-bit length and 32-bit key (RDMA remote buffer) |
+| 5h | Transport Data Block | Transport specific (used by NVMe/TCP) |
+
+- **Subtype:** 0h address, 1h offset (in-capsule data on fabrics), Ah transport specific.
+- **Keyed layout:** bytes 0 to 7 address, bytes 8 to 10 length, bytes 11 to 14 key, byte 15 type and subtype.
+- **Walking it:** if DPTR is a Data Block the buffer is one fragment and there is no list at all. Otherwise DPTR is a Segment or Last Segment descriptor naming an array. The controller reads the array and follows Segment descriptors until it reaches the Last Segment.
+- **Rules (see question 4.14 for errors):** the total of Data Block and Bit Bucket lengths must equal the transfer length (a controller that sets SGLS bit 18 also accepts a larger total), and a segment holds whole 16-byte descriptors.
+- **Contrast with PRP:** a fragment can start at any byte (subject to SGLS alignment) and have any length, so a scattered buffer needs no bounce copy.
+FOLLOW:
+- Can Bit Bucket be used on a write? => No. It tells the controller to discard bytes it would send to the host, so it belongs to reads. Expect an error on a write; check the spec for which one.
+- Where do Keyed descriptors appear on PCIe? => They do not. They carry RDMA remote buffer keys, so they belong to NVMe over Fabrics (see that module).
+PITFALL: Reading a Segment descriptor's length as payload bytes. It is the size of the descriptor array it points to.
+VERIFY: Segment address alignment (qword) and length rule (multiple of 16), the placement rule that only the last descriptor of a segment may be Segment or Last Segment, and the exact type 5 usage, in the NVMe Base Specification SGL section.
+
+@@ 4.07 | Intermediate | Concept | tags=sgls,identify-controller,prp-vs-sgl,linux,sgl_threshold
+Q: How does the host learn that a controller supports SGLs, and when should it use them instead of PRPs?
+SHORT: Identify Controller has a 32-bit SGLS field. Bits 1:0 give support: 0 none, 1 supported with byte alignment, 2 supported with dword alignment and granularity. Further bits flag keyed SGL (2), Bit Bucket (16), a contiguous metadata pointer (17), lengths larger than the data (18), an SGL for metadata (19), the offset subtype (20) and transport SGL (21). PRPs always work on PCIe, so use SGLs for scattered or unaligned buffers.
+DEEP:
+- **Read SGLS first:** a host must check the individual bits, not just "non-zero". A controller can support data SGLs but not Bit Bucket or metadata SGLs.
+- **PRP strengths:** simple, universal, 8 bytes per page, and a two-page buffer needs no list.
+- **SGL strengths:** arbitrary fragment sizes and alignments, so scatter-gather buffers need no bounce copy or block-layer splitting. A large contiguous buffer is a single descriptor in DPTR, so no list fetch at all (a 128 KiB PRP buffer needs a 248 B list).
+- **Linux (recent kernels):** SGLs are used on I/O queues when the controller supports them and the average segment is at least `sgl_threshold` (default 32 KiB, set to 0 to disable). Requests with page gaps that PRPs cannot express, user passthrough commands (so the device can validate lengths), and requests with multiple integrity segments are forced onto SGLs. Without SGL support the block layer splits requests at non-page-aligned gaps.
+- **PCIe cost:** fewer bytes for big fragments, more for many tiny ones, and one dependent fetch for either kind of list. See the PCIe page, NVMe over PCIe module.
+- **Validation:** run every data-path test in both modes. The two paths are often separate hardware or firmware code, and a passing PRP suite proves little about SGLs.
+FOLLOW:
+- What does SGLS = 10b change? => Data blocks must be dword aligned and dword multiples in length. Violations give SGL Data Block Granularity Invalid.
+- Would you make SGL the default for a new host driver? => Only for controllers that report it and workloads with big scattered buffers. Otherwise PRPs are simpler and universally supported.
+PITFALL: Assuming SGL is faster because it is newer. It adds descriptor fetches, and fragments smaller than the PCIe payload size make small TLPs.
+VERIFY: SGLS bit positions (2 and 16 to 21) in Identify Controller, and the current Linux `sgl_threshold` default and forced-SGL conditions for your kernel version.
+
+@@ 4.08 | Intermediate | Concept | tags=mptr,metadata,extended-lba,psdt,pract
+Q: How is metadata addressed: what do MPTR and PSDT do for extended LBA versus separate metadata?
+SHORT: With extended LBAs, metadata sits inline after each LBA's data, so the PRPs or SGL simply cover data plus metadata and MPTR is unused. With separate metadata, MPTR points to a second buffer. Under PSDT 00b (PRPs) it is one contiguous, dword-aligned buffer. Under PSDT 01b it is one contiguous buffer, and under 10b it points to an SGL segment holding a single descriptor. Which layout applies is set by the namespace LBA format.
+DEEP:
+- **Layout source:** Identify Namespace gives the LBA format (metadata size MS) and a flag in FLBAS saying whether metadata is extended (bit 4). See Namespaces & Identify Structures and Data Protection.
+- **Sizes:** separate metadata needs (NLB + 1) x MS bytes. For 256 LBAs at MS = 8 that is 2048 B. Extended LBA turns a 512 B block into 520 B on the host side, so a 4 KiB LBA becomes 4104 B and buffers are no longer page multiples.
+- **PRP mode:** the metadata buffer must be physically contiguous as seen by the device. A host that hands over a virtually contiguous but physically split buffer has the controller overrun into unrelated memory.
+- **SGL mode:** PSDT 10b lets scattered metadata be described. Data and metadata are then both SGL. There is no mode with PRP data and SGL metadata.
+- **PRACT case:** when protection information is inserted or stripped by the controller and MS equals the PI size, no metadata is transferred, so MPTR is unused. Check this in the spec for your format.
+- **Validation:** place guard bytes before and after the metadata buffer to catch overruns, and compare the metadata contents with expected PI tuples.
+FOLLOW:
+- Can data use PRPs while metadata uses an SGL? => No. PSDT 10b makes the command an SGL command, and with PSDT 00b MPTR is a plain contiguous buffer.
+- Does the metadata size count in the PCIe traffic? => Yes, extended LBA adds it to every block moved, and separate metadata adds its own TLPs, so 4 KiB + 8 B is an extra small TLP or an oddly sized last TLP.
+PITFALL: Forgetting metadata when computing buffer size and page count. 32 LBAs of 4104 B need 33 pages, not 32.
+VERIFY: The MPTR alignment for each PSDT value, the FLBAS extended-metadata bit, and the PRACT rule for MS equal to PI size, in the NVM Command Set Specification.
+
+@@ 4.09 | Intermediate | Trap | tags=prp2,offset,two-pages,alignment
+Q: A host sends a 4 KiB write whose buffer starts at offset 0x200 in a page, and sets PRP2 to 0 because "4 KiB fits in one page". What happens?
+SHORT: It does not fit. The buffer covers 3584 bytes in the first page and 512 bytes in the next, so PRP2 must hold the second page address. With PRP2 = 0 the controller has no way to know it is a bug. It fetches the last 512 bytes from bus address 0, so the result is an IOMMU fault or Data Transfer Error, or silently stored garbage in the last LBA. The page count decides, not the length.
+DEEP:
+| Case | Pages | PRP2 |
+|---|---|---|
+| 4 KiB at offset 0 | 1 | Unused |
+| 4 KiB at offset 0x200 | 2 | Second data page |
+| 3584 B at offset 0x200 | 1 | Unused |
+| 8 KiB at offset 0 | 2 | Second data page |
+| 8 KiB at offset 0x200 | 3 | List with 2 entries |
+
+- **Why it is a trap:** many people remember "PRP2 is only for more than one page" or "for more than 4 KiB". It is for more than one page of the buffer's actual layout.
+- **Linux logic:** the driver checks `offset + length <= 2 x page size` before choosing the single-segment PRP form.
+- **Symptoms:** if the controller reads PRP2 = 0, the data for the last LBA comes from address 0 on a write, or is written to address 0 on a read. With an IOMMU that shows up as a DMAR or IO_PAGE_FAULT record naming the SSD.
+- **Test grid:** offsets {0, 4, 0x1FC, 0x200, 0xFFC} against lengths that land one LBA below, on and above each page boundary, for reads and writes. Include unaligned lengths only when the LBA size allows.
+- **Bits 1:0 of PRP1:** a non-dword-aligned PRP1 is not legal. The expected status is PRP Offset Invalid or Invalid Field, and specifications allow controller variation, so accept a documented set.
+FOLLOW:
+- Does the controller have to ignore junk in an unused PRP2? => It is reserved when unused, so a well-behaved controller ignores it. A validator can put a poison address there and check the command still succeeds and the address is never accessed.
+- What if the buffer is exactly page aligned but 4 KiB + 512 B long? => Two pages, so PRP2 is the second page and only 512 B of it are used.
+PITFALL: Deciding PRP2 usage from the length alone. Offset plus length decides.
+VERIFY: The PRP2 reserved-when-unused wording, and the status code for a PRP1 with bits 1:0 set, in the NVMe Base Specification.
+
+@@ 4.10 | Advanced | Debug | tags=sqe,decode,prp-list,off-by-one,analyzer
+Q: An analyzer shows this Write SQE and a 256-byte PRP list fetch. The last LBA of every such write reads back wrong. Decode it and find the bug.
+SHORT: The SQE is a Write of 256 blocks (NLB = 255, 128 KiB at 512 B) with PRP1 at offset 0x200. That buffer touches 33 pages, so the list needs 32 entries (256 B). The host built only 31 entries because it divided 131072 by 4096 and ignored the offset. The controller reads a 32nd slot holding stale data, so the last 512 bytes come from the wrong page.
+DEEP:
+```
+DW0  00310001  opcode 01h Write, FUSE 0, PSDT 00b (PRP), CID 0031h
+DW1  00000001  NSID 1
+DW2  00000000
+DW3  00000000
+DW4  00000000  MPTR low
+DW5  00000000  MPTR high
+DW6  2ABCD200  PRP1 low
+DW7  00000001  PRP1 high
+DW8  30000000  PRP2 low
+DW9  00000001  PRP2 high
+DW10 00001000  SLBA low
+DW11 00000000  SLBA high
+DW12 000000FF  NLB = 255 (zero based)
+DW13 00000000
+DW14 00000000
+DW15 00000000
+```
+1. **Data length:** (255 + 1) x 512 B = 131072 B (assuming a 512 B LBA format).
+2. **PRP1:** 0x1_2ABC_D200, so page base 0x1_2ABC_D000, offset 0x200. The first page carries 4096 - 512 = 3584 B.
+3. **Remaining:** 131072 - 3584 = 127488 B = 31.125 pages, so 32 more pages (the last one only 512 B).
+4. **PRP2:** 0x1_3000_0000 is a list (page aligned, qword aligned as required). It must hold 32 entries, 0x1_2ABC_E000 up to 0x1_2ABE_D000 in this contiguous example, and the 32nd entry supplies the last 512 B.
+5. **What the trace shows:** the MRd for the list is 256 B, so the controller expects 32 entries. But host memory holds only 31 valid entries. Slot 31 is stale, left over from an earlier command.
+
+- **Bug location:** if the list MRd is 248 B (assuming the controller fetches only the entries it needs), the controller counted 31 entries and the firmware ignored the offset. If it is 256 B and the host list has 31 valid entries, the bug is in the host.
+- **Symptom fit:** only the last LBA of each command differs (SLBA + 255 = 0x10FF). If slot 31 held zero, expect an IOMMU fault at address 0. If it held an old buffer address, the last LBA is written with that buffer's stale content.
+- **Fix and check:** compute pages = ceil((offset + length) / page). Add a regression that sweeps offsets and lengths around each boundary.
+FOLLOW:
+- How would you catch this without an analyzer? => Poison the list page with a distinct address pattern before each command and fault-map the pages around the buffer under a strict IOMMU. A read of an unmapped slot then faults immediately.
+- Would the same bug show for offset 0? => No. Aligned 128 KiB needs 31 entries, so the bug hides until the buffer is unaligned.
+PITFALL: Trusting a passing aligned-buffer test. Off-by-one page count bugs only appear when the offset is non-zero.
+VERIFY: NLB position in CDW12 (bits 15:0) for Write, and that the assumed LBA format is 512 B (check Identify Namespace).
+
+@@ 4.11 | Advanced | Debug | tags=cqe,status,dnr,error-log,host-bugs
+Q: Four failing completions arrive with DW3 = 0x80270031, 0x80050042, 0x00090055 and 0x801F0061. Decode each, and say what host or firmware bug class each suggests.
+SHORT: In DW3, bits 31:17 are the status field (SC in 24:17, SCT in 27:25, DNR in bit 31), bit 16 is the phase tag and bits 15:0 are the command ID. So: SC 13h PRP Offset Invalid (CID 0031h), SC 02h Invalid Field in Command (CID 0042h), SC 04h Data Transfer Error with DNR clear (CID 0055h), and SC 0Fh Data SGL Length Invalid (CID 0061h). All are generic status (SCT 0).
+DEEP:
+Decode with `SC = (DW3 >> 17) & 0xFF`, `SCT = (DW3 >> 25) & 7`, `DNR = DW3 >> 31`, `P = (DW3 >> 16) & 1`.
+
+| DW3 | P | SCT | SC | DNR | CID | Meaning | Usual cause |
+|---|---|---|---|---|---|---|---|
+| 0x80270031 | 1 | 0 | 13h | 1 | 0031h | PRP Offset Invalid | Non-zero offset in PRP2 or a list entry, or PRP1 not dword aligned |
+| 0x80050042 | 1 | 0 | 02h | 1 | 0042h | Invalid Field in Command | Length over MDTS, reserved PSDT, SGL used when SGLS = 0, bad NLB |
+| 0x00090055 | 1 | 0 | 04h | 0 | 0055h | Data Transfer Error | Controller could not move data: unreachable host memory (UR, CA, poisoned or timed-out completion) |
+| 0x801F0061 | 1 | 0 | 0Fh | 1 | 0061h | Data SGL Length Invalid | Descriptor lengths do not add up to the transfer length |
+
+- **DNR:** Do Not Retry. Set on the first, second and fourth means resubmitting the same command cannot succeed. Clear on Data Transfer Error means a retry might, since it can be transient.
+- **Find the field:** the Error Information log (Get Log Page, log ID 01h) has an entry per failed command with SQ ID, command ID, the status field and a Parameter Error Location saying which byte and bit of the command was at fault. Read it right after the failure, since entries are numbered and the log has limited depth. Linux exposes the same fields as `nvme error-log`.
+- **Triage order:** decode status, match the CID to the submitted SQE (kernel tracepoints or analyzer), read the error log entry, then check MDTS, PSDT and SGLS against the command before suspecting firmware.
+- **Blame:** 13h, 0Fh and most 02h are host construction errors. 04h means a datapath or platform fault, so look at PCIe error registers and the IOMMU log too.
+FOLLOW:
+- Why would a controller pick 02h over 13h for a bad PRP? => The specification leaves some cases open, and 02h is the general bucket. A validator should test against the allowed set, not one code.
+- What does the M bit mean? => More information is available in the Error Information log page.
+PITFALL: Fixating on the status code name. Different controllers return different valid codes for the same host mistake, so use the Parameter Error Location and the command dump.
+VERIFY: DW3 bit layout, the Parameter Error Location encoding (byte and bit), and status names 0Fh and 13h in the NVMe Base Specification.
+
+@@ 4.12 | Advanced | Cross-layer | tags=tlp,mps,mrrs,rcb,list-fetch,pcie
+Q: What does a PRP list fetch and an unaligned buffer cost on PCIe? Show the TLP counts.
+SHORT: The list is fetched with memory reads, which each carry at most MRRS bytes and come back as completions of at most MPS bytes, split at RCB. A 1 MiB write has a 2040-byte list, which is 4 MRds at MRRS 512, against 2048 MRds for the data, so it costs under 0.2 percent of the traffic but adds a dependent round trip. Unaligned buffers add about one TLP per 4 KiB page.
+DEEP:
+Assumptions: MPS 256 B, MRRS 512 B, RCB 64 B, 4DW headers, 26 B overhead per TLP (as on the PCIe page), 1 microsecond fetch round trip, page-aligned lists.
+
+1. **List size:** 1 MiB aligned = 256 pages, E = 255 entries = 2040 B.
+2. **List fetch:** ceil(2040 / 512) = 4 MRds. Each 512 B read comes back as at least 2 completions (at MPS 256), so at least 8 CplDs. If the root complex splits at RCB, up to 8 per read.
+3. **Data fetch:** 1 MiB / 512 B = 2048 MRds and 4096 CplDs. List overhead: 4 / 2048 = 0.2 percent.
+4. **Latency:** the list read is a dependent round trip of about 1 microsecond. It can overlap the transfer of the PRP1 page, but a controller that waits for the list before starting adds about that much to first-data latency.
+5. **4 KiB rule:** no TLP crosses a 4 KiB boundary, and PRP pages are 4 KiB aligned, so a page-aligned PRP buffer needs no more data TLPs than contiguous memory would.
+6. **Offset buffers:** 4 KiB written from host memory at MRRS 512: aligned = 8 MRds, offset 0x100 = 9 (3840 B in page 1 needs 8 requests, 256 B in page 2 needs 1). For a read (MWr, MPS 256) aligned = 16 TLPs, offset 0x40 = 17 (4032 B is 15.75 TLPs, plus a 64 B piece in page 2). That is 4538 wire bytes instead of 4512, so 90.3 percent instead of 90.8 percent.
+7. **SGL fragments:** each fragment splits TLPs at its own edges, so many sub-256 B fragments push efficiency down fast (see the PCIe page, NVMe over PCIe module).
+
+- **Where to see it:** an analyzer filtered on the SSD shows MRd length, address and tag. Group by MRd address to see which are list fetches.
+FOLLOW:
+- Why do completion sizes differ between platforms? => Root complexes may split completions at 64 or 128 B (RCB) or send up to MPS. Both are legal, so a checker should test the rules, not exact sizes.
+- Does a longer list make throughput worse? => Not through bandwidth. It hurts through the extra dependent fetch and, if tags are scarce, the outstanding-read budget.
+PITFALL: Treating PRP list traffic as a bandwidth cost. It is a latency and tag-use cost, and small next to the data.
+VERIFY: Whether the Read Completion Boundary splitting rule allows the completion sizes you observe, in the PCIe Base Specification (Completion Rules).
+
+@@ 4.13 | Advanced | Scenario | tags=chaining,boundary,firmware-bug,sweep,prp-list
+Q: A 2 MiB write passes, a 2 MiB + 8 KiB write passes, but a 2 MiB + 4 KiB write returns Success and the last page reads back wrong. MDTS is 10 (4 MiB). Where do you look and how do you prove it?
+SHORT: 2 MiB + 4 KiB is 513 pages, so the list has exactly 512 entries and fills one list page completely. A firmware bug that treats the last slot as a link whenever the page is full, and not only when more entries follow, would misread the 512th data entry as a next-list pointer. At 514 pages the link really is needed, so bigger sizes pass. Sweep page counts, not byte counts, to prove it.
+DEEP:
+1. **Reason about page counts:** E = 512 at 513 pages. One list page holds 512 slots, so the list is full with no link. E = 513 is the first size needing a link. If firmware checks "slot 511 is the link" unconditionally, exactly E = 512 breaks.
+2. **Predict the pattern:** the failure depends on pages touched, not bytes. It should hit 513 pages regardless of offset: 2 MiB + 4 KiB aligned, or 2 MiB at offset 0x200.
+3. **Sweep:** list sizes E = 509 to 515 (pages 510 to 516), and E = 1021 to 1024 for the second chain level as far as MDTS allows, each at offsets 0, 0x200 and 0xFFC, for read and write, with a pattern that encodes the page index.
+4. **Read the analyzer:** after fetching the list, the MRd of "the next list" would go to an address equal to the last data page. That is the proof, since a genuine link points to a separate list page.
+5. **Rule out the host:** on Linux the driver only writes a link when more entries follow. Dump the list for the failing size to confirm 512 valid data entries and no link.
+
+| Pages | E | Expected list layout |
+|---|---|---|
+| 512 | 511 | One list page, 511 entries |
+| 513 | 512 | One list page, 512 data slots, no link |
+| 514 | 513 | Page 1: 511 data + link; page 2: 2 data |
+| 1024 | 1023 | Page 1: 511 + link; page 2: 512 data |
+| 1025 | 1024 | Page 1: 511 + link; page 2: 511 + link; page 3: 2 data |
+
+- **Coverage note:** with MDTS 9 the whole chaining path is unreachable, so a controller can ship with chaining never tested. Check the reported MDTS against what you can exercise.
+FOLLOW:
+- Why did the bigger sizes pass? => The link was needed there, so treating slot 511 as a link was correct.
+- Would a 4 MiB transfer at offset 0x200 change the boundary? => Yes, only the pages touched matters. It touches 1025 pages, which is the three-list-page case.
+PITFALL: Sweeping bytes in round numbers such as 1 MiB, 2 MiB and 4 MiB. Those are exactly the sizes that avoid the boundary cases.
+VERIFY: The rule that the last slot of a list page is a link only when more entries follow, in the NVMe Base Specification PRP List section.
+
+@@ 4.14 | Advanced | Concept | tags=sgl,status-codes,negative-tests,validation
+Q: Which malformed SGLs should a controller reject, and with which status codes?
+SHORT: A controller should return a defined error, not corrupt data or hang. The relevant generic codes are 0Dh (invalid SGL segment descriptor), 0Eh (invalid number of SGL descriptors), 0Fh (data SGL length invalid), 10h (metadata SGL length invalid), 11h (SGL descriptor type invalid), 16h (SGL offset invalid), 1Eh (SGL data block granularity invalid), plus 02h Invalid Field in Command for command-level mistakes such as PSDT set when SGLs are unsupported.
+DEEP:
+| Malformed case | Expected status (check spec) |
+|---|---|
+| Descriptor lengths sum to less than the transfer | 0Fh Data SGL Length Invalid |
+| Sum larger than the transfer, when SGLS bit 18 is clear | 0Fh Data SGL Length Invalid |
+| Reserved or unsupported descriptor type, or Keyed descriptor on PCIe | 11h SGL Descriptor Type Invalid |
+| Bit Bucket on a write | 11h or 02h, check spec |
+| Bad Segment or Last Segment structure | 0Dh Invalid SGL Segment Descriptor |
+| More descriptors than the controller supports | 0Eh Invalid Number of SGL Descriptors |
+| Misaligned or non-dword-length block with SGLS = 10b | 1Eh SGL Data Block Granularity Invalid |
+| PSDT 01b or 10b when SGLS bits 1:0 = 0 | 02h Invalid Field in Command |
+| PSDT 11b (reserved) | 02h Invalid Field in Command |
+| Metadata SGL lengths wrong | 10h Metadata SGL Length Invalid |
+
+- **Linux names:** nvme.h calls these NVME_SC_SGL_INVALID_LAST (0Dh), _COUNT (0Eh), _DATA (0Fh), _METADATA (10h), _TYPE (11h), _OFFSET (16h) and _GRANULARITY (1Eh). They do not match the specification names, so map by number.
+- **What "good" looks like:** the command completes with a defined status, no data is transferred beyond the described buffers, the controller stays up, and the next valid command succeeds.
+- **Method:** build each case with an SQE builder outside the kernel driver, submit it alone, check the status against the allowed set, then check that the guard regions around every fragment are untouched and that no CSTS.CFS or reset occurred.
+- **Order of checks:** a case can violate several rules. Test one violation at a time, or which code comes back becomes controller dependent.
+FOLLOW:
+- Why is the expected code a set and not a single value? => The specification does not order the checks and sometimes allows a broader code, so record which a controller returns and treat unexpected success or hangs as the real failures.
+- What is the highest-risk negative case? => A length larger than the described buffers. If the controller accepts it, it will DMA beyond the SGL into unrelated host memory.
+PITFALL: Only checking that "an error came back". The important check is that nothing was transferred beyond the described buffers.
+VERIFY: The exact condition for each of 0Dh, 0Eh, 0Fh, 10h, 11h, 16h and 1Eh, and the status for Bit Bucket on writes, in the NVMe Base Specification.
+
+@@ 4.15 | Principal | Scenario | tags=test-design,fuzzing,conformance,iommu,coverage
+Q: You own PRP and SGL validation for a new controller. Design the suite: what do you vary, what is the oracle, how do you keep failures debuggable?
+SHORT: Vary the geometry (offset, length, page count, list start, chain depth, descriptor count, fragment sizes and alignments), the command type, the metadata layout and the address space. Use an oracle that tags every byte with its expected origin, and guard regions plus a strict IOMMU to catch over- and under-runs. Add negative cases with expected status sets, and make every case replayable from a seed with the raw SQE and list bytes logged.
+DEEP:
+1. **Geometry, PRP:** pages touched E = 0, 1, 2 and every list boundary (510 to 514, 1022 to 1026 if MDTS allows), offsets {0, 4, 0x1FC, 0x200, 0xFFC}, list start offsets (page aligned and qword aligned), CC.MPS other than 0 if supported.
+2. **Geometry, SGL:** 1, 2, N descriptors, single and nested segments, Last Segment position, fragments of 1 B (if byte alignment is supported), dword multiples, sizes straddling MPS, Bit Bucket at the start, middle and end of reads.
+3. **Data and space:** read, write, compare, with and without metadata (extended and separate), buffers above 4 GiB, IOVAs from a real IOMMU, hugepage-backed and ordinary buffers.
+4. **Oracle:** fill each fragment with a pattern that encodes its LBA and byte offset, so a miscompare shows exactly which bytes came from where. Surround every fragment and every list page with canaries, and check the list page is never written by the controller.
+5. **IOMMU as a probe:** map only the described pages, leave the surroundings unmapped, and run in strict mode. An overrun or a misread pointer then faults with the exact address, instead of a quiet miscompare.
+6. **Negative cases:** a table of malformed inputs, each with an allowed status set, that verifies no data beyond the buffers moves, and that a valid command right afterwards works.
+7. **Determinism:** each case is a seed plus a parameter tuple. On failure, dump the SQE, the list or SGL bytes, the LBAs and the observed status. Re-run from the dump.
+8. **Coverage and pass criteria:** a matrix report of covered boundary classes, zero miscompares, zero IOMMU faults, zero unexpected statuses, and the same result over repeated runs and power cycles.
+- **Tooling:** the Linux driver only builds legal, well-shaped commands. Crafting arbitrary PRP lists and SGLs needs NVMe passthrough with your own SQE, a user-space driver (SPDK) or a PCIe exerciser.
+FOLLOW:
+- How do you stop the suite being a pile of random cases? => Drive it from a boundary-first generator, then add seeded randomness around it, and tie each case to the spec rule it checks.
+- How many iterations before you trust it? => Coverage of the boundary classes matters more than count. Then run long random soaks and treat any single miscompare as a defect.
+PITFALL: Validating only through the Linux driver. It allocates lists from fixed pools and emits a narrow set of shapes, so many list offsets, SGL alignments and all malformed cases never happen.
+VERIFY: The list start alignment rule (qword or page), the maximum SGL descriptor count the controller reports, and the mandatory checks in the NVMe Base Specification.
+
+@@ 4.16 | Principal | Cross-layer | tags=iommu,bad-address,unsupported-request,cmb,data-transfer-error
+Q: PRPs are host bus addresses the controller must trust. How do you validate behavior when a PRP or list entry points somewhere it should not?
+SHORT: Only the PCIe fabric can reject a bad address, not the controller. A read from a bad address returns UR or CA, and a good controller fails just that command, typically with Data Transfer Error. A write to a bad address is posted, so the device sees nothing: the host logs an IOMMU fault and the command can complete Success with the data lost. Validate that the controller never hangs, corrupts other commands, or goes fatal.
+DEEP:
+- **Read path (Write commands and list fetches):** the MRd gets a UR or CA completion, or no completion and a Completion Timeout. The controller must fail that command (Data Transfer Error is the natural code) and keep serving the rest. See the PCIe page, Error Handling module.
+- **Write path (Read commands):** memory writes are posted. Nothing returns to the device. The host sees a DMAR or IO_PAGE_FAULT record and no NVMe error. Only host-side monitoring catches it.
+- **Targets to try:** an unmapped IOVA, a hole in the middle of a multi-page buffer, a physical address beyond RAM (IOMMU off), another endpoint's BAR (peer-to-peer, which ACS may block), and 64-bit addresses such as 0x1_0000_0000 or near the top of the address width to catch 32-bit truncation.
+- **CMB targets:** the CMBSZ bits (LISTS, RDS, WDS) say what may live in the controller's own memory. A PRP into the CMB where it is not allowed should give Invalid Use of Controller Memory Buffer (12h).
+- **Method:** program the IOMMU (or an exerciser) so exactly one page of a buffer is unmapped, run at QD > 1 with mixed good commands, and observe: which command fails, with which status, how long the failure takes (Completion Timeout range versus immediate UR), whether later commands succeed, and whether CSTS.CFS, a reset or a DPC event follows.
+- **Pass criteria:** no hang, no fatal status for a per-command error, no corruption of neighbors, defined status where one is possible, and the host log entries match the injected fault.
+FOLLOW:
+- Is CSTS.CFS ever acceptable here? => Only where the spec calls for it. A DPC-enabled port may still bring the link down for an uncorrectable error, so decide in advance whether that is in scope.
+- How does the host see a fault on a list fetch? => As a failed or timed-out command plus IOMMU log lines. Correlate by timestamp and address.
+PITFALL: Expecting every bad address to give an NVMe error status. A read command can complete Success while its data never reached the host.
+VERIFY: The status the spec assigns to a failed host memory access, the CMBSZ bit meanings and 12h, and the UR versus CA rules for unmapped IOVAs in the PCIe Base Specification.
+
+@@ 4.17 | Principal | Debug | tags=sgl,miscompare,root-cause,analyzer,ab-test
+Q: Reads miscompare only when the host uses SGLs, on one platform, and never with PRPs. How do you root-cause it?
+SHORT: Treat it as three suspects: host descriptors (the driver or platform built a bad SGL), firmware (parse or DMA bug), and the platform data path (IOMMU, root complex, ordering). Localize by mapping where the wrong bytes land, capturing the SQE and descriptors on an analyzer, comparing them with the data TLPs, and changing one variable at a time: PRP versus SGL with identical buffers, then another platform, then a user-space driver.
+DEEP:
+1. **Characterize the miscompare:** with a pattern that encodes address and fragment, map the wrong bytes. Whole fragments swapped, the last fragment missing, data shifted by a few bytes, or corruption at fragment edges each point differently.
+2. **Reduce:** shrink to the smallest failing command: fewest fragments, one segment, one LBA span. Keep the buffer identical between attempts.
+3. **Capture:** on the analyzer, decode the SQE fetch. DPTR is the descriptor: for example `00 00 00 30 01 00 00 00 | 30 00 00 00 | 00 00 00 | 30` is address 0x1_3000_0000, length 48, type 3h Last Segment (byte 15 = 30h), which names three descriptors. Then decode the segment fetch and compare against the data TLPs (address and size of each MWr).
+4. **Decision table:**
+
+| Observation | Points to |
+|---|---|
+| Descriptors legal, MWr addresses or lengths differ from them | Firmware SGL walk or DMA |
+| Descriptors illegal, wrong length sum, wrong descriptor count | Host driver or its bounce path |
+| Descriptors legal, MWr correct, data still wrong in host | IOMMU, root complex, ordering or cache (platform) |
+| Fails only above a fragment count or segment length | Segment chaining or descriptor count in firmware |
+| Fails only at odd address or length | SGLS alignment rules |
+
+5. **A/B, one variable at a time:** on Linux set `sgl_threshold` to 0 to stop threshold-based SGL use while keeping the workload. On recent kernels the forced cases (page-gap requests, passthrough commands) still use SGLs, so confirm on the analyzer which form each command took. Re-run on a second platform. Submit the identical descriptor image from a user-space driver (SPDK).
+6. **Close out:** turn the failing descriptor layout into a permanent regression case and check it on every firmware build.
+- **Kernel visibility:** the standard nvme tracepoints show the command fields but, on the kernels I would expect, not the descriptors (check your trace format), so dump them from the driver or the analyzer.
+FOLLOW:
+- Which SGL-specific firmware bugs are typical suspects? => Confusing Segment with Last Segment, off-by-one on descriptor count in chained segments, wrong handling of a short final descriptor, and unaligned fragment starts.
+- Why can the platform matter for an SGL bug? => Different root complexes split reads and completions differently for small unaligned fragments, and the IOMMU may coalesce segments differently, so the same firmware sees different sequences.
+PITFALL: Comparing PRP against SGL and stopping there. That changes fragment merging, list placement and alignment together, so hold the buffer layout constant and flip only the descriptor style.
+VERIFY: The descriptor byte layout above against the NVMe Base Specification SGL figure, and Linux `sgl_threshold` behavior on your kernel.

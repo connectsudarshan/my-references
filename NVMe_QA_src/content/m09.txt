@@ -1,0 +1,382 @@
+# Module 9: Status Codes, Errors & Recovery
+
+@@ 9.01 | Basic | Concept | fig=cqestatus | tags=cqe,status,dw3,phase-tag,dnr
+Q: What is in the CQE status field, and how do you pull SC, SCT, CRD, M and DNR out of DW3?
+SHORT: A 16-byte CQE ends with DW3: the command identifier in bits 15:0, the Phase Tag (P) in bit 16, and the status field in bits 31:17. Inside it, bits 24:17 are the Status Code (SC), 27:25 the Status Code Type (SCT), 29:28 the Command Retry Delay (CRD), bit 30 More (M) and bit 31 Do Not Retry (DNR). SCT 0 with SC 0 means success.
+DEEP:
+| DW3 bits | Field | Meaning |
+|---|---|---|
+| 15:0 | CID | Command identifier of the completed command |
+| 16 | P | Phase Tag, inverts on every pass through the CQ |
+| 24:17 | SC | Status Code, looked up in the table chosen by SCT |
+| 27:25 | SCT | 0 generic, 1 command specific, 2 media and data integrity, 3 path related, 7 vendor specific |
+| 29:28 | CRD | Index of a retry delay time, 0 means none |
+| 30 | M | More information is in the Error Information log page |
+| 31 | DNR | Do Not Retry |
+
+- **The other DWords:** DW0 is a command-specific result (Set Features value, Abort outcome). DW1 is reserved, except that Zone Append returns the LBA it used as a 64-bit value in DW0 and DW1 together. DW2 holds the SQ Head Pointer in bits 15:0 and the SQ Identifier in bits 31:16.
+- **Validity:** the status field means nothing until P matches the phase the host expects for that pass of the CQ. A stale slot has the old phase.
+- **Success:** SCT 0 and SC 0. P is 1 on the first pass, so DW3 is nonzero on a valid first-pass entry, but on the second pass P is 0 and a success with CID 0 has DW3 = 0.
+- **Two numbering conventions:** analyzers show the raw DW3. Linux stores the status shifted right by one to drop P, so its SC sits in bits 7:0, SCT in 10:8, CRD in 12:11, M in bit 13 and DNR in bit 14 (masks 1800h, 2000h and 4000h).
+FOLLOW:
+- Is the status field valid before the phase tag matches? => No. Until P matches the expected phase the slot is stale, and no bit in it means anything.
+- Does a failed command still return the SQ Head Pointer? => Yes. Every CQE carries SQHD and SQID, so an error completion frees its SQ slot exactly as a success does.
+PITFALL: Comparing DW3 to zero to detect success. P is 1 on first-pass entries and 0 on second-pass ones, so mask it out and test SCT and SC.
+VERIFY: Bit positions of CRD, M and DNR in the Completion Queue Entry figure of the NVMe Base Specification, and the DW0 and DW2 layout.
+
+@@ 9.02 | Basic | Concept | tags=sct,status-code-type,decode,path
+Q: What are the status code types, and how do you read a status such as SCT 2 SC 81h?
+SHORT: SCT chooses the table in which SC is looked up. SCT 0 is generic, 1 is command specific, 2 is media and data integrity, 3 is path related (ANA and pathing), and 7 is vendor specific, with 4 to 6 reserved. So SC 81h alone is meaningless: SCT 0 SC 81h is Capacity Exceeded, but SCT 2 SC 81h is Unrecovered Read Error. Always read the pair.
+DEEP:
+| SCT | Name | Examples (SC in hex) |
+|---|---|---|
+| 0 | Generic | 00 Success, 01 Invalid Opcode, 02 Invalid Field, 06 Internal Error, 80 LBA Out of Range |
+| 1 | Command specific | 01 Invalid Queue Identifier, 02 Invalid Queue Size, 03 Abort Command Limit Exceeded, 08 Invalid Interrupt Vector, 0C Invalid Queue Deletion |
+| 2 | Media and data integrity | 80 Write Fault, 81 Unrecovered Read Error, 82 to 84 PI check errors, 85 Compare Failure, 87 Deallocated or Unwritten Block |
+| 3 | Path related | 00 Internal Path Error, 01 to 03 ANA states, 60 Controller Pathing Error, 70 Host Pathing Error, 71 Command Aborted By Host |
+| 7 | Vendor specific | Defined by the vendor |
+
+- **Command specific means opcode specific:** SCT 1 SC 03h is only meaningful for an Abort, and SC 0Ch only for a Delete I/O CQ. The same numbers mean something else for other opcodes.
+- **Where ZNS lives:** zone errors are SCT 1 with SC B8h to BFh (Zone Boundary Error, Zone Is Full, Zone Is Read Only, Zone Is Offline, Invalid Write, Too Many Active or Open Zones, Invalid State Transition).
+- **Path related:** these drive multipath failover, so the host cares whether it was the path or the media that failed (module 14).
+- **Generic 80h and up:** these values belong to the NVM command set and are still in SCT 0.
+FOLLOW:
+- Who defines SCT 7? => The vendor. A validator should log the raw pair and map it through the vendor's documentation, never guess.
+- Which type would a failed ANA-inaccessible path return? => SCT 3, SC 02h, Asymmetric Namespace Access Inaccessible. It is a path problem, not a media error, and the host may retry on another path.
+PITFALL: Printing only SC. Log SCT and SC together, plus the DNR and M flags, ideally with the decoded name.
+VERIFY: SC range allocations within each SCT (generic, command set specific, vendor) and the exact code names for your spec revision.
+
+@@ 9.03 | Basic | Concept | tags=generic-status,invalid-opcode,invalid-field,cid-conflict,data-transfer,internal-error
+Q: When does a controller return Invalid Opcode, Invalid Field, Command ID Conflict, Data Transfer Error and Internal Error?
+SHORT: Invalid Opcode (01h) means the opcode is reserved or unsupported on that queue. Invalid Field (02h) means a reserved or unsupported value in a defined field. Command ID Conflict (03h) means the CID is already in use. Data Transfer Error (04h) means moving data or metadata failed, for example a PCIe error during DMA. Internal Error (06h) means the controller failed for a reason that is not the host's command.
+DEEP:
+| SC | Name | Typical trigger |
+|---|---|---|
+| 01h | Invalid Opcode | Reserved or unsupported opcode, an admin opcode sent on an I/O SQ, an optional command such as Copy that the drive does not implement |
+| 02h | Invalid Field | Reserved bit set, unsupported CNS, log page or feature value, transfer larger than MDTS |
+| 03h | Command ID Conflict | CID equals one still outstanding in that SQ |
+| 04h | Data Transfer Error | DMA to or from host memory failed: UR or CA completion, poisoned TLP, IOMMU fault, unmapped PRP |
+| 06h | Internal Error | Firmware or hardware failure unrelated to the command's contents |
+| 0Bh | Invalid Namespace or Format | NSID not present, not active or not attached, or the namespace format is invalid |
+
+- **Log page link:** for Invalid Field, the Error Information log entry's Parameter Error Location names the byte and bit, which is far quicker than staring at the SQE.
+- **Retry expectations:** codes caused by the host's command (01h, 02h, 0Bh) should not succeed on retry, so DNR is expected set. Internal Error and Data Transfer Error may succeed on retry.
+- **Escalation:** a persistent Internal Error usually comes with an Async Event of type Persistent Internal Error and often CSTS.CFS.
+- **Debug rule:** a Data Transfer Error with a clean NVMe side is a PCIe or IOMMU problem until proven otherwise (see the PCIe page, error handling module).
+FOLLOW:
+- Data Transfer Error appears but the SSD looks healthy. Where do you look? => PCIe AER on the SSD and the root port (UR, CA, poisoned TLP, completion timeout), the IOMMU fault log, and whether the PRP addresses were actually mapped.
+- Is Command ID Conflict reliable to test? => Not always. CID uniqueness is the host's job, so a controller may mishandle a duplicate instead of returning 03h. Test it, but treat a different outcome as a spec question to settle, not automatically a bug.
+PITFALL: Reading Internal Error as a media error. It says the controller failed, not that NAND returned bad data. Media problems are SCT 2.
+VERIFY: Whether detection of 03h is required, the DNR expectation for each code, and the exact wording of 04h (Data Transfer Error, not to be confused with Transient Transport Error, SC 22h) in the NVMe Base Specification.
+
+@@ 9.04 | Intermediate | Concept | tags=lba-range,capacity-exceeded,namespace-not-ready,write-protected,format-in-progress
+Q: When does an SSD return LBA Out of Range, Capacity Exceeded, Namespace Not Ready, Format In Progress or Namespace Is Write Protected, and what should the host do?
+SHORT: LBA Out of Range (SCT 0, SC 80h) means the command touches a block beyond the namespace size. Capacity Exceeded (81h) means the command would exceed the namespace's capacity, mainly on thin-provisioned namespaces. Namespace Not Ready (82h) is a condition that may clear, so retry after the CRD delay if DNR is clear. Reservation Conflict is 83h, Format In Progress 84h, Namespace Is Write Protected 20h.
+DEEP:
+- **Range rule:** a command is out of range when SLBA + NLB + 1 exceeds NSZE, where NLB is 0-based. Example with NSZE = 1,000,000 blocks: an 8-block write (NLB = 7) at SLBA = 999,996 touches blocks up to 1,000,003 and fails. At SLBA = 999,992 it ends at 999,999 and succeeds.
+- **Boundary tests:** SLBA = NSZE - 1 with NLB = 0 passes and with NLB = 1 fails. SLBA = NSZE fails. SLBA = FFFFFFFFFFFFFFFFh with NLB = 1 tests integer overflow in the controller's check, since a careless sum wraps to a small number.
+- **Capacity Exceeded:** the address may be legal (below NSZE) but the namespace cannot back it. It appears when a thin-provisioned namespace runs out of backing space (module 7).
+- **Namespace Not Ready:** the namespace cannot be accessed for a reason that is not an ANA state. With DNR clear and a nonzero CRD, the host may retry after the delay.
+- **In-progress states:** Format In Progress (84h) is returned to I/O to a namespace being formatted. A Sanitize in progress returns its own I/O status (SCT 0, SC 1Dh) to most I/O.
+- **Write protection:** writes to a write-protected namespace return SC 20h, and reads still work.
+FOLLOW:
+- Should a host retry LBA Out of Range? => No. The command itself is wrong, so retrying can only fail again.
+- How does Capacity Exceeded differ from an out-of-range write? => Out of range is about the address exceeding NSZE. Capacity Exceeded is about space: the address is legal but the namespace cannot back it.
+PITFALL: Forgetting that NLB is 0-based when computing the last LBA. An off-by-one makes boundary tests pass or fail for the wrong reason.
+VERIFY: SC 20h, 84h and 1Dh, the write-protect and format-in-progress behavior of reads, and the thin provisioning rules for 81h in the NVM Command Set Specification.
+
+@@ 9.05 | Intermediate | Trap | tags=sct,decode,trap,linux,nvme-cli
+Q: A script logs "status 0x80 = LBA Out of Range" for a failed command. Why can that be wrong, and what are the ways a status number gets printed?
+SHORT: SC 80h means different things per SCT: SCT 0 is LBA Out of Range, SCT 1 is Conflicting Dataset Management Attributes, and SCT 2 is Write Fault. The printed number also depends on the tool. In raw DW3 the phase bit is bit 16 (bit 0 of the upper half), Linux drops it, and tools such as nvme-cli fold SCT and SC into one value. Decode from SCT and SC, never from a lone byte.
+DEEP:
+| SC | SCT 0 generic | SCT 1 command specific | SCT 2 media |
+|---|---|---|---|
+| 80h | LBA Out of Range | Conflicting Dataset Management Attributes | Write Fault |
+| 81h | Capacity Exceeded | Invalid Protection Information | Unrecovered Read Error |
+| 82h | Namespace Not Ready | Attempted Write to Read Only Range | End-to-end Guard Check Error |
+| 83h | Reservation Conflict | Command Size Limit Exceeded | End-to-end Application Tag Check Error |
+
+The same failed read seen three ways:
+- **Raw DW3 upper half:** C503h (P in bit 0, SC in bits 8:1, SCT in 11:9, DNR in bit 15, M in bit 14).
+- **Linux status:** 6281h (phase dropped, SCT 2 in bits 10:8, SC 81h, M 2000h, DNR 4000h).
+- **Log text:** `(sct 0x2 / sc 0x81) MORE DNR`.
+
+- **Command specific is opcode specific:** SCT 1 values from 80h up mean different things for the NVM commands and for Fabrics Connect.
+- **Decoder design:** key a table on (SCT, SC), add the opcode for SCT 1, decode flags separately, and print the raw value when the pair is unknown. Never crash on an unknown status.
+FOLLOW:
+- Why does the Linux log line show both sct and sc? => Neither one alone identifies the error, and the flags MORE and DNR are appended so the retry policy is visible.
+- What should a test assert on a failing command? => The (SCT, SC) pair, or an explicit set of allowed pairs where the spec permits alternatives, plus the DNR policy.
+PITFALL: Matching on the low byte of a status. It merges an out-of-range write, a Write Fault and a Dataset Management attribute error into one bucket.
+VERIFY: SCT 1 values 180h to 183h for the NVM command set, and the number convention your nvme-cli and libnvme version prints.
+
+@@ 9.06 | Intermediate | Concept | tags=media-error,unrecovered-read,write-fault,pi,dulbe,tler
+Q: What do the media and data integrity statuses (SCT 2, 80h to 87h) mean, and when does an SSD return each?
+SHORT: Write Fault (80h): a write failed on media after being accepted. Unrecovered Read Error (81h): ECC and all internal recovery failed, so the data cannot be returned. Guard, Application Tag and Reference Tag Check Errors (82h to 84h): the end-to-end protection check failed. Compare Failure (85h): a Compare found a mismatch. Access Denied (86h): security. Deallocated or Unwritten Logical Block (87h): the block has no data and the host enabled DULBE.
+DEEP:
+- **81h Unrecovered Read Error:** raised after read retry, soft decode and any parity recovery all fail. The controller must not return wrong data silently. It may spend a long time before giving up, which the host bounds with the Error Recovery feature (Time Limited Error Recovery, TLER, in 100 ms units).
+- **80h Write Fault:** program failures are normally hidden by remapping. Seeing this means recovery resources are gone, often together with a read-only or degraded state in SMART.
+- **82h to 84h:** returned only when the command asks for checks (PRCHK) on a namespace with protection information. It tells you which tag mismatched (module 8).
+- **85h:** a normal outcome of a Compare command, so it is not evidence of a broken drive.
+- **87h:** governed by the DULBE bit of the Error Recovery feature. When set, reading a deallocated or unwritten block returns 87h. Otherwise it returns success with the data the namespace format defines.
+- **Deterministic test:** use Write Uncorrectable on chosen LBAs, read them back to get 81h, read their neighbors to prove no collateral damage, then compare Error Information log and SMART Media and Data Integrity counters to what you expect.
+FOLLOW:
+- A read returns success with wrong data. Which status class failed? => None. That is silent data corruption, the worst case, which is why validators compare against a reference pattern and PI and not only the status.
+- Do correctable ECC events show up as statuses? => No. They return success. Rising correctable rates only appear in logs and telemetry, so watch trends there.
+PITFALL: Counting only failed statuses as media problems. A drive can be heavily stressed while returning success on every read.
+VERIFY: TLER units and where it lives in the Error Recovery feature (FID 05h), DULBE behavior, which media errors increment the SMART counter, and the PI check status assignments.
+
+@@ 9.07 | Intermediate | Concept | tags=dnr,crd,more,retry,crdt,linux
+Q: How do DNR, CRD and More decide whether and when a host retries a failed command?
+SHORT: DNR set means resubmitting the same command is expected to fail, so the host completes it with an error. With DNR clear the host may retry, and a nonzero CRD picks one of three delay times (CRDT1 to CRDT3 in Identify Controller, in 100 ms units) to wait first. More set means the Error Information log page has extra detail. Linux retries up to max_retries (default 5).
+DEEP:
+| DNR | CRD | Host action |
+|---|---|---|
+| 1 | any | Fail the request. Do not retry, on this or any other path |
+| 0 | 0 | May retry immediately, bounded by a retry count |
+| 0 | 1 to 3 | Wait CRDTn x 100 ms, then retry |
+
+- **Linux logic:** the completion path completes the request if DNR is set or the retry count reached max_retries. Otherwise it requeues it, with a delay of crdt[CRD-1] x 100 ms when CRD is nonzero. With multipath, path-related statuses fail over to another path instead.
+- **Delay budget:** if CRDT1 = 5, one retry waits 500 ms, and the five allowed retries add up to at most 2.5 s of pure delay. If a controller returns a retryable status with CRD = 0 or all CRDT values zero, the host retries in microseconds, five times, which can look like a hang.
+- **M bit:** when More is set, read the Error Information log (LID 01h) and find the entry with the same SQID and CID.
+- **Host-generated status:** when the driver cancels commands at a reset it synthesizes Command Aborted By Host (SCT 3, SC 71h). That status never appears on the wire.
+FOLLOW:
+- May a DNR command be retried on another path? => No. The rule covers resubmission to any controller in the NVM subsystem, so failover does not help.
+- Is CRD binding on the host? => It is advisory. The controller states how long it needs, and the host chooses whether to obey. The values come from Identify Controller, so a controller with zero CRDT entries effectively disables the delay.
+PITFALL: Blindly retrying commands that are not idempotent after a failure or timeout. A retried Zone Append that had actually executed appends twice.
+VERIFY: CRD validity when DNR is set, the CRDT fields in Identify Controller, and the DNR expectations for each status code.
+
+@@ 9.08 | Intermediate | Numeric | tags=error-log,log-page-01h,elpe,parameter-error-location,get-log-page
+Q: What does the Error Information log page contain, how big is it, and how do you tie an entry to a failed command?
+SHORT: Log page 01h holds 64-byte entries for recent failures, newest first: a 64-bit Error Count starting at 1, SQID, CID, status, Parameter Error Location (byte and bit in the command), LBA, NSID and more. Identify Controller's ELPE, a 0's based value, gives the number of entries. Match an entry to a failed CQE by SQID and CID. A 64-entry log is 4096 bytes, so NUMD is 1023.
+DEEP:
+| Bytes | Field |
+|---|---|
+| 7:0 | Error Count, starts at 1, 0 marks an unused slot |
+| 9:8 | SQID, FFFFh if not tied to one command |
+| 11:10 | CID, FFFFh if not tied to one command |
+| 13:12 | Status Field (bit 0 phase, 15:1 status) |
+| 15:14 | Parameter Error Location |
+| 23:16 | LBA of the first block that had the error |
+| 27:24 | NSID |
+| 28 | Vendor specific information available (log page ID) |
+| 39:32 | Command Specific Information |
+
+Newer revisions add transport type, command set indicator and opcode bytes in the same 64-byte entry.
+
+1. **Size:** with ELPE = 63, there are 64 entries x 64 B = 4096 B, so Get Log Page uses NUMD = 4096 / 4 - 1 = 1023 (a 0's based dword count), and CDW10 = 03FF0001h with RAE clear.
+2. **Parameter Error Location:** bits 7:0 are the byte (0 to 63) and bits 10:8 the bit (0 to 7). A value of 0028h is byte 40, bit 0, which is the low bit of CDW10. For an Identify with a reserved CNS, that points straight at the CNS field.
+3. **Automation:** snapshot the highest Error Count before and after a test. The difference is the number of logged errors, and a gap larger than the entries returned means entries were lost.
+4. **Commands:** `nvme error-log /dev/nvme0` or `nvme get-log /dev/nvme0 --log-id=1 --log-len=4096`.
+FOLLOW:
+- A command failed but there is no entry. Is that a bug? => Not necessarily. If M was clear in the CQE, no entry is promised, and the log is a bounded list of recent errors.
+- Why is Error Count useful for a test harness? => It is a monotonic identifier, so deltas count errors independent of how many slots the drive keeps.
+PITFALL: Treating the log as a complete history. It holds a bounded number of recent entries, and only errors the controller chose to log.
+VERIFY: Entry byte offsets for the newer fields, the ordering (newest first), the minimum ELPE, retention across power cycles, and the CDW10 layout of Get Log Page for your spec revision.
+
+@@ 9.09 | Advanced | Concept | tags=csts,cfs,fatal,all-ones,recovery
+Q: What does CSTS.CFS mean, what should the host do when it sees it, and why can a CSTS value of FFFFFFFFh fool you?
+SHORT: CSTS.CFS (bit 1) is set by the controller on a fatal error it cannot report any other way. The host should stop trusting the queues, capture evidence, and reset the controller (CC.EN to 0, wait for RDY 0, set EN, wait for RDY 1), escalating to NSSR or a PCIe reset if that fails. A CSTS read of FFFFFFFFh also has CFS set, but it usually means a dead link, not a controller report.
+DEEP:
+| CSTS | Meaning |
+|---|---|
+| 00000001h | RDY set, healthy |
+| 00000000h | Not ready: disabled or resetting |
+| 00000003h | RDY and CFS: a fatal error while running, such as a firmware assert |
+| FFFFFFFFh | All ones: the read failed (UR or completion timeout), so link down, device removed or stuck in a bad power state |
+
+1. **Detect:** CSTS polled in the timeout path, or an Async Event of type Persistent Internal Error. Some hangs never set CFS, so timeouts still matter.
+2. **Capture first:** CSTS, CAP, PCI Status and AER registers, host logs, then after re-enable the Error Information, SMART and vendor debug logs, and any controller-initiated telemetry. Volatile state can be lost on a power cycle.
+3. **Reset:** CC.EN to 0, wait for CSTS.RDY = 0 (bounded by CAP.TO in 500 ms units), then re-enable.
+4. **Escalate:** NSSR if CAP.NSSRS is set, FLR or hot reset, then power cycle.
+- **Linux:** the timeout handler resets on CFS or NSSRO. It prints `controller is down; will reset: CSTS=0x..., PCI_STATUS=0x...` and, for all ones, adds a hint about a faulty power saving mode. Its ready wait returns an error immediately on all ones.
+- **Validation:** a firmware-injected assert should set CFS or produce a timeout within a bound, the reset should recover, and the assert dump should be retrievable.
+FOLLOW:
+- Should the host keep issuing I/O after CFS? => No. Commands in flight are unreliable and completions may never arrive. Quiesce, capture and reset.
+- How do you tell a controller fatal from a link loss? => Read the PCI Vendor ID and Link Status as well as CSTS. All ones from config space too means the link or device is gone.
+PITFALL: Decoding FFFFFFFFh as RDY = 1 and CFS = 1. Check for all ones first and treat it as a PCIe problem (see the PCIe page, configuration space module).
+VERIFY: When CFS clears, whether admin commands work after CFS, CAP.TO and the Controller Ready Timeouts register in NVMe 2.x, and the Linux message text on your kernel.
+
+@@ 9.10 | Advanced | Debug | tags=cqe,decode,analyzer,dmesg,error-log
+Q: Decode these three CQEs and the matching log lines, and say what the host should do with each: DW3 = C50300A7h, 11050011h and 80050021h.
+SHORT: Take status = DW3 >> 16. C50300A7h is SCT 2, SC 81h, M and DNR set: an Unrecovered Read Error on CID A7h. Do not retry, read the Error Information log. 11050011h is SCT 0, SC 82h, CRD 1: Namespace Not Ready, retry after CRDT1 x 100 ms. 80050021h is SCT 0, SC 02h, DNR: Invalid Field on CID 21h, so fix the command using the log's Parameter Error Location.
+DEEP:
+Method: status = DW3 >> 16. P = bit 0, SC = (status >> 1) and FFh, SCT = (status >> 9) and 7, CRD = (status >> 12) and 3, M = bit 14, DNR = bit 15.
+
+| DW3 | CID | status | P | SCT | SC | CRD | M | DNR | Meaning |
+|---|---|---|---|---|---|---|---|---|---|
+| C50300A7h | A7h | C503h | 1 | 2 | 81h | 0 | 1 | 1 | Unrecovered Read Error |
+| 11050011h | 11h | 1105h | 1 | 0 | 82h | 1 | 0 | 0 | Namespace Not Ready |
+| 80050021h | 21h | 8005h | 1 | 0 | 02h | 0 | 0 | 1 | Invalid Field |
+
+Linux values (status shifted by one): 6281h, 0882h and 4002h. The first prints as:
+```
+nvme0n1: I/O Cmd(0x2) @ LBA 8192, 8 blocks, <text> (sct 0x2 / sc 0x81) MORE DNR
+```
+- **Case 1:** read Error Information (M is set), find the entry with SQID and CID A7h. The entry's LBA is the first block that failed, which can lie inside the command's range and not equal its SLBA. Check whether the LBA was previously marked by Write Uncorrectable. If not, look at media health.
+- **Case 2:** wait CRDT1 x 100 ms and retry, bounded. If Format or Sanitize is running, wait for it to finish.
+- **Case 3:** DNR means the SQE is wrong. The log entry's Parameter Error Location names the byte and bit. Byte 40 is CDW10.
+- **Also look at DW2:** if DW2 = 00030045h, the completion came from SQ 3 and SQ Head is 45h. Any CQE whose CID is not outstanding on that SQ is a duplicate or a stray, and a checker should flag it.
+FOLLOW:
+- Success status but DW0 is nonzero. Error? => No. Many commands return results in DW0 (Set Features, Abort, Create Queue). Never infer failure from DW0.
+- The same CID completes twice on one SQ with no new submission. What is it? => A duplicate completion: a controller bug, or a host CID reuse race. Track outstanding CIDs per SQ and flag it.
+PITFALL: Forgetting that analyzer DW3 still has the phase bit. Linux's 4002h is 8005h on the wire.
+
+@@ 9.11 | Advanced | Concept | tags=timeout,abort,reset,linux,acl
+Q: An I/O command times out. Walk through what a robust host does, including Abort, the reset escalation and what Linux does.
+SHORT: The host first checks if the controller is dead (CSTS.CFS or all ones) and resets at once if so. Otherwise it polls the CQ in case an interrupt was lost, then sends Abort for that SQID and CID and waits one more timeout. If the command is still outstanding, or it was an admin command, the host resets the controller with CC.EN 1 to 0, cancels everything outstanding and reinitializes. Linux defaults are 30 s for I/O and 60 s for admin commands.
+DEEP:
+1. **Timer fires.** Read CSTS. If the device is gone or CFS is set, log `controller is down; will reset` and reset now.
+2. **Missed interrupt check.** Poll the CQ. If the command has completed, log `completion polled` and finish. This is a sign of a lost or mismatched interrupt (module 10).
+3. **Admin command, or already aborted:** reset the controller immediately.
+4. **Otherwise Abort:** send Abort (opcode 08h, SQID in CDW10 bits 15:0, CID in bits 31:16) on the admin queue, mark the command, and re-arm the timer.
+5. **Second expiry:** reset. The reset writes CC.EN = 0, waits for RDY = 0 (bounded by CAP.TO), completes every outstanding request as Command Aborted By Host, re-enables the controller and requeues retryable I/O. If the re-enable fails, Linux logs `Disabling device after reset failure` and marks the namespaces dead.
+- **Abort semantics:** best effort. The aborted command completes with Command Abort Requested (SC 07h). The Abort's own CQE reports through DW0 bit 0 whether the command was aborted (bit set means it was not). The controller limits concurrent Aborts (Identify Controller ACL, 0's based), and beyond that returns Abort Command Limit Exceeded (SCT 1, SC 03h).
+- **Ordering:** the target's CQE and the Abort's CQE arrive in either order.
+- **Do not reuse the CID or buffers** until the command's own CQE arrives or a reset ends it.
+FOLLOW:
+- Why not reset on every timeout? => A reset kills every outstanding command on every queue for one slow command. Poll first, then Abort, then reset.
+- What if the Abort itself times out? => The admin queue is now suspect, so the host resets. Linux sends an admin-queue timeout straight to reset.
+PITFALL: Assuming an aborted command is gone. Abort is best effort, so the command may still complete normally or still be running.
+VERIFY: Abort DW0 bit 0 polarity, ACL semantics, timeout defaults (30 s and 60 s) and message text on your kernel version.
+
+@@ 9.12 | Advanced | Cross-layer | fig=nvmereset | tags=reset,cc-en,nssr,flr,perst,scope
+Q: Which resets can hit an NVMe SSD, and what does each preserve and clear?
+SHORT: NVMe defines a Controller Level Reset (CC.EN 1 to 0, and on PCIe also FLR and a hot reset) and an NVM Subsystem Reset (NSSR write, PERST# or a power cycle). A controller reset clears that controller's queues, in-flight commands and volatile state, and touches nothing else. NSSR does the same to every controller in the subsystem and may drop the link. None of them erase NAND data. PCIe config space survives only the resets that do not reset it.
+DEEP:
+| Trigger | Scope | NVMe registers, queues, in-flight I/O | PCIe config and link | Host must redo |
+|---|---|---|---|---|
+| CC.EN 1 to 0 | One controller | Cleared | Kept | AQA, ASQ, ACQ, CC, then queues |
+| FLR | One function | Cleared | Config reset | Restore config, then init |
+| Hot reset | The device | Cleared | Reset, link retrains | Re-enumerate, then init |
+| NSSR | All controllers | Cleared | Device dependent | Check NSSRO, maybe re-enumerate |
+| PERST# or power cycle | Whole subsystem | Cleared | Fully reset | Full enumeration and init |
+
+The PCIe page (Reset module) has the PCIe-side scope, and module 2 has the register handshake.
+- **What survives all of them:** NAND contents, namespaces and attachments, saved feature values, persistent logs. Unsaved feature values return to defaults.
+- **In flight:** no CQE arrives for commands outstanding at the reset. The host completes them itself. Acknowledged writes should survive. A write in flight is indeterminate, so old or new data is acceptable but a torn mix is not.
+- **Ordering rule:** after CC.EN = 0, wait for RDY = 0 (up to CAP.TO x 500 ms) before setting EN again.
+- **Validation matrix:** each trigger against idle, mid-write, mid-flush, an admin command in progress and a firmware download. Check register state, features, recovery time, data and counters (Power Cycles and Unsafe Shutdowns should not move on a controller reset, though some vendors count them).
+FOLLOW:
+- How do you tell an NSSR from a CC.EN reset afterwards? => CSTS.NSSRO is set after an NSSR (write 1 to clear), and the Power Cycles counter is unchanged. After a CC.EN toggle only RDY moved.
+- Why test every trigger separately? => Each one reaches a different firmware path. State cleared by CC.EN but stale after FLR or PERST# is a real bug class.
+PITFALL: Treating a reset as a clean slate for everything. Media, wear and thermal state persist, and some firmware keeps state across CC.EN resets, hiding bugs that only a power cycle exposes.
+VERIFY: The NVMe over PCIe Transport mapping of each PCIe reset to a controller or subsystem reset, whether PERST# counts as an NSSR, NSSR link behavior, reservation persistence, and when CSTS.NSSRO clears.
+
+@@ 9.13 | Advanced | Concept | tags=delete-sq,delete-cq,aborted,sq-deletion,phase-tag
+Q: What happens to outstanding commands when you delete an I/O queue, and what must the host do first?
+SHORT: Deleting an I/O submission queue aborts the commands still outstanding in it, reported as Command Aborted due to SQ Deletion (SCT 0, SC 08h). An I/O completion queue can only be deleted after every SQ that posts to it is gone, otherwise Delete I/O CQ returns Invalid Queue Deletion (SCT 1, SC 0Ch). A safe host quiesces first, deletes SQs, then CQs, and zeroes a CQ before reusing it.
+DEEP:
+1. **Quiesce:** stop submitting to the SQ.
+2. **Delete I/O SQ** (opcode 00h): outstanding commands are aborted, with status 08h.
+3. **Wait** for the Delete SQ completion on the admin queue, then consume any completions left in the associated CQ.
+4. **Delete I/O CQ** (opcode 04h), only after all SQs mapped to it are deleted.
+5. **Reuse:** Create I/O CQ (opcode 05h) before Create I/O SQ (opcode 01h), because the SQ names the CQ. Create SQ against a missing CQ returns Completion Queue Invalid (SCT 1, SC 00h).
+- **Zero the CQ memory:** a new CQ starts at phase 1. If old entries with P = 1 remain in the buffer, the host reads them as valid completions.
+- **Three ways to be aborted:** 07h (an Abort command), 08h (SQ deletion), and 371h (the host cancelled it, never on the wire). A validator that counts only one will miscount.
+- **Resets differ:** the admin queues are not deleted by commands. A controller reset removes them.
+- **Tests:** delete an SQ with a full queue and account for every CID. Delete a CQ while an SQ still uses it (expect 0Ch, and the CQ still works afterwards). Delete the same QID twice. Recreate with the same QID under load.
+FOLLOW:
+- Why must the CQ exist before its SQ? => Create I/O SQ carries the CQID it will post to. If the CQ is not there the command fails with Completion Queue Invalid.
+- Can a host delete the admin queues with these commands? => No. QID 0 is torn down by a controller reset (CC.EN to 0).
+PITFALL: Reusing a CQ buffer without zeroing it. Stale P = 1 entries look like fresh completions and the host consumes garbage.
+VERIFY: Whether every aborted command gets a CQE and its order relative to the Delete SQ completion, the status for deleting an invalid QID, and the Create ordering rules in the Admin Command Set chapter.
+
+@@ 9.14 | Advanced | Concept | tags=aer,async-event,error-log,notice,smart
+Q: How does Async Event Request work, and how should a host handle the events, especially the error events?
+SHORT: The host keeps Async Event Request commands outstanding on the admin queue, up to AERL + 1. The controller completes one only when an event occurs, with the event type in DW0 bits 2:0, the event information in bits 15:8 and the log page to read in bits 23:16. The host must read that log page to re-arm the event, then submit a new AER. Types include Error status, SMART and Health, Notice, plus I/O command set specific and vendor specific.
+DEEP:
+| Type | Example event information | Read this log |
+|---|---|---|
+| 0 Error status | 00 Write to Invalid Doorbell Register, 01 Invalid Doorbell Write Value, 02 Diagnostic Failure, 03 Persistent Internal Error, 04 Transient Internal Error, 05 Firmware Image Load Error | Error Information (01h) |
+| 1 SMART and Health | 00 Reliability, 01 Temperature threshold, 02 Spare below threshold | SMART and Health (02h) |
+| 2 Notice | 00 Namespace Attribute Changed, 01 Firmware Activation Starting, 02 Telemetry Log Changed, 03 ANA Change | Changed NS List, Firmware Slot, Telemetry, ANA |
+
+- **Enable:** Set Features, Asynchronous Event Configuration (FID 0Bh). Identify Controller (OAES) lists what is supported. Linux enables the subset it handles, such as namespace changes, firmware activation and ANA changes.
+- **Limit:** AERL is 0's based. Exceeding it returns Asynchronous Event Request Limit Exceeded (SCT 1, SC 05h).
+- **Re-arming:** the controller does not report another event of the same class until the host reads the log page with Retain Asynchronous Event cleared.
+- **Timeouts:** AERs sit outstanding by design, so the host's timeout policy must exempt them. A controller reset drops them and the host reissues them.
+- **Persistent Internal Error:** Linux does not just re-arm. It schedules a controller reset.
+- **Validation:** provoke each event and check one AER completion with the right type, info and log page ID, and no repeat until the log is read. Doorbell errors are cheap tests: ring a doorbell for a queue that does not exist, and ring a value beyond the queue size.
+FOLLOW:
+- Why must the log be read after the event? => The event is masked until then. That prevents an event storm and tells the controller the host has seen it.
+- What if an event fires when no AER is outstanding? => The controller holds it and reports when the host next submits an AER, within limits. Check the spec for how many are kept.
+PITFALL: Treating an AER completion as a failed command. It completes successfully when the event fires. The event is in DW0.
+VERIFY: The DW0 field positions (especially bits 23:16), the event information values for each type, the AERL rules, and how many events a controller queues while no AER is outstanding.
+
+@@ 9.15 | Principal | Numeric | tags=timeout,budget,retry,recovery-time,statistics
+Q: A single I/O hangs the controller. On Linux defaults, how long until the application sees an error, and how do you turn that into a test pass criterion?
+SHORT: With io_timeout 30 s and one Abort, the first timeout sends Abort at 30 s, the second at 60 s triggers a reset. Requests are cancelled and retried up to 5 times, so a command that hangs every time costs 6 x (60 s + reset time). With a 2 s reset that is 372 s, about 6.2 minutes, and with a 20 s worst-case reset it is 480 s. Pass criteria come from measured reset time distributions.
+DEEP:
+Assumptions: I/O timeout 30 s, max_retries 5, the Abort is never answered, CAP.TO = 14h (20 x 500 ms = 10 s per phase), a healthy reset takes 2 s, and the same command hangs again after each retry.
+1. Detection: 30 s to the first timeout, Abort sent, timer re-armed.
+2. Escalation: 30 s later the second timeout finds the command already aborted, so the driver resets. That is 60 s.
+3. Reset: 2 s when healthy (CC.EN toggle, queue creation). Worst case is disable (10 s) plus enable (10 s) = 20 s.
+4. Retry: the cancelled request is requeued. Attempts = 1 + 5 = 6.
+5. Total: 6 x (60 + 2) = 372 s = 6.2 min. With 20 s resets: 6 x 80 = 480 s = 8 min.
+
+| Time | Event |
+|---|---|
+| 0 s | Command submitted, controller stops answering |
+| 30 s | Timeout, Abort sent on the admin queue |
+| 60 s | Second timeout, controller reset |
+| 62 s | Reset done, request retried (retry 1 of 5) |
+
+- **If the controller is dead** (all ones), the first timeout (30 s) resets at once, the re-enable fails, and the driver gives up, so the application sees errors after about 30 s and not minutes later.
+- **Turning it into a criterion:** measure the reset time (CC.EN = 0 to I/O ready) across N resets. Require the maximum to stay below CAP.TO x 500 ms and below the platform's budget. To show a failure rate under 0.1 percent with 95 percent confidence and zero failures, you need about 3 / 0.001 = 3000 clean resets (the rule of three).
+- **Timeout tuning:** set test timeouts from the measured worst-case latency plus margin, not from the spec bound.
+FOLLOW:
+- Which knobs shorten the ladder? => nvme_core io_timeout and max_retries on the host, CAP.TO on the device side, and multipath fail-fast policies.
+- What changes for a hung admin command? => It skips the Abort stage and resets at the first timeout, so the ladder is one timeout (60 s admin default) plus the reset.
+PITFALL: Setting test timeouts below the worst legitimate latency. Garbage-collection stalls then look like hangs, and healthy behavior becomes a reset storm and false failures.
+VERIFY: Linux defaults (io_timeout 30, admin_timeout 60, max_retries 5) and whether host-cancelled requests count toward retries on your kernel.
+
+@@ 9.16 | Principal | Scenario | tags=conformance,negative-test,status,automation,passthrough
+Q: How would you design an automated negative test suite that checks a new SSD's status codes and error handling?
+SHORT: Make it table-driven from the spec: each row is one command with one injected fault, the allowed (SCT, SC) set, the DNR and M policy, and a no-side-effect check. Run faults in isolation, because error precedence is not always defined. After each failure, prove the queue still works and the error log matches. Send commands by passthrough or a user-space driver so nothing retries or rewrites them, and separate must-return from may-return statuses.
+DEEP:
+- **Row schema:** id, queue type, opcode and fields, precondition (namespace and queue state), allowed status set, flag rules, side-effect check, spec reference.
+
+| Fault family | Example | Expect (SCT/SC) |
+|---|---|---|
+| Unsupported opcode | Unassigned admin or I/O opcode | 0 / 01h |
+| Reserved field | Identify with reserved CNS | 0 / 02h, location in error log |
+| Bad NSID | Unallocated NSID | 0 / 0Bh |
+| Out of range | SLBA = NSZE, overflowing SLBA | 0 / 80h |
+| Queue management | Duplicate QID, size beyond MQES, bad vector, delete CQ with an SQ | 1 / 01h, 02h, 08h, 0Ch |
+| Limits | AERs beyond AERL + 1, Aborts beyond ACL + 1 | 1 / 05h, 1 / 03h |
+| Transfer size | Length above MDTS | 0 / 02h |
+
+- **Guard rails:** one fault per command. After each, send a known-good command to prove the controller and queue survive. Check Error Count and the M bit against the log. A failed write must leave the data unchanged, so pre-fill, fail, read back.
+- **Runner:** `nvme admin-passthru` and `nvme io-passthru`, SPDK or a custom driver. The kernel block layer splits, merges, retries and hides raw statuses.
+- **Coverage:** map each row to what the drive advertises (ONCS bits, supported features and logs), and report untested statuses.
+- **Triage:** each deviation is a bug or a spec ambiguity. Record which, per firmware build, and rerun it on the next build.
+FOLLOW:
+- Two errors in one command (bad NSID and bad LBA). Which status? => The spec does not fix precedence for every pair, so avoid the combination or accept either. Record each firmware's choice to catch regressions.
+- Why not use the kernel block path? => It reshapes commands and retries or converts statuses. Passthrough or a user-space driver sends the SQE you built and returns the raw CQE.
+PITFALL: Using the reference drive's behavior as the expected result. That bakes its bugs into the suite. Derive expectations from the spec and review each deviation.
+VERIFY: Precedence rules, which statuses are mandatory versus optional per command, and each row's exact code in the NVMe Base and NVM Command Set specifications.
+
+@@ 9.17 | Principal | Scenario | tags=fault-injection,recovery,validation,data-integrity,statistics
+Q: Design a fault-injection and recovery test that shows an SSD survives hangs, fatal errors and resets under load with no data loss and bounded recovery time.
+SHORT: Run a workload with a per-LBA sequence ledger, inject one fault at a random point, then require: detection within the timeout budget, recovery within the CAP.TO bound, exactly one CQE per CID, no acknowledged data lost or torn, and clean logs. Faults include dropped completions or interrupts, forced error statuses, firmware hang or assert, queue deletes and each reset type. Repeat thousands of times and report recovery percentiles.
+DEEP:
+1. **Oracle:** a ledger records, per LBA, the last acknowledged sequence number and any writes in flight. After recovery every block must equal the acknowledged version or a later in-flight one. Older, torn beyond the atomic write size, or misplaced data is a failure.
+2. **Faults:**
+
+| Fault | How injected | Expected host behavior |
+|---|---|---|
+| Error status | Linux nvme fault injection (debugfs) | Retry or fail per DNR (tests the host only) |
+| Lost interrupt | PCIe interposer drops the MSI-X write | Timeout poll finds the CQE, no reset |
+| Command hang | Vendor hook or debug command | Abort, then reset |
+| Fatal error | Firmware assert | CSTS.CFS, reset, dump retrieved |
+| Resets | CC.EN, NSSR, FLR, hot reset, PERST# at random I/O phases | Recovery within bound |
+| Queue delete | Delete an SQ under load | Every CID accounted for |
+
+3. **Per-run checks:** detection latency, recovery time, exactly one CQE per CID, ledger, Error Count and AER consistency, SMART Unsafe Shutdowns and Power Cycles unchanged for non-power resets, namespaces and Identify data intact, saved features kept.
+4. **Statistics:** many runs per fault and phase cell. Zero failures in 3000 runs gives a bound under 0.1 percent at 95 percent confidence. Report recovery-time percentiles.
+5. **Automatic capture on failure:** CSTS, PCIe config and AER, dmesg, error log, telemetry and an analyzer snapshot, classified by signature.
+FOLLOW:
+- Why not mask the MSI-X vector to emulate a lost interrupt? => Masking sets the pending bit and the interrupt arrives later, so it is a delay and not a loss. Drop the write to test a true loss.
+- Data after reset is newer than the last acknowledged write. Failure? => No. An in-flight write may complete. Only older, torn or misplaced data fails.
+PITFALL: Judging recovery only by whether the driver rebinds. Success is proven by the data check afterwards, and injecting only at idle misses the interesting races.
+VERIFY: Linux nvme fault-injection knobs on your kernel, the atomic write rules (AWUN, NAWUPF) used for the torn-write check, and whether the vendor offers hang or assert injection.

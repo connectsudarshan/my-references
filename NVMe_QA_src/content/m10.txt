@@ -1,0 +1,328 @@
+# Module 10: Interrupts, Coalescing & Polling
+
+@@ 10.01 | Basic | Concept | fig=intpath | tags=completion-path,cqe,msi-x,doorbell,overview
+Q: Walk a completion from the controller to the host driver. What happens between the NAND finishing and the application getting its data?
+SHORT: The controller writes a 16-byte CQE into the completion queue slot at its tail, with the phase tag set. It then decides whether and when to signal the CQ's interrupt vector (pin, MSI or MSI-X). The interrupt lands on a CPU, the ISR reads CQEs from the head until the phase tag stops matching, completes each command by its CID, and writes the CQ Head Doorbell once. The CQE is always written first, and the interrupt is only a hint that it is there.
+DEEP:
+1. **Post:** the controller writes the CQE (command-specific DW0, SQ Head Pointer and SQ ID, CID, phase bit and status) to host memory as a PCIe posted write, then advances its CQ tail.
+2. **Decide to signal:** the controller checks the CQ's IEN bit, the vector named by the CQ's IV, any mask state, and its interrupt coalescing settings (see 10.05).
+3. **Signal:** for MSI-X the controller sends one posted write to the vector's address with the vector's data. It carries no queue number, no CID and no data.
+4. **Deliver:** the platform turns the write into an interrupt on the CPU that the vector targets. The ISR runs and reads the CQE at the head, checks the phase bit, issues a read barrier, and handles the CQE.
+5. **Drain and acknowledge:** the ISR repeats until the phase bit does not match, then writes the CQ Head Doorbell in BAR0. That frees CQ slots and tells the controller what has been consumed. The SQ Head Pointer in each CQE is what frees SQ slots.
+6. **Finish:** blk-mq completes the request, and the waiting task is woken.
+
+- **Who owns which step:** steps 1 to 3 are firmware decisions, and steps 4 to 6 are host driver behavior. A validator must know which side a missing or late completion belongs to.
+- **Polling shortcut:** a polled host does steps 1, 5 and 6 only. It never needs steps 2 to 4.
+- **Where PCIe fits:** the CQE write and the vector write are ordinary posted writes, so their ordering is a PCIe question (see the PCIe page, Flow Control and Ordering module).
+FOLLOW:
+- Why does the ISR need to know which CQ to look at, if the vector is per CQ? => Several CQs may share a vector, and the message carries only the vector, so the handler scans every CQ mapped to it.
+- What frees the space in the CQ? => Only the CQ Head Doorbell write. The controller must not post more entries than the free slots, so a host that is slow to ring the doorbell stalls completions.
+PITFALL: Treating the interrupt as the completion. The completion is the CQE, and the interrupt only tells the host to look for it.
+
+@@ 10.02 | Basic | Concept | tags=msi-x,msi,pin-based,intx,vectors,interrupt-modes
+Q: Which interrupt mechanisms can an NVMe controller use over PCIe, and how do they differ in what NVMe can do with them?
+SHORT: NVMe over PCIe defines four modes: pin-based (INTx), single-message MSI, multiple-message MSI (up to 32 vectors) and MSI-X (up to 2048). The host enables exactly one. The mode decides how many vectors exist, so it decides how many completion queues can have their own interrupt. MSI-X is the recommended mode. The mode also decides how masking works.
+DEEP:
+| Mode | Vectors | CQ vector mapping | Masking |
+|---|---|---|---|
+| Pin-based INTx | 1 (vector 0) | Every CQ uses IV 0 | INTMS and INTMC |
+| Single MSI | 1 (vector 0) | Every CQ uses IV 0 | INTMS and INTMC |
+| Multiple-message MSI | Up to 32 | IV 0 to 31 | INTMS and INTMC |
+| MSI-X | Up to 2048 | Any IV up to the table size minus 1 | MSI-X table mask bits and Function Mask |
+
+- **Why MSI-X wins for NVMe:** each vector has its own address and data, so each CQ can interrupt the CPU that owns its SQ. MSI multi-message shares one address across vectors, so on x86 all its vectors target one CPU. Mechanics are on the PCIe page (Interrupts module).
+- **Who chooses:** the controller advertises MSI and MSI-X capabilities in PCI config space (a device may implement both). The host driver enables one of them, or leaves INTx active.
+- **Linux behavior:** the nvme driver allocates with all interrupt types allowed (MSI-X, then MSI, then INTx), first taking a single vector to bring the admin queue up, then reallocating the number it needs for the I/O queues.
+- **Consequence for CQ creation:** with pin-based or single MSI, the IV field in every Create I/O Completion Queue command must be 0.
+FOLLOW:
+- Does the controller need to support all four modes? => No. The transport specification recommends MSI-X and lets a device choose which capabilities to implement, so check what your device exposes.
+- Can a drive work with only INTx? => Yes, functionally, with all completions on one shared level-triggered line and all CPUs contending for it. That is slow but valid, and a useful bring-up and conformance mode.
+PITFALL: Assuming a host that "supports MSI-X" always uses it. Firmware or BIOS options, a broken table, or a kernel parameter can push the driver to MSI or INTx, and then per-queue interrupts silently disappear.
+VERIFY: Which interrupt mechanisms a PCIe controller must implement and the exact multiple-message MSI limits, in the NVMe over PCIe Transport Specification and the PCIe Base Specification MSI section.
+
+@@ 10.03 | Basic | Concept | tags=vector-0,iv,ien,create-io-cq,invalid-vector
+Q: How does an NVMe completion queue get its interrupt vector, and what is special about vector 0?
+SHORT: The Admin CQ always uses vector 0 and is never created by a command. Each I/O CQ is created by Create I/O Completion Queue, whose CDW11 carries PC (bit 0), IEN (bit 1, interrupts enabled) and IV (bits 31:16, the vector). Several CQs may name the same vector. An IV that the controller cannot honor fails the command with Invalid Interrupt Vector, status code type 1, code 08h.
+DEEP:
+- **Create I/O CQ fields:** CDW10 holds QID (bits 15:0) and QSIZE (bits 31:16, 0's based). CDW11 holds PC, IEN and IV. If IEN is 0 the controller posts CQEs and raises no interrupt for this CQ, which is what a polled queue uses.
+- **Vector 0:** the Admin CQ uses it. I/O CQs may also use it, and must when the host has only pin-based or single-MSI interrupts.
+- **Linux mapping:** I/O queue n normally gets vector n, unless only one vector is available, and then all queues and the admin queue share vector 0. A polled queue is created with IEN clear.
+- **Sharing:** if two CQs name vector 5, one interrupt covers both, and the ISR must scan both. The controller still counts unacknowledged entries per vector, not per CQ.
+- **Example (8 CQs, 4 vectors):** CQ1 and CQ2 on vector 1, CQ3 and CQ4 on vector 2, CQ5 to CQ8 on vector 3, admin on vector 0. Interrupt Vector Configuration (10.05) is addressed per vector, so one setting covers both CQs of vector 1.
+- **Errors to know:** a vector beyond what the controller has returns 08h (Linux calls it `NVME_SC_INVALID_VECTOR`, 0x108 with the status code type included). A bad QID returns Invalid Queue Identifier (01h) and a bad size returns Invalid Queue Size (02h).
+FOLLOW:
+- Can the admin and an I/O CQ share vector 0? => Yes. Linux does it whenever it ends up with one vector, and a controller must handle it.
+- What does IEN=0 with a nonzero IV mean? => No interrupts for that CQ. The IV is ignored for signaling, but a validator should still check the controller does not send a message.
+PITFALL: Assuming the controller checks IV against the MSI-X table size the host enabled. The controller knows its own vector capability, and the host may have enabled fewer, so test both boundaries.
+VERIFY: Create I/O CQ CDW11 bit positions and the Invalid Interrupt Vector status code in the NVMe Base Specification.
+
+@@ 10.04 | Intermediate | Concept | tags=interrupt-status,pba,head-doorbell,level,edge,mask
+Q: When exactly does an NVMe controller signal an interrupt, and what does the CQ Head Doorbell have to do with it?
+SHORT: For pin-based and MSI, the controller keeps a per-vector interrupt status. It is set while any CQ on that vector has unacknowledged entries (interrupts enabled, vector unmasked) and clears when CQ Head Doorbell writes acknowledge them all. INTx is level-driven from that status. MSI sends a message when an unmasked status bit turns on, or when a mask clears while the status is set. MSI-X checks the Function Mask and vector mask first, and sets the PBA bit if masked.
+DEEP:
+- **Unacknowledged entries:** entries the controller has posted between the host's CQ head (as last written by doorbell) and the CQ tail. Entries the host has read but not yet acknowledged still count.
+- **Pin-based:** the interrupt line stays active while the status is set, so it clears only when the host has rung the doorbell for everything. A late doorbell keeps the line asserted and can cause a repeat interrupt.
+- **MSI:** edge-like. A message goes out when an unmasked status bit goes from 0 to 1. Clearing a mask bit while CQEs are still unacknowledged also sends one.
+- **MSI-X:** before sending, the controller checks that Function Mask and the vector's table mask are clear. If either is set it sets the vector's PBA bit and sends the message once both clear.
+- **Spec advice:** the transport specification recommends that the host mask the vector while it processes CQEs, to avoid spurious or lost interrupts, and unmask afterward. For pin-based and MSI use INTMS and INTMC. For MSI-X use the MSI-X mask bits.
+- **Why it matters for validation:** the interesting cases are the ones at the boundary. A CQE that lands while the host is between "last CQE read" and "doorbell written" is where controllers and hosts disagree (see 10.14).
+FOLLOW:
+- Is there one interrupt per CQE? => No. A vector signals on state changes, so many CQEs can share one interrupt, and the ISR must drain until the phase bit mismatches.
+- What does the PBA bit represent? => An interrupt the device wanted to send while masked, sent once when the mask clears.
+PITFALL: Modeling the controller as "one message per completion". A scoreboard built that way flags coalescing, shared vectors and masked periods as failures.
+VERIFY: The wording of the interrupt status conditions and of when MSI and MSI-X messages are re-sent after a CQ Head Doorbell write, in the NVMe over PCIe Transport Specification (interrupt section and host annex).
+
+@@ 10.05 | Intermediate | Concept | tags=coalescing,fid-08h,fid-09h,thr,time,cd,set-features
+Q: How does NVMe interrupt coalescing work, and how do the Interrupt Coalescing and Interrupt Vector Configuration features interact?
+SHORT: Interrupt Coalescing (Set/Get Features FID 08h) has an Aggregation Threshold (THR, bits 7:0, 0's based) and an Aggregation Time (TIME, bits 15:8, in 100 microsecond units). A controller may hold an interrupt until either the threshold or the time is reached. Interrupt Vector Configuration (FID 09h) takes a vector (bits 15:0) and a Coalescing Disable bit (bit 16) so that one vector can opt out. The algorithm itself is vendor specific.
+DEEP:
+- **Defaults:** 0 in both fields means no coalescing. TIME 0 means no delay, and THR 0 (0's based) means a threshold of one entry, so either at zero removes the effect.
+- **Threshold is per vector:** the count is of CQEs per interrupt vector, so two CQs on one vector fill the same counter.
+- **Time is a delay limit:** it is the recommended maximum delay for a CQE before its interrupt. The smallest nonzero value is 100 microseconds, which is longer than a whole NAND read.
+- **Vendor-specific parts:** support for both features is required for PCIe controllers, but the transport specification leaves the aggregation algorithm to the vendor. When the timer starts, whether it restarts, and how the threshold and time combine can differ between drives.
+- **Admin CQ and errors:** the feature applies only to I/O queues, so Admin CQ interrupts are not delayed by it, and interrupts for commands that complete in error should not be coalesced. The base specification text also lets a controller apply TIME per vector or across all vectors, and lets it restart the timer or count when the host writes a CQ Head Doorbell, which can delay an interrupt indefinitely under steady load.
+- **Per vector opt-out:** Set Features FID 09h with the vector in CDW11 bits 15:0 and CD in bit 16. Use it to keep a latency-critical vector immediate while others coalesce.
+- **nvme-cli:** `nvme set-feature /dev/nvme0 -f 8 -v 0x0107` (THR 7, so 8 entries, and TIME 1, so 100 us), `nvme get-feature /dev/nvme0 -f 8 -H`, and `nvme get-feature /dev/nvme0 -f 9 -c <vector>` for the per-vector bit.
+FOLLOW:
+- Does FID 08h apply per queue? => No. It is one setting for the controller, applied to counts per vector, and FID 09h switches it off per vector.
+- Why leave the algorithm vendor specific? => Implementations differ in hardware timers, so the specification gives host-tunable limits rather than an exact behavior.
+PITFALL: Treating TIME as a precise timer. It is a maximum delay hint, and validating it needs a tolerance taken from the vendor's requirements, not a bit-exact check.
+VERIFY: The exact THR and TIME field definitions (0's based threshold, 100 microsecond unit), the CD bit position, the requirement to support both features, and the wording about the Admin CQ, in the NVMe Base Specification and the NVMe over PCIe Transport Specification.
+
+@@ 10.06 | Intermediate | Numeric | tags=coalescing,thr,time,interrupt-rate,latency,worked-example
+Q: 800K IOPS of 4 KiB random reads are spread over 16 vectors. Compare interrupt rate, CPU cost and added latency for a few THR/TIME settings, and say what happens to a QD1 probe.
+SHORT: Each vector sees 50,000 completions per second, one every 20 us, so with no coalescing you get 800K interrupts per second, about 1.2 cores at an assumed 1.5 us each. THR 3 with TIME 1 cuts that 4 times for at most 60 us of added delay. THR 7 with TIME 1 cuts it 6 times, delay up to 100 us. Going further saves almost nothing while latency keeps growing. A QD1 read on an otherwise idle vector always waits the full TIME.
+DEEP:
+Assumptions: even arrivals per vector (the real pattern is bursty), a controller that counts per vector and starts the timer on the first pending CQE, N = THR + 1 entries, and 1.5 us of CPU per interrupt. Real drives differ, so measure.
+1. Per vector rate: 800,000 / 16 = 50,000 per second, so one completion every 20 us.
+2. Off (CDW11 = 0x0000): 800,000 interrupts per second, 800,000 x 1.5 us = 1.2 cores.
+3. THR 3, TIME 1 (0x0103, N = 4): four entries need 3 gaps = 60 us, under 100 us, so the threshold fires. Cycle = 60 + 20 = 80 us, so 12,500 per vector, 200K total, 0.3 core. Added delay: first CQE waits 60 us, average 30 us.
+4. THR 7, TIME 1 (0x0107, N = 8): eight need 140 us, so the timer fires at 100 us. About 6 CQEs per interrupt, cycle 120 us, 8,333 per vector, 133K total, 0.2 core. Added delay up to 100 us, average about 50 us.
+5. THR 15, TIME 2 (0x020F, N = 16): timer fires at 200 us. About 11 CQEs per interrupt, 4,545 per vector, 73K total, 0.11 core. Added delay up to 200 us, average about 100 us.
+
+| Setting | Interrupts per second | IRQ CPU | Worst added delay |
+|---|---|---|---|
+| Off | 800K | 1.2 cores | 0 |
+| 0x0103 | 200K | 0.30 core | 60 us |
+| 0x0107 | 133K | 0.20 core | 100 us |
+| 0x020F | 73K | 0.11 core | 200 us |
+
+- **The knee:** the first step saves 0.9 core for 30 us of average delay. The last saves 0.1 core more for another 50 us. Pick the smallest setting that meets the CPU budget.
+- **QD1 probe:** one command in flight on an otherwise idle vector never reaches the threshold, so it waits the full 100 us (on a busy vector it would share the batch of the other traffic): 80 us becomes 180 us and per-thread IOPS drops from 12.5K to 5.6K. FID 09h with CD set on that vector removes the delay.
+FOLLOW:
+- Why is 100 us so coarse? => The TIME unit is 100 us and zero means no delay, so there is no setting between "off" and 100 us. Only the threshold can bound the delay below that, and only if traffic arrives fast enough.
+- What if the threshold exceeds the CQ depth? => The threshold can never be reached, so the timer alone must release the interrupt. That is a good corner case for a controller test.
+PITFALL: Comparing settings only by average interrupt rate. The worst-case wait for the first CQE in a batch is what an SLA or a timeout sees.
+VERIFY: The 0's based THR and the timer start rule for your controller (spec leaves it vendor specific), and the interrupt CPU cost, which you should measure on your host.
+
+@@ 10.07 | Intermediate | Trap | tags=intms,intmc,msi-x,masking,registers,pin-based
+Q: A test script writes bit 5 of INTMS to mask vector 5 on an SSD running in MSI-X mode, and interrupts keep arriving. Is the SSD broken?
+SHORT: No. INTMS (BAR0 0Ch) and INTMC (BAR0 10h) mask vectors for pin-based and MSI interrupts only. In MSI-X mode a vector is masked through its MSI-X table entry mask bit or the Function Mask in the MSI-X capability. The script masked nothing that the device is obliged to look at. A write of 1 to INTMS sets a mask bit and a write of 1 to INTMC clears it.
+DEEP:
+- **Registers:** INTMS at offset 0Ch and INTMC at offset 10h in the controller registers, each 32 bits, one bit per vector, so up to vectors 0 to 31, matching MSI's limit.
+- **Semantics:** writing 1 to a bit in INTMS masks that vector, writing 1 to the same bit in INTMC unmasks it, and writing 0 does nothing. Two registers mean a CPU never needs a read-modify-write on a shared mask, so two CPUs masking different vectors cannot undo each other.
+- **While masked:** no message or line assertion comes out. The transport specification lists a clear mask bit as one of the conditions for setting the interrupt status, so the status is not set while masked. Clearing the mask while CQEs are still unacknowledged sets it and sends the interrupt (10.04).
+- **MSI-X:** the MSI-X mask bits and the pending bit array control it. The transport specification says the MSI-X table should be used for masking.
+- **In real drivers:** the Linux PCIe driver does not touch INTMS or INTMC in normal operation, and neither does SPDK's PCIe driver. Those registers matter to a custom host, a validation exerciser, or an OS forced into MSI or INTx mode.
+- **How to test them:** force the mode (a custom driver, an exerciser, or on Linux boot with `pci=nomsi` for INTx), then check mask, unmask and pending behavior with CQEs posted while masked.
+FOLLOW:
+- What should a controller do with a masked pin-based interrupt when a CQE arrives? => Keep the line inactive, and assert it when the mask clears, if entries remain unacknowledged.
+- Do INTMS and INTMC affect polling? => No. CQEs are posted regardless of masks, and a polling host never looks at either register.
+PITFALL: Writing INTMS in a test and reading INTMC or INTMS back as proof that interrupts are masked. Only the absence of message writes at the analyzer proves it.
+VERIFY: Read behavior of INTMS and INTMC (returning the current mask), the reserved bit handling above the vector count, and their exact behavior when MSI-X is enabled, in the NVMe Base Specification controller registers section.
+
+@@ 10.08 | Intermediate | Debug | tags=fio,qd1,latency,get-feature,coalescing,nvme-cli
+Q: After a firmware update, QD1 4 KiB random read latency is 1.09 ms instead of 82 us, but QD32 IOPS is unchanged and nothing appears in dmesg. `nvme get-feature /dev/nvme0 -f 8` returns 0x00000a0f. What is going on, and how do you prove it?
+SHORT: The value decodes as THR = 0x0F (a threshold of 16 completions, 0's based) and TIME = 0x0A (10 x 100 us = 1 ms). At QD1 only one completion is pending on the vector, so the threshold is never reached and every interrupt waits for the 1 ms timer. At QD32 the threshold is reached first, hiding the problem. Prove it by writing 0, or setting CD for that vector, and rerunning.
+DEEP:
+1. **Decode:** 0x0A0F has bits 7:0 = 0x0F and bits 15:8 = 0x0A. THR = 15, so N = 16 entries. TIME = 10, so 10 x 100 us = 1,000 us.
+2. **Explain the symptom:** measured QD1 latency of about 1.09 ms is the 82 us device latency plus roughly 1 ms of wait, plus a few tens of us of interrupt overhead. QD32 on one thread has enough completions per vector to reach 16 quickly, so the timer rarely matters.
+3. **Confirm with a controlled change:** `nvme set-feature /dev/nvme0 -f 8 -v 0` and rerun the same fio job (`fio --name=qd1 --filename=/dev/nvme0n1 --rw=randread --bs=4k --iodepth=1 --direct=1 --ioengine=io_uring --runtime=10`). Latency returns to about 82 us if coalescing was the cause. Also try `-f 9` with CD set on the vector of the CPU running fio.
+4. **Cross-check without changing the drive:** run the same job on a poll queue or with a polling engine (IEN=0). Polled latency should be normal even with coalescing set, because the CQE is posted immediately (see 10.11).
+5. **Find who set it:** compare `nvme get-feature` with the default and saved values (nvme-cli's select option), check tuning scripts or vendor tools that ran at boot, and check if the new firmware changed the default or restores a saved value after reset.
+- **Verdict logic:** a bad default in new firmware is a firmware regression. A host script setting it is a configuration problem. In both cases the checker to add is "QD1 latency after boot with default features".
+FOLLOW:
+- Would the completion polled message appear? => No. The 1 ms delay is far below the 30 s default I/O timeout, and the ISR does run eventually.
+- How would you catch this earlier in validation? => Read FID 08h and 09h in the baseline check after every firmware update and controller reset, and fail if the default is not what the spec or the product requirements say.
+PITFALL: Looking only at throughput. Coalescing hides at high queue depth and shows only in QD1 latency and p99 at light load.
+VERIFY: The nvme-cli option for selecting default or saved values in get-feature, and whether Interrupt Coalescing values persist across controller reset in your controller's requirements.
+
+@@ 10.09 | Advanced | Concept | tags=polling,phase-tag,spdk,poll-queues,io-uring,hipri
+Q: How does phase-tag polling work at the NVMe level, and how do Linux poll queues and SPDK use it?
+SHORT: The host keeps a CQ head index and an expected phase value. A new entry is present when the phase bit of the entry at the head equals the expected phase. On wrap the head returns to 0 and the expected phase flips. Nothing needs an interrupt, so the CQ is created with IEN = 0. Linux does this for dedicated poll queues driven by io_uring hipri, and SPDK does it as its normal mode from an application core.
+DEEP:
+- **Loop:** read the status word at `cq[head]`. If its bit 0 equals the expected phase, the entry is new. Issue a read barrier before reading the other fields, process, advance head, and when head wraps set head to 0 and flip the expected phase. After draining, write the CQ Head Doorbell once.
+- **Initial state:** a newly created CQ is zeroed and the controller writes phase 1 on its first pass, so the host starts by expecting 1. A CQ of size 2 wraps every second completion, which is a cheap way to exercise phase handling.
+- **Linux:** `nvme.poll_queues=N` (or `modprobe nvme poll_queues=N`) reserves poll queues. They are created without IEN, use no vector, and dmesg shows `nvme nvme0: 8/0/2 default/read/poll queues`. io_uring with IOPOLL and `RWF_HIPRI` (fio `--hipri`) routes I/O to them. The timeout handler also polls a CQ for a completion it might have missed.
+- **SPDK:** the application calls `spdk_nvme_qpair_process_completions()` in a loop on its own core. By default SPDK creates I/O CQs with IEN clear. Newer versions have an optional interrupt mode that sets IEN and maps queue ID to vector.
+- **What the controller sees:** no vector writes, and CQ Head Doorbell writes at the polling batch rate. The host's phase checks are reads of host memory and generate no PCIe traffic.
+- **Validation value:** polling has no interrupt to hide a late CQE, so it stresses phase tag and CQE visibility correctness. A controller must send zero message writes for a CQ created with IEN = 0.
+FOLLOW:
+- Can a CQ with IEN = 1 also be polled? => Yes, the phase tag does not depend on IEN. Linux does it in the timeout handler, taking a lock and disabling the vector's IRQ so it does not race the ISR.
+- Why does a phase bit exist instead of a tail pointer? => The host cannot read the controller's tail cheaply, and a phase bit lets it detect new entries from host memory alone, with no MMIO read.
+PITFALL: Reading the CQE body before checking the phase or before the barrier. It works on x86 and produces stale fields on weakly ordered CPUs.
+VERIFY: Poll queue parameter, dmesg format and hipri behavior on your kernel version (without poll queues, hipri I/O may fail with an error), and the SPDK enable_interrupts option in your SPDK release.
+
+@@ 10.10 | Advanced | Numeric | tags=polling,interrupt,cpu,latency,tradeoff,worked-example
+Q: Quantify polling versus interrupts for a 80 us TLC read and a 10 us low-latency read: latency, IOPS per thread, and CPU cost.
+SHORT: With an assumed 4 us of interrupt and wakeup latency and 0.3 us of poll detection, polling saves 4.4 percent of latency on an 80 us read (84 to 80.3 us) and 26 percent on a 10 us read (14 to 10.3 us). That means about 4.6 percent and 36 percent more QD1 IOPS per thread. The price is a full core: about 20 times the CPU per I/O for TLC and 2.6 times for the fast media, at QD1.
+DEEP:
+Assumptions (measure them on your platform): interrupt path adds 4 us latency (IRQ entry, handler, wakeup, context switch) and costs 3 us CPU; submission costs 1 us CPU in both modes; poll detection adds 0.3 us and the polled thread burns 100 percent of its core while it waits.
+1. **Latency, 80 us device:** interrupt 80 + 4 = 84 us, polled 80 + 0.3 = 80.3 us.
+2. **IOPS per QD1 thread:** interrupt 1 / 84 us = 11,905, polled 1 / 80.3 us = 12,453 (+4.6 percent).
+3. **Same for a 10 us device:** 14 us gives 71,429 IOPS, and 10.3 us gives 97,087 (+36 percent).
+4. **CPU per I/O at QD1:** interrupt mode uses 1 + 3 = 4 us of CPU per I/O. Polled uses the whole wait: 80.3 us and 10.3 us. Ratio 20 times and 2.6 times.
+5. **Cores for 1M IOPS at QD1 per thread:** by Little's law you need 1M x latency threads. Interrupt: 84 threads, but each is only 4.8 percent busy, so about 4 cores of work. Polled: 80.3 threads at 100 percent, 80 cores.
+6. **Deep queues change the answer:** a polled thread at QD32 with 80.3 us latency does 32 / 80.3 us = about 398K IOPS, and needs only 1.3 us of CPU per I/O (1 submit + 0.3 reap), so 1M IOPS needs about 2.5 threads. Interrupt mode at the same load costs 1.3 + 3 / batch us per I/O: 4.3 us with one CQE per interrupt, 2.05 us with four. Polling wins on CPU only when each polling loop finds work.
+- **Rule of thumb:** polling pays when device latency is close to the interrupt overhead (low latency media) or when queues are deep enough that the spin is always productive. It loses badly on slow media at low QD.
+FOLLOW:
+- Does polling help throughput on a slow SSD? => Only when it lowers CPU per I/O at high queue depth. It does nothing for device-limited throughput.
+- Where does the 4 us come from? => Interrupt delivery, ISR, softirq or wakeup and a context switch. On a virtualized host it can be several times larger.
+PITFALL: Comparing polled and interrupt latency on a slow NAND SSD and concluding polling is useless, or measuring only latency on fast media and ignoring the core it burns.
+VERIFY: The 4 us and 3 us figures, which are assumptions. Measure them with `perf` and a null block or a fast device on your host.
+
+@@ 10.11 | Advanced | Trap | tags=coalescing,cqe,polling,latency,measurement,analyzer
+Q: A colleague enables coalescing (TIME 1 ms) and reports that command completion latency on a polled queue got worse. Is that possible, and what exactly does coalescing delay?
+SHORT: Coalescing delays the interrupt, not the CQE. The controller posts the CQE when the command finishes, and only the signaling of the vector is held back. A host that polls the phase tag sees the entry immediately, with or without coalescing. If the polled queue's latency rose, something else changed: the test measured at the ISR, the queue is not polled, or the firmware also batches CQE posting. Separate the two events on an analyzer.
+DEEP:
+- **What the feature says:** Aggregation Time is the maximum delay a controller may apply to a CQE before an interrupt is signaled, and Aggregation Threshold is the number of entries per vector to aggregate before signaling. The wording is about the interrupt.
+- **Where the delay appears:** in interrupt-driven queues with IEN = 1. A polled queue (IEN = 0) is untouched by design.
+- **Measure both events:** take timestamps of the CQE MWr and of the vector MWr on an analyzer. Their difference is the interrupt delay. The gap from the command's doorbell to the CQE is the device latency.
+- **Where a false result comes from:**
+  1. Latency measured at the application on an interrupt queue and blamed on the SSD.
+  2. A polled queue that in fact has IEN = 1 and is waited on with an interrupt-driven syscall.
+  3. A firmware that batches CQE writes internally. That is legal but not "interrupt coalescing", and needs its own requirement and check.
+- **Test to prove it:** on one drive create a CQ with IEN = 1 and one with IEN = 0, set FID 08h to 0x0A0F, and issue one command on each at QD1. The polled CQ should see the CQE at device latency. The interrupt CQ should see the message about 1 ms later.
+FOLLOW:
+- Should CQE posting ever be delayed by the interrupt settings? => Not by the feature's definition. If CQE latency moves with FID 08h, treat it as a defect or as an undocumented CQE batching behavior.
+- Why does this matter for timeouts? => Host timeouts and polling-based recovery act on the CQE, so a controller that holds CQEs as well as interrupts can look hung to a host that polls.
+PITFALL: Timestamping "completion" at interrupt arrival and calling the difference between two firmware builds a media or firmware-FTL regression, when it is an interrupt setting.
+VERIFY: The Aggregation Time wording in the current NVMe Base Specification, and your product requirements on whether CQE posting may be batched.
+
+@@ 10.12 | Advanced | Debug | tags=analyzer,trace,coalescing,timer,spurious,scoreboard
+Q: From an analyzer trace of CQE writes and vector writes, how do you check the coalescing behavior of a controller? Work through this trace, given vector 2 with THR = 3 and TIME = 1.
+SHORT: Group CQE writes by vector (CQ2 and CQ5 share vector 2), then for each vector write find the pending CQEs it released and compare the delay with the settings. Here interrupts at 93 and 403 us are correct, but the one at 783 us released a CQE that waited 183 us, so the timer restarted on each CQE. The one at 883 us has no unacknowledged entries behind it, which points to a timer that was not cancelled after a threshold interrupt.
+DEEP:
+Settings: FID 08h = 0x0103, so N = 4 entries, TIME = 100 us. CQ2 and CQ5 are both created with IV = 2. Times are microseconds from the trace start.
+
+| Row | t (us) | Event |
+|---|---|---|
+| 1 | 0 | CQE written, CQ2 |
+| 2 | 30 | CQE written, CQ2 |
+| 3 | 55 | CQE written, CQ5 |
+| 4 | 90 | CQE written, CQ2 |
+| 5 | 93 | MWr to vector 2 |
+| 6 | 300 | CQE written, CQ5 |
+| 7 | 340 | CQE written, CQ2 |
+| 8 | 403 | MWr to vector 2 |
+| 9 | 600 | CQE written, CQ2 |
+| 10 | 660 | CQE written, CQ5 |
+| 11 | 720 | CQE written, CQ2 |
+| 12 | 780 | CQE written, CQ5 |
+| 13 | 783 | MWr to vector 2 |
+| 14 | 883 | MWr to vector 2 |
+
+1. **Rows 1 to 5:** four CQEs across two CQs reach N = 4 at 90 us and the message follows in 3 us. This is correct, and it shows the count is per vector, not per CQ.
+2. **Rows 6 to 8:** two CQEs, the first at 300 us. The timer expires at 400 us and the message is at 403 us. Correct.
+3. **Rows 9 to 13:** the first CQE at 600 us should have released an interrupt by about 700 us with two entries. The message came at 783 us, driven by the threshold, so the first entry waited 183 us. That matches a timer that restarts on every CQE and never expires while CQEs arrive less than 100 us apart. Under sustained traffic, that means TIME is not a maximum.
+4. **Row 14:** no CQE arrived after row 12. If the CQ Head Doorbell writes in the same trace show all four entries acknowledged before 883 us, this message signals nothing. It is 100 us after the last CQE, so it fits a stale timer armed by row 12 and not cancelled by the threshold interrupt.
+- **Method as a script:** parse CQE writes (CQ address maps to CQ ID) and vector writes (address and data map to vector), keep a per-vector list of unacknowledged CQEs from the doorbell writes, and at each message compute count, oldest delay and remaining entries. Flag oldest delay above TIME plus tolerance, and a message with zero unacknowledged entries.
+FOLLOW:
+- Is a delay above TIME a spec violation? => TIME is a recommended maximum and the algorithm is vendor specific. The spec text even allows the timer or count to restart on a CQ Head Doorbell write, so raise it against the product requirement first.
+- What if the doorbell writes are missing from the trace? => You cannot tell spurious from legitimate, so capture host doorbells too or use a host that logs its CQ head.
+PITFALL: Judging only by interrupt count. Row 5 and row 13 look identical to a counter, and only per-CQE delay separates a healthy from a broken timer.
+VERIFY: How your controller starts, restarts and cancels its aggregation timer, in its own product specification, since the NVMe specification leaves it vendor specific.
+
+@@ 10.13 | Advanced | Cross-layer | tags=number-of-queues,fid-07h,msi-x,vector-count,linux,queue-count
+Q: How do the number of I/O queues, the number of MSI-X vectors and the CPU count get reconciled during initialization, and what must firmware guarantee?
+SHORT: The host asks for queues with Set Features Number of Queues (FID 07h, 0's based requests) and the controller answers in CQE DW0 with how many it allocated. The host then allocates PCI vectors, at most 1 (admin) plus its I/O queues, and gets whatever the platform grants. It creates only as many I/O queues as it has vectors for. The controller must return a queue count it can serve and expose an MSI-X table large enough for the vectors it accepts in Create I/O CQ.
+DEEP:
+1. **Request:** CDW11 has NSQR (bits 15:0) and NCQR (bits 31:16), both 0's based. Linux asks for one queue per possible CPU plus any write and poll queues.
+2. **Grant:** the completion DW0 has NSQA (bits 15:0) and NCQA (bits 31:16), 0's based, and may be lower than requested.
+3. **Vectors:** Linux requests one vector for the admin queue plus one per non-polled I/O queue, and accepts fewer.
+4. **Reduce to fit:** the driver limits I/O queues to the vectors granted minus the admin vector, and adds the poll queues on top.
+5. **Create:** Create I/O CQ then Create I/O SQ for each. If fewer queues come online than planned, Linux deletes and retries with fewer.
+
+Worked example: a 64-CPU host requests 64 queues, so CDW11 = 0x003F003F. The drive answers DW0 = 0x001F001F (32 queues each). Linux wants 33 vectors. The drive's MSI-X table size field reads 16 (17 vectors), so the platform grants 17, and the driver ends with 16 I/O queues and dmesg shows `16/0/0 default/read/poll queues`. Four CPUs share each queue.
+
+- **What firmware must guarantee:** NCQA and NSQA it can back with real resources, an MSI-X table with at least the vectors it will accept as IV, Invalid Queue Identifier for a QID above what was granted, and Invalid Interrupt Vector for an IV it cannot serve.
+- **What to test:** requests above what the controller supports (the grant is capped, not an error) and above the 65,534 limit of the field itself (Invalid Field), a second Set Features Number of Queues after queues exist, IV equal to the table size, a Create with IV = 0 for every queue, and reset followed by another negotiation.
+FOLLOW:
+- Do queue count and vector count have to match? => No. Linux ends up with matching counts, but the spec allows CQs to share vectors and hosts on other stacks do.
+- Where do you see the CPU-to-queue mapping? => `/sys/block/nvme0n1/mq/*/cpu_list`, plus the vector affinity in `/proc/irq/<n>/effective_affinity_list`.
+PITFALL: Concluding the SSD limited the queue count when the platform limited the vectors. Compare the FID 07h result, the MSI-X table size in `lspci`, and the dmesg queue line.
+VERIFY: The behavior of a repeated Set Features Number of Queues (expected Command Sequence Error), the NSQA and NCQA field layout, and the maximum queue count, in the NVMe Base Specification.
+
+@@ 10.14 | Principal | Debug | tags=lost-interrupt,race,doorbell,timeout,completion-polled,mask,exerciser
+Q: About one command in ten million times out with "completion polled" on an MSI-X SSD with coalescing off, always at low queue depth. What is your hypothesis list, and how do you reproduce it deterministically?
+SHORT: The completion was posted and the host was never woken, so the wake-up decision failed, not the data path. The leading suspect is a race at the end of ISR processing: a CQE lands after the host's last phase check but before its CQ Head Doorbell write, and a controller that only signals on a state change does not signal again. Capture CQE, vector and doorbell writes together, then reproduce by delaying the host's doorbell write by a controlled amount.
+DEEP:
+1. **Read the log:** Linux prints `nvme nvme0: I/O tag N (cid) QID Q timeout, completion polled` when its timeout handler finds the CQE already there. The queue and tag give the CQ to trace.
+2. **Hypotheses, ranked:**
+   1. End-of-burst race. The host drains CQEs, sees the phase mismatch, and is about to write the head doorbell. A new CQE arrives in that window. The controller still counts the vector as having unacknowledged entries, so it sees no state change. Then the doorbell write acknowledges only the older entries. If the controller does not re-evaluate the vector on that doorbell write, the new CQE gets no message.
+   2. Coalescing timer not armed when a CQE arrives while an interrupt for the previous batch is in flight.
+   3. Mask or pending bit handling: a message discarded while masked, or the PBA bit cleared without sending.
+   4. Host or platform: IRQ affinity migration, interrupt remapping fault.
+3. **Capture:** an analyzer with all three streams time-aligned: CQE MWr (CQ, tail), vector MWr, and host CQ Head Doorbell MWr (CQ, value). In a failing episode look for the pattern "message, CQE arrives, doorbell, silence".
+4. **Reproduce deterministically:** use an exerciser or a modified host that delays the doorbell write by a programmable time D after its last phase check, and sweep D from 0 to a few microseconds while a second command completes at a matching moment. The failure becomes a function of D, not a 1 in 10^7 lottery.
+5. **Check both host styles:** a non-masking host (Linux) and a host that masks the vector during processing, as the transport specification recommends. Unmask with entries pending must send a message. A controller that passes only with the masking host is fragile against most real hosts.
+6. **Pass criterion:** after the doorbell write that leaves at least one unacknowledged CQE, a message (or the vector remaining asserted for pin-based) within a bound.
+- **Rule out platform:** if the trace shows the message was sent, look at the IOMMU interrupt remapping log and the CPU's IRQ state instead.
+FOLLOW:
+- The trace shows no message and the PBA bit is clear. What does that tell you? => The controller never decided to signal, so the cause is in firmware's signaling logic, not in masks or the platform.
+- Why does it appear only at low queue depth? => At high depth another completion soon arrives and produces a fresh signal, which covers the missed one. At QD1 or QD2 nothing rescues it, so the command waits for the timeout.
+PITFALL: Fixing the symptom with a shorter host timeout or an interrupt-independent poll in software. That hides a firmware defect that will hit other hosts.
+VERIFY: The exact rule for whether a controller must send another MSI or MSI-X message after a CQ Head Doorbell write that leaves entries unacknowledged, in the NVMe over PCIe Transport Specification interrupt section, and the Linux log text on your kernel.
+
+@@ 10.15 | Principal | Scenario | tags=validation,test-plan,scoreboard,spurious,missing-interrupt,automation
+Q: How do you design an automated test that detects missing and spurious interrupts on an NVMe SSD, at the NVMe level, and what are its invariants?
+SHORT: Use three independent observers and per-vector invariants. Observers: a bus analyzer or exerciser seeing CQE, vector and doorbell writes, host per-vector interrupt counters, and the count of completion-polled timeouts as a cheap fleet signal. Invariants: no message for a CQ with IEN = 0, every unmasked CQE gets a message within the coalescing bound, no message when nothing is unacknowledged, and one message on unmask if pending. Sweep IV mappings, coalescing values and resets.
+DEEP:
+1. **Observers:**
+   - **Bus level:** analyzer capture or exerciser scoreboard of CQE MWr, vector MWr and CQ Head Doorbell writes, per CQ and per vector.
+   - **Host level:** per-vector counts from `/proc/interrupts`, `/proc/irq/<n>/spurious` and interrupts processed by the driver, compared with CQEs handled.
+   - **Fleet level:** count of `completion polled` timeouts as a missing-interrupt indicator, and the unhandled ISR count as a spurious indicator.
+2. **Invariants (per vector v):**
+   1. IEN = 0 on every CQ mapped to v means zero writes to v.
+   2. Any CQE on an IEN = 1 CQ with v unmasked leads to a message within TIME plus tolerance, or earlier by threshold (10.12).
+   3. No message unless at least one CQE is unacknowledged, apart from documented races.
+   4. Masked v produces no message, and unmask with pending entries produces one (pin-based: line asserted).
+   5. Admin CQ (vector 0) is not delayed by coalescing, and CD on a vector removes delay for that vector.
+   6. Messages are at most CQEs and at least one per burst.
+3. **Sweep:**
+   - IV mapping: 1:1, N:1, all to vector 0, IV at table size minus 1, IV = table size (expect error).
+   - FID 08h: 0, THR only, TIME only, THR above CQ depth, maximum values. FID 09h: CD on and off per vector.
+   - Load: QD1, QD2, bursts, saturation, mixed polled and interrupt queues.
+   - Events during traffic: Delete I/O CQ with a pending coalesced interrupt (no message afterward), Set Features changes with I/O in flight, controller reset and re-initialization (defaults come back).
+   - Host modes: MSI-X, MSI (custom driver), INTx (`pci=nomsi`).
+4. **Automation:** run as a nightly matrix, capture on failure only (rolling buffer), classify by invariant, and store CQE-to-message latency histograms per firmware build so regressions show as shifts.
+- **Fault injection:** delay the doorbell write, drop a message in the exerciser to prove the checker fires, and inject a masked window.
+FOLLOW:
+- What is your first cheap check on a new build? => Compare interrupts per second with IOPS per vector over a fixed workload, then the timeout count with the previous build. Big shifts point to coalescing or signaling changes.
+- How do you keep false positives down? => Use tolerances from product requirements for timers, and whitelist the documented boundary race until the vendor rule is confirmed.
+PITFALL: Validating only through a stock OS driver. It never masks, never uses INTx or MSI, and never delays a doorbell, so most boundary cases never occur.
+VERIFY: Which invariants the specification requires versus the vendor requires, controller reset defaults for FID 08h and 09h, and the exact `/proc/irq/<n>/spurious` fields on your kernel.
+
+@@ 10.16 | Principal | Scenario | tags=cpu-budget,iops,coalescing,polling,affinity,tradeoff
+Q: A customer drives 2M IOPS of 4 KiB reads from one Gen5 SSD on a 32-core host, and interrupts consume about 20 percent of the CPU. What are the levers, the numbers behind them, and how do you decide?
+SHORT: With 32 vectors, 2M IOPS is 62.5K interrupts per second per vector, which at an assumed 3 us each is about 6 cores. Levers: coalescing (fewer interrupts, up to 100 us added), poll queues (no interrupts, at 1.3 us of CPU per I/O), per-vector opt-out for latency-critical queues, and affinity or isolation fixes. First measure interrupts per IOPS, since many completions per interrupt already means the cost is elsewhere. Decide from the p99 target.
+DEEP:
+1. **Measure:** `mpstat -P ALL 1` for `%irq` and `%soft`, `/proc/interrupts` deltas against IOPS, and `perf top` for time in the ISR path. The ratio of interrupts to IOPS tells you how many CQEs each interrupt handles. One means no batching.
+2. **Budget:** 2,000,000 / 32 = 62,500 interrupts per second per vector at worst, one every 16 us. At 3 us each, 2M x 3 us = 6 cores, about 19 percent of 32 cores.
+3. **Little's law:** outstanding I/O = 2M x 80 us = 160 commands, so about 5 per vector. That is enough to batch a little but not much.
+
+| Lever | Effect | Cost |
+|---|---|---|
+| Coalescing 0x0103 (N = 4, 100 us) | Four entries take 3 x 16 = 48 us, so the cycle is 64 us: 15.6K per vector, 500K total, 1.5 cores | Up to 48 us added, 24 us average |
+| Poll queues (`poll_queues`, io_uring hipri) | No interrupts. About 2M x 1.3 us = 2.6 cores | Spin time is real work only with enough depth, so about 160 outstanding across 3 threads |
+| CD on the latency-critical vector, coalescing on the rest | Bulk traffic saves CPU, critical traffic stays immediate | Two traffic classes to manage |
+| Bigger blocks or batching in the application | Fewer I/Os for the same bytes | Application change |
+| Isolate cores, pin IRQs to the IO cores | Removes interference and cache misses | Not fewer interrupts |
+
+4. **Decide:** if p99 has slack of 100 us or more, coalescing gives the fastest gain. If latency is strict, poll queues on the hot path. If mixed, use CD and per-class queues. Reject any change without a before and after p99 at the target IOPS.
+5. **Firmware validation angle:** run this same matrix on the drive: interrupt-rate reduction should match the setting, no lost or spurious interrupts at 62.5K per second per vector, and per-vector CD really immediate.
+FOLLOW:
+- Why might polling use less CPU than interrupts here? => At 160 outstanding commands over 3 threads, each spin finds work almost every pass, so the only cost is submit and reap, which is less than an interrupt per CQE.
+- Does Linux adapt coalescing automatically? => Not in the mainline driver as far as I know, so any adaptive behavior is a host tool changing FID 08h. Check your kernel.
+PITFALL: Enabling coalescing to cut CPU without measuring per-vector completion rate first. If each vector already batches 4 to 8 CQEs per interrupt, the savings are small and the tail latency cost is real.
+VERIFY: The 3 us per interrupt and 1.3 us per polled I/O costs (assumptions, measure them), poll queue behavior on your kernel, and whether your kernel version has any adaptive interrupt coalescing.

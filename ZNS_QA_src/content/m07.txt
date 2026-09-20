@@ -1,0 +1,422 @@
+# Module 7: Errors, Status Codes & Read Rules
+
+@@ 7.01 | Basic | Concept | tags=status-codes,sct,sc,catalog,command-specific
+Q: Which zone-specific status codes does ZNS define, and when is each one returned?
+SHORT: The base ZNS command set adds eight Command Specific status codes (SCT 1h), SC B8h to BFh. Five describe a zone state or geometry problem on an I/O command (Zone Boundary Error, Zone Is Full, Zone Is Read Only, Zone Is Offline, Zone Invalid Write), two are resource limits (Too Many Active Zones, Too Many Open Zones), and one is a bad Zone Management Send action (Invalid Zone State Transition). In Linux they are 0x1b8 to 0x1bf. ZRWA adds B6h and B7h (see DEEP).
+DEEP:
+| SC | Name | Typical trigger |
+|---|---|---|
+| B8h | Zone Boundary Error | Write or append longer than the space left in the zone, or a read spanning two zones when Read Across Zone Boundaries is 0 |
+| B9h | Zone Is Full | Write or append to a Full zone |
+| BAh | Zone Is Read Only | Write or append to a Read Only zone |
+| BBh | Zone Is Offline | Read or write to an Offline zone |
+| BCh | Zone Invalid Write | Write whose SLBA is not the write pointer |
+| BDh | Too Many Active Zones | The command would need one active resource more than MAR allows |
+| BEh | Too Many Open Zones | It needs an open resource and none can be freed |
+| BFh | Invalid Zone State Transition | Zone Management Send action not legal from the zone's current state |
+
+- **Encoding:** the Linux value is SCT shifted left 8 plus SC, so SCT 1 and SC BCh is 0x1bc. Raw CQE decoding of a whole status field is in 4.09.
+- **Added with ZRWA (later ZNS revision):** B6h Invalid Zone Operation (for example a ZRWA request on a zone that is not Empty, or an invalid explicit flush) and B7h ZRWA Resources Unavailable. They are in libnvme and QEMU but not in Linux nvme.h. See module 11.
+- **Not on the list:** an SLBA that is not a zone start is Invalid Field in Command (SCT 0, SC 02h), an address beyond the namespace is LBA Out of Range (SCT 0, SC 80h), and NAND failures use the media error type (SCT 2: Write Fault 80h, Unrecovered Read Error 81h).
+- **Where the detail lives:** resource codes are in module 6, append cases in module 5, transitions in module 4. This module is about reading and reacting to the whole set.
+- **Triage habit:** for any of these, ask which zone state and which command produced it. The code alone rarely names the bug.
+FOLLOW:
+- Is Zone Invalid Write the same as writing to a Full zone? => No. Zone Is Full is about the zone's state. Zone Invalid Write means the zone accepts writes but the SLBA is not the write pointer.
+- Which of the eight does Linux treat specially? => Only the two Too Many codes get their own block status. The rest become a generic I/O error (see 7.03).
+PITFALL: Memorising B8h to BFh as a flat list. In an interview or a triage, the useful skill is mapping code to cause: state problem, address problem, length problem, resource problem or media problem.
+VERIFY: The status names and the per-command lists of which command may return which code, in the ZNS Command Set Specification. The SC values B8h to BFh match Linux include/linux/nvme.h. B6h and B7h match libnvme and QEMU, and the spec revision that introduced them needs a check.
+
+@@ 7.02 | Basic | Concept | tags=write,status,zone-state,invalid-write,boundary
+Q: What does a Write return for each zone state and for each kind of bad address or length?
+SHORT: A Write that starts exactly at the write pointer and fits succeeds in Empty, Open and Closed zones. Full returns Zone Is Full, Read Only returns Zone Is Read Only and Offline returns Zone Is Offline. In a writable zone, an SLBA that is not the write pointer returns Zone Invalid Write, and a length that runs past the space left returns Zone Boundary Error. A rejected write should leave the state and write pointer unchanged.
+DEEP:
+| Zone state | Correct write | SLBA not at WP | Runs past capacity |
+|---|---|---|---|
+| Empty | Success, zone becomes Implicitly Open | Zone Invalid Write | Zone Boundary Error |
+| Implicitly or Explicitly Open | Success | Zone Invalid Write | Zone Boundary Error |
+| Closed | Success, zone reopens implicitly | Zone Invalid Write | Zone Boundary Error |
+| Full | Zone Is Full | Zone Is Full (or Invalid Write, see 7.11) | Zone Is Full |
+| Read Only | Zone Is Read Only | Zone Is Read Only (see 7.11) | Zone Is Read Only |
+| Offline | Zone Is Offline | Zone Is Offline (see 7.11) | Zone Is Offline |
+
+- **Resources first:** a correct write to an Empty or Closed zone can still fail with Too Many Active Zones or Too Many Open Zones (module 6).
+- **The last write:** a write that ends exactly at ZSLBA + ZCAP succeeds and makes the zone Full. The next write returns Zone Is Full.
+- **Address-specific writes only:** the write pointer check applies to commands that name an LBA. Zone Append names the zone start instead, so it never returns Zone Invalid Write (5.06).
+- **Free oracle:** a rejected write must not move the write pointer, so a Report Zones right after any failure should equal the one before.
+- **Gap addresses:** an SLBA between ZCAP and the end of the zone is not writable. The exact status in a zone that is not yet Full is worth a directed test and a VERIFY.
+FOLLOW:
+- Which status means the host and the device disagree about the write pointer? => Zone Invalid Write. Every other zone status is about state, length or resources.
+- Does Zone Invalid Write put the zone into an error state? => No. The zone stays as it was, and the next correct write succeeds.
+PITFALL: Expecting one status per bad write. A write with several faults at once can return more than one legal status (7.11).
+VERIFY: The status for an SLBA inside the capacity gap of a non-Full zone, that a rejected write leaves the write pointer unchanged, and which write-like commands are address-specific, in the ZNS Command Set Specification.
+
+@@ 7.03 | Basic | Cross-layer | tags=linux,block-layer,errno,dnr,nvme-cli,tracing
+Q: How does a zone error status reach a Linux application, and what is lost on the way?
+SHORT: The NVMe driver keeps the full status in the request, but converts it to a block status: Too Many Active and Too Many Open get their own resource statuses, Capacity Exceeded becomes no space, and every other status, including Zone Invalid Write and Zone Is Read Only, becomes a generic I/O error, which the application sees as EIO. To see the real SCT and SC use the kernel log, NVMe tracepoints, nvme-cli or passthrough.
+DEEP:
+| NVMe status | Linux block status | errno seen |
+|---|---|---|
+| Too Many Active Zones (1h/BDh) | BLK_STS_ZONE_ACTIVE_RESOURCE | EOVERFLOW |
+| Too Many Open Zones (1h/BEh) | BLK_STS_ZONE_OPEN_RESOURCE | ETOOMANYREFS |
+| Capacity Exceeded (0h/81h) | BLK_STS_NOSPC | ENOSPC |
+| Every other zone status | BLK_STS_IOERR | EIO |
+
+- **Kernel log:** recent kernels print one rate-limited line per failed I/O with the opcode, LBA, block count, status name, `sct 0x1 / sc 0xbc` and a DNR flag. That is the fastest way to see the real code. The wording depends on the kernel version.
+- **Tracing:** enable the nvme trace events (`echo 1 > /sys/kernel/tracing/events/nvme/enable`) to see submit and completion with status.
+- **Passthrough:** `nvme io-passthru` and the nvme-cli zns commands print the status name and value, and they skip the block layer's checks.
+- **Retries:** the driver also decides whether to retry from the status and the DNR bit (7.07), and the application never sees that.
+- **Consequence for validation:** a test that only sees EIO cannot tell Zone Invalid Write from Zone Is Read Only. Assert exact statuses at the NVMe layer (passthrough, SPDK, analyzer), and use the block layer only for end-to-end behavior.
+FOLLOW:
+- A dd to a zone returns Input/output error. What is the first step? => Read dmesg for the sct and sc line, or repeat the write through nvme passthrough. Then Report Zones on that zone.
+- Does the application see DNR? => No. It is used inside the driver for the retry decision and printed in the log.
+PITFALL: Writing a test that expects a specific errno such as EIO to mean Zone Invalid Write. The mapping is many to one.
+VERIFY: The kernel log wording and the version that added it, and the errno values, on the kernel you test. The block status mapping matches drivers/nvme/host/core.c.
+
+@@ 7.04 | Intermediate | Concept | tags=read,status,offline,boundary,dulbe,media-error
+Q: Which reads to a zoned namespace can fail, and with what status?
+SHORT: Very few. A read fails with Zone Is Offline in an Offline zone, with Zone Boundary Error when it spans two zones and the Read Across Zone Boundaries bit is 0, with LBA Out of Range beyond the namespace, and with a media error (Unrecovered Read Error) when the data cannot be recovered. A read at or above the write pointer normally succeeds and returns the unwritten-block value, unless DULBE is enabled and the device reports an Unwritten Logical Block error.
+DEEP:
+| Condition | Result |
+|---|---|
+| Zone Offline | Zone Is Offline (SCT 1, BBh) |
+| Zone Read Only, Full, Open, Closed or Empty | Success. Blocks at or above the WP return the unwritten value |
+| Range spans zones, Read Across Zone Boundaries = 0 | Zone Boundary Error (SCT 1, B8h) |
+| Range spans zones, bit = 1 | Success if every zone touched is readable |
+| Range beyond the namespace | LBA Out of Range (SCT 0, 80h) |
+| NAND data lost | Unrecovered Read Error (SCT 2, 81h) |
+| DULBE enabled and unwritten block read | Deallocated or Unwritten Logical Block (SCT 2, 87h) |
+
+- **No Read Only status for reads:** Zone Is Read Only exists only for writes. Reads of a Read Only zone succeed, which is how the host evacuates data.
+- **Why success above the WP:** unlike SMR drive models, ZNS allows it, and the value comes from DLFEAT (3.11 has the full state table and the encodings).
+- **Linux never spans zones:** the driver sets the request chunk size to the zone size, so the block layer splits I/O at zone boundaries. The Read Across Zone Boundaries bit matters only for passthrough, SPDK and other user-space stacks.
+- **Media error is real loss:** Unrecovered Read Error means that range is gone. The host recovers from redundancy, and does not retry in a loop.
+- **Capacity gap:** what a read between ZCAP and the end of the zone returns is a directed test to add. Module 3 records it as an unwritten-block read.
+FOLLOW:
+- How do you test Read Across Zone Boundaries? => Read Identify to learn the bit, then read across the boundary and expect success or Zone Boundary Error to match the bit. Include a case where the second zone is Offline.
+- Which read status must a validator never accept in a Read Only zone? => Zone Is Read Only, because it applies to writes. A valid read should succeed.
+PITFALL: Treating a read above the write pointer as an error to be asserted. It is legal and returns the unwritten value.
+VERIFY: The DLFEAT and OZCS bit assignments, the read result for LBAs between ZCAP and zone end, and what a cross-zone read returns when one of the zones is Offline, in the NVM and ZNS Command Set Specifications.
+
+@@ 7.05 | Intermediate | Trap | tags=boundary,capacity,partial-write,write-sizing
+Q: A 128-block write starts 100 blocks before the zone capacity. Does the device write 100 blocks and fail the rest?
+SHORT: No. The command is aborted with Zone Boundary Error, no data is written, and the zone stays open with the same write pointer. There is no short write in ZNS, so the host never gets a partial count. Only a write that ends exactly at ZSLBA + ZCAP succeeds and makes the zone Full. The host must split or size writes itself, using capacity, not zone size.
+DEEP:
+Example: ZSLBA 0x20000, ZCAP 0xDC00, so the capacity limit is 0x2DC00. The WP is 0x2DC00 - 100 = 0x2DB9C.
+
+| Write from WP | Status | State afterwards |
+|---|---|---|
+| 99 blocks | Success | Open, 1 block left |
+| 100 blocks | Success | Full |
+| 101 blocks | Zone Boundary Error | Open, WP still 0x2DB9C |
+| 128 blocks | Zone Boundary Error | Open, WP still 0x2DB9C |
+
+- **Why hosts hit it:** they plan from Zone Size (the gap between ZCAP and ZSZE is not writable), or they run several writers and cannot know how much is left.
+- **Host options for the tail:** pad it with a filler record, Finish the zone and give up the tail, or pick a record size that divides the capacity.
+- **Same rule for Append:** an append that does not fit fails whole (5.06).
+- **Test boundaries:** with r blocks left, write r - 1, r and r + 1 (success, success and Full, Zone Boundary Error), and one write that starts at the last block.
+- **Recovery after the error:** nothing to repair. Send the smaller write and the zone becomes Full.
+FOLLOW:
+- How does the host know the remaining space without Report Zones? => From its shadow: ZCAP minus (WP minus ZSLBA), provided the shadow is trusted (7.12).
+- Is the error also used when the write would cross into the next zone? => Yes. Any write longer than the space left in its zone gets it.
+PITFALL: Retrying the same write. It fails the same way until the host shortens it or picks another zone.
+VERIFY: Whether the length check is against zone capacity or zone size in the spec wording, and that a Zone Boundary Error leaves state and WP unchanged.
+
+@@ 7.06 | Intermediate | Concept | tags=read-only,offline,media,evacuation,degraded
+Q: Why does a controller move a zone to Read Only or Offline, and what does the host keep in each state?
+SHORT: The controller does it when the media under a zone can no longer be trusted, for example after NAND program or erase failures with no spare left. Read Only keeps the written data readable and refuses writes, so the host can copy it out. Offline means the zone is not accessible and reads fail as well. Both states are entered by the controller, Reset Zone does not recover either, and the WP is not valid in either.
+DEEP:
+| | Read Only | Offline |
+|---|---|---|
+| Reads | Succeed | Zone Is Offline |
+| Writes and appends | Zone Is Read Only | Zone Is Offline |
+| Open, Close, Finish, Reset | Invalid Zone State Transition | Invalid Zone State Transition |
+| Offline Zone command | Moves to Offline | Success, no change |
+| Counts as active or open | No | No |
+| Write pointer field | Not valid | Not valid |
+
+- **Typical causes (firmware view, not spec text):** program or erase failure with no spare block for the zone's stripe, worn-out blocks, or lost redundancy. A zone can also start life Offline after a Format or namespace creation.
+- **Data promise:** data acknowledged before the fault is expected to be readable. The tail that was in flight may not be, and the WP cannot tell you where it ends, so the host uses its own record.
+- **What the failing command sees:** the write that hit the fault may complete with a media error status (SCT 2, Write Fault). Later writes see Zone Is Read Only. Which one the host sees first is device specific.
+- **Host reaction:** stop allocating to the zone, evacuate readable data, optionally send Offline Zone once the data is safe, remove the zone from capacity accounting, and raise an alert if the count crosses a threshold (7.16).
+- **Resources:** both states release active and open resources, so a fault can hide by freeing a slot.
+FOLLOW:
+- Can the host bring a Read Only zone back? => Not with Zone Management commands. Recovery, if any, is vendor specific or a format.
+- Should a validator require Zone Is Read Only for the write that caused the fault? => No. Accept the media error or the zone status, and require the zone status from the next command on.
+PITFALL: Assuming Read Only means all earlier data is safe. The zone went bad because the media misbehaved, so verify readability during evacuation and keep a second copy where the data matters.
+VERIFY: Which status the write that triggers the transition returns, whether written data must remain readable in Read Only, and any Read Only to Offline transition the controller may make on its own, in the ZNS Command Set Specification.
+
+@@ 7.07 | Intermediate | Concept | tags=retry,dnr,policy,linux,backoff
+Q: Which zone errors should a host retry, and how do DNR and the Linux retry logic interact with them?
+SHORT: Almost none, at least not blindly. Zone errors describe a zone state or a host mistake, so the same command fails again until something changes. Retry only after fixing the cause: pick another zone, shorten the write, resync the write pointer, or free a resource. Linux retries a failed request up to nvme_core.max_retries times (default 5) unless DNR is set, so a device that returns these statuses without DNR causes pointless retries.
+DEEP:
+| Status | Host reaction |
+|---|---|
+| Zone Boundary Error | Shorten the write, or move to a new zone |
+| Zone Is Full | Rotate to a new zone, then confirm with Report Zones |
+| Zone Is Read Only | Stop writing, evacuate, mark the zone bad |
+| Zone Is Offline | Mark the zone dead, recover data from redundancy |
+| Zone Invalid Write | Drain, Report Zones, resync the shadow WP, find the lost or reordered write |
+| Too Many Active or Open Zones | Free a resource (Close, Finish, Reset), then retry with bounded backoff |
+| Invalid Zone State Transition | The host state model is wrong. Report the zone and re-plan |
+
+- **DNR:** it is bit 31 of CQE dword 3. It tells the host that retrying cannot succeed. Whether the ZNS spec requires it for these statuses is not something I could confirm, so a validator records it and treats it as informational.
+- **Linux logic:** the request completes without retry if DNR is set, if the request is marked no-retry, or if the retry count has reached the limit. Nothing in the driver exempts zone statuses, so a Zone Invalid Write without DNR is retried up to 5 times.
+- **Danger of a retry:** the second attempt of a Zone Invalid Write write can succeed by accident once an earlier write lands and moves the WP. That hides a reordering bug and shifts data.
+- **Unknown outcome:** never retry an append blindly (5.10). For a timed-out write, resync first (7.14).
+FOLLOW:
+- Which of these are worth an automatic retry with backoff? => Only the two Too Many statuses, and only if another writer is expected to release a resource soon.
+- Should a test assert DNR = 1 on Zone Is Full? => Only if the vendor datasheet promises it. Otherwise log it.
+PITFALL: Wrapping writes in a generic retry-on-EIO loop. On a zoned device most EIOs are deterministic, and a loop turns them into hangs or duplicates.
+VERIFY: Whether the specification requires DNR for any zone status, and the nvme_core.max_retries default on your kernel (5 in the source checked).
+
+@@ 7.08 | Intermediate | Cross-layer | tags=detection,zone-descriptor-changed,changed-zone-list,report-zones,health-log
+Q: How does the host find out that zones have failed, and which signals can it rely on?
+SHORT: There are four signals: the status of a command that touches the bad zone, the Zone Descriptor Changed event with the Changed Zone List log page, a periodic Report Zones sweep, and the health log. None is complete alone. An inline error appears only if the host touches the zone, the event can be lost or overflow, and the health log is not per zone. A Report Zones sweep is the ground truth.
+DEEP:
+| Signal | Sees | Blind spot |
+|---|---|---|
+| Inline status (BAh, BBh, media error) | The zones being written or read | Zones the host is not using. Reads of Read Only zones still succeed |
+| Zone Descriptor Changed event and Changed Zone List | Changes the host did not cause | Overflow (count FFFFh), reset clears it, mainline Linux does not consume it (6.11) |
+| Report Zones sweep | Every zone, with state and attributes | It is a snapshot. Costs one report per few thousand zones (4.11) |
+| SMART and vendor logs | Available Spare, Percentage Used, media errors, Critical Warning | Not zone specific |
+
+- **Sweep design:** run it on a timer, after every controller reset or timeout, and after any burst of errors. Compare with the last snapshot and log each zone whose state moved to Read Only or Offline.
+- **What to record:** zone ID, time first seen, previous state, the shadow WP, and the valid data map for the zone, so evacuation knows what to copy.
+- **Filtering:** Report Zones can filter by state, so the sweep can ask for Read Only and Offline zones only. The filter codes are in 4.08.
+- **Validation:** after injecting a media fault, assert that the event or sweep reports exactly the expected zones and no others, and that the reported state matches what commands then return.
+FOLLOW:
+- Why sweep after a controller reset? => The Changed Zone List does not survive a reset, and the driver's view of the namespace may have changed too.
+- Can a zone go Read Only with no event at all? => Yes, if the device does not support the event or the host did not enable it. A sweep is the fallback.
+PITFALL: Relying on the asynchronous event alone. It is a hint, and the design must still work when it is missing.
+VERIFY: The trigger list for the Zone Descriptor Changed notice and the ZRASF values for Read Only and Offline (see the note in 4.08), in the ZNS Command Set Specification.
+
+@@ 7.09 | Advanced | Debug | tags=debug,status-sequence,host-bug,log,triage
+Q: Read the host log below (4 KiB LBAs, ZSZE 0x10000, ZCAP 0xDC00) and name the host bug behind each failing status.
+SHORT: Six of eight commands fail and each points to a different host mistake. Lines 1 and 2: the write was sized from Zone Size instead of capacity, then retried. Line 4: a write into a zone that line 3 made Full. Line 5: two unordered writers on one zone. Line 6: Reset Zone on a Read Only or Offline zone. Line 7: a read of an Offline zone the allocator still trusts.
+DEEP:
+| # | Command | SLBA | NLB | Status (SCT/SC) |
+|---|---|---|---|---|
+| 1 | Write zone 2 | 0x2DB00 | 512 | 1h/B8h |
+| 2 | Write zone 2 | 0x2DB00 | 512 | 1h/B8h |
+| 3 | Write zone 2 | 0x2DB00 | 256 | 0h/00h |
+| 4 | Write zone 2 | 0x2DC00 | 8 | 1h/B9h |
+| 5a | Write zone 4 (thread B) | 0x40040 | 64 | 1h/BCh |
+| 5b | Write zone 4 (thread A) | 0x40000 | 64 | 0h/00h |
+| 6 | Reset zone 6 | 0x60000 | - | 1h/BFh |
+| 7 | Read zone 7 | 0x70400 | 16 | 1h/BBh |
+
+1. **Lines 1 and 2:** zone 2 starts at 0x20000, so its capacity ends at 0x2DC00. The WP is 0x2DB00, leaving 0x100 = 256 blocks. A 512-block write exceeds that, so Zone Boundary Error. The host planned to fill to the end of the zone (0x30000). Line 2 repeats the same command, which cannot succeed.
+2. **Line 3:** 256 blocks fits exactly, so the zone becomes Full.
+3. **Line 4:** the write sits at ZSLBA + ZCAP = 0x2DC00. The host never recorded that line 3 filled the zone. Zone Is Full (not Zone Invalid Write) shows the device checked the state first, which is legal but see 7.11.
+4. **Line 5:** thread B wrote at 0x40040 before thread A's 0x40000 executed. The WP was still 0x40000, so B got Zone Invalid Write. A then succeeded. B must be resubmitted at 0x40040. See 5.03.
+5. **Line 6:** Reset succeeds from Open, Closed and Full, so BFh on a Reset means the zone is Read Only or Offline (4.09). The host treats Reset as a universal recycle step.
+6. **Line 7:** Zone Is Offline on a read. The zone went Offline earlier, and the allocator was never told (7.08).
+
+Fix list: track capacity, not size; remember Full on completion; serialize or use Append; branch on zone state before Reset; sweep for failed zones. Lines 3 and 5b are the only healthy commands.
+FOLLOW:
+- How would you confirm line 6 without looking at the device? => The state of zone 6 must be Read Only or Offline in Report Zones. If it is anything else, BFh on Reset is a device bug.
+- Which of the six failures could be a device bug instead? => Line 4 if the zone was not Full, and line 5 only if a QD 1 replay of the same commands still fails.
+PITFALL: Fixing each failure locally with a retry. Each status needs a change to host bookkeeping, and retries hide the cause.
+VERIFY: The precedence between Zone Is Full and Zone Invalid Write for line 4 (see 7.11), and that the statuses on lines 6 and 7 apply as decoded, in the ZNS Command Set Specification.
+
+@@ 7.10 | Advanced | Numeric | tags=numeric,capacity,record-size,tail,boundary,append
+Q: Zone capacity is 0xDC00 blocks of 4 KiB and the host writes 192 KiB records. How many records fit, what happens at the tail, and what does planning from Zone Size cost?
+SHORT: ZCAP is 56,320 blocks (220 MiB) and a record is 48 blocks, so 1,173 records fit using 56,304 blocks. The remaining 16 blocks (64 KiB, 0.028 percent) are too small for one more record, so record 1,174 gets Zone Boundary Error. A host planning from Zone Size (65,536 blocks) expects 1,365 records, which is 192 more than the zone can hold.
+DEEP:
+Assumptions: 4 KiB LBAs, ZCAP = 0xDC00, ZSZE = 0x10000, records written as ordinary Writes at the write pointer, one at a time.
+1. ZCAP = 0xDC00 = 56,320 blocks = 220 MiB.
+2. Record = 192 KiB / 4 KiB = 48 blocks.
+3. Records that fit: floor(56,320 / 48) = 1,173, using 1,173 x 48 = 56,304 = 0xDBF0 blocks.
+4. Tail: 56,320 - 56,304 = 16 blocks = 0x10 blocks = 64 KiB, which is 16 / 56,320 = 0.028 percent of the zone.
+5. Record 1,174 (48 blocks) with WP at ZSLBA + 0xDBF0: 48 > 16, so Zone Boundary Error, nothing written, zone still open.
+6. Planning from Zone Size: floor(65,536 / 48) = 1,365 records, so the host over-plans by 1,365 - 1,173 = 192 records = 9,216 blocks = 36 MiB, which is the size of the gap between ZCAP and ZSZE.
+7. Across a namespace of 4,096 zones the tails add up to 4,096 x 64 KiB = 256 MiB. Small, but it decides a state machine.
+
+Options at the tail:
+| Option | Result | Cost |
+|---|---|---|
+| Pad 16 blocks of filler | Zone becomes Full exactly at capacity | 64 KiB written, and the filler must be recognizable |
+| Send Finish Zone | Zone becomes Full, resources released | 64 KiB unused |
+| Choose a divisor record size | For 40 blocks: 56,320 / 40 = 1,408 records, tail 0 | Fits this capacity only |
+
+With Zone Append at queue depth 8, the appends already in flight when the tail is reached each fail whole. Up to 7 more Zone Boundary Errors arrive, and they are normal, not faults (5.06).
+FOLLOW:
+- What changes if the drive reports variable zone capacity? => The record count differs per zone, so compute it per zone from the descriptor, and re-read ZCAP after a Reset.
+- How would you assert this in a test? => Fill a zone with records of every size from 1 to 64 blocks. Expect exactly floor(ZCAP / size) successes, then Zone Boundary Error on the next write if a remainder is left (Full only when the sum equals ZCAP, in which case the next write returns Zone Is Full).
+PITFALL: Sizing the zone tail from Zone Size. The last 36 MiB of address space never accepts data.
+VERIFY: None for the arithmetic. Confirm the actual ZCAP and ZSZE on your drive, and whether ZCAP can vary per zone.
+
+@@ 7.11 | Advanced | Trap | tags=precedence,multi-fault,allowed-set,oracle,characterization
+Q: A write has the wrong SLBA and also hits a Full, Read Only or Offline zone, or runs past capacity. Which status does the device return, and how should a validator treat it?
+SHORT: The specification defines each error on its own, and as far as I could confirm it gives no complete precedence order for combinations, so different devices may return different legal statuses for the same command. A validator should assert an allowed set for multi-fault commands, for example Zone Is Full or Zone Invalid Write for a wrong-SLBA write to a Full zone, and an exact code only where a single fault applies.
+DEEP:
+| Command | Faults present | Statuses to allow |
+|---|---|---|
+| Write below WP, fits, zone Open | Wrong SLBA only | Zone Invalid Write exactly |
+| Write to Full zone at any SLBA | Full plus maybe wrong SLBA | Zone Is Full, Zone Invalid Write |
+| Write to Read Only zone, wrong SLBA | Read Only plus wrong SLBA | Zone Is Read Only, Zone Invalid Write |
+| Write to Offline zone, any SLBA | Offline plus others | Zone Is Offline first choice, record the rest |
+| Write at WP, longer than space | Length only | Zone Boundary Error exactly |
+| Write at wrong SLBA, longer than space | Both | Zone Invalid Write, Zone Boundary Error |
+
+- **Cross-class order:** generic checks (Invalid Field, LBA Out of Range) usually come before zone checks, but treat that as observed behavior, not a rule.
+- **Test matrix:** 6 zone states x 4 SLBA positions (at WP, below, above, in the gap) x 2 lengths (fits, exceeds) = 48 cells. Only a minority have a single fault.
+- **Characterize, do not fail:** record what each firmware build returns per cell. A change between builds is a compatibility note to raise with the vendor, because host stacks may switch on the status.
+- **Host rule that makes the question moot:** on any zone status, Report Zones and decide from the state, never from the code alone.
+- **Linux hides it anyway:** all of these become EIO through the block layer (7.03).
+FOLLOW:
+- Which cells can be asserted exactly? => The single-fault ones: wrong SLBA in an Empty, Open or Closed zone with a length that fits, and a correct SLBA with a length that overruns.
+- Should the vendor define an order? => Ask for it in the datasheet, and record the answer as an interoperability requirement.
+PITFALL: Encoding one drive's behavior as the spec. That fails a compliant second source and passes a wrong first one.
+VERIFY: Whether the ZNS Command Set Specification or the NVMe Base Specification states an ordering between zone state checks, the write pointer check and the boundary check.
+
+@@ 7.12 | Advanced | Cross-layer | tags=power-loss,write-pointer,recovery,shadow,resync
+Q: After a power loss or controller reset, how does a host establish the real write pointer, and which error tells it that its shadow is stale?
+SHORT: Never trust the shadow write pointer after any reset. Run Report Zones over all zones, compare each WP with the last durable and last submitted points the host recorded, and check the data between the checkpoint and the WP by header or CRC. A host that resumes from a stale shadow gets Zone Invalid Write on its first write, whether the real WP is higher or lower, or it appends after a torn tail without noticing.
+DEEP:
+1. Wait for the controller to become ready, re-Identify (limits can differ after a format), then Report Zones for every zone in chunks (4.11).
+2. Classify each zone against the host's records:
+
+| Observed WP | Meaning | Action |
+|---|---|---|
+| Equals the last durable end | Clean | Resume at the WP |
+| Between durable end and submitted end | Some non-durable tail persisted, maybe torn | Verify tail by CRC, then continue or Finish |
+| Below the durable end | Acknowledged data lost | Device bug (3.15) |
+| Above the submitted end | Data the host never wrote | Device bug, or a second writer |
+
+3. **Zone state changes:** zones that were open are Closed now. The host must reopen them, and the active count equals the Closed zones (6.08).
+4. **No rewind:** a WP cannot be moved back to discard a torn tail. The host either treats the torn record as dead in its own metadata and continues after it, Finishes the zone, or copies out and Resets.
+5. **Symptom of a stale shadow:** the first write returns Zone Invalid Write, because SLBA is above the WP (data lost) or below it (data persisted that the host did not know about). Both directions look the same in the status.
+6. **Tail check:** the WP has no record boundaries, so a torn tail is found only from content, using a length and CRC in each record header.
+FOLLOW:
+- Does the WP alone tell you whether the last record is complete? => No. The WP can land inside a multi-block write, so only the record's own length and CRC show it (5.13).
+- What do you assert in a power-cut test? => No acknowledged durable data is missing, every LBA below the WP reads back, and the WP lies between the durable end and the submitted end.
+PITFALL: Rebuilding host state from a checkpoint file without asking the device. The device is the only source of truth for the WP.
+VERIFY: The durability and WP-rollback guarantees after unexpected power loss, and the initial zone states after each reset type, in the ZNS and NVM Command Set Specifications.
+
+@@ 7.13 | Advanced | Cross-layer | tags=linux,zone-write-plugging,wp-update,eio,fault-injection
+Q: What does the Linux zoned block layer do when a write to a zone fails, and how do you test that path?
+SHORT: With zone write plugging (Linux 6.10 or later), a failed write makes the block layer abort the other writes queued for that zone. In Linux 6.13 and later it also flags the write pointer as unknown, and further writes then fail in the block layer, without reaching the device, until the user runs a zone report, resets the zone or finishes it. One device error can therefore become a burst of EIO with no matching NVMe commands.
+DEEP:
+In the source of Linux 6.13 and later (the flag is BLK_ZONE_WPLUG_NEED_WP_UPDATE), a comment says the user must run a report zones, reset or finish the zone to recover a reliable write pointer position, and that writes are failed if the user did not. Kernels 6.10 to 6.12 used a different error state (BLK_ZONE_WPLUG_ERROR) with an in-kernel recovery step, so behavior differs by kernel.
+
+1. A write completes with any error. The zone write plug aborts its queued BIOs and sets the flag that the write pointer needs an update.
+2. New writes to that zone are failed by the block layer. Nothing is sent to the SSD.
+3. A report zones on the zone (blkzone report, or the kernel's own report) refreshes the tracked write pointer from the device.
+4. Writes then proceed from the device's WP.
+
+- **Counting errors:** the first failure is a device status in the trace. The EIO burst that follows has no matching commands. Count device statuses from the NVMe trace or analyzer, and application errors separately.
+- **Append:** native Zone Append requests are not plugged (5.08), so this tracking applies to regular writes and to appends the block layer emulates.
+- **Test method:** inject one failing status on a write to a chosen zone (nvme fault injection through debugfs, or a QEMU model), run a sequential writer through the block layer, and check the sequence: one device error, then EIOs, then recovery after `blkzone report`. Finally read back and verify data.
+- **Assertions:** no data lands after the failed write, the zone's WP after the report equals the device's, and other zones are unaffected.
+FOLLOW:
+- Why not just retry the write in the block layer? => The write may have partly executed, and a retry needs the WP. The layer instead asks the device.
+- Does passthrough hit the same tracking? => No. Passthrough goes around the block layer, so it sees the device's raw statuses.
+PITFALL: Counting the EIO burst as separate device failures, or blaming the SSD for errors that never reached it.
+VERIFY: The recovery triggers on your kernel (the NEED_WP_UPDATE model appears in v6.13 and later, the ERROR model in v6.10 to v6.12, from the kernel source), and the nvme fault injection debugfs path and parameters.
+
+@@ 7.14 | Principal | Scenario | tags=timeout,unknown-outcome,recovery,write-pointer,controller-reset
+Q: A Write to a zone times out at 30 seconds, the driver resets the controller, and the host has no completion. How do you recover the zone, and what must never be done?
+SHORT: A timed-out command has an unknown outcome: it may have executed fully, partly or not at all. After the controller is back, stop new writers, run Report Zones on the zone to get the true WP, and compare it with the write's SLBA and length: at SLBA means not landed, at SLBA plus length means landed, between means torn. Never blind-retry an append. A retried Write is fenced by the SLBA check, but still resync first.
+DEEP:
+Setup: one Write in flight per zone (SLBA s, NLB n). The driver aborts, then resets the controller (Linux default I/O timeout is 30 s, nvme_core.io_timeout).
+1. **Freeze the zone:** no new submissions. Keep the host record of the in-flight write (s, n, data, sequence).
+2. **Wait for readiness:** the controller is ready again, Identify is re-read, and a previously open zone is expected to be Closed (6.08).
+3. **Read the truth:** Report Zones for the zone gives state and WP_true.
+4. **Classify:**
+
+| WP_true | Meaning | Action |
+|---|---|---|
+| s | The write did not land | Resubmit at s |
+| s + n | The write landed | Complete it as success and verify data |
+| between | Torn write (a prefix landed) | Write the missing blocks from WP_true |
+| Zone Read Only or Offline | The fault took the zone | Evacuate (7.06) |
+
+5. **Why Write is safer than Append:** resubmitting a Write that already landed fails with Zone Invalid Write, because the WP moved, so nothing is duplicated. A duplicate append succeeds twice (5.10).
+6. **Linux angle:** the failed write also leaves the block layer's write pointer flagged as unknown (7.13), so a report is needed there too.
+7. **Durability:** a landed write is durable only under the usual rules (FUA, or Flush, or a non-volatile cache).
+8. **Root cause separately:** capture the controller's logs and telemetry before further resets. A timeout is a symptom, and a Reset-all on full zones is one known cause (4.14).
+FOLLOW:
+- Is an Abort enough to know the command did not run? => Only if the original completes with Command Abort Requested. If the Abort reports that the command was not aborted, it may have run.
+- What if the host used Zone Append at queue depth 8? => Reconcile the zone by content (5.10, 5.13), because the in-flight appends cannot be classified from one WP value.
+PITFALL: Assuming the WP moved by the full length or not at all. A torn write can leave it partway.
+VERIFY: Whether the WP can land inside one Write command after a reset and the atomicity that applies (AWUPF, NAWUPF), and the driver's handling of timed-out commands on your kernel.
+
+@@ 7.15 | Principal | Scenario | tags=test-design,conformance,error-paths,side-effects,fault-injection
+Q: Design a validation suite for the error paths of a ZNS SSD: statuses, side effects and recovery. What does it contain and how do you decide pass?
+SHORT: Build a table of cells (command, zone state, address condition, length condition), each with an allowed status set and a required post-state, and run every cell through raw NVMe passthrough. After each cell check the CQE and diff a full Report Zones for side effects. Add multi-fault cells as allowed sets, media fault injection for Read Only and Offline, power loss during errors and a randomized soak. Pass means no side effects and no status outside its set.
+DEEP:
+1. **Axes:** commands (Write, Append, Read, Zone Management Send actions), zone states (7), address (at WP, below, above, in the gap, not a zone start, past the namespace) and length (fits, exact, one more, spans a zone). Three commands x 7 x 6 x 4 gives 504 cells before pruning.
+2. **Cell record:** allowed statuses (7.11), whether DNR is checked, post-state of the zone, WP, resource counts, and expected data.
+3. **Side effects:** after every cell, Report Zones for all zones and diff with the model. A failed write to zone A that moves zone B is a real bug class, and single-zone checks miss it.
+4. **Recovery after error:** after each cell, do a correct write at the WP. An error must not wedge the zone. After thousands of errors, run the resource probe from 6.16 to catch leaks.
+5. **Fault injection:** NAND program and erase failures must produce Read Only or Offline in the right zones only, with the statuses of 7.06, the event or sweep signal (7.08) and released resources.
+6. **Concurrency:** run error storms next to a healthy workload and check that the healthy commands keep their latency and never fail.
+7. **Resets and power loss:** cut power and reset in the middle of error handling, then apply 7.12.
+8. **Reference:** a model with QEMU's ZNS device as a cross-check for logic errors. Differences from hardware are questions about the spec, not verdicts.
+
+Exit criteria: every cell run once with pass or a written waiver, zero side-effect diffs across a long soak, statuses agreeing with the vendor's datasheet, and each firmware build's characterization data (7.11) archived.
+FOLLOW:
+- A status is outside the set. Who is right? => Read the spec text. If it supports the device, add it to the set and record the ambiguity. Otherwise file a defect with the CQE, the report and the trace.
+- Why use passthrough instead of the block layer? => The block layer splits, rewrites and blocks commands, and it maps most statuses to EIO (7.03).
+PITFALL: Checking only the failing command's status. The bugs that escape are the side effects on other zones and the states the zone gets stuck in.
+VERIFY: The complete list of write-like commands and status lists per command in your ZNS revision, since the cell count depends on it.
+
+@@ 7.16 | Principal | Cross-layer | tags=read-only,evacuation,capacity,die-failure,fleet,numeric
+Q: A drive with zones mapped to 4-die groups loses one die, and a quarter of its zones go Read Only. How do you size and run the host response, and how do you validate it?
+SHORT: Read Only zones stay readable, so the host copies their live data to healthy zones, and the capacity math decides whether that is possible. With 4,096 zones of 1 GiB at 80 percent full, 1,024 Read Only zones hold 819 GiB, but the 3,072 healthy zones have only 614 GiB free, a shortfall of 205 GiB that must go to other drives. Evacuation at 1.5 GB/s takes about 10 minutes. Validate with die-level fault injection.
+DEEP:
+Assumptions (illustrative): 16 dies, zones mapped to 4-die groups (4 groups), 4,096 zones of 1 GiB capacity (4 TiB), live data spread evenly at 80 percent, evacuation reads at 1.5 GB/s.
+1. Affected zones: 4,096 / 4 = 1,024 zones, which is 25 percent.
+2. Live data in them: 1,024 x 0.8 GiB = 819.2 GiB.
+3. Healthy zones: 3,072, holding 3,072 x 0.8 = 2,457.6 GiB, so free space is 614.4 GiB.
+4. Shortfall: 819.2 - 614.4 = 204.8 GiB cannot stay on this drive. It must come from replicas or be shed.
+5. Time: 819.2 GiB x 1.0737 GB/GiB / 1.5 GB/s = about 586 s, roughly 10 minutes, assuming reads succeed and writes are not the limit.
+6. Write limits: the evacuation writers use open and active zones, so they need a budget within MOR and MAR (6.12).
+
+Host procedure:
+- Detect (7.08) and freeze allocation to Read Only zones.
+- Evacuate in priority order: data with no other replica first.
+- Expect Unrecovered Read Error on the failed die's data, and rebuild it from redundancy.
+- Send Offline Zone after the data is safe, so the zone state is settled.
+- Recompute capacity and GC thresholds, and alert fleet management. Retire the drive when the loss exceeds a policy limit.
+
+Validation: inject a die failure (vendor tool or emulator), then check that only the mapped zones change state, the statuses follow 7.06, the change is reported (7.08), surviving zones keep their data and latency, and the host completes evacuation within its bound.
+FOLLOW:
+- How do you know which zones a die maps to? => The spec does not say. Use vendor logs or observe the failure set, and check that it is stable and plausible for the design.
+- What if every zone stripes across all dies? => One die failure touches every zone with data, so the whole drive is effectively lost.
+PITFALL: Planning evacuation against the drive's pre-failure capacity. The healthy space is 25 percent smaller.
+VERIFY: How many zones a media fault takes out depends on the zone-to-die mapping, which is vendor specific and not in the spec.
+
+@@ 7.17 | Principal | Debug | tags=debug,write-fault,invalid-write,cascade,fault-injection,attribution
+Q: In a fault-injection run, one Write Fault is followed by a burst of Zone Invalid Write completions on the same zone. How do you tell whether the device or the host is at fault?
+SHORT: Look for the first failure and treat the rest as a possible cascade. If the write pointer after the Write Fault is still at the failed SLBA, the later writes were submitted at addresses beyond it before the host saw the error, so Zone Invalid Write is correct and the host must fence errors. It is a device bug if the WP moved past data that was never written, or if a QD 1 replay with no pipelining still fails.
+DEEP:
+Trace (4 KiB LBAs, one zone, host keeps three writes in flight):
+```
+#   t(ms)  cmd    SLBA     NLB  status
+41  10.20  Write  0x30A00  64   0h/00h
+42  10.31  Write  0x30A40  64   2h/80h  Write Fault
+43  10.33  Write  0x30A80  64   1h/BCh  Zone Invalid Write
+44  10.34  Write  0x30AC0  64   1h/BCh  Zone Invalid Write
+    Report Zones after: state 20h (Implicitly Open), WP 0x30A40
+```
+1. **Find the first error:** #42 is the root. Submit times show #43 and #44 were sent before #42's completion.
+2. **Check the WP:** 0x30A40 is the SLBA of #42, so no data landed. #43 (0x30A80) and #44 (0x30AC0) are above the WP, so Zone Invalid Write is the right status. The device behaved consistently.
+3. **Host fault:** the writer pipelined Writes to one zone, and any error turns the rest of the pipeline into failures. It also relies on in-order execution the spec does not promise (5.03). The correct reaction to #42 is to drain, Report Zones, and resubmit from WP 0x30A40.
+4. **Device suspects, from the report:**
+
+| Report after the run | Reading |
+|---|---|
+| WP 0x30A40 | Consistent. Host cascade |
+| WP 0x30A80 | The WP passed unwritten data. LBAs 0x30A40 to 0x30A7F are a hole, so the device is wrong unless the spec allows it |
+| WP between 0x30A40 and 0x30A80 | Torn write. Check the atomicity rules |
+| Zone Read Only | A Write Fault may legitimately put the zone there. #43 and #44 then allow Zone Is Read Only or Zone Invalid Write (7.11) |
+
+5. **Prove it:** replay at QD 1 per zone. If the cascade disappears, the pipeline caused it. If a single write still fails at the correct WP, the device is wrong.
+6. **Counters:** cascade length equals the writes in flight at the failure minus one, here 2, so a longer burst points to more parallelism than the host believes.
+FOLLOW:
+- The report shows the zone Read Only and #43 returned Zone Invalid Write. Is that a bug? => Not by itself. The combination is a multi-fault case with an allowed set (7.11). Log it and check the vendor's stated order.
+- How do you rewrite the lost data? => From WP_true, using the host's copy. The failed write did not land, so the sequential rule is satisfied if the zone accepts writes.
+PITFALL: Counting each Zone Invalid Write in the burst as an independent device defect. They share one cause, which is the first error.
+VERIFY: Whether the WP may advance on a write that fails with Write Fault, and what a Write Fault does to the zone state, in the ZNS and NVM Command Set Specifications.

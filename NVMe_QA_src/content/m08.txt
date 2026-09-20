@@ -1,0 +1,343 @@
+# Module 8: End-to-End Data Protection & Metadata
+
+@@ 8.01 | Basic | Concept | tags=metadata,lbaf,ms,identify
+Q: What is per-LBA metadata in NVMe, and how does a namespace advertise it?
+SHORT: Metadata is a fixed number of extra bytes (MS) kept with every logical block, on top of the LBA data size (LBADS). Each LBA Format descriptor in Identify Namespace holds MS, LBADS as a power of two, and a relative performance hint. FLBAS says which format is in use, and MC, DPC and DPS describe how metadata is transferred and protected. MS can be 0, and it only changes through Format NVM or namespace creation.
+DEEP:
+- **LBA Format descriptor:** 4 bytes: MS (16 bits), LBADS (8 bits, log2 so 12 means 4096 and 9 means 512), RP (2 bits). NLBAF is the zero-based count of formats.
+- **FLBAS:** bits 3:0 give the format index in use (bits 6:5 extend it when there are more than 16 formats), and bit 4 says extended LBA (1) or separate buffer (0).
+- **MC:** bit 0 = extended LBA supported, bit 1 = separate metadata pointer supported.
+- **DPC and DPS:** DPC lists which PI types and locations the format can use, DPS says which are enabled (see 8.08).
+- **What it is for:** mostly the 8-byte Protection Information, but the bytes can also carry host-defined tags. Many client drives expose only MS=0 formats. Enterprise drives often add 4096+8 or 4096+64 style formats.
+- **Not addressing:** the logical block size the host sees is LBADS. NSZE, NCAP and NUSE count LBAs, so metadata never changes the reported capacity.
+- **On Linux:** `nvme id-ns -H /dev/nvme0n1` lists every LBA format with its Metadata Size and Data Size and marks the one in use.
+FOLLOW:
+- Can a namespace use two formats at once? => No. One format is in use, and switching means Format NVM (destructive) or creating the namespace again with a different FLBAS.
+- Does metadata reduce the capacity NSZE reports? => No. The drive must find flash for it, usually in NAND spare area or by giving up some over-provisioning.
+PITFALL: Calling LBADS plus MS "the sector size". The logical block is LBADS only, and metadata rides alongside it.
+
+@@ 8.02 | Basic | Concept | fig=pifmt | tags=pi,guard,app-tag,ref-tag,end-to-end
+Q: What is in the 8-byte Protection Information tuple, and where is it generated and checked?
+SHORT: PI is 8 bytes per LBA: a 16-bit Guard (CRC-16 of the block data), a 16-bit Application Tag and a 32-bit Reference Tag, all big-endian. A generator (application, block layer, HBA or the controller itself with PRACT) attaches it, the controller can verify it on writes and reads when PRCHK asks, and the host verifies what comes back. A mismatch completes with a Guard, Application Tag or Reference Tag Check Error.
+DEEP:
+| Field | Size | Content | Enabled by |
+|---|---|---|---|
+| Guard | 16 bits | CRC-16 T10-DIF (polynomial 0x8BB7, initial value 0) over the block data | PRCHK bit 2 |
+| Application Tag | 16 bits | Host-owned tag, compared under a mask (LBATM) | PRCHK bit 1 |
+| Reference Tag | 32 bits | Type dependent, for Type 1 the low 32 bits of the LBA | PRCHK bit 0 |
+
+- **Position:** in the last 8 or first 8 bytes of the metadata, chosen by the format (see 8.08). With PI in the last bytes and MS above 8, the Guard also covers the metadata bytes in front of the PI.
+- **Byte order:** the tuple is big-endian even though the rest of NVMe is little-endian. Linux declares it as `__be16, __be16, __be32`. Scripts and analyzers must byte-swap.
+- **Escape value:** an Application Tag of 0xFFFF tells the controller to skip checking that block (Type 1 and 2). Type 3 needs the Reference Tag to be all ones too.
+- **Why "end to end":** the same tuple travels from the point of generation, through PCIe, into and out of the drive, and back to the host. Any layer in between that corrupts the block or its address breaks the match.
+FOLLOW:
+- Is PI little-endian like the rest of NVMe? => No. CQE and SQE fields are little-endian, PI tuples are big-endian.
+- Does the Guard protect the tags? => No. It covers the data (and leading metadata), while the tags are compared field by field.
+PITFALL: Parsing a metadata dump as little-endian. A correct Reference Tag of 0x00001000 then looks like 0x00100000.
+VERIFY: That the Guard covers leading metadata when PI is in the last 8 bytes, and the escape rules, in the NVM Command Set Specification.
+
+@@ 8.03 | Basic | Concept | tags=extended-lba,mptr,separate-metadata,transfer
+Q: What is the difference between extended-LBA metadata and a separate metadata buffer, and how does each appear in a command?
+SHORT: With an extended LBA, each block's metadata follows its data in the same host buffer, so a block is LBADS + MS bytes and PRPs or SGLs describe one interleaved stream. With a separate buffer, data is a plain LBADS stream and the metadata lives in its own contiguous buffer addressed by the Metadata Pointer (MPTR, SQE DW4-5). FLBAS bit 4 selects the mode per format, and MC says which modes the controller supports.
+DEEP:
+- **Extended:** N blocks need N x (LBADS + MS) bytes. DPTR (PRP or SGL) covers all of it. MPTR is not used. This is the DIF-style layout: data, then its metadata, then the next block.
+- **Separate:** N blocks need N x LBADS through DPTR, and N x MS bytes in one physically contiguous buffer pointed to by MPTR. With SGLs, the PSDT field in CDW0 selects whether MPTR is a contiguous buffer (01b) or points to an SGL segment for the metadata (10b).
+- **Chosen per format, not per command:** MSET in Format NVM sets it, so a host cannot mix modes on one namespace.
+- **Host stack reality:** the Linux PCIe driver uses a separate buffer for block-layer PI and only permits extended-LBA formats through passthrough. Fabrics support only the extended form.
+- **What it means for firmware:** the DMA engine must gather two streams (data and metadata) in separate mode, or handle blocks that are not page multiples in extended mode. Both paths need tests.
+- **The no-metadata case:** with PRACT=1 and MS equal to the PI size, neither mode is used because no metadata crosses the interface (see 8.06).
+FOLLOW:
+- Which mode is better for the host? => Separate keeps data buffers page-friendly and matches the block layer. Extended keeps data and metadata in one DMA stream, which fits fabrics capsules.
+- Where is MPTR in the SQE? => Bytes 16 to 23 (DW4 and DW5).
+PITFALL: Treating extended LBA as just a bigger sector. I/O sizes are no longer multiples of 4096, and a 4104-byte block straddles page boundaries.
+VERIFY: MPTR alignment rule and the PSDT encodings for metadata SGLs in the NVMe Base Specification.
+
+@@ 8.04 | Intermediate | Numeric | tags=numeric,extended-lba,overhead,prp
+Q: For a 4 KiB + 8 B format, work out the extended-LBA size, the buffers for a 128 KiB write in both modes, and the overhead. How does 512 B + 8 B compare?
+SHORT: An extended LBA is 4096 + 8 = 4104 bytes. A 128 KiB write is 32 LBAs: 131,328 bytes in one extended buffer (33 pages, so PRP1 plus 32 list entries if page aligned), or 131,072 bytes of data plus 256 bytes in a separate metadata buffer. The PI overhead is 8/4096 = 0.195 percent, against 8/512 = 1.56 percent for 512-byte blocks.
+DEEP:
+1. Extended LBA size = 4096 + 8 = 4104 bytes.
+2. 128 KiB / 4 KiB = 32 LBAs. Extended buffer = 32 x 4104 = 131,328 bytes = 32.06 pages, so 33 pages. With a page-aligned start that is PRP1 plus 32 PRP list entries. Plain data would be 32 pages: PRP1 plus 31 entries.
+3. Separate mode: 131,072 bytes through DPTR plus 32 x 8 = 256 bytes in one MPTR buffer.
+4. Flash cost: 8 / 4096 = 0.195 percent, about 1.95 GB per 1 TB of user data. At 512 B + 8 it is 1.56 percent (15.6 GB per TB). At 4096 + 64 it is 1.56 percent, and at 4096 + 16 (a 16-byte PI format) 0.39 percent.
+5. PCIe cost (assuming MPS 256 and 24 bytes of TLP overhead, as on the PCIe page): plain data is 512 TLPs, the extended buffer is 131,328 / 256 = 513 TLPs. Useful-data efficiency moves from 91.4 to 91.25 percent. The link cost is negligible. The visible cost is alignment and the extra small DMA in separate mode.
+6. Small case: one 4 KiB extended I/O is 4104 bytes, which spans two pages, so PRP1 and PRP2 (no list). Eight blocks are 32,832 bytes, which is 8 pages plus 64 bytes, so 9 PRP entries.
+- **Assumptions:** 4 KiB page, page-aligned buffer, 24 bytes of TLP overhead, decimal TB for the flash cost.
+FOLLOW:
+- Why do vendors prefer 4 KiB blocks with PI? => Eight times less PI overhead per byte, and one PI tuple per 4 KiB matches the flash mapping unit.
+- What happens to a 128 KiB I/O in extended mode when the host buffer is not page aligned? => It can touch one more page, so it needs one more PRP entry. Only the first PRP entry may carry an offset, the rest are page aligned.
+PITFALL: Forgetting that with PRACT=1 and MS=8 the host buffer is plain 4096 bytes per block, not 4104.
+VERIFY: Whether MDTS is applied to data only or to data plus metadata for extended LBA formats.
+
+@@ 8.05 | Intermediate | Concept | tags=pi-types,type1,type2,type3,reference-tag
+Q: How do PI Types 1, 2 and 3 differ, and how does the Reference Tag behave in each?
+SHORT: In every type the Guard is a CRC of the data. Type 1 ties the Reference Tag to the address: the command's initial reference tag (ILBRT) must equal the low 32 bits of the starting LBA, and the tag increments by one per block. Type 2 lets the host choose ILBRT freely, and it still increments per block. Type 3 does not increment or check the Reference Tag, which the host may use as an opaque tag.
+DEEP:
+| Type | Reference Tag value | Increment per block | Controller ref check |
+|---|---|---|---|
+| 1 | Low 32 bits of the LBA (ILBRT = SLBA low bits) | +1 | Yes, if PRCHK bit 0 is set |
+| 2 | Host-chosen ILBRT | +1 | Yes, if PRCHK bit 0 is set |
+| 3 | Opaque, not defined by the controller | None | No |
+
+- **Set at format time:** DPS bits 2:0 hold the type (0 means PI is off). The choices are limited to those in DPC bits 0 to 2. Changing type means Format NVM.
+- **Type 1 catches misdirected I/O:** a block returned for the wrong LBA carries the wrong reference tag, so the check fails even though its Guard is perfectly valid.
+- **Type 2 exists** for hosts whose tags are not the on-disk LBA, for example virtual addresses that are remapped later. Linux treats Types 1 and 2 alike for reference tag checks and remaps tags between virtual and physical block numbers for partitions and stacked devices.
+- **Type 3** gives the controller only the Guard to check, so it detects corruption but not misdirection.
+- **Mismatched ILBRT:** on Type 1, sending a check request with an ILBRT that is not the low 32 bits of the SLBA is commonly rejected as Invalid Protection Information (command specific status 0x81). QEMU's emulation does this with DNR set.
+FOLLOW:
+- Which type does Linux use for a namespace formatted Type 3? => It generates and verifies the Guard only, and does not enable reference tag checking.
+- Why is the reference tag only 32 bits when LBAs are 64 bits? => It is inherited from the T10 DIF format. See the aliasing trap in 8.11.
+PITFALL: Assuming the Reference Tag always equals the LBA. That is Type 1 (and how Linux uses Type 2), not a general rule.
+VERIFY: Type 3 Reference Tag semantics and the exact status returned for a Type 1 ILBRT mismatch in the NVM Command Set Specification.
+
+@@ 8.06 | Intermediate | Concept | tags=pract,prchk,generate,strip
+Q: What does PRACT do on reads and writes, and how does it depend on the metadata size?
+SHORT: PRACT (Protection Information Action) tells the controller to generate PI on a write and strip it on a read instead of passing it through. When MS equals the PI size, the host sees plain LBADS blocks and never handles metadata. When MS is larger, the controller handles the PI bytes but the remaining metadata still crosses the interface. With PRACT=0 the whole metadata, PI included, is transferred and the controller only checks it as PRCHK asks.
+DEEP:
+| | PRACT=1, MS = 8 | PRACT=1, MS > 8 | PRACT=0 |
+|---|---|---|---|
+| Write | Controller generates PI from the data, LBAT and ILBRT. Host sends data only | Controller generates the PI bytes, host still sends the other metadata | Host sends data and PI, controller checks per PRCHK |
+| Read | Controller checks per PRCHK, strips PI, returns data only | Controller checks, PI bytes are not returned, other metadata is | Controller checks per PRCHK, returns data and PI, host checks |
+
+- **Linux behavior:** when a request has no integrity payload, the driver sets PRACT=1 (and the Write Zeroes path does too), so a filesystem works unmodified on a PI namespace. When the block layer supplies PI, PRACT=0 is used.
+- **PRCHK on its own:** with PRACT=0 and PRCHK=0 the controller stores and returns PI unchecked. That is how a validator reads back stored tags for debug.
+- **Test value:** PRACT=1 exercises the controller's generation logic and PRACT=0 exercises PI transport and checking. Both must be in the matrix.
+- **fio mirrors this:** `pi_act=1` means the ioengine uses no metadata buffer for MS = PI size, and does not build or verify the PI part when MS is larger.
+FOLLOW:
+- Is PRACT a namespace setting? => No, it is a per-command bit in CDW12 bit 29.
+- With PRACT=1, where do the generated Application and Reference Tags come from? => From LBAT (CDW15) and ILBRT (CDW14), with the reference tag incrementing per block.
+PITFALL: Treating PRACT=1 as protection from the host memory to the controller. The controller generates PI after the data has already crossed PCIe, so any corruption before that is baked in.
+VERIFY: What a PRACT=1 read returns when MS > PI size, and whether PRCHK bits are evaluated on a PRACT=1 write, in the NVM Command Set Specification.
+
+@@ 8.07 | Intermediate | Concept | tags=cdw12,cdw14,cdw15,prinfo,lbat,lbatm
+Q: Which Read and Write command fields control protection information, and how do you encode them?
+SHORT: CDW12 carries NLB in bits 15:0 (zero-based) and PRINFO in bits 29:26: PRACT is bit 29, PRCHK guard bit 28, application tag bit 27, reference tag bit 26. CDW14 holds the initial reference tag (ILBRT). CDW15 holds the application tag (LBAT) in bits 15:0 and its mask (LBATM) in bits 31:16. The controller compares the stored application tag with LBAT only in bit positions set in LBATM.
+DEEP:
+| Dword | Bits | Field |
+|---|---|---|
+| CDW12 | 15:0 | NLB, zero-based |
+| CDW12 | 26 | PRCHK reference tag check |
+| CDW12 | 27 | PRCHK application tag check |
+| CDW12 | 28 | PRCHK guard check |
+| CDW12 | 29 | PRACT |
+| CDW12 | 30, 31 | FUA, Limited Retry |
+| CDW14 | 31:0 | ILBRT |
+| CDW15 | 15:0, 31:16 | LBAT, LBATM |
+
+- **Encoding examples:** PRACT=0 with all checks is PRINFO 0x7, so CDW12 = 0x1C000000 | NLB. PRACT=1 with all checks is PRINFO 0xF, so 0x3C000000 | NLB. The nvme-cli `--prinfo` option takes that 4-bit value (bit 3 PRACT, bits 2:0 PRCHK guard, app, ref), and SPDK exposes the same bits as `SPDK_NVME_IO_FLAGS_PRCHK_*` and `PRACT`.
+- **Application tag compare:** the check passes when (stored AND LBATM) equals (LBAT AND LBATM). A mask of 0 makes the check vacuous. fio defaults are apptag 0x1234 and mask 0xFFFF.
+- **Reference tag:** for Types 1 and 2 the expected tag for block i is ILBRT + i. nvme-cli uses `--ref-tag`, `--app-tag` and `--app-tag-mask`.
+- **Zero-based count:** `nvme read --block-count` is also zero-based, so 0 means one block. Off-by-one here silently changes what you test.
+FOLLOW:
+- What does PRACT=0 with PRCHK=0 give you? => Raw PI passthrough. The controller stores and returns the tuple without checking, which is how you inspect what is on media.
+- Do these dwords change for 64-bit guard formats? => Yes, newer formats use more tag bits (see 8.14).
+PITFALL: Passing `--block-count` as a one-based count and then chasing a phantom reference tag error at the last block.
+VERIFY: Exact dword placement of ILBRT and the extended tag bits for the PI format in use, in your NVM Command Set Specification revision.
+
+@@ 8.08 | Intermediate | Debug | tags=identify,flbas,dps,dpc,mc,decode
+Q: `nvme id-ns` shows flbas=0x11, mc=0x03, dpc=0x1f and dps=0x09, and LBA format 1 is ms:8 lbads:12. Decode it and say what a 4-block write must look like.
+SHORT: flbas 0x11 means format index 1 in use with extended LBA. mc 0x03 means the controller supports both extended and separate metadata. dpc 0x1f means Types 1, 2 and 3 are supported with PI at the first or last 8 bytes. dps 0x09 means Type 1 is enabled with PI in the first 8 bytes. Format 1 is 4096 + 8, so each block in the host buffer is 4104 bytes, unless PRACT=1 strips PI.
+DEEP:
+1. **flbas = 0x11 = 0001 0001b:** bits 3:0 = 1 selects LBAF 1 (ms 8, lbads 12, so 4096 + 8). Bit 4 = 1 is extended LBA. Bits 6:5 = 0.
+2. **mc = 0x03:** bit 0 = extended supported, bit 1 = separate pointer supported. A different format could use the other mode, this one is extended.
+3. **dpc = 0x1f = 1 1111b:** bit 0 Type 1, bit 1 Type 2, bit 2 Type 3, bit 3 PI in first 8 bytes, bit 4 PI in last 8 bytes.
+4. **dps = 0x09 = 1001b:** bits 2:0 = 001 is Type 1 enabled. Bit 3 = 1 means PI is in the first 8 bytes. With MS equal to 8 the location makes no difference because PI is the whole metadata.
+5. **Four-block write, PRACT=0:** NLB = 3 (zero-based). Buffer = 4 x 4104 = 16,416 bytes, block i is 4096 data bytes then its 8-byte tuple. Guard = CRC-16 of the 4096 bytes, App = LBAT, Ref = SLBA low 32 bits + i. Set CDW14 = SLBA low bits.
+6. **Four-block write, PRACT=1:** buffer = 4 x 4096 = 16,384 bytes with no tuple. The controller generates the tuples.
+7. **MPTR is not used on this format**, because the format is extended.
+FOLLOW:
+- How would dps look with Type 3 and PI in the last 8 bytes on a 4096 + 64 format? => 0x03. Bits 2:0 = 3, bit 3 = 0, and the tuple is at metadata bytes 56 to 63.
+- What does `nvme format --pi=3` need first? => dpc bit 2 must be set, and it erases the namespace.
+PITFALL: Reading dps bit 3 as an enable bit. PI is on when dps bits 2:0 are nonzero, and bit 3 only says where the tuple sits.
+
+@@ 8.09 | Advanced | Cross-layer | tags=host,controller,linux,blk-integrity,gaps
+Q: Who checks what in an end-to-end protected I/O, and which failures does PI still miss?
+SHORT: PI is a chain. A generator (application through an integrity-aware interface, the Linux block layer, a driver or HBA, or the controller with PRACT) attaches tags. The controller verifies on write before it commits and on read before it returns, when PRCHK asks, and the host verifies the read. Each check covers only the span since the last generation, so corruption before generation, or in a layer that regenerates PI, is invisible. PCIe LCRC and ECRC protect only the link.
+DEEP:
+- **Write path:** application buffer, block layer (generates PI when integrity is enabled), driver and DMA over PCIe, controller ingress check, internal pipeline (8.10), NAND. **Read path:** the same in reverse, with a controller check on egress and a host verify at the end.
+- **Linux controls:** `/sys/block/<dev>/integrity/` has `format`, `read_verify`, `write_generate`, `tag_size` and `device_is_integrity_capable`. When a filesystem does the I/O, the block layer generates PI, so coverage starts at the block layer, not at the application.
+- **The controller checks only when told:** PRCHK bits of 0 mean it stores and returns PI without checking. A driver that sends PRINFO=0 gets no controller verification at all.
+- **What PI detects:** random bit corruption (via the Guard) and misdirected reads and writes (via the Type 1 Reference Tag).
+- **What PI misses:**
+  - Corruption before generation. With PRACT=1 the controller generates PI after PCIe, so host memory and link errors are baked in.
+  - Firmware that regenerates PI on egress from already-corrupted data.
+  - Lost or stale writes: the old block, with its old, self-consistent PI at the right LBA, passes every check.
+  - Wrong data with a Guard collision, at a rate of 2^-16 for random corruption (see 8.13).
+- **Fix for staleness:** use the Application Tag as a generation counter (see 8.17), so a stale block fails the tag check.
+FOLLOW:
+- Does PI replace ECC? => No. ECC corrects NAND bit errors. PI detects any corruption left after ECC, including buffer, DMA and mapping errors.
+- Does ECRC make PI redundant on the PCIe hop? => No. ECRC covers only the PCIe path, and neither host memory, the drive's DRAM nor the FTL.
+PITFALL: Saying PI catches stale data. It catches corruption and misdirection. A lost write returns an old block that is internally consistent.
+VERIFY: The Linux integrity sysfs attribute names on your kernel, and PRINFO handling on your driver version.
+
+@@ 8.10 | Advanced | Cross-layer | tags=firmware,datapath,ftl,gc,ecc,pipeline
+Q: How does SSD firmware carry PI through its data path, and where should a validator aim?
+SHORT: A protected write is checked at ingress, held in buffers, possibly compressed or encrypted, ECC-encoded and programmed. Firmware either stores the 8 PI bytes with each block or verifies them at ingress and keeps its own per-block CRC and LBA tag, rebuilding PI on reads. Every stage that copies, moves or remaps data (DMA engines, DRAM buffers, garbage collection, read retry, mapping) is a place a bit or an address can go wrong, and PI can expose it only if it is verified at egress.
+DEEP:
+- **Typical pipeline (design dependent):** host DMA in, PI verify, write buffer (SRAM or DRAM), optional compress or encrypt, LDPC encode, NAND program. On reads: NAND read, LDPC decode, decrypt, PI verify or rebuild, DMA out.
+- **Storing PI:** the 8 bytes may live in NAND spare area with the ECC codeword, or firmware may store less (a CRC plus the LBA) and regenerate the tuple. Ask the vendor, and test the answer.
+- **Bugs PI exposes:**
+  - Wrong page returned for an LBA (mapping or GC bug): Reference Tag mismatch, status 0x284.
+  - Data changed in a buffer or by a DMA engine: Guard mismatch, status 0x282.
+  - Application Tag not persisted or masked wrongly: status 0x283, or a silent round-trip mismatch.
+- **Blind spot:** firmware that recomputes the Guard on egress from the data it holds produces a valid tuple for corrupted data. Egress must compare against a stored check.
+- **Internal checks:** GC and read scrub should verify PI too, so bad data is not relocated and given a fresh valid tuple.
+- **Power loss:** after a PLP flush or recovery, blocks should still carry the same tuples, and none should show a mixed old and new state.
+- **Validator angles:** round-trip arbitrary Application Tags and masks bit-exactly, read with PRCHK=0 and compare tuples to what was written, hit GC and wear-leveling under load, and look at the status split (0x282 vs 0x283 vs 0x284) as a locator.
+FOLLOW:
+- Why does a Type 1 Reference Tag catch mapping bugs? => It names the LBA. If the FTL returns another LBA's page, the tag says so.
+- What if the drive stores no PI at all and regenerates it? => The interface still looks protected, but only ECC guards the media. A round trip of a deliberately odd Application Tag exposes it.
+PITFALL: Assuming the drive stores your PI. Test that arbitrary tags come back exactly as written.
+VERIFY: What the NVM Command Set Specification requires a controller to return for blocks that are deallocated or never written on a PI namespace.
+
+@@ 8.11 | Advanced | Trap | tags=trap,reference-tag,wrap,zero-block,escape
+Q: Which properties of the Guard and the tags make PI tests pass when they should fail?
+SHORT: The Reference Tag is only 32 bits, so LBAs 2^32 apart alias (16 TiB apart with 4 KiB blocks, 2 TiB with 512 B). The CRC-16 of an all-zero block is 0, so a zeroed block with a zeroed tuple passes the Guard check and fails only on its Reference Tag. An Application Tag of 0xFFFF disables checking of that block on Types 1 and 2, and erased flash reads as all ones. Type 3 has no reference tag check. Test patterns must avoid these blind spots.
+DEEP:
+1. **Wrap:** 2^32 x 4096 = 16 TiB, and 2^32 x 512 = 2 TiB. A misdirected write between LBA X and X + 2^32 is not caught by the Reference Tag, and the Guard covers only data. Test with pairs of such LBAs on a large namespace.
+2. **Zero block:** the T10 CRC-16 (initial value 0) of 4096 zero bytes is 0x0000, so a zero block with an all-zero tuple passes the Guard check, and the Application Tag check when LBAT is 0. Only the Reference Tag fails, and only if the LBA is not 0. Firmware that returns zeros for unmapped blocks passes a Guard-only test.
+3. **0xFFFF escape:** any block whose Application Tag is 0xFFFF skips checking on Types 1 and 2. A corrupted tag that turns into 0xFFFF, or an erased page read back as all ones, is exempt.
+4. **Type 3:** no Reference Tag check, so misdirected I/O is not detected by tags.
+5. **Guard collision:** random corruption escapes with probability 2^-16.
+- **Design consequence:** never use zero, 0xFF or constant fills for PI tests. Use address-seeded pseudo-random data, keep Application Tag values away from 0xFFFF, and check the PI you read back with PRCHK=0 as well as the CQE.
+FOLLOW:
+- How do you test the 2^32 boundary? => Use a namespace larger than 2^32 LBAs (for example 16 TiB+ at 4 KiB) and do I/O straddling LBA 0xFFFFFFFF to 0x100000000. The expected tag wraps modulo 2^32.
+- Why does a zero-filled fio verify hide bugs? => Zero data has Guard 0, so a bug that replaces a block with zeros still passes when the tuple is zero too.
+PITFALL: Using zero or 0xFF fill patterns in PI tests. They match erased-state and default-state behavior, so failures can look like passes.
+VERIFY: Escape rules for Type 3 (Application and Reference Tag both all ones) and PI behavior for deallocated or never-written blocks (DLFEAT) in the NVM Command Set Specification.
+
+@@ 8.12 | Advanced | Debug | tags=debug,status-0x284,cqe,dmesg,error-log
+Q: A read on a Type 1 PI namespace fails with status 0x284. Decode the CQE, read the host logs, and walk through the triage.
+SHORT: 0x284 is SCT 2 (Media and Data Integrity), SC 0x84, End-to-end Reference Tag Check Error. First decide who caught it: the controller (a non-success CQE, and Linux logs "protection error") or the host (a "ref tag error at location" or "guard tag error" line from the block layer while the CQE was successful). Then re-read with checks off, parse the raw tuples big-endian, and compare them to the expected LBA sequence.
+DEEP:
+1. **Decode the CQE:** DW3 = 0x8509001F means CID 0x001F, phase 1, SC = 0x84, SCT = 2, CRD = 0, M = 0, DNR = 1. Linux keeps status as 15 bits, so it prints 0x4284 (DNR is 0x4000). SCT 2 codes: 0x82 Guard, 0x83 Application Tag, 0x84 Reference Tag.
+2. **Host log:**
+```
+nvme0n1: ref tag error at location 4099 (rcvd 4100)
+blk_update_request: protection error, dev nvme0n1, sector 32792 op 0x0:(READ)
+```
+The first line is printed by the block layer's own verify (the controller had returned success), and shows the expected and received tags. A controller-detected error gives only "protection error" (Linux maps the guard, app and ref codes to BLK_STS_PROTECTION).
+3. **Error Information log:** `nvme error-log /dev/nvme0` shows the failing CID, status and LBA when the drive records it.
+4. **Re-read raw:** `nvme read /dev/nvme0n1 -s 4096 -c 7 -z 32768 -y 64 -p 0 -d d.bin -M m.bin` (a 4096 + 8 separate-metadata format, zero-based -c 7 is 8 blocks). Split m.bin into 8-byte tuples and unpack with `struct.unpack(">HHI", ...)`.
+5. **Classify:**
+
+| Raw tuples show | Meaning |
+|---|---|
+| Ref = expected + constant, all blocks | The command's ILBRT was wrong (host bug) |
+| One block has another LBA's tag | Mapping or GC bug, or an earlier misdirected write |
+| Ref tags right, Guard wrong vs your CRC16 of the data | Data or PI corrupted after generation |
+| Tuple all 0xFF | Unwritten or deallocated block, or erased flash returned |
+| Tuple all 0x00 | Zero fill, from a fresh block or a bug |
+
+6. **Bisect:** compare with the write log (PRINFO, ILBRT used), check whether the failure is repeatable (with DNR clear Linux retries up to the `max_retries` module parameter, which can hide a transient), and repeat with a different size, queue and firmware.
+FOLLOW:
+- The CQE has DNR=1. Will Linux retry? => No. Retry needs DNR clear and retries below max_retries (5 by default).
+- How do you tell a host-detected from a controller-detected error? => Host detections print the "guard tag error" or "ref tag error" line and the command completes successfully. Controller detections show a non-zero status in traces and the error log.
+PITFALL: Retrying with PRCHK enabled only. Read once with checks off, because the stored tuple is the evidence.
+VERIFY: The unit of the location number in the block layer messages on your kernel, and which fields your drive fills in the Error Information log.
+
+@@ 8.13 | Advanced | Numeric | tags=numeric,crc16,fault-injection,probability
+Q: How many random corruptions must a fault-injection test apply to see one Guard escape, and what can you assume about small errors?
+SHORT: A random corruption matches the 16-bit Guard by chance with probability 2^-16 (1.5e-5). That is one escape per 65,536 corruptions on average, and about 196,000 trials for 95 percent confidence of seeing at least one. Single-bit errors and bursts up to 16 bits are always detected, so an escape on such a structured error is a real bug, while an escape in a random-garbage test is expected at the 2^-16 rate.
+DEEP:
+1. p = 2^-16 = 1.526e-5.
+2. Expected trials to the first escape = 1/p = 65,536.
+3. Trials for a 95 percent chance of at least one escape: n = ln(0.05) / ln(1 - p) = 196,327. For 99 percent: 301,803.
+4. Time cost: at 100k injected writes per second, 196k trials is about 2 seconds. Statistics are cheap, so run them.
+5. Exhaustive structured sweep: every single-bit flip in one extended LBA of 4 KiB + 8 bytes. That is 4104 x 8 = 32,832 bit positions (32,768 data bits, 16 Guard bits, 16 Application Tag bits, 32 Reference Tag bits). Each must fail with a check error, subject to the notes below.
+- **How to inject:** on the write path, build a tuple that does not match the data (flip one data bit after computing the Guard, or flip one tuple bit) and send it with PRACT=0 and PRCHK on. The controller must return 0x282, 0x283 or 0x284 and must not accept the write. Media-level injection needs a firmware or NAND hook.
+- **Caveats:** a flipped Application Tag bit is detected only if that bit is set in LBATM. For Types 1 and 2, a flip that yields the value 0xFFFF is exempt. For Type 3 the Reference Tag bits are not checked.
+- **Reading the results:** escapes above about 2^-16 on random data, or any escape on a single-bit flip, mean the check covers only part of the block (for example only the first 512 bytes) or is not enabled. Sweep flip positions across the whole block, including the last bytes.
+FOLLOW:
+- Is the escape rate the same for 64-bit guard formats? => It is about 2^-64 for random errors, so effectively never observable.
+- Why do burst errors up to 16 bits never escape? => A CRC of degree 16 detects every burst up to 16 bits long, by construction.
+PITFALL: Treating one random-garbage escape as a bug. Only structured errors (single-bit, short bursts) must never escape.
+
+@@ 8.14 | Advanced | Concept | tags=pi-formats,crc64,storage-tag,elbaf
+Q: What changed in PI with the later command set specifications: 64-bit guards, storage tags and larger PI formats?
+SHORT: Later NVM Command Set revisions add PI formats beyond the classic 16-bit Guard: a 64-bit guard CRC with a 16-byte tuple, in which the Reference Tag field grows to a 48-bit combined tag. A 32-bit guard format is also defined. Identify reports the format per LBA format through the extended LBA format array, together with a storage tag size, and a storage tag check error status was added. Verify all details against the spec revision you test.
+DEEP:
+- **What is confirmed in Linux and SPDK headers:** the NVM-specific Identify Namespace structure has `elbaf[64]`. Each entry has a storage tag size in bits 6:0 and a PI format in bits 8:7, where 0 = 16-bit guard, 1 = 32-bit guard, 2 = 64-bit guard. Linux defines a 16-byte tuple for the 64-bit case: 8-byte guard, 2-byte Application Tag, 6-byte Reference Tag. SPDK defines status 0x88, End-to-end Storage Tag Check Error, next to 0x82 to 0x84.
+- **Controller side:** Linux reads the ELBAF data only when the controller advertises extended LBA format support in CTRATT.
+- **Escape rule:** for the 64-bit format Linux treats Application Tag 0xFFFF as the "no check" escape when reference tag checking is on (Types 1 and 2), and requires the 48-bit reference tag to be all ones as well when it is off (Type 3).
+- **Overhead:** a 16-byte PI on 4 KiB blocks is 0.39 percent (16 / 4096) versus 0.195 percent for 8 bytes.
+- **CRC differences:** the 64-bit CRC in Linux and QEMU uses all-ones initial value and final XOR, unlike the CRC-16 T10-DIF that starts at 0. Reusing a CRC-16 helper or its zero-block identity does not carry over.
+- **Test impact:** the matrix gains a PI-format dimension. Every tuple parser, CRC model and length calculation in the harness must be parameterized by format. nvme-cli exposes `--storage-tag` and `--storage-tag-check` on reads and writes.
+FOLLOW:
+- What is the storage tag? => A tag field of size STS from the ELBAF entry, part of the tag space that the host can use as an opaque tag instead of a sequential reference tag. Check the exact split in the spec.
+- Does Format NVM select the PI format? => It selects an LBA format, and the format's ELBAF entry carries the PI format.
+PITFALL: Hard-coding the 8-byte tuple and the 0x8BB7 polynomial in a harness. A namespace with a 64-bit guard breaks every offset and CRC.
+VERIFY: Guard and PI sizes per PI format, the tag split with STS, CRC-32C and CRC-64 parameters, the CTRATT bit for extended LBA formats, and the revision that introduced each.
+
+@@ 8.15 | Principal | Scenario | tags=test-plan,negative-tests,matrix,coverage
+Q: How would you design a protection-information validation plan for a new enterprise SSD, including negative tests?
+SHORT: Build a matrix over format (LBADS, MS, extended or separate, PI location), PI type, PRACT and PRCHK combinations, transfer size and alignment, and the commands that touch PI. Give each cell an oracle from a host-side reference model. Then add negative tests (wrong Guard, Application Tag and Reference Tag) that must fail with the right status, plus boundary, reset, power-loss and stress runs. Exit on coverage and zero unexplained PI errors, not on test count.
+DEEP:
+1. **Discover the space:** parse `id-ns` for every LBA format, DPC types and locations, MC modes. Format NVM changes everything, so use small namespaces for speed and one large namespace for the 2^32 wrap.
+2. **Positive round trips:** write with PRACT=1, then read with PRACT=0, PRCHK=0 and check the tuple against the model (Guard = CRC-16, App = LBAT, Ref = ILBRT + i). Write with host-built PI, arbitrary Application Tag and mask, then read back and require a bit-exact round trip.
+3. **Negative tests:** corrupt one field at a time (Guard, App under mask, Ref, ILBRT mismatch on Type 1). Expect 0x282, 0x283, 0x284 or Invalid Protection Information. Try the error in block k of N. The media state after a failed multi-block write is a subtle point, so document what the drive does and do not assume the old data remains.
+4. **Command coverage:** Read, Write, Compare, Write Zeroes (PRACT), Copy, Verify, and Dataset Management deallocate followed by reads, then Format and Sanitize wiping PI.
+5. **Size and alignment:** NLB 1 to the MDTS limit, PRP and SGL variants, unaligned buffers, MPTR alignment, and I/O straddling LBA 2^32.
+6. **Interactions:** controller reset and shutdown mid-write, power loss (see the PLP module), GC and wear leveling under load, namespace attach and detach.
+7. **Stress:** fio with the io_uring_cmd engine and `md_per_io_size`, `pi_act`, `pi_chk=GUARD,REFTAG,APPTAG`, `apptag` and `apptag_mask`, for days, mixed sizes, verifying on read.
+8. **Exit criteria:** every matrix cell run, negative tests return the expected status 100 percent of the time, zero unexplained PI errors per TB moved.
+FOLLOW:
+- How do you keep the matrix from exploding? => Pairwise on independent dimensions (size, alignment, queue depth), full cross on the risky ones (PRACT x MS x PI location x mode).
+- Which single test finds the most? => Address-seeded random data with generation-counter tags, PRACT=0, mixed sizes and GC pressure, read back with PRCHK on and a host CRC.
+PITFALL: Testing only PRACT=1 with MS=8, which is the Linux default. It never exercises host-supplied PI or metadata transport.
+VERIFY: PI handling for Copy, Verify, Compare, Write Zeroes and deallocated blocks in the NVM Command Set Specification, and failed multi-block write semantics.
+
+@@ 8.16 | Principal | Cross-layer | tags=silent-corruption,rootcause,fio-verify,bisect
+Q: fio verify reports a data miscompare on a PI-enabled namespace, but no PI error was ever returned. What does that tell you, and how do you root-cause it?
+SHORT: The corruption happened before PI was generated, after it was last verified, or checking was never enabled. First establish the real checking configuration: PRCHK bits on reads and writes, PRACT, and who generates PI. Then bisect the data path by moving where PI is generated (host-built with PRACT=0, against controller-built with PRACT=1) and by reading raw data plus PI with checks off, to see whether the stored PI matches the wrong data.
+DEEP:
+1. **Prove checking is on:** read `integrity/read_verify` and `write_generate`, and capture the actual PRINFO in CDW12 (analyzer, nvme tracepoints or `--show-command`). PRCHK=0 is the most common reason nothing fired.
+2. **Classify the miscompare:** which LBAs, what span (whole block, 512 B, 64 B), what content (old data means a lost write, another LBA's data means misdirection, single bit flips, zeros).
+3. **Raw readback:** PRACT=0 and PRCHK=0, data and tuples. If the Guard matches the wrong data, PI was generated after the corruption. If it does not match, the checks were missing on that path.
+4. **Move the generation point:** run again with host-built PI in user space, PRACT=0 and PRCHK on. Corruption in host memory or on PCIe now shows as write-side guard errors. Corruption inside the drive after ingress shows on reads.
+5. **Correlate:** block size, queue depth, GC activity, temperature, specific LBAs (a channel or die pattern), firmware version and power events. Pull the Error Information log and vendor logs. Check AER counters on the link (see the PCIe page, error handling).
+6. **Decide:**
+
+| Observation | Likely location |
+|---|---|
+| Host-built Guard fails on write | Host memory, PCIe or ingress |
+| Write accepted, read passes checks, but data differs from the host CRC | Egress regenerates PI, corruption is inside the drive after ingress |
+| Read Guard error | Stored data or PI damaged inside the drive (possibly beyond ECC) |
+| Old data with valid PI | Lost write in FTL, cache or PLP path |
+| Another LBA's data with valid tags on Type 3 | Misdirection that Type 3 cannot see |
+
+FOLLOW:
+- Why can PRACT=1 hide the problem? => The controller generates PI after the data crossed PCIe, so a flipped bit in host memory or the link is signed as good.
+- What if the driver never sets PRCHK? => Send raw commands yourself (passthrough, io_uring_cmd or SPDK) with PRACT=0 and PRCHK on, which does not depend on the block layer.
+PITFALL: Assuming a PI-enabled namespace means the data path was checked. Look at the PRINFO bits that were actually sent.
+
+@@ 8.17 | Principal | Scenario | tags=automation,oracle,harness,fault-injection,spdk,fio
+Q: How would you build an automated data-integrity framework that uses PI as an oracle across drives, formats and fault injection?
+SHORT: Generate deterministic address-seeded data and tags in user space with an independent reference model, submit through passthrough (io_uring_cmd, SPDK or nvme-cli ioctl) so you control PRACT, PRCHK and tags exactly, and log each command's PRINFO and expected status. Check every read three ways: the CQE status, a host recompute of Guard, Reference Tag and Application Tag, and a data hash. Add fault injection, matrix coverage tracking and an automatic triage bundle on failure.
+DEEP:
+- **Components:**
+  1. Format manager: parse `id-ns`, choose LBA format, PI type and location, run Format NVM.
+  2. Pattern generator: block content = PRNG(seed, LBA, generation). Any block is regenerable without storing it, so verification scales to whole drives.
+  3. Executor: io_uring_cmd or SPDK for speed and exact CDW control, nvme-cli for conformance scripts.
+  4. Checker: the three-way check above, with an independent CRC model.
+  5. Injector: bad tuples on write, PCIe faults (AER injection or protocol exerciser), power cuts, firmware error hooks.
+  6. Triage: on failure, dump command, CQE, error log, raw tuples with checks off, host and device logs and the LBA history.
+- **Application Tag as generation counter:** put a per-LBA write generation (never 0xFFFF) in the tag and set the mask to 0xFFFF. A stale or lost write then fails the tag check, closing the gap in 8.09.
+- **Reference model:**
+```
+def crc16_t10dif(data, crc=0):
+    for b in data:
+        crc ^= b << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x8BB7) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
+    return crc
+# known answer: crc16_t10dif(b"123456789") == 0xD0DB
+tuple8 = struct.pack(">HHI", guard, app, ref & 0xFFFFFFFF)
+```
+- **Metrics:** PI errors per TB, matrix coverage, negative-test pass rate, time to first failure, replayability (same seed gives the same LBAs and payloads).
+- **Speed:** fio's `io_uring_cmd` engine can generate and verify PI at high rates (it uses ISA-L for CRC-16 when available). A Python model is for oracle checks on samples and triage, not for bulk data.
+FOLLOW:
+- Why regenerate rather than store expected data? => Constant memory, no golden copies, and the log needs only seed and generation to replay any block.
+- How do you handle a flaky failure? => Record seed, LBA and command history so it replays, and repeat with checks on and off before blaming the drive.
+PITFALL: Letting the harness and the firmware share a CRC bug. Use independent known-answer vectors such as the CRC of "123456789".
+VERIFY: fio PI options (`pi_act`, `pi_chk`, `apptag`, `apptag_mask`) need io_uring_cmd or xnvme and a recent fio, so check the version you run.

@@ -1,0 +1,11 @@
+{
+ "title": "ZNS Q&amp;A — Study Guide",
+ "kicker": "ZNS · Q&amp;A STUDY GUIDE",
+ "crumb": "ZNS Q&A",
+ "lskey": "znsqa.v1",
+ "appid": "znsqa",
+ "exportpfx": "zns-qa",
+ "out_file": "ZNS_QA_Study_Guide.html",
+ "hero_h": "ZNS Q&amp;A Study Guide",
+ "hero_p": "Zoned Namespaces from the zoned-storage model to Principal-level firmware validation and debug scenarios, building on the NVMe page."
+}
