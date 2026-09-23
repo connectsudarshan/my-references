@@ -22,13 +22,13 @@ DEEP:
 - **Groups:** CAP and VS say what the device is. CC, AQA, ASQ, ACQ, INTMS, INTMC and NSSR are the host's controls. CSTS is the device's answer.
 - **64-bit registers:** CAP, ASQ, ACQ, BPMBL and CMBMSC. The rest are 32-bit.
 - **Gaps:** 18h and the space between the listed registers is reserved. Never write there.
-- **INTMS and INTMC:** writing 1 to a bit of INTMS masks that vector, writing 1 to the same bit of INTMC unmasks it. They apply to pin-based and MSI interrupts, not MSI-X (see the interrupts module).
+- **INTMS and INTMC:** writing 1 to a bit of INTMS masks that vector, writing 1 to the same bit of INTMC unmasks it. They apply to pin-based and MSI interrupts. With MSI-X the host shall not access them, and the MSI-X mask table is used instead (see the interrupts module).
 - **Reading them in the lab:** `nvme show-regs /dev/nvme0` dumps them, or map `/sys/bus/pci/devices/<BDF>/resource0` and read 32-bit words. Reads are safe, writes to a live controller are not.
 FOLLOW:
 - Which registers are 64 bits wide? => CAP, ASQ, ACQ, BPMBL and CMBMSC. Access rules are in question 2.08.
 - Is BAR0 size fixed? => No. It grows with the doorbell stride and the queue count (question 2.10), and may also carry the MSI-X table, the PBA or a CMB.
 PITFALL: Putting CSTS at 18h. 18h is reserved, CSTS is at 1Ch and NSSR at 20h.
-VERIFY: Which revision introduced CMBMSC, CMBSTS, CMBEBS, CMBSWTP, NSSD and CRTO, and the exact register list in your target NVMe Base Specification revision. The offsets above match the Linux and SPDK headers.
+VERIFY: Which revision introduced CMBMSC, CMBSTS, CMBEBS, CMBSWTP, NSSD and CRTO (Base 2.3 does not say; it only says CRTO is mandatory from 2.0 on). The offsets above match Figure 33 of Base 2.3.
 
 @@ 2.02 | Basic | Concept | tags=cap,vs,capabilities,version
 Q: What do CAP and VS tell the host before it programs anything?
@@ -36,38 +36,40 @@ SHORT: CAP is a read-only 64-bit capabilities register: MQES (maximum queue entr
 DEEP:
 | Bits | Field | Meaning and use |
 |---|---|---|
-| 15:0 | MQES | Maximum queue entries, 0-based: maximum size is MQES + 1 |
+| 15:0 | MQES | Maximum queue entries, 0-based: maximum size is MQES + 1. On PCIe it limits I/O SQs and CQs. Minimum legal value is 1 (two entries) |
 | 16 | CQR | Contiguous Queues Required: I/O queues must be physically contiguous |
 | 18:17 | AMS | Arbitration mechanisms beyond round robin: bit 17 weighted round robin with urgent, bit 18 vendor specific |
-| 31:24 | TO | Worst-case ready timeout, in 500 ms units |
+| 31:24 | TO | Worst-case time for RDY to change after CC.EN changes, in either direction, in 500 ms units. FFh is 127.5 s |
 | 35:32 | DSTRD | Doorbell stride: 4 << DSTRD bytes |
 | 36 | NSSRS | NVM Subsystem Reset supported |
 | 44:37 | CSS | Command sets supported: bit 0 NVM, bit 6 one or more I/O command sets, bit 7 admin only |
 | 45 | BPS | Boot Partitions supported |
+| 47:46 | CPS | Controller Power Scope: 00b not reported, 01b controller, 10b domain, 11b NVM subsystem |
 | 51:48, 55:52 | MPSMIN, MPSMAX | Page size range: 2^(12+value) bytes |
 | 56, 57 | PMRS, CMBS | PMR and CMB present |
-| 58, 60:59 | NSSS, CRMS | NVM Subsystem Shutdown supported, ready-mode support (newer revisions) |
+| 58 | NSSS | NVM Subsystem Shutdown supported |
+| 60:59 | CRMS | Controller ready modes: bit 59 with media (set by 2.0 and later controllers), bit 60 independent of media |
+| 61 | NSSES | NVM Subsystem Shutdown Enhancements supported (2.3 behavior, Base 3.6.3) |
 
-- **VS:** 00010400h is 1.4.0 and 00020000h is 2.0.0. It says which spec revision the controller claims, not which optional features exist. Feature gating uses CAP bits and Identify fields.
+- **VS:** 00010400h is 1.4.0, 00020000h is 2.0.0 and 00020300h is 2.3.0. It says which spec revision the controller claims, not which optional features exist. Feature gating uses CAP bits and Identify fields.
 - **Real gating example:** Linux uses NSSR only if VS is 1.1 or later and CAP.NSSRS is set.
 - **Sizing from CAP:** queue depth is min(MQES + 1, the host's wish). Doorbell addresses use DSTRD. The host page size must lie in MPSMIN to MPSMAX.
 FOLLOW:
 - MPSMIN is 0 and MPSMAX is 4. What can the host program? => CC.MPS from 0 to 4, so memory page sizes from 4 KB to 64 KB.
 - Does MQES limit the admin queue? => For PCIe it applies to I/O queues. Admin queue depth comes from AQA, up to 4096 entries (question 2.07).
 PITFALL: Hard-coding queue depth or doorbell stride from the drive on your desk. Both come from CAP and differ between products.
-VERIFY: CAP field positions for CPS, NSSS and CRMS in your revision, and whether MQES also caps the admin queues. The main field positions match Linux and SPDK.
 
 @@ 2.03 | Basic | Concept | fig=ctrlinit | tags=init,enable,ready,admin-queue
 Q: What is the controller initialization sequence from the host's point of view?
-SHORT: After PCIe enumeration the host waits for CSTS.RDY to be 0, writes AQA, ASQ and ACQ, programs CC with the page size, command set, arbitration and queue entry sizes, then sets CC.EN to 1 and polls CSTS.RDY until it is 1, bounded by CAP.TO times 500 ms. Then it uses the admin queue to identify the controller, set the queue count, create the I/O queues and post Async Event Requests.
+SHORT: After PCIe enumeration the host waits for CSTS.RDY to be 0, writes AQA, ASQ and ACQ, programs CC with the page size, command set, arbitration and queue entry sizes, then sets CC.EN to 1 and polls CSTS.RDY until it is 1, bounded by CAP.TO times 500 ms. Then it uses the admin queue to identify the controller and namespaces, set the queue count, create the I/O queues and post Async Event Requests.
 DEEP:
 1. **PCIe first:** memory space and bus master are on, BAR0 is mapped, and the MSI-X vector for admin completions is ready.
 2. **Quiesce:** if CC.EN is 1, clear it and wait until CSTS.RDY is 0. A previous reset may still be finishing.
 3. **Admin queues:** allocate physically contiguous memory, then write AQA, ASQ and ACQ.
-4. **Configure:** write CC fields (MPS, CSS, AMS, IOSQES, IOCQES) with EN still 0. Some drivers do this and step 5 in one write.
+4. **Configure:** write CC.CSS (000b NVM, 110b all supported I/O command sets, 111b admin only, chosen from CAP.CSS), then AMS and MPS, all with EN still 0 (Base 2.3, 3.5.1). IOSQES and IOCQES only have to be set before the first Create I/O queue command (else Invalid Queue Size), but drivers usually write them here. Some drivers do this and step 5 in one write.
 5. **Enable:** write CC.EN = 1.
 6. **Wait:** poll CSTS.RDY until 1. Time out after CAP.TO times 500 ms and treat the controller as failed.
-7. **Admin commands:** Identify Controller, Set Features (Number of Queues), Create I/O Completion Queue, then Create I/O Submission Queue, then Identify namespaces and Async Event Requests.
+7. **Admin commands:** Identify Controller, the command set and namespace Identify commands, Set Features (Number of Queues), MSI or MSI-X setup sized from the granted queue count, Create I/O Completion Queue, then Create I/O Submission Queue. Async Event Requests may be posted any time after RDY.
 
 ```
 if (CC & EN) { CC = 0; wait CSTS.RDY == 0 }
@@ -77,60 +79,61 @@ CC |= EN;  wait CSTS.RDY == 1   ; timeout about CAP.TO * 500 ms
 ```
 
 - **Order matters for CQ and SQ:** a Create I/O SQ names the CQ it completes into, so the CQ must exist first.
+- **Recommended, not mandated:** the list in 3.5.1 is written with "should", and drivers differ in where they place interrupt setup. The hard rules are AQA, ASQ and ACQ before EN, CSS, AMS and MPS only while EN is 0, Number of Queues before any I/O queue, and CQ before SQ.
 - **What a trace shows:** MRd of CSTS repeating until it returns RDY, then a doorbell MWr to SQ0, then the first bus-master read of the admin SQE.
 FOLLOW:
 - Why wait for RDY = 0 before configuring? => A reset triggered earlier may still be running, and writing configuration into a controller mid-reset gives undefined results.
 - Why must ASQ and ACQ be written before EN? => The controller may fetch from them as soon as RDY is 1, so they have to be valid by then.
 PITFALL: Setting CC.EN and then writing AQA, ASQ and ACQ. The controller can become ready pointing at address 0.
-VERIFY: The numbered initialization list in the NVMe Base Specification, especially where interrupt setup and the Number of Queues step fall.
 
 @@ 2.04 | Intermediate | Concept | tags=cc,configuration,en,mps,css,ams,shn
 Q: Walk through the fields of the CC register and say which can change while the controller is enabled.
-SHORT: CC (offset 14h) is the host's control word. EN is bit 0, CSS bits 6:4, MPS 10:7, AMS 13:11, SHN 15:14, IOSQES 19:16 and IOCQES 23:20. The configuration fields are set while EN is 0 and are not changed while it is 1. SHN is the exception and is written at shutdown. Entry sizes are log2 values, so a common Linux value is 00460001h: EN, IOSQES 6 (64 B) and IOCQES 4 (16 B).
+SHORT: CC (offset 14h) is the host's control word. EN is bit 0, CSS bits 6:4, MPS 10:7, AMS 13:11, SHN 15:14, IOSQES 19:16 and IOCQES 23:20. CSS, AMS and MPS may only change while EN is 0, and the entry sizes must not change once I/O queues exist. SHN is written while EN is 1, at shutdown. Entry sizes are log2 values, so a common Linux value is 00460001h: EN, IOSQES 6 (64 B) and IOCQES 4 (16 B).
 DEEP:
 | Bits | Field | Encoding |
 |---|---|---|
 | 0 | EN | 1 enables the controller. 1 to 0 is a controller reset |
-| 6:4 | CSS | 000b NVM command set, 110b all supported I/O command sets, 111b admin only |
-| 10:7 | MPS | Memory page size = 2^(12+MPS): 0 is 4 KB, 4 is 64 KB |
+| 6:4 | CSS | 000b NVM command set, 110b all supported I/O command sets, 111b admin only (each needs its CAP.CSS bit) |
+| 10:7 | MPS | Memory page size = 2^(12+MPS): 0 is 4 KB, 4 is 64 KB, the field can express up to 128 MiB |
 | 13:11 | AMS | 000b round robin, 001b weighted round robin with urgent, 111b vendor specific |
 | 15:14 | SHN | 00b none, 01b normal shutdown, 10b abrupt shutdown |
 | 19:16 | IOSQES | log2 of the I/O SQ entry size: 6 means 64 B |
 | 23:20 | IOCQES | log2 of the I/O CQ entry size: 4 means 16 B |
-| 24 | CRIME | Controller Ready Independent of Media Enable (newer revisions) |
+| 24 | CRIME | Controller Ready Independent of Media Enable (2.0 and later). RW only if CAP.CRMS is 11b, else RO 0. The mode latches when EN goes 0 to 1 |
 
 - **Value check:** EN 1, IOSQES 6 shifted to bit 16 is 60000h, IOCQES 4 shifted to bit 20 is 400000h. Sum: 460001h.
 - **Admin queue entries:** fixed at 64 B and 16 B. IOSQES and IOCQES apply only to I/O queues.
-- **Ranges:** MPS must lie within CAP.MPSMIN to MPSMAX, AMS and CSS must be ones CAP advertises, and the entry sizes must lie in the range Identify Controller reports (SQES and CQES fields).
-- **Invalid values:** the host may not program them. What a device does if it happens is device specific. The Linux soft target latches CSTS.CFS, and a validator should record what the DUT does and require recovery through a CC.EN reset.
+- **Ranges:** MPS must lie within CAP.MPSMIN to MPSMAX, AMS and CSS must be ones CAP advertises, and the entry sizes must lie in the range Identify Controller reports (SQES and CQES fields, Figure 328).
+- **Invalid values:** the host shall not program them, and Base 2.3 says controller behavior is undefined for an unsupported AMS or MPS. The Linux soft target latches CSTS.CFS, and a validator should record what the DUT does and require recovery through a CC.EN reset.
+- **EN edges:** setting EN 0 to 1 while RDY is 1, or 1 to 0 while RDY is 0, has undefined results, so wait for RDY between edges. A write that sets SHN may also change other fields, including EN.
+- **CRIME:** changing it may change CAP.TO, and it never changes CRTO (Base 2.3, 3.5.3). Write it before enabling.
 FOLLOW:
-- Which CC field is written while EN is 1? => SHN, to request a shutdown. All the other fields wait for EN to be 0.
-- Why does Linux read CAP again after its first CC write? => Its source comment says the CAP value may change after the initial CC write, so it re-reads CAP before it computes the wait.
-PITFALL: Changing MPS or IOSQES on a running controller and expecting the new size to apply. It needs a full EN 1 to 0 to 1 cycle.
-VERIFY: The exact list of CC fields frozen while EN is 1, the CRIME semantics and the revision that added it, and the CSS encodings for your revision.
+- Which CC field is written while EN is 1? => SHN, to request a shutdown. CSS, AMS and MPS wait for EN to be 0, and IOSQES and IOCQES must not change once I/O queues exist.
+- Why does Linux read CAP again after its first CC write? => Its source comment says the CAP value may change after the initial CC write, and the spec allows it: changing CC.CRIME may change CAP.TO. So it re-reads CAP before it computes the wait.
+PITFALL: Changing MPS or AMS on a running controller and expecting the new value to apply. The spec makes it undefined, and it needs a full EN 1 to 0 to 1 cycle. Changing IOSQES or IOCQES with I/O queues present is undefined too.
 
 @@ 2.05 | Intermediate | Concept | tags=csts,rdy,cfs,shst,nssro
 Q: What does each CSTS field mean, and how should a driver or test read CSTS safely?
-SHORT: CSTS (offset 1Ch) has RDY (bit 0, ready), CFS (bit 1, controller fatal status), SHST (bits 3:2, shutdown status), NSSRO (bit 4, NVM subsystem reset occurred) and PP (bit 5, processing paused). Always test for all ones first: a read of FFFFFFFFh means the link or device is gone, and decoded naively it looks like ready, fatal and shutdown-in-progress at once.
+SHORT: CSTS (offset 1Ch) has RDY (bit 0, ready), CFS (bit 1, controller fatal status), SHST (bits 3:2, shutdown status), NSSRO (bit 4, NVM subsystem reset occurred) and PP (bit 5, processing paused) and ST (bit 6, shutdown type). Always test for all ones first: a read of FFFFFFFFh means the link or device is gone, and decoded naively it looks ready, fatal and shutting down at once.
 DEEP:
 | Bit | Field | Meaning |
 |---|---|---|
 | 0 | RDY | Controller is ready to process commands after CC.EN went to 1 |
 | 1 | CFS | Fatal error the controller could not report through a completion queue |
 | 3:2 | SHST | 00b normal operation, 01b shutdown processing occurring, 10b shutdown processing complete |
-| 4 | NSSRO | An NVM Subsystem Reset occurred. Host clears it by writing 1 |
-| 5 | PP | Processing paused, seen while the controller pauses during a firmware activation without reset (VERIFY) |
+| 4 | NSSRO | An NVM Subsystem Reset occurred (valid only if CAP.NSSRS is 1). Host clears it by writing 1 |
+| 5 | PP | Processing paused, for example during firmware activation. Valid only while CC.EN and CSTS.RDY are both 1 |
+| 6 | ST | Shutdown type: 1 means SHST reports an NVM Subsystem Shutdown, 0 a controller shutdown. Only an NVM Subsystem Reset clears it |
 
 - **All ones:** FFFFFFFFh has RDY = 1, CFS = 1 and SHST = 11b, which is reserved. It almost always comes from the PCIe side (link down, surprise removal, a reset in progress). Linux returns an error for it before it looks at any field.
-- **CFS:** the host reacts with a controller reset, and if the reset does not complete, a heavier reset. Linux checks CFS in the timeout handler before it aborts a command.
-- **NSSRO:** it tells a driver that the controller was reset under it. Linux treats it as a reason to reset, and clears it at probe by writing 1.
+- **CFS:** it is not signaled by an interrupt, so the host finds it by polling or in a timeout handler (Base 2.3, 9.5). The host then issues a Controller Reset, and if CFS stays set an NVM Subsystem Reset where supported, which may drop the PCIe link. Linux checks CFS in the timeout handler before it aborts a command.
+- **NSSRO:** its initial value is 1 if the last NSSR happened while power was applied, and 0 after a reset caused by power application or by an NSSR that activated new firmware. It tells a driver that the controller was reset under it. Linux treats it as a reason to reset, and clears it at probe by writing 1.
 - **PP:** after a firmware-activation notice Linux quiesces I/O and polls until PP clears, and resets the controller if the pause outlasts its limit.
 - **Polling cost:** each CSTS read is a non-posted MRd, so keep it out of the fast path. Poll with a sleep of 1 to 2 ms as Linux does.
 FOLLOW:
 - Can RDY stay 1 while CFS is 1? => Yes, so read both. Linux treats CFS set or RDY clear as a dead controller.
 - Where would you see SHST 01b in a log? => A CSTS value of 4h during shutdown, and the driver's shutdown wait loop reporting it if it times out.
 PITFALL: Decoding CSTS without checking for FFFFFFFFh first, then reporting a "fatal controller" that is really a dead link.
-VERIFY: Whether NSSRO survives each reset type and how it is cleared, the exact PP semantics, and the CFS clearing rules in the Base Specification.
 
 @@ 2.06 | Intermediate | Numeric | tags=cap,decode,timeout,dstrd,mqes
 Q: `nvme show-regs` prints cap : 240083014030fff. Decode it field by field and say what a host does with the result.
@@ -138,7 +141,7 @@ SHORT: Split it into two 32-bit halves: low 14030FFFh, high 02400830h. Low: MQES
 DEEP:
 The value is illustrative. Decode with shifts, low dword first.
 1. **Low dword 14030FFFh.** Bits 15:0 = 0FFFh = 4095, so MQES + 1 = 4096 entries. Bits 31:16 = 1403h = 0001 0100 0000 0011b. Bit 16 (CQR) = 1. Bit 17 (AMS) = 1. Bits 31:24 = 14h = 20 (TO).
-2. **Timeout:** 20 x 500 ms = 10,000 ms = 10 s. The Linux wait loop uses (TO + 1) / 2 whole seconds, so (20 + 1) / 2 = 10 s (integer division).
+2. **Timeout:** 20 x 500 ms = 10,000 ms = 10 s. The unit is 500 ms and the largest value, FFh, is 127.5 s (Base 2.3, Figure 36). The Linux wait loop uses (TO + 1) / 2 whole seconds, so (20 + 1) / 2 = 10 s (integer division).
 3. **High dword 02400830h** covers bits 63:32. Bits 3:0 = 0 (DSTRD): stride 4 << 0 = 4 bytes. Bit 4 = 1: NSSRS (bit 36 overall).
 4. **CSS:** overall bits 44:37. Bit 5 of the high dword is bit 37 overall, CSS bit 0 (NVM), and it is set. Bit 11 of the high dword is bit 43 overall, CSS bit 6 (I/O command sets), also set. CSS = 41h.
 5. **Page sizes:** bits 51:48 = 0 (MPSMIN, 4 KB) and bits 55:52 = 4 (MPSMAX, 2^(12+4) = 64 KB). The upper half 0240h has nibble 4 at bit 20 of the high dword.
@@ -151,32 +154,32 @@ FOLLOW:
 - What would a TO of 0 mean for a driver? => Taken literally the device promises readiness immediately. Linux's integer division turns it into a zero-second wait, so a DUT with TO 0 that needs more than a few ms to become ready fails probing.
 - Why does DSTRD 0 give 4 bytes? => The stride is 4 << DSTRD bytes, so 0 gives 4 and 1 gives 8.
 PITFALL: Reading the 64-bit CAP as two words and shifting the wrong dword, so that TO or MPSMAX come out garbled.
-VERIFY: The `-H` flag and output format of your nvme-cli version, and the definition of CAP.TO for units and rounding in the Base Specification.
+VERIFY: The `-H` flag and output format of your nvme-cli version.
 
 @@ 2.07 | Intermediate | Concept | tags=aqa,asq,acq,admin-queue,contiguous
 Q: How do AQA, ASQ and ACQ define the admin queues, and what rules apply?
 SHORT: AQA holds two 0-based sizes: ASQS in bits 11:0 and ACQS in bits 27:16. ASQ and ACQ hold the 64-bit base addresses of the admin submission and completion queues, page aligned, in physically contiguous host memory. Sizes run from 2 to 4096 entries, entries are always 64 B (SQ) and 16 B (CQ), and all three are written before CC.EN is set.
 DEEP:
 - **AQA:** ASQS bits 11:0 and ACQS bits 27:16, each 0-based. A 32-entry queue is 31, so AQA = 001F001Fh. Linux writes the same value into both halves.
-- **Limits:** minimum 2 entries (value 1), maximum 4096 (value 0FFFh).
-- **ASQ, ACQ:** bits 63:12 are the base address, so the address is at least 4 KB aligned. Bits 11:0 are reserved.
+- **Limits:** minimum 2 entries (value 1), maximum 4096 (value 0FFFh). Enabling the controller with ASQS or ACQS at 0 is undefined.
+- **ASQ, ACQ:** bits 63:12 are the base address, so the address is at least 4 KB aligned. Bits 11:0 are reserved. The address shall be aligned to the CC.MPS page size (Base 2.3, Figures 45 and 46), so with a 64 KB MPS a merely 4 KB aligned base is not enough.
 - **Contiguous:** the admin queues are one physically contiguous region each. CAP.CQR only concerns I/O queues.
 - **Fixed entry sizes:** 64 B and 16 B, whatever CC.IOSQES says.
 - **Interrupts:** admin CQ completions use vector 0 (interrupts module).
 - **Sizing rule:** the host keeps at most (queue size - 1) commands outstanding, and the CQ should be at least as big as the SQ so completions always have a slot.
-- **After a reset:** treat AQA, ASQ and ACQ as cleared and write them again. Linux does on every reset, and it clears the CQ memory so old phase bits are not mistaken for new completions.
+- **After a reset:** a Controller Reset (CC.EN 1 to 0) does not reset AQA, ASQ or ACQ (Base 2.3, 3.7.2), although it does reset the admin queue state. Other resets do reset them, so a host writes all three on every initialization, as Linux does, and it clears the CQ memory so old phase bits are not mistaken for new completions.
+- **When:** AQA, ASQ and ACQ may only be modified while CC.EN is 0 (Base 2.3, CC.EN description).
 - **Validation ideas:** program the minimum (2 entries) and maximum (4096) sizes and run the queue to wrap several times, program a size mismatch between ASQS and ACQS, and place the queues at high addresses above 4 GB to test the upper 32 bits.
 FOLLOW:
 - Why are the sizes 0-based? => Zero entries makes no sense and a 12-bit field then reaches 4096.
 - What happens if ASQ holds an unmapped address? => The first SQE fetch fails on the PCIe side (UR or completion timeout, depending on the IOMMU and platform), and no admin command ever completes.
 PITFALL: Writing the queue size instead of size minus one. The controller then thinks the queue is one entry larger than the memory.
-VERIFY: Whether ASQ, ACQ and AQA writes are ignored or undefined while CC.EN is 1, and the ASQS and ACQS minimums for your revision.
 
 @@ 2.08 | Intermediate | Trap | tags=access-width,mmio,ordering,64-bit,posted-writes
 Q: What rules govern how the host accesses controller registers, and what goes wrong when they are broken?
-SHORT: Registers are memory-mapped and meant for naturally aligned 32-bit or 64-bit accesses. A 64-bit register may be written as two 32-bit halves, and the order matters: Linux writes ASQ and ACQ low half first, but CMBMSC high half first because its enable bits live in the low half. MMIO writes are posted, so a write is not proven done until a later read returns. Byte accesses and doorbell reads are outside what the driver expects.
+SHORT: Base 2.3 (3.1.4) says the host shall access a property at its defined width, starting at its first byte, unless the transport says otherwise, and accesses spanning two properties are not supported. Linux writes 64-bit ASQ and ACQ as two halves, low first, but CMBMSC high half first because its enable bit is in the low half. MMIO writes are posted, so a write is not proven done until a later read returns.
 DEEP:
-- **Width and alignment:** use 4-byte accesses on 32-bit registers and 4- or 8-byte on 64-bit ones. Byte and 16-bit accesses to controller registers are not something drivers do. A device may ignore them or mishandle them.
+- **Width and alignment:** use a property's own width (4 bytes for a dword, 8 for a qword) and start at its first byte. Accesses that span two or more properties are not supported. Reserved bits read as 0 (software should not rely on it) and are written as 0. Whether a 64-bit register may be split, and what a device does with byte or 16-bit accesses, is left to the transport specification, so a test should try them and record the result.
 - **Two-half writes:** if the controller acts on a register as soon as it sees a half, the order decides whether it acts on a mix of old and new bits. For ASQ the address is only used later, so order is harmless. For CMBMSC the enable bit (CMSE) sits in the low half with the base address in both halves, so the high half goes first.
 - **Splitting:** an 8-byte MMIO store is one 8-byte MWr on x86-64, but hypervisors, bridges and 32-bit hosts can split it. A DUT must tolerate both forms, and a test should try both.
 - **Posted writes:** a CC write may still be in flight when the CPU moves on. Timing an enable from the store instruction hides that. Timestamp from the analyzer, or write then read back CC.
@@ -184,30 +187,30 @@ DEEP:
 - **Test recipe:** run each register access as 8 bytes and as two 4-byte halves in both orders, read every register before and after, and check reserved bits stay zero and no unexpected state change happens.
 FOLLOW:
 - Why is reading CSTS in a tight loop bad for latency? => Each read is a non-posted PCIe request and the core stalls for the round trip, so pollers use a short sleep between reads.
-- What does the DUT do on a byte write to CC? => Unspecified, so record it. A hang or a changed EN bit is a firmware bug worth a report even if no spec line is violated.
+- What does the DUT do on a byte write to CC? => A byte write is outside the width Base 2.3 (3.1.4) requires, so the response is not defined there. Record it. A hang or a changed EN bit is a firmware bug worth a report even if no spec line is violated.
 PITFALL: Measuring "enable to ready" from the store instruction time. The posted write reaches the device later, so the measured time is short by the posting delay.
-VERIFY: The register access width and alignment rules, the required order for 64-bit registers accessed as two 32-bit halves, and how the controller must handle other access sizes, in the register chapter of the Base Specification.
+VERIFY: The required order for 64-bit registers accessed as two 32-bit halves, and how the controller must handle other access sizes, in the NVMe over PCIe Transport Specification (Base 2.3 defers memory-based access rules to it).
 
 @@ 2.09 | Advanced | Concept | tags=en,rdy,timeout,cap-to,crto,reset
 Q: What do CC.EN and CSTS.RDY promise in each direction, and how is the wait bounded?
-SHORT: Setting CC.EN from 0 to 1 promises that CSTS.RDY becomes 1 within the advertised timeout, and the controller then accepts admin commands. Clearing CC.EN is a controller reset: queues are deleted, state returns to defaults, and RDY falls to 0 within the same bound. CAP.TO gives that bound in 500 ms units. Newer revisions add CRTO with separate ready timeouts, and Linux uses the larger value if it is at least CAP.TO.
+SHORT: Setting CC.EN from 0 to 1 promises that CSTS.RDY becomes 1 within the advertised timeout, and the controller then accepts admin commands. Clearing CC.EN is a controller reset: queues are deleted, state returns to defaults, and RDY falls to 0 within the same bound. CAP.TO gives that bound in 500 ms units, FFh being 127.5 s. From 2.0 on CRTO adds CRWMT and CRIMT, and the host picks one by CC.CRIME for the enable wait.
 DEEP:
 | Event | Host action | Device promise | Bound |
 |---|---|---|---|
 | Enable | CC.EN 0 to 1 | RDY becomes 1 and admin commands are accepted | CAP.TO, or CRTO for the ready mode |
 | Disable, controller reset | CC.EN 1 to 0 | Reset finished, RDY becomes 0 | CAP.TO |
-| Shutdown | CC.SHN written | SHST becomes 10b | RTD3E, not CAP.TO |
+| Shutdown | CC.SHN written | SHST becomes 10b | RTD3E (typical, wait 1 s if 0), not CAP.TO |
 
 - **What RDY means:** the controller can process commands from the admin queue. A doorbell rung before RDY has no defined effect.
-- **Controller reset:** it does not touch PCIe configuration space or the link. Every NVMe register goes back to its default, so the host writes AQA, ASQ, ACQ and CC afresh.
+- **Controller reset:** it does not touch PCIe configuration space or the link. NVMe properties return to their defaults, except AQA, ASQ, ACQ, the PMR registers and CMBMSC, which a Controller Reset leaves alone (Base 2.3, 3.7.2). I/O queues are deleted and the admin queues are reset.
 - **Not instant:** the controller may need to finish or abort commands, flush state and reload tables. That is why TO exists.
-- **CRTO (newer revisions):** CRWMT (bits 15:0) is the ready time with media, CRIMT (bits 31:16) is the time when CC.CRIME lets the controller become ready before the media is. Both are in 500 ms units. Linux takes CRWMT only if it is at least CAP.TO and disables CRIME, because media-dependent commands may then fail with an Admin Command Media Not Ready status.
+- **CRTO (mandatory from 2.0):** CRWMT (bits 15:0) is the wait for the controller and the media to be ready, in either mode. CRIMT (bits 31:16) is the wait when CC.CRIME chose Ready Independent of Media, and reads 0 if CAP.CRMS.CRIMS is 0. CRWMT is at least CRIMT. Both are in 500 ms units, and CAP.TO mirrors the applicable one, capped at FFh. Linux takes CRWMT only if it is at least CAP.TO and disables CRIME, because in that mode media-dependent commands may fail with Admin Command Media Not Ready (24h) or Namespace Not Ready (82h).
 - **Validation:** measure enable-to-ready and disable-to-not-ready over thousands of cycles, compare against the advertised bound, and watch for drift between firmware builds.
 FOLLOW:
-- Can the host set EN back to 1 right after clearing it? => Not until RDY reads 0. The initialization sequence waits for it, and a device may mishandle an early re-enable.
+- Can the host set EN back to 1 right after clearing it? => Not until RDY reads 0. Setting EN 0 to 1 while RDY is 1 has undefined results (Base 2.3, CC.EN).
 - Is CAP.TO a command timeout? => No. It bounds only the ready transition. Command timeouts are a host policy (Linux defaults to 30 s for I/O and 60 s for admin, module 9).
 PITFALL: Setting a harness timeout from a typical ready time. A device with a slow media scan takes far longer, and the bound to test against is CAP.TO or CRTO, not the average.
-VERIFY: Whether CAP.TO also bounds the 1 to 0 transition in your revision, the meaning and defaults of CRTO, CRMS and CRIME, and the Linux command timeout defaults (module parameters).
+VERIFY: The Linux command timeout defaults (module parameters, kernel version) and the exact Linux CRTO handling.
 
 @@ 2.10 | Advanced | Numeric | tags=doorbell,dstrd,bar0,sizing,stride
 Q: Compute doorbell addresses and the minimum BAR0 size for a controller with N I/O queue pairs, at several doorbell strides.
@@ -228,56 +231,57 @@ Assumptions: N I/O queue pairs plus the admin pair, so N + 1 pairs, two doorbell
 | 128 | 10 | 4 KiB | 1,060,864 | 2 MiB |
 | 65,535 | 0 | 4 B | 528,384 | 1 MiB |
 
-- **Why a big stride:** with DSTRD 10 each doorbell owns a 4 KiB page. A hypervisor can map one page to one guest queue, and a user-space driver can hand queues to separate processes without them touching each other's doorbells.
+- **Why a big stride:** with DSTRD 10 each doorbell owns a 4 KiB page. A hypervisor can map one page to one guest queue, and a user-space driver can hand queues to separate processes without them touching each other's doorbells. Base 2.3 (8.2.2) presents non-zero strides as a software emulation aid and says the expected value for hardware is 0, so a DUT with DSTRD 0 is normal.
 - **Validation:** read the queue count granted by Set Features (Number of Queues), create the maximum, then ring the last CQ head doorbell and the first. Check nothing aliases, wraps or corrupts another queue.
 - **Host bug class:** a driver that maps too little of BAR0 for the negotiated queue count. Linux remaps BAR0 to the size the queue count needs.
 FOLLOW:
 - What limits the queue count if BAR0 is small? => The controller cannot expose more doorbells than fit, so its Number of Queues answer should match. A mismatch is a firmware bug to test for.
 - Where is admin queue doorbell 0? => SQ0 tail at 1000h and CQ0 head at 1000h plus the stride.
 PITFALL: Using a fixed 8-byte spacing because one drive used it. The spacing is 4 << DSTRD and differs per controller.
-VERIFY: The 16 KiB BAR0 floor (MLBAR bits 31:14) and where the MSI-X table and PBA sit for NVMe over PCIe, and the doorbell offset formula in the register chapter of the Base Specification.
+VERIFY: The 16 KiB BAR0 floor (MLBAR bits 31:14), where the MSI-X table and PBA sit, and the CQ head doorbell formula, all in the NVMe over PCIe Transport Specification. Base 2.3 (Figure 33 note 4) quotes only the SQ tail formula, 1000h + (2y x (4 << CAP.DSTRD)), and defers the rest to the transport.
 
 @@ 2.11 | Advanced | Concept | tags=shutdown,shn,shst,rtd3e,unsafe-shutdown
 Q: How do normal and abrupt shutdown work, and how do you validate a controller's shutdown behavior?
-SHORT: The host writes CC.SHN = 01b for a normal shutdown or 10b for an abrupt one, then polls CSTS.SHST: 00b normal operation, 01b processing, 10b complete. On a normal shutdown the controller flushes volatile data and metadata so the next power-on is clean. Abrupt tells it power is about to fail, so it does the minimum quickly. The wait is bounded by RTD3E from Identify Controller, with at least 5 s in Linux.
+SHORT: The host writes CC.SHN = 01b for a normal shutdown or 10b for an abrupt one, then polls CSTS.SHST: 00b normal operation, 01b processing, 10b complete. On a normal shutdown the controller flushes volatile data and metadata so the next power-on is clean. Abrupt tells it power is about to fail, so it does the minimum quickly. The host should wait at least RTD3E from Identify Controller (a typical latency, 1 s if it reads 0), and Linux waits at least 5 s.
 DEEP:
-1. Host stops submitting I/O, waits for outstanding commands, and issues Flush if needed.
+1. Host stops submitting I/O, waits for outstanding commands, and issues Flush if it wants to. The recommended normal sequence then deletes all I/O SQs and then all I/O CQs (Base 2.3, 3.6.1). For an abrupt shutdown the host only stops submitting.
 2. Host writes CC.SHN = 01b (normal) or 10b (abrupt). Linux leaves EN at 1 for a normal shutdown.
 3. Controller sets SHST = 01b while it works, then 10b when done.
 4. Host waits for SHST = 10b within the timeout, then powers off or resets.
-5. To use the controller again, the host performs a CC.EN 1 to 0 to 1 cycle.
+5. To use the controller again, the host does a Controller Level Reset (CC.EN 1 to 0) and re-enables it. If EN is already 0, one write with EN = 1 and SHN = 00b also works.
 
-- **Timeout:** RTD3E in Identify Controller is the worst-case entry latency in microseconds. RTD3E = 8,000,000 means 8 s. Linux clamps its wait between its 5 s default and 60 s, so an RTD3E of 0 gives 5 s.
-- **Normal versus abrupt:** normal flushes user data and writes back the mapping table and journal, so the next boot needs no recovery scan. Abrupt has a lower power-backup requirement, so it can be shorter.
-- **SMART evidence:** the Unsafe Shutdowns counter should rise after a power cut with no SHN and stay flat after a completed normal shutdown.
-- **Subsystem level:** newer revisions add NVM Subsystem Shutdown (CAP.NSSS and the NSSD register).
-- **Validation matrix:** normal and abrupt, idle and under a heavy write load, with a Flush in flight, timing of SHST 01b to 10b against RTD3E, data verification after the next power-on, and Unsafe Shutdowns deltas.
+- **Timeout:** RTD3E (Identify Controller bytes 91:88) is the typical, not the worst-case, Runtime D3 entry latency in microseconds. Base 2.3 (3.6.1) recommends waiting at least RTD3E, or at least 1 s if it is 0. RTD3E = 8,000,000 means 8 s. Linux clamps its wait between its 5 s default and 60 s, so an RTD3E of 0 gives 5 s. While shutdown runs the controller may abort commands with Commands Aborted due to Power Loss Notification (05h), and disabling the controller with CC.EN meanwhile is not recommended.
+- **Normal versus abrupt:** Base 2.3 defines the two notifications (normal: the controller should be given time before power is removed, abrupt: the host may or may not wait) but does not list what each must flush. A typical firmware flushes user data and writes back the mapping table and journal on normal, so the next boot needs no recovery scan, and does less on abrupt.
+- **SMART evidence:** the Unexpected Power Losses counter (previously named Unsafe Shutdowns) counts power losses while SHST is not 10b, so it should rise after a power cut with no SHN and stay flat after a completed shutdown. Base 2.3 adds that the next initialization may then take longer.
+- **Subsystem level:** NVM Subsystem Shutdown (Base 2.3, 3.6.3) is advertised by CAP.NSSS (bit 58), and CAP.NSSES (bit 61) marks the 2.3 enhancements. The host writes NSSD (offset 64h) with 4E726D6Ch ("Nrml") or 41627074h ("Abpt"), CSTS.ST reads 1, and the host should wait at least NSSL from Identify Controller (30 s if 0). An NVM Subsystem Reset must follow before commands run.
+- **Validation matrix:** normal and abrupt, idle and under a heavy write load, with a Flush in flight, timing of SHST 01b to 10b against RTD3E, data verification after the next power-on, and Unexpected Power Losses deltas.
 FOLLOW:
-- What if SHST never reaches 10b? => The host must give up after the timeout and remove power or reset. Linux logs the shutdown wait failure, and a DUT that overruns RTD3E is a firmware defect.
+- What if SHST never reaches 10b? => The host gives up after its own timeout and removes power or resets. Linux logs the shutdown wait failure. Base 2.3 sets no hard bound (RTD3E is typical), so a DUT that overruns RTD3E by a wide margin is a defect to raise, and one that never completes is a clear failure.
 - Is abrupt shutdown a data-loss risk? => Data the host already made durable (a completed Flush, or writes to a drive without a volatile cache) must survive. Cached data that was never flushed may be lost, as in any power fail.
-PITFALL: Treating SHN as CC.EN. A shutdown does not clear EN, and a controller in SHST 10b is not reusable until reset.
-VERIFY: Which host actions are allowed after SHST = 10b, the RTD3E field position and units, the normal-versus-abrupt contract, and the NSSS and NSSD semantics in your revision.
+PITFALL: Treating SHN as CC.EN. A shutdown does not clear EN, and a controller in SHST 10b is not reusable until a Controller Level Reset and re-enable, or one write with EN = 1 and SHN = 00b if EN was already 0.
+VERIFY: What normal versus abrupt shutdown must flush (Base 2.3 does not say), and the Linux shutdown timeout constants for your kernel.
 
 @@ 2.12 | Advanced | Trap | tags=nssr,subsystem-reset,nssro,4e564d65
 Q: How does NVM Subsystem Reset work, and why is it not just another controller reset?
-SHORT: The host writes 4E564D65h, ASCII "NVMe", to NSSR at offset 20h. It works only if CAP.NSSRS is 1 and resets the whole NVM subsystem, which means every controller and the shared state behind them, close to a power cycle without removing power. Afterwards CSTS.NSSRO reads 1 until the host clears it by writing 1. On PCIe the link commonly drops, so the host must expect failed reads and a full re-initialization.
+SHORT: The host writes 4E564D65h, ASCII "NVMe", to NSSR at offset 20h. It works only if CAP.NSSRS is 1 and resets the whole NVM subsystem, which means every controller and the shared state behind them, close to a power cycle without removing power. Afterwards CSTS.NSSRO reads 1 until the host clears it by writing 1. On PCIe the link may drop (Base 2.3, 9.5), so the host must expect failed reads and a full re-initialization.
 DEEP:
-- **Value:** 4Eh 'N', 56h 'V', 4Dh 'M', 65h 'e'. Any other value must not trigger a reset.
-- **Support:** check CAP.NSSRS first. NSSR came with NVMe 1.1, so Linux also checks VS.
-- **Scope:** one NVM subsystem can hold several controllers (dual-port drives, virtualization). NSSR resets all of them, including those used by other hosts. CC.EN 1 to 0 only resets one controller.
-- **NSSRO:** it lets a controller that survived the reset tell its host that it happened. Linux treats a set NSSRO as a reason to reset, and clears it at probe by writing 1.
-- **On PCIe:** the Linux helper follows the write with a CSTS read on purpose, "to trigger a pcie read error", because the link often goes down. The transport specification and the device decide how, so expect Detect, retraining and a fresh enumeration.
+- **Value:** 4Eh 'N', 56h 'V', 4Dh 'M', 65h 'e'. Any other value has no functional effect, and the field reads back 0h (Figure 43).
+- **Support:** check CAP.NSSRS first. If it is 0 the NSSR address range is reserved. Linux also requires VS 1.1 or later.
+- **Scope:** one NVM subsystem can hold several controllers (dual-port drives, virtualization). NSSR resets all of them, including those used by other hosts, and disables the PMR of each (3.7.1). In a multi-domain subsystem the scope is the domain of the controller written, or possibly the whole subsystem. CC.EN 1 to 0 only resets one controller and leaves the PMR registers alone.
+- **NSSRO:** its initial value is 1 after an NSSR that happened with power applied, so a host can tell an NSSR from other causes of lost communication. It is 0 after a power-on reset, and 0 if the NSSR activated new firmware. It is valid only if CAP.NSSRS is 1. Linux treats a set NSSRO as a reason to reset, and clears it at probe by writing 1.
+- **After CFS:** Base 2.3 (9.5) says try a Controller Reset first, and use NSSR only if CFS stays set and the host tolerates PCIe links going down. Hosts using Firmware First error handling should not use it.
+- **On PCIe:** the Linux helper follows the write with a CSTS read on purpose, "to trigger a pcie read error", because the link may go down. The transport specification and the device decide how, so expect Detect, retraining and a fresh enumeration.
 - **What to test:**
   - Write values other than 4E564D65h (0, 4E564D64h, the byte-swapped form) and check nothing resets.
-  - NSSR with CAP.NSSRS = 0 is ignored or handled as defined.
+  - NSSR with CAP.NSSRS = 0: the range is reserved, so record what the DUT does.
   - NSSR under I/O load, and during a Format or firmware commit.
   - State compared with a CC.EN reset: what survives which reset (volatile write cache, features, queue state).
   - NSSRO set, then cleared with a write of 1.
 FOLLOW:
-- Does NSSR remove power? => No. It is a reset, so persistent media, namespace configuration and the firmware in use stay. It may load a pending firmware image, like any reset (VERIFY).
+- Does NSSR remove power? => No. It is a reset, so persistent media, namespace configuration and the firmware in use stay. It can activate a pending firmware image when Firmware Commit reports that an NVM Subsystem Reset is required (Base 2.3, 3.11).
 - How does a host know NSSR finished on PCIe? => It waits out the link recovery, re-enumerates, reads CSTS until it is not all ones, then runs initialization again.
 PITFALL: Byte-swapping the magic value or using it on a device that reports NSSRS = 0.
-VERIFY: NSSR effect on the PCIe link and configuration space in the NVMe over PCIe Transport Specification, NSSRO retention across reset types, and exactly which subsystem state is reset.
+VERIFY: NSSR effect on the PCIe link and configuration space (NVMe over PCIe Transport Specification, not in Base 2.3), and which revision introduced NSSR (Base 2.3 does not say).
 
 @@ 2.13 | Advanced | Cross-layer | tags=cmb,cmbloc,cmbsz,cmbmsc,bar
 Q: How do CMBLOC, CMBSZ and CMBMSC describe a Controller Memory Buffer, and what do you validate in it?
@@ -289,15 +293,16 @@ Worked decode. CMBSZ = 0010021Bh and CMBLOC = 00000002h.
 3. SZ = bits 31:12 = 100h = 256. Size = 256 x 1 MiB = 256 MiB.
 4. CMBLOC: BIR = 2, OFST = 0. The CMB sits at offset 0 of BAR2, so BAR2 must be at least 256 MiB.
 
-- **1.4 scheme:** Linux sets CMBMSC.CRE first, reads CMBSZ and CMBLOC, then writes the CMB's host bus address into CMBMSC with CMSE = 1 (high dword first). The address lets the controller recognize host addresses in a PRP or SGL that point into its own CMB. CMBSTS.CBAI flags an invalid base address.
+- **1.4 scheme:** CMBLOC and CMBSZ read as 0 until CMBMSC.CRE is 1, and CMBMSC is mandatory when CAP.CMBS is 1 (Base 2.3). Linux sets CMBMSC.CRE first, reads CMBSZ and CMBLOC, then writes the CMB's host bus address into CMBMSC with CMSE = 1 (high dword first). The address lets the controller recognize host addresses in a PRP or SGL that point into its own CMB. CMBSTS.CBAI flags an invalid base address. Before the 1.4 scheme a CMB was simply always enabled. CMBEBS (5Ch) and CMBSWTP (60h) report the elasticity buffer size and sustained write throughput, with 0 meaning not reported.
 - **Use in Linux:** submission queues can be placed in a CMB when CMBSZ.SQS is set. Completion queues stay in host memory. The CMB is also registered for peer-to-peer DMA.
+- **Contents:** Base 2.3 (8.2.1) says CMB contents are undefined after CMSE goes 0 to 1, after a Controller Reset and after an FLR. CMBMSC itself survives a Controller Reset and an FLR (3.7.2).
 - **PCIe side:** the CMB is BAR space with the routing, ACS and non-posted read cost covered on the PCIe page, NVMe over PCIe module.
 - **Validation:** capability bits versus real behavior (place an SQ in the CMB and check commands run), size versus BAR size, CMBMSC enable and disable, base address invalid handling, contents after CC.EN, FLR and PERST#, and P2P data transfers.
 FOLLOW:
 - Is CMB content persistent? => No. A CMB is ordinary volatile memory. A Persistent Memory Region is the persistent variant (question 2.14).
 - Why does Linux clip the CMB to the BAR size? => A controller may report a CMB larger than its BAR, for example behind a bridge, so the driver uses the part that fits.
 PITFALL: Treating SZ as a byte count. It is a count of SZU units.
-VERIFY: CMBMSC, CMBSTS, CMBEBS and CMBSWTP fields, the 1.4 enabling sequence, the SZU encodings, and whether CMB contents survive each reset type.
+VERIFY: CMB contents after PERST# or an NVM Subsystem Reset (Base 2.3 does not say).
 
 @@ 2.14 | Advanced | Concept | tags=pmr,pmrcap,pmrctl,pmrsts,persistence
 Q: How is a Persistent Memory Region controlled through its registers, and what makes it different from a CMB?
@@ -305,7 +310,7 @@ SHORT: PMR is device memory intended to keep its contents across resets and powe
 DEEP:
 | Offset | Register | Use |
 |---|---|---|
-| E00h | PMRCAP | RDS, WDS, BIR (bits 7:5), timeout unit and value, write barrier mechanisms, CMSS |
+| E00h | PMRCAP | RDS (3), WDS (4), BIR (7:5, valid values 2 to 5), PMRTU (9:8), PMRWBM (13:10), PMRTO (23:16), CMSS (24) |
 | E04h | PMRCTL | EN, bit 0 |
 | E08h | PMRSTS | ERR, NRDY, health status HSTS, CBAI |
 | E0Ch, E10h | PMREBS, PMRSWTP | Elasticity buffer size and sustained write throughput |
@@ -313,14 +318,14 @@ DEEP:
 
 - **Enable handshake:** write PMRCTL.EN = 1, poll PMRSTS.NRDY until 0, time out after PMRTO times the PMRTU unit. Disable is the mirror: NRDY should return to 1. SPDK implements this.
 - **Memory space:** the host writes the bus address into PMRMSCL and PMRMSCU with the enable bit (CMSE, bit 1 of the lower register), then checks PMRSTS.CBAI for an invalid base.
-- **Persistence is not free:** host writes are posted. A store is not durable when the CPU instruction retires. The host uses the mechanism PMRCAP advertises (PMRWBM), typically a read to force earlier writes out, and PMREBS and PMRSWTP describe how much data the device can absorb and how fast it persists it.
-- **Health:** PMRSTS.HSTS reports states such as normal, restore error, read only and unreliable.
+- **Persistence is not free:** host writes are posted. A store is not durable when the CPU instruction retires. The host uses a mechanism PMRWBM advertises (at least one bit is set): bit 0 says a completed read from any PMR address makes earlier writes persistent, bit 1 says a completed read of PMRSTS does. PMREBS and PMRSWTP describe how much data the device can absorb and how fast it persists it.
+- **Health:** PMRSTS.HSTS (bits 11:9) reports 000b normal, 001b restore error, 010b read only and 011b unreliable. PMRSTS.ERR (7:0) is vendor specific and, once non-zero, stays non-zero until the PCI function is reset.
+- **Resets:** PMRCAP, PMRCTL, PMRSTS, PMREBS, PMRSWTP and PMRMSCL/U are not reset by a Controller Reset (Base 2.3, 3.7.2), so the PMR stays enabled across CC.EN 1 to 0. An NVM Subsystem Reset does disable it (3.7.1).
 - **Validation:** enable and disable timing against PMRTO, data written before a reset or power cycle read back afterwards, behavior after a power cut with no barrier and with one, PMRSTS.ERR after injected faults, and repeated enable cycles.
 FOLLOW:
 - How does PMR differ from a CMB at the register level? => A CMB has CMBLOC and CMBSZ and no enable handshake in the 1.3 scheme. PMR has its own control and status registers with an enable handshake and a persistence contract.
 - Does Linux use PMR? => It does not manage PMR in the NVMe driver. SPDK does, which makes SPDK the practical test vehicle.
 PITFALL: Treating a completed MMIO store to the PMR as durable. Use the advertised barrier, and test a power cut in the middle.
-VERIFY: Whether your target revision still specifies PMR, the PMRWBM bit meanings, PMRTU encodings, PMRSTS field widths and the HSTS values.
 
 @@ 2.15 | Principal | Debug | tags=dmesg,csts,probe-failure,rdy,triage
 Q: A DUT fails to probe. dmesg shows "Device not ready; aborting initialisation, CSTS=0x0". Another run shows "aborting reset, CSTS=0x1". What does each tell you and how do you proceed?
@@ -345,15 +350,15 @@ Also read the CSTS value before trusting any message. FFFFFFFFh is a link proble
 7. **Vary:** cold or warm boot, PCIe speed, temperature, after firmware update, and with a media state that needs a rebuild.
 FOLLOW:
 - The DUT recovers after a longer wait every time. Fix the host or the DUT? => The DUT. CAP.TO is its promise, and a device that needs 14 s must advertise at least that. Raise the host timeout only as a diagnostic.
-- CSTS=0x0 appears only after an abrupt power cut. What next? => Suspect power-loss recovery in firmware (table rebuild) taking longer than TO. Time RDY across many abrupt cuts and check that CAP.TO covers the worst case.
+- CSTS=0x0 appears only after an abrupt power cut. What next? => Suspect power-loss recovery in firmware (table rebuild) taking longer than TO. CAP.TO is defined as the worst case, including after an abrupt shutdown or power loss (Base 2.3, Figure 36), so a controller that exceeds it violates its own promise. Time RDY across many abrupt cuts.
 PITFALL: Raising the host timeout and calling the problem solved. The test then passes while a real host with the default wait still fails.
-VERIFY: The exact wording of the dmesg messages on your kernel version, and whether a controller may legally exceed CAP.TO after an unsafe shutdown.
+VERIFY: The exact wording of the dmesg messages on your kernel version.
 
 @@ 2.16 | Principal | Scenario | tags=test-plan,conformance,stress,statistics,automation
 Q: Design a register-level conformance and stress plan for initialization, reset and shutdown, with pass criteria and sample sizes.
 SHORT: Build four groups: reset-value and invariance checks on every register, enable and disable handshake timing over thousands of cycles against CAP.TO, negative CC and AQA programming that must fail safe and recover, and shutdown and NSSR sequences. Pass means every bound is met on every cycle and no cycle needs a power cycle. Zero failures in 3000 cycles supports a failure rate under 0.1 percent at 95 percent confidence.
 DEEP:
-1. **Invariants:** after each reset type read CAP, VS and the default values of every writable register. CAP and VS should not change between resets. Linux re-reads CAP after its first CC write because it may change, so record any change and review it.
+1. **Invariants:** after each reset type read CAP, VS and the default values of every writable register. Exceptions (Base 2.3, 3.7.2): a Controller Reset leaves AQA, ASQ, ACQ, the PMR registers and CMBMSC alone, and an FLR leaves CMBMSC alone. CAP and VS should not change between resets, except that CAP.TO may change with CC.CRIME. Record any change and review it.
 2. **Handshake timing:** loop enable then disable, timestamp with an analyzer or a user-space driver (SPDK, pynvme), record RDY 0 to 1 and 1 to 0 latencies. Hard criterion: every latency under the advertised bound. Soft: p99.99 within an agreed margin of the bound.
 3. **Negative programming:** MPS outside MPSMIN to MPSMAX, unsupported CSS or AMS, wrong IOSQES or IOCQES, AQA at 2 and 4096 entries, changes while EN is 1. Criteria: no hang, no data corruption, recovery through CC.EN 1 to 0, and behavior recorded and stable between builds.
 4. **Access patterns:** 8-byte versus two 4-byte accesses in both orders, posted-write races (EN then immediate doorbell), doorbell writes before RDY.
@@ -368,13 +373,13 @@ FOLLOW:
 - One hang in 20,000 cycles. Pass? => No. A hang needing a power cycle is a fail. Keep the trace, then reproduce with an analyzer and identify the trigger.
 - Why not test on a system with the Linux driver bound? => The driver races the test, resets the controller on timeouts, and hides posting effects. Use vfio or a user-space driver, with the kernel driver unbound.
 PITFALL: Counting cycles without varying the environment. Ten thousand identical warm cycles at 25 C say little about a cold boot at temperature.
-VERIFY: The device's advertised bounds for each test, spec statements about which register values are preserved across each reset type, and behavior for invalid CC values.
+VERIFY: The device's advertised bounds for each test, and your own pass criteria for invalid CC values (Base 2.3 only says an unsupported AMS or MPS gives undefined behavior).
 
 @@ 2.17 | Principal | Cross-layer | tags=re-enable,stale-state,phase-tag,reset,queues
 Q: The controller enables and identifies fine the first time, but after a CC.EN reset the second enable times out on the first admin command. What stale state do you suspect, on the host and in the firmware?
-SHORT: RDY comes back to 1, so the register handshake works, but the queue state on the two sides is out of step. On the firmware side suspect admin queue head, tail or phase state not reset, or old AQA, ASQ and ACQ contents reused. On the host side suspect stale completion queue memory whose old phase bits look like new completions, or a submission tail that was not zeroed. Compare doorbell values, CQ contents and the SQE fetch on the bus.
+SHORT: RDY comes back to 1, so the register handshake works, but the queue state on the two sides is out of step. On the firmware side suspect admin queue head, tail or phase state not reset, or stale AQA, ASQ and ACQ values used. On the host side suspect stale completion queue memory whose old phase bits look like new completions, or a submission tail that was not zeroed. Compare doorbell values, CQ contents and the SQE fetch on the bus.
 DEEP:
-After a controller reset the contract is a blank slate. Both sides must start with SQ head and tail at 0, CQ head at 0, and the first pass of the CQ expecting phase 1.
+After a controller reset the queue state is a blank slate (AQA, ASQ and ACQ are the exception: a Controller Reset leaves their values alone). Both sides must start with SQ head and tail at 0, CQ head at 0, and the first pass of the CQ expecting phase 1.
 
 | Stale item | Where | Symptom |
 |---|---|---|
@@ -382,9 +387,9 @@ After a controller reset the contract is a blank slate. Both sides must start wi
 | SQ tail not reset | Host | Doorbell write with an old value: the controller sees a jump and fetches junk |
 | Firmware SQ head and CQ tail not reset | Device | Fetches from the wrong slot, completes to the wrong slot, wrong phase |
 | Phase expectation not reset | Device | Completions post with phase 0, host ignores them |
-| Old AQA, ASQ, ACQ kept | Device | Uses last time's addresses after the host allocated new ones |
+| AQA, ASQ, ACQ not rewritten, or new values ignored | Host or device | A Controller Reset keeps them by design, so old addresses stay in use after the host allocated new queue memory |
 | Outstanding Async Event Requests kept | Device | Host sees an event from before the reset, or none |
-| Features not back to defaults | Device | Different queue count, wrong interrupt settings |
+| Features not back to defaults | Device | Different queue count, wrong interrupt settings (only the Timestamp feature may be kept) |
 
 - **Method:** capture the second enable on an analyzer. Check the first SQE fetch address against ASQ, the completion write address against ACQ, and the phase bit of the completion. Compare with the first enable, which worked.
 - **Cross-layer check:** the interrupt path (MSI-X vector 0 masking after the first enable) can look identical to a lost completion. Read the CQ memory to tell them apart.
@@ -394,4 +399,4 @@ FOLLOW:
 - What resets the phase tag on the controller side? => The controller reset and queue creation. The first pass through any newly created CQ posts entries with phase 1.
 - Can this show up only with a full queue at reset? => Yes. Reset with commands outstanding leaves more state to clean, and testing it separately finds bugs an idle reset misses.
 PITFALL: Blaming the interrupt path first because "the command hangs". Read the CQ memory and the doorbell values before you look at MSI-X.
-VERIFY: The full list of state that a controller-level reset returns to defaults, including persistence of Feature values and pending Async Event Requests, in the Base Specification.
+VERIFY: Which Feature values and pending Async Event Requests a Controller Reset clears. Base 2.3 (3.7.2, CC.EN) says internal state such as Feature values not persistent across power states returns to default, and only the Timestamp feature was checked as a value that may be kept (5.2.26.1.7).

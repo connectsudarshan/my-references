@@ -52,7 +52,7 @@ DEEP:
 - **Transition:** as free blocks run out, GC copies valid pages to make space, write amplification rises above 1, and random write throughput drops, from a modest amount to several times depending on the design and over-provisioning.
 - **Steady state:** write amplification and throughput are stable. This is the number that matters for enterprise data sheets and for fleet planning.
 - **PTS-style sequence:**
-  1. Purge to a known state: `nvme format /dev/nvme0n1 --ses=1` or `nvme sanitize /dev/nvme0 --sanact=2`.
+  1. Purge to a known state: `nvme format /dev/nvme0n1 --ses=1` (Secure Erase Settings 001b, User Data Erase) or `nvme sanitize /dev/nvme0 --sanact=2` (Sanitize Action 010b, Block Erase), Base 2.3, 5.2.10 and 5.2.22.
   2. Workload-independent preconditioning: write the drive with large sequential blocks, a multiple of its capacity.
   3. Workload-dependent preconditioning: run the target workload in fixed rounds until steady state is reached.
   4. Measure over a defined window of rounds, and report the average of that window.
@@ -84,7 +84,7 @@ FOLLOW:
 - Does a 4 KiB write reach the same ceiling? => Roughly. The device issues read requests upstream and receives about 4,480 B of completions downstream, so downstream becomes the loaded direction.
 - What if the drive trains at Gen3 x4 by mistake? => The 4 KiB read ceiling halves to 861K and sequential to 3.6 GB/s. Check `LnkSta` first when a result is exactly half of the spec.
 PITFALL: Doubling the link rate to "16 GB/s" for both directions, or treating raw link bandwidth as the achievable sequential number.
-VERIFY: Framing and DLLP overhead for your generation, and the platform's MPS and MRRS settings.
+VERIFY: Framing and DLLP overhead for your generation (PCIe Base Specification) and the platform's MPS and MRRS settings.
 
 @@ 18.05 | Intermediate | Numeric | tags=littles-law,fio,iodepth,numjobs,rate-limit
 Q: You must show 800K IOPS of 4 KiB random reads at about 90 us average latency. Choose numjobs, iodepth and a rate limit, and say what each number means.
@@ -291,12 +291,12 @@ Illustrative drive: 1 TB, 100 GB SLC cache, 5 GB/s into SLC, 2 GB/s direct to TL
   - Fill level: run the same write at 10, 50 and 100 percent used (`size` or a partitioned span) to see the cache boundary.
   - Rate: throttle with `rate` to see whether the drop happens at the same total bytes written, which points to the cache.
   - Log: `write_bw_log` plus `log_avg_msec=1000` gives the time series, and compare the drop point with GB written.
-  - WA: compute NAND writes / host writes from the SMART or vendor log before and after.
+  - WA: compute media writes / host writes from the Endurance Group Information log (Media Units Written over Data Units Written) or a vendor or OCP log before and after. The SMART log has host writes only.
 FOLLOW:
 - Does a longer idle period restore the SLC cache? => Often, since the firmware migrates the cache to TLC in the background, but the time needed and the policy vary by drive. Measure idle-then-burst recovery for your product.
 - Why does write latency spike during GC while read latency also rises? => Both compete for the same dies and channels, and GC reads and programs pages in the background.
 PITFALL: Judging a drive on its first 20 seconds of writes.
-VERIFY: SLC cache sizing, migration policy and WA counters (SMART or OCP log fields) for your product.
+VERIFY: SLC cache sizing and migration policy are vendor specific. Check whether your product fills Media Units Written in the Endurance Group Information log or uses an OCP or vendor log.
 
 @@ 18.13 | Advanced | Trap | tags=fio,traps,alignment,page-cache,unmapped-reads,sync-engine
 Q: Your test script reports 1.4M IOPS from a drive rated at 1.0M. List the ways a fio test can produce false performance numbers.
@@ -312,9 +312,9 @@ DEEP:
 - **Wrong denominator:** MB/s versus MiB/s, or a 1 s sample that includes ramp-up.
 FOLLOW:
 - How do you detect the unmapped-read effect quickly? => Run the same read job before and after filling the span. If IOPS drop sharply or latency rises to NAND-like values, the first run was reading unmapped zeros.
-- What confirms the drive really saw the I/O? => Compare fio's issued bytes with the drive's host-read counters in the SMART log and, ideally, PCIe analyzer traffic.
+- What confirms the drive really saw the I/O? => Compare fio's issued bytes with the drive's host-read counters in the SMART log (Data Units Read is in thousands of 512-byte units, rounded up, so it needs a long run) and, ideally, PCIe analyzer traffic.
 PITFALL: Trusting the job file instead of the achieved queue depth, and never checking the drive-side counters.
-VERIFY: Which fio version changed defaults for percentiles and buffer handling, and the DLFEAT bits of the drive under test.
+VERIFY: Which fio version changed defaults for percentiles and buffer handling, and the DLFEAT bits of the drive under test (NVM Command Set Specification).
 
 @@ 18.14 | Advanced | Debug | tags=fio,output,tail-latency,stall,triage
 Q: Read this fio output. The average looks fine and IOPS are within 3 percent of expectation, yet a customer complains of latency spikes. What does the output tell you, and what do you do next?
@@ -383,7 +383,7 @@ DEEP:
 
 4. **Host:** per-core utilization while running. A fio thread at 100 percent means host-bound, so add jobs, check IRQ affinity, run on the drive's NUMA node, try `hipri` polling.
 5. **Device:**
-   - Read SMART and vendor counters for temperature and throttling.
+   - Read SMART and vendor counters for temperature and throttling. The SMART log has Warning and Critical Composite Temperature Time, and thermal management transition counts and times when host controlled thermal management is used (Base 2.3, 5.2.12.1.3).
    - Compare data written recently (in SLC or fresh blocks) with data migrated to TLC. A 2x difference in IOPS points at NAND read time.
    - Compare read spans of 1 GiB and the full drive to see die-collision and cache effects.
    - Use firmware debug counters (core utilization, die busy time) if you have access.
@@ -408,10 +408,10 @@ DEEP:
 | Device latency monitor | Time inside the controller | PCIe, SQE fetch and posting delays |
 
 - **Method:** timestamp all sources against one clock, compare histograms, not means, and study the tail buckets. A device-internal p99.99 of 1.8 ms with a host p99.99 of 6 ms points at the host or PCIe, not the firmware.
-- **Device latency monitoring:** the OCP Datacenter NVMe SSD specification defines a feature and log page that count commands over configurable latency thresholds, per read, write and trim class, inside the controller. Validate it by injecting a known delay and checking that the buckets and the host histogram agree within tolerance.
-- **Predictable latency:** NVMe defined Predictable Latency Mode with deterministic and non-deterministic windows on NVM Sets. Validate that reads in the deterministic window meet the bound and that GC is deferred to the other window.
+- **Device latency monitoring:** Base 2.3 defines no latency monitor. The OCP Datacenter NVMe SSD specification defines a feature and log page that count commands over configurable latency thresholds, per read, write and trim class, inside the controller. Validate it by injecting a known delay and checking that the buckets and the host histogram agree within tolerance.
+- **Predictable latency:** Base 2.3 (8.1.19) defines Predictable Latency Mode per NVM Set, reported by CTRATT bit 5. The host enables it with Feature 13h and the set then starts in the Non-Deterministic Window (NDWIN). Feature 14h selects the Deterministic Window (DTWIN) or NDWIN. Log 0Ah gives the current window, the typical and maximum limits (DTWIN Reads Typical in 4 KiB random reads, Writes Typical in Optimal Write Size units, DTWIN Time Maximum) and reliable estimates of what remains. Log 0Bh lists the NVM Sets with pending events. If the host exceeds a limit, or a Deterministic Excursion occurs, the set may leave DTWIN by itself. The latency values are vendor specific and cover the NVM subsystem, not the PCIe or fabric path, although Identify's NVM Set entry gives a Random 4 KiB Read Typical time in 100 ns units. Validate that reads in DTWIN meet the vendor bound while the host stays inside the estimates, that maintenance and GC move to NDWIN, and that the events fire when thresholds are crossed.
 FOLLOW:
 - Why is the device monitor not enough on its own? => It cannot see delay before the controller fetches the command or after it posts the completion, such as a delayed doorbell or a late interrupt.
 - How do you validate the monitor itself? => Inject a controlled stall (firmware hook, throttle or analyzer-side delay), then compare bucket counts with host-side histograms of the same window.
 PITFALL: Quoting a QoS number with no drive state, queue depth or window, which makes the claim unfalsifiable.
-VERIFY: OCP Datacenter NVMe SSD specification revision, the latency monitor feature ID and log page ID (believed to be log page C3h), its bucket layout, and NVMe Predictable Latency Mode requirements (feature, log pages and NVM Set behavior) in the NVMe Base Specification revision you target.
+VERIFY: OCP Datacenter NVMe SSD specification revision, the latency monitor feature ID and log page ID (believed to be log page C3h) and its bucket layout, all in the OCP specification, which is not part of Base 2.3.

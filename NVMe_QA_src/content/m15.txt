@@ -12,13 +12,12 @@ DEEP:
 - **What it means for a PCIe SSD engineer:** the SSD is usually behind a target, so a firmware stall becomes a network-visible event (keep-alive expiry, reconnect) rather than only a driver timeout.
 FOLLOW:
 - Is an NVMe-oF target always an SSD? => No. A target implements an NVM subsystem: Linux nvmet or SPDK in front of PCIe SSDs, an array controller, or a bridge chip. The SSD behind it may not know fabrics exist.
-- Where are Fabrics commands specified in NVMe 2.x? => In the Base specification, with the RDMA and TCP transport specifications defining the bindings. FC-NVMe is a T11 standard.
+- Where are Fabrics commands specified in NVMe 2.x? => In the Base specification chapter 6 (Base 2.3), with the RDMA and TCP transport specifications defining the transport bindings. FC-NVMe is INCITS 556 (FC-NVMe-2), developed by the T11 committee.
 PITFALL: Treating NVMe-oF as "NVMe over Ethernet only". Fibre Channel and InfiniBand are fabrics too, and TCP runs over any IP network.
-VERIFY: Which 2.x document defines what (Base, RDMA transport, TCP transport) and the FC-NVMe standard reference.
 
 @@ 15.02 | Basic | Concept | tags=nqn,addressing,host-nqn,discovery-nqn
 Q: What is an NQN, and what does a host need in order to reach a fabrics subsystem?
-SHORT: An NVMe Qualified Name (NQN) is a globally unique text name for a subsystem or a host, in the form nqn.yyyy-mm.reverse-domain:unique-string or nqn.2014-08.org.nvmexpress:uuid:<uuid>, at most 223 bytes. To connect, a host needs the transport type, address and service ID (port) plus the subsystem NQN, and it presents its own host NQN and host ID. The discovery subsystem has the well-known NQN nqn.2014-08.org.nvmexpress.discovery.
+SHORT: An NVMe Qualified Name (NQN) is a globally unique text name for a subsystem or a host, in the form nqn.yyyy-mm.reverse-domain:unique-string or nqn.2014-08.org.nvmexpress:uuid:<uuid>, at most 223 bytes (Base 2.3, 4.7). To connect, a host needs the transport type, address and service ID (port) plus the subsystem NQN, and it presents its own host NQN and host ID. The discovery subsystem has the well-known NQN nqn.2014-08.org.nvmexpress.discovery.
 DEEP:
 | Item | Example | Where it comes from |
 |---|---|---|
@@ -33,13 +32,12 @@ nvme connect -t tcp -a 10.0.0.5 -s 4420 -n nqn.2024-05.com.example:jbof1-ssd0 -q
 ```
 
 - **Default ports:** 4420 for NVMe/TCP and NVMe/RDMA I/O controllers, 8009 for a TCP discovery service.
-- **Access control:** a target may keep an allowed-host list by host NQN. An unknown host gets Connect status SCT 1, SC 84h (Invalid Host), and Linux logs `Connect for subsystem <nqn> is not allowed, hostnqn: <nqn>`.
+- **Access control:** a target may keep an allowed-host list by host NQN. An unknown host gets Connect status SCT 1, SC 84h, Connect Invalid Host, and Linux logs `Connect for subsystem <nqn> is not allowed, hostnqn: <nqn>`.
 - **Same name elsewhere:** Identify Controller SUBNQN returns the subsystem NQN, also on PCIe SSDs (see module 1).
 FOLLOW:
 - What breaks when a VM template is cloned with its hostnqn file? => Two hosts present the same host NQN, and allowed-host lists, reservations and target-side bookkeeping become ambiguous. Linux even warns when the same hostnqn shows up with a different hostid.
 - Is the NQN the same as the controller ID? => No. The NQN names the subsystem. The controller ID (CNTLID) names one controller inside it and is assigned at Connect.
 PITFALL: Hard-coding one subsystem NQN in a test and reusing it on two targets. NQNs must be unique per subsystem, or path detection and multipath grouping collapse two devices into one.
-VERIFY: The exact NQN grammar and the 223-byte limit in the Base Specification.
 
 @@ 15.03 | Basic | Concept | tags=transports,rdma,tcp,fc,loop
 Q: Compare the RDMA, TCP and Fibre Channel transports. Which would you pick for a validation lab?
@@ -59,13 +57,13 @@ FOLLOW:
 - Which RDMA flavors exist? => InfiniBand, RoCE (v1 legacy and v2, UDP/IP routable) and iWARP (RDMA over TCP). The discovery log's RDMA provider type field names them.
 - Does NVMe/TCP need TCP offload? => No. It works with plain NICs, and offload only reduces CPU.
 PITFALL: Comparing NVMe/TCP and NVMe/RDMA throughput on different NICs, MTUs and CPU governors, then blaming the protocol.
-VERIFY: How FC-NVMe creates associations and connections (Link Service names) if you rely on them.
+VERIFY: How FC-NVMe creates associations and connections (Link Service names); this lives in INCITS 556 (FC-NVMe-2), not the Base Specification.
 
 @@ 15.04 | Intermediate | Concept | tags=capsule,in-capsule-data,ioccsz,iorcsz,sgl
 Q: What is a capsule, and which Identify Controller fields describe its size?
-SHORT: A command capsule is a 64-byte submission queue entry plus optional in-capsule data. A response capsule is the 16-byte completion entry. Identify Controller reports IOCCSZ and IORCSZ (capsule sizes in 16-byte units, including the SQE and CQE), ICDOFF (where in-capsule data starts) and MSDBD (SGL data block descriptors per command). Small writes fit in the capsule, larger data moves by the transport.
+SHORT: A command capsule is a 64-byte submission queue entry plus optional in-capsule data. A response capsule is the 16-byte completion entry. Identify Controller reports IOCCSZ and IORCSZ (capsule sizes in 16-byte units, including the SQE and CQE), ICDOFF (where in-capsule data starts) and MSDBD (SGL data block descriptors per command). Small writes fit in the capsule, larger data moves by the transport. (Base 2.3, 5.2.13.2.1)
 DEEP:
-- **Sizes in units of 16 bytes:** IOCCSZ counts the whole command capsule, including the 64-byte SQE, so 4 means no room for data. IORCSZ = 1 means a bare CQE.
+- **Sizes in units of 16 bytes:** IOCCSZ counts the whole command capsule, including the 64-byte SQE, so the minimum allowed value is 4 (no room for data). IORCSZ's minimum allowed value is 1 (a bare 16-byte CQE).
 - **Worked example:** IOCCSZ = 260 gives 260 x 16 = 4160 bytes, so 4160 - 64 = 4096 bytes of in-capsule data. The Linux target computes this as (64 + inline size) / 16.
 - **Data pointer:** fabrics uses SGLs only, never PRPs (see module 4). In-capsule data is an SGL Data Block descriptor with the Offset subtype (1h). RDMA uses a Keyed Data Block descriptor (type 4h). The Linux TCP host uses a Data Block descriptor with the transport-specific subtype (Ah) for data moved by PDUs.
 - **Decision on the host:** if the write length fits in the advertised in-capsule size, send it inline and save a round trip. Otherwise send only the command and let the target pull or request the data.
@@ -75,7 +73,7 @@ FOLLOW:
 - Does a response capsule ever carry data? => Not in the basic model. Read data comes as separate data transfers, and the response capsule is the CQE.
 - Who decides the in-capsule size? => The controller advertises what it accepts. The host must not exceed it.
 PITFALL: Forgetting that IOCCSZ includes the SQE. Reading 260 as 4160 bytes of data is off by 64.
-VERIFY: Minimum values and exact units of IOCCSZ, IORCSZ and ICDOFF, and the admin capsule size for each transport.
+VERIFY: The admin queue capsule size is fixed by each NVMe Transport binding specification (RDMA, TCP, FC-NVMe), not the Base spec (Base 2.3, 3.3.2.1.1); confirm the 8 KiB NVMe/TCP figure against the NVMe over TCP Transport Specification.
 
 @@ 15.05 | Intermediate | Concept | tags=connect,property-get,property-set,fctype,bring-up
 Q: What are the Fabrics commands, and how does a host bring a fabrics controller up?
@@ -87,18 +85,17 @@ DEEP:
 4. Identify Controller, then Set Features Number of Queues.
 5. **Connect, each I/O queue:** QID 1 to N, SQSIZE (zero-based), and the CNTLID from step 2.
 
-- **Connect command:** RECFMT, QID, SQSIZE, CATTR (one bit disables SQ flow control), KATO in milliseconds. The 1024-byte data holds HOSTID (16 B), CNTLID (2 B), SUBNQN (256 B at offset 256) and HOSTNQN (256 B at offset 512).
-- **Connect failures (SCT 1):** 80h incompatible format, 81h controller busy, 82h invalid parameters (DW0 gives the offset and whether it is in the command or data), 83h restart discovery, 84h invalid host.
-- **Property access:** 4 or 8 bytes at a register offset. Doorbells, AQA, ASQ and ACQ do not exist, because queues come from Connect.
+- **Connect command:** RECFMT, QID, SQSIZE (0's based), CATTR, KATO in milliseconds. CATTR (Base 2.3, 6.3) has four defined bits: bit 4 CONNENT (Discovery controller vs host), bit 3 INDIVIOQDELS (host supports individual I/O Queue deletion), bit 2 DISSQFC (request to disable SQ flow control), bits 1:0 PRIOCLASS (WRR priority, I/O Queues only). The 1024-byte data holds HOSTID (16 B), CNTLID (2 B), SUBNQN (256 B at offset 256) and HOSTNQN (256 B at offset 512).
+- **Connect failures (SCT 1):** 80h Incompatible Format, 81h Controller Busy, 82h Connect Invalid Parameters (DW0 gives the offset and whether it is in the command or data), 83h Connect Restart Discovery, 84h Connect Invalid Host.
+- **Property access:** 4 or 8 bytes at a register offset. CAP, VS, CC, CSTS and CRTO are the mandatory properties for a message-based controller (Base 2.3, 3.1.4); doorbells, AQA, ASQ and ACQ are reserved (do not exist) for fabrics, because queues come from Connect.
 FOLLOW:
 - Why still run Set Features Number of Queues? => It sets how many I/O queues the controller accepts. A Connect with a QID above that gets Invalid Parameters, with DW0 pointing at the QID field.
 - Which command carries the keep-alive timeout? => Connect on the admin queue (KATO), adjustable with Set Features KATO, and renewed with the Keep Alive command (opcode 18h).
 PITFALL: Expecting Create I/O SQ/CQ on a fabrics controller. Those commands are not used, and Connect replaces them.
-VERIFY: Which controller properties Property Get and Set may access, the CATTR bit list, and the DW0 layout of the Connect response and error cases.
 
 @@ 15.06 | Intermediate | Concept | tags=discovery,discovery-log,lid70,genctr,referral
 Q: How does discovery work, and what is in the discovery log page?
-SHORT: A host connects to a discovery controller, at a known address (TCP port 8009 by convention) with NQN nqn.2014-08.org.nvmexpress.discovery, and reads Get Log Page LID 70h. The log has a 1024-byte header with a generation counter (GENCTR), the record count (NUMREC) and format (RECFMT), followed by 1024-byte entries. Each entry gives the transport, address, port, subsystem NQN, subsystem type and requirements for one reachable port.
+SHORT: A host connects to a discovery controller, at a known address (TCP port 8009 by convention) with NQN nqn.2014-08.org.nvmexpress.discovery, and reads Get Log Page LID 70h. The log has a 1024-byte header with a generation counter (GENCTR), the record count (NUMREC) and format (RECFMT), followed by 1024-byte entries (Base 2.3, 5.2.12.3.3). Each entry gives the transport, address, port, subsystem NQN, subsystem type and requirements for one reachable port.
 DEEP:
 - **Entry fields:** TRTYPE, ADRFAM, SUBTYPE, TREQ, PORTID, CNTLID (dynamic or static), ASQSZ, EFLAGS, TRSVCID, SUBNQN, TRADDR and a transport-specific TSAS field. Each entry is 1024 bytes.
 - **SUBTYPE:** 1 a referral to another discovery service, 2 an NVM subsystem, 3 the current discovery subsystem.
@@ -119,8 +116,7 @@ subnqn:  nqn.2024-05.com.example:jbof1-ssd0    traddr:  10.0.0.5
 FOLLOW:
 - Why do validators read the log twice? => To check that GENCTR is stable and that NUMREC and the entries agree. A torn read after a port change is a real target bug class.
 - What is a referral? => An entry of subtype 1 pointing at another discovery service, so a host can walk a tree of discovery controllers.
-PITFALL: Assuming the discovery log lists only what the caller may access. It lists what the target advertises, and a Connect can still be refused as Invalid Host.
-VERIFY: LID 70h, entry and header layout, subtype values and the asynchronous event for a discovery log change in the Base Specification.
+PITFALL: Assuming the discovery log lists only what the caller may access. It lists what the target advertises, and a Connect can still be refused as Connect Invalid Host.
 
 @@ 15.07 | Intermediate | Cross-layer | tags=queues,doorbells,pcie-differences,sqhd,flow-control
 Q: What disappears or changes in the queue model when NVMe moves from PCIe to fabrics?
@@ -141,11 +137,11 @@ DEEP:
 - **SQ flow control:** the target returns the SQ head in each response so the host never overruns it. A Connect attribute can disable this, and then the host must limit itself by queue depth alone.
 - **Phase tag:** no longer needed to find new entries, because each response arrives as a message.
 - **Queue count:** Linux defaults to one I/O queue per online CPU (queue size 128), and each queue is a separate connection.
+- **Not supported over fabrics (Base 2.3, Figure 28 and Figure 32):** the Create/Delete I/O Submission/Completion Queue admin commands are mandatory for PCIe and not supported for Fabrics; the Interrupt Coalescing (Feature ID 08h) and Interrupt Vector Configuration (09h) features are likewise PCIe-only. Property Get/Set exposes no PCIe-only registers: AQA, ASQ, ACQ, doorbells, NSSR and the CMB/PMR/boot-partition properties are reserved for message-based controllers.
 FOLLOW:
 - What does the host lose without MSI-X? => Nothing of the NVMe semantics. The transport wakes the host: a socket callback on TCP or a completion queue event on RDMA. Coalescing knobs of module 10 do not apply.
 - What happens to queue depth limits? => MQES in CAP still bounds SQSIZE, and Linux clamps the queue size to it and to MAXCMD.
 PITFALL: Applying PCIe reasoning about shared CQs or doorbell batching to fabrics, where neither exists.
-VERIFY: Which Get/Set Features and admin commands are not supported over fabrics, and whether Property Get/Set exposes any PCIe-only registers.
 
 @@ 15.08 | Advanced | Concept | tags=rdma,keyed-sgl,memory-registration,rdma-read,invalidate
 Q: How does NVMe over RDMA move data? Explain the keyed SGL, memory registration and who initiates each transfer.
@@ -166,7 +162,7 @@ FOLLOW:
 - Why is in-capsule data valuable on RDMA? => It avoids registration and an RDMA Read round trip for small writes.
 - How do you see this on a wire? => RoCEv2 traces show Send, RDMA Read Request and Response, RDMA Write and Send with Invalidate. tcpdump cannot see it on hardware-offloaded NICs, so use NIC mirroring or an RDMA-aware capture.
 PITFALL: Assuming the host sends write data. In NVMe/RDMA the target pulls it, so the target must be able to reach the host buffer at that moment.
-VERIFY: SGL subtype Fh semantics, the exact RDMA CM private data fields, and the MDTS cap for the Linux target on your kernel.
+VERIFY: SGL descriptor subtypes Ah to Fh are defined as "NVMe Transport Specific" by Base 2.3 (4.3.2, Figure 117), so the exact subtype Fh (remote invalidation) semantics and the RDMA CM private data fields live in the NVMe over RDMA Transport Specification, not the Base spec. The MDTS cap for the Linux target on your kernel is also outside the Base spec.
 
 @@ 15.09 | Advanced | Concept | tags=tcp,pdu,icreq,r2t,h2cdata,c2hdata,digest
 Q: List the NVMe/TCP PDU types and explain the sequence for a write and a read.
@@ -231,10 +227,10 @@ DEEP:
 - **Test design:** define the pass criterion by which knob you set. KATO gives detection time, ctrl_loss_tmo gives the time to removal, and fast I/O fail or multipath gives the time to an error or failover.
 - **Both sides expire:** a 5-second KATO means the target may tear down the controller at about the same moment the host does, so the reconnect gets a new controller with a new CNTLID.
 FOLLOW:
-- What is traffic-based keep-alive? => A controller attribute (TBKAS) where normal traffic counts as liveness, so the host sends Keep Alive only after quiet periods.
+- What is traffic-based keep-alive? => The TBKAS bit in Controller Attributes (Identify Controller): if set, the controller restarts its Keep Alive Timeout Interval whenever it fetches any Admin or I/O command, so the host need not send Keep Alive during active traffic (Base 2.3, 3.9.3.1).
 - What does a negative ctrl_loss_tmo do? => Retry forever, the setting used when hosts must survive long target outages.
 PITFALL: Reading KATO as an I/O error timeout. It is a liveness timer, and it is the start of recovery, not the end.
-VERIFY: Keep-alive and requeue behavior in your kernel version, including fast_io_fail_tmo and whether multipath is enabled, and the exact TBKAS rules.
+VERIFY: Keep-alive and requeue behavior in your kernel version, including fast_io_fail_tmo and whether multipath is enabled.
 
 @@ 15.12 | Principal | Cross-layer | tags=latency,error-semantics,path-errors,reconnect,budget
 Q: A tenant says the same SSD is twice as slow over NVMe/TCP as local for 4 KiB QD1 reads. Build a latency budget, find which part is the fabric, and explain how error behavior differs from PCIe.
@@ -256,13 +252,13 @@ These numbers are illustrative assumptions. Replace them with measurements.
 4. **CPU and IRQ:** check softirq and interrupt affinity, busy poll settings and CPU frequency. NVMe/TCP is sensitive to them.
 5. **Tail:** compare p99.99, since retransmits and CPU jitter dominate, not the SSD.
 
-- **Error differences:** timeouts trigger controller teardown and reconnect and not Abort or a controller reset of the SSD. Path statuses (SCT 3: Controller Path Error 60h, Host Path Error 70h, Host Aborted Command 71h, ANA states 01h to 03h) tell multipath what to do.
-- **Stale write hazard:** after a reconnect the host re-sends in-flight writes on a new connection. Test whether the target drains or aborts the old queue's commands, because a late old write landing after a newer write to the same LBA is a data-integrity bug.
+- **Error differences:** timeouts trigger controller teardown and reconnect and not Abort or a controller reset of the SSD. Path Related Status (SCT 3, Base 2.3, 4.2.3): 60h Controller Pathing Error, 70h Host Pathing Error, 71h Command Aborted By Host, and ANA states 01h Asymmetric Access Persistent Loss, 02h Asymmetric Access Inaccessible, 03h Asymmetric Access Transition tell multipath what to do.
+- **Stale write hazard:** after a reconnect the host re-sends in-flight writes on a new connection. Test whether the target drains or aborts the old queue's commands, because a late old write landing after a newer write to the same LBA is a data-integrity bug. Base 2.3 does not say how a target must order this drain on a general connection loss; it only defines outstanding-command behavior as undefined for an explicit Exported Port delete (8.3-family commands).
 FOLLOW:
 - Which change gives the biggest QD1 gain? => Moving from kernel TCP to RDMA or polled I/O. A larger queue depth hides latency but not the QD1 number.
 - Why compare p99.99 too? => Fabric tails come from retransmits and scheduling, so a good median can hide a bad tail.
 PITFALL: Benchmarking over a path with a 200 microsecond retransmit or a busy CPU and reporting it as a transport property.
-VERIFY: SCT 3 status values and the target's teardown ordering rules in the Base Specification.
+VERIFY: The target's exact teardown ordering on a transport connection loss (as opposed to an admin-initiated port delete) is not specified in the Base Specification; confirm against your target implementation.
 
 @@ 15.13 | Principal | Debug | tags=dmesg,keep-alive,reconnect,triage,tcpdump
 Q: A host logs the lines below every few hours against a JBOF. Decide whether the SSD, the target or the network is at fault, and describe your evidence plan.
@@ -320,4 +316,4 @@ FOLLOW:
 - How does a host boot from a fabrics namespace? => Firmware with an NVMe-oF initiator connects, and an NVMe Boot Firmware Table (NBFT) hands the connection data to the OS. Earlier setups used initramfs scripts. Test reconnect during boot.
 - What is the special risk of an EBOF? => The bridge chip becomes part of the path. It may reorder, rewrite Identify data or limit MDTS and queue counts, so validate the bridge and the SSD separately.
 PITFALL: Running only local SSD tests and assuming they cover a fabrics deployment. Timeouts, reconnect, MDTS and queue limits change at the target, and only a fabric run shows it.
-VERIFY: NBFT definition and support level in your firmware and OS, and any passthrough limits in your kernel version.
+VERIFY: NBFT is defined in the NVM Express Boot Specification (not the Base Specification); confirm support level in your firmware and OS, and any passthrough limits in your kernel version.

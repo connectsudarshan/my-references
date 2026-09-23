@@ -194,7 +194,7 @@ rows = [
 y = 48
 for st, kind, desc, new, old, calc in rows:
     b += [rect(10, y, 80, 38, 'box', 4), text(50, y + 17, st, 's h'), text(50, y + 30, kind, 'xs d')]
-    b += cell(96, y, 200, 38, 'box', [desc] if desc else ['operational:', 'no ENLAT or EXLAT used'], 'xs', 'xs')
+    b += cell(96, y, 200, 38, 'box', [desc] if desc else ['operational: ENLAT/EXLAT', 'apply, but Linux ignores these'], 'xs', 'xs')
     b += cell(302, y, 210, 38, 'dl' if new != 'none' else 'box', [new], 's')
     b += cell(518, y, 232, 38, 'tl' if old != 'none' else 'box', [old, '(%s)' % calc] if calc else [old], 's', 'xs d')
     y += 42
@@ -284,9 +284,10 @@ for names, cells, gcls, gl, (pcls, pl_) in ops:
     y += 54
 f1 = 'Filled = in scope. Dashed = only if asked for (all namespaces, FNA, listed LBAs). Blank = outside the scope the text gives.'
 f2 = 'Opal Revert or GenKey can act on one locking range, not the whole subsystem. SES=0 read-back and secure-erase wording: VERIFY.'
-chk(f1, 'xs', 740); chk(f2, 'xs', 740)
-b += [text(10, y + 10, f1, 'xs d', 'start'), text(10, y + 22, f2, 'xs d', 'start')]
-py = y + 34
+f3 = 'Crypto erase row is Sanitize SANACT=4 (whole subsystem). Sanitize Namespace (8Ch) is the same erase for one namespace.'
+chk(f1, 'xs', 740); chk(f2, 'xs', 740); chk(f3, 'xs', 740)
+b += [text(10, y + 10, f1, 'xs d', 'start'), text(10, y + 22, f2, 'xs d', 'start'), text(10, y + 34, f3, 'xs d', 'start')]
+py = y + 46
 panels = [
     (8, 'dl', 'Scope first', ['Format can be limited to one', 'namespace. Sanitize cannot: on a', 'drive with two namespaces it', 'destroys both, attached or not.']),
     (259, 'pl', 'Guarantee second', ['Logical (Deallocate, Format SES=0):', 'the mapping changes. Physical (block', 'erase, overwrite, key destruction):', 'the media or the key changes.']),

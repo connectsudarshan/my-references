@@ -15,6 +15,7 @@ FOLLOW:
 - Can a namespace use two formats at once? => No. One format is in use, and switching means Format NVM (destructive) or creating the namespace again with a different FLBAS.
 - Does metadata reduce the capacity NSZE reports? => No. The drive must find flash for it, usually in NAND spare area or by giving up some over-provisioning.
 PITFALL: Calling LBADS plus MS "the sector size". The logical block is LBADS only, and metadata rides alongside it.
+VERIFY: The LBA Format descriptor, FLBAS, MC, DPC and DPS layouts and NSZE, NCAP and NUSE are defined in the NVM Command Set Specification. Base 2.3 only selects the format in Format NVM through LBAFL (bits 3:0) and LBAFU (bits 13:12) (5.2.10).
 
 @@ 8.02 | Basic | Concept | fig=pifmt | tags=pi,guard,app-tag,ref-tag,end-to-end
 Q: What is in the 8-byte Protection Information tuple, and where is it generated and checked?
@@ -41,16 +42,15 @@ Q: What is the difference between extended-LBA metadata and a separate metadata 
 SHORT: With an extended LBA, each block's metadata follows its data in the same host buffer, so a block is LBADS + MS bytes and PRPs or SGLs describe one interleaved stream. With a separate buffer, data is a plain LBADS stream and the metadata lives in its own contiguous buffer addressed by the Metadata Pointer (MPTR, SQE DW4-5). FLBAS bit 4 selects the mode per format, and MC says which modes the controller supports.
 DEEP:
 - **Extended:** N blocks need N x (LBADS + MS) bytes. DPTR (PRP or SGL) covers all of it. MPTR is not used. This is the DIF-style layout: data, then its metadata, then the next block.
-- **Separate:** N blocks need N x LBADS through DPTR, and N x MS bytes in one physically contiguous buffer pointed to by MPTR. With SGLs, the PSDT field in CDW0 selects whether MPTR is a contiguous buffer (01b) or points to an SGL segment for the metadata (10b).
+- **Separate:** N blocks need N x LBADS through DPTR, and N x MS bytes in one physically contiguous buffer pointed to by MPTR. With PRPs (PSDT 00b) MPTR must be dword aligned. With SGLs, PSDT (CDW0 bits 15:14) selects whether MPTR is a contiguous buffer (01b, byte alignment only if SGLS.MBA is set) or the address of a qword-aligned segment holding exactly one SGL descriptor for the metadata (10b, needs SGLS.MSDS) (Base 2.3, Figures 91 and 92).
 - **Chosen per format, not per command:** MSET in Format NVM sets it, so a host cannot mix modes on one namespace.
-- **Host stack reality:** the Linux PCIe driver uses a separate buffer for block-layer PI and only permits extended-LBA formats through passthrough. Fabrics support only the extended form.
+- **Host stack reality:** the Linux PCIe driver uses a separate buffer for block-layer PI and only permits extended-LBA formats through passthrough. Fabrics support only the extended form (Base 2.3, 2.2: no separate metadata buffer, no MPTR).
 - **What it means for firmware:** the DMA engine must gather two streams (data and metadata) in separate mode, or handle blocks that are not page multiples in extended mode. Both paths need tests.
 - **The no-metadata case:** with PRACT=1 and MS equal to the PI size, neither mode is used because no metadata crosses the interface (see 8.06).
 FOLLOW:
 - Which mode is better for the host? => Separate keeps data buffers page-friendly and matches the block layer. Extended keeps data and metadata in one DMA stream, which fits fabrics capsules.
 - Where is MPTR in the SQE? => Bytes 16 to 23 (DW4 and DW5).
 PITFALL: Treating extended LBA as just a bigger sector. I/O sizes are no longer multiples of 4096, and a 4104-byte block straddles page boundaries.
-VERIFY: MPTR alignment rule and the PSDT encodings for metadata SGLs in the NVMe Base Specification.
 
 @@ 8.04 | Intermediate | Numeric | tags=numeric,extended-lba,overhead,prp
 Q: For a 4 KiB + 8 B format, work out the extended-LBA size, the buffers for a 128 KiB write in both modes, and the overhead. How does 512 B + 8 B compare?
@@ -62,12 +62,12 @@ DEEP:
 4. Flash cost: 8 / 4096 = 0.195 percent, about 1.95 GB per 1 TB of user data. At 512 B + 8 it is 1.56 percent (15.6 GB per TB). At 4096 + 64 it is 1.56 percent, and at 4096 + 16 (a 16-byte PI format) 0.39 percent.
 5. PCIe cost (assuming MPS 256 and 24 bytes of TLP overhead, as on the PCIe page): plain data is 512 TLPs, the extended buffer is 131,328 / 256 = 513 TLPs. Useful-data efficiency moves from 91.4 to 91.25 percent. The link cost is negligible. The visible cost is alignment and the extra small DMA in separate mode.
 6. Small case: one 4 KiB extended I/O is 4104 bytes, which spans two pages, so PRP1 and PRP2 (no list). Eight blocks are 32,832 bytes, which is 8 pages plus 64 bytes, so 9 PRP entries.
+- **MDTS:** CTRATT bit 16 (MEM) decides whether metadata counts. With MEM = 0 the limit includes interleaved metadata, so the 131,328-byte extended write exceeds an MDTS of 128 KiB and is aborted with Invalid Field in Command. With MEM = 1 the limit excludes metadata (Base 2.3, Figure 328, MDTS and CTRATT).
 - **Assumptions:** 4 KiB page, page-aligned buffer, 24 bytes of TLP overhead, decimal TB for the flash cost.
 FOLLOW:
 - Why do vendors prefer 4 KiB blocks with PI? => Eight times less PI overhead per byte, and one PI tuple per 4 KiB matches the flash mapping unit.
 - What happens to a 128 KiB I/O in extended mode when the host buffer is not page aligned? => It can touch one more page, so it needs one more PRP entry. Only the first PRP entry may carry an offset, the rest are page aligned.
 PITFALL: Forgetting that with PRACT=1 and MS=8 the host buffer is plain 4096 bytes per block, not 4104.
-VERIFY: Whether MDTS is applied to data only or to data plus metadata for extended LBA formats.
 
 @@ 8.05 | Intermediate | Concept | tags=pi-types,type1,type2,type3,reference-tag
 Q: How do PI Types 1, 2 and 3 differ, and how does the Reference Tag behave in each?
@@ -83,12 +83,12 @@ DEEP:
 - **Type 1 catches misdirected I/O:** a block returned for the wrong LBA carries the wrong reference tag, so the check fails even though its Guard is perfectly valid.
 - **Type 2 exists** for hosts whose tags are not the on-disk LBA, for example virtual addresses that are remapped later. Linux treats Types 1 and 2 alike for reference tag checks and remaps tags between virtual and physical block numbers for partitions and stacked devices.
 - **Type 3** gives the controller only the Guard to check, so it detects corruption but not misdirection.
-- **Mismatched ILBRT:** on Type 1, sending a check request with an ILBRT that is not the low 32 bits of the SLBA is commonly rejected as Invalid Protection Information (command specific status 0x81). QEMU's emulation does this with DNR set.
+- **Mismatched ILBRT:** on Type 1, sending a check request with an ILBRT that is not the low 32 bits of the SLBA is commonly rejected as Invalid Protection Information (SCT 1, SC 81h, listed in Base 2.3, Figure 104). QEMU's emulation does this with DNR set.
 FOLLOW:
 - Which type does Linux use for a namespace formatted Type 3? => It generates and verifies the Guard only, and does not enable reference tag checking.
 - Why is the reference tag only 32 bits when LBAs are 64 bits? => It is inherited from the T10 DIF format. See the aliasing trap in 8.11.
 PITFALL: Assuming the Reference Tag always equals the LBA. That is Type 1 (and how Linux uses Type 2), not a general rule.
-VERIFY: Type 3 Reference Tag semantics and the exact status returned for a Type 1 ILBRT mismatch in the NVM Command Set Specification.
+VERIFY: Type 3 Reference Tag semantics, and when 81h (rather than 84h) is returned for a Type 1 ILBRT mismatch, in the NVM Command Set Specification. Base 2.3 only lists the codes.
 
 @@ 8.06 | Intermediate | Concept | tags=pract,prchk,generate,strip
 Q: What does PRACT do on reads and writes, and how does it depend on the metadata size?
@@ -149,6 +149,7 @@ FOLLOW:
 - How would dps look with Type 3 and PI in the last 8 bytes on a 4096 + 64 format? => 0x03. Bits 2:0 = 3, bit 3 = 0, and the tuple is at metadata bytes 56 to 63.
 - What does `nvme format --pi=3` need first? => dpc bit 2 must be set, and it erases the namespace.
 PITFALL: Reading dps bit 3 as an enable bit. PI is on when dps bits 2:0 are nonzero, and bit 3 only says where the tuple sits.
+VERIFY: The flbas, mc, dpc and dps bit layouts in the NVM Command Set Specification. Base 2.3 leaves Format NVM PI, PIL and MSET (CDW10 bits 7:5, 8, 4) I/O Command Set specific.
 
 @@ 8.09 | Advanced | Cross-layer | tags=host,controller,linux,blk-integrity,gaps
 Q: Who checks what in an end-to-end protected I/O, and which failures does PI still miss?
@@ -217,7 +218,7 @@ nvme0n1: ref tag error at location 4099 (rcvd 4100)
 blk_update_request: protection error, dev nvme0n1, sector 32792 op 0x0:(READ)
 ```
 The first line is printed by the block layer's own verify (the controller had returned success), and shows the expected and received tags. A controller-detected error gives only "protection error" (Linux maps the guard, app and ref codes to BLK_STS_PROTECTION).
-3. **Error Information log:** `nvme error-log /dev/nvme0` shows the failing CID, status and LBA when the drive records it.
+3. **Error Information log:** `nvme error-log /dev/nvme0` shows the failing CID, status and, for I/O commands, the LBA, when the CQE had M set. Read it before any controller reset, because the controller should clear the log on a Controller Level Reset (Base 2.3, 5.2.12.1.2).
 4. **Re-read raw:** `nvme read /dev/nvme0n1 -s 4096 -c 7 -z 32768 -y 64 -p 0 -d d.bin -M m.bin` (a 4096 + 8 separate-metadata format, zero-based -c 7 is 8 blocks). Split m.bin into 8-byte tuples and unpack with `struct.unpack(">HHI", ...)`.
 5. **Classify:**
 
@@ -234,7 +235,7 @@ FOLLOW:
 - The CQE has DNR=1. Will Linux retry? => No. Retry needs DNR clear and retries below max_retries (5 by default).
 - How do you tell a host-detected from a controller-detected error? => Host detections print the "guard tag error" or "ref tag error" line and the command completes successfully. Controller detections show a non-zero status in traces and the error log.
 PITFALL: Retrying with PRCHK enabled only. Read once with checks off, because the stored tuple is the evidence.
-VERIFY: The unit of the location number in the block layer messages on your kernel, and which fields your drive fills in the Error Information log.
+VERIFY: The unit of the location number in the block layer messages on your kernel, and the meaning of the log entry LBA field for the NVM command set (Base 2.3 defers it to the NVM Command Set Specification).
 
 @@ 8.13 | Advanced | Numeric | tags=numeric,crc16,fault-injection,probability
 Q: How many random corruptions must a fault-injection test apply to see one Guard escape, and what can you assume about small errors?
@@ -257,8 +258,8 @@ PITFALL: Treating one random-garbage escape as a bug. Only structured errors (si
 Q: What changed in PI with the later command set specifications: 64-bit guards, storage tags and larger PI formats?
 SHORT: Later NVM Command Set revisions add PI formats beyond the classic 16-bit Guard: a 64-bit guard CRC with a 16-byte tuple, in which the Reference Tag field grows to a 48-bit combined tag. A 32-bit guard format is also defined. Identify reports the format per LBA format through the extended LBA format array, together with a storage tag size, and a storage tag check error status was added. Verify all details against the spec revision you test.
 DEEP:
-- **What is confirmed in Linux and SPDK headers:** the NVM-specific Identify Namespace structure has `elbaf[64]`. Each entry has a storage tag size in bits 6:0 and a PI format in bits 8:7, where 0 = 16-bit guard, 1 = 32-bit guard, 2 = 64-bit guard. Linux defines a 16-byte tuple for the 64-bit case: 8-byte guard, 2-byte Application Tag, 6-byte Reference Tag. SPDK defines status 0x88, End-to-end Storage Tag Check Error, next to 0x82 to 0x84.
-- **Controller side:** Linux reads the ELBAF data only when the controller advertises extended LBA format support in CTRATT.
+- **What is confirmed in Linux and SPDK headers:** the NVM-specific Identify Namespace structure has `elbaf[64]`. Each entry has a storage tag size in bits 6:0 and a PI format in bits 8:7, where 0 = 16-bit guard, 1 = 32-bit guard, 2 = 64-bit guard. Linux defines a 16-byte tuple for the 64-bit case: 8-byte guard, 2-byte Application Tag, 6-byte Reference Tag. SPDK defines status 0x88, End-to-end Storage Tag Check Error, next to 0x82 to 0x84, and Base 2.3 lists it as SCT 2, SC 88h (Figure 106).
+- **Controller side:** the capability is CTRATT bit 15, Extended LBA Formats Supported (ELBAS, Base 2.3, Figure 328), and Linux reads the ELBAF data only when it is set. The host must also set LBA Format Extension Enable (LBAFEE) in the Host Behavior Support feature (5.2.26.1.14), otherwise Format NVM to such a format fails with Invalid Namespace or Format (5.2.10).
 - **Escape rule:** for the 64-bit format Linux treats Application Tag 0xFFFF as the "no check" escape when reference tag checking is on (Types 1 and 2), and requires the 48-bit reference tag to be all ones as well when it is off (Type 3).
 - **Overhead:** a 16-byte PI on 4 KiB blocks is 0.39 percent (16 / 4096) versus 0.195 percent for 8 bytes.
 - **CRC differences:** the 64-bit CRC in Linux and QEMU uses all-ones initial value and final XOR, unlike the CRC-16 T10-DIF that starts at 0. Reusing a CRC-16 helper or its zero-block identity does not carry over.
@@ -267,7 +268,7 @@ FOLLOW:
 - What is the storage tag? => A tag field of size STS from the ELBAF entry, part of the tag space that the host can use as an opaque tag instead of a sequential reference tag. Check the exact split in the spec.
 - Does Format NVM select the PI format? => It selects an LBA format, and the format's ELBAF entry carries the PI format.
 PITFALL: Hard-coding the 8-byte tuple and the 0x8BB7 polynomial in a harness. A namespace with a 64-bit guard breaks every offset and CRC.
-VERIFY: Guard and PI sizes per PI format, the tag split with STS, CRC-32C and CRC-64 parameters, the CTRATT bit for extended LBA formats, and the revision that introduced each.
+VERIFY: Guard and PI sizes per PI format, the tag split with STS, CRC-32C and CRC-64 parameters, and the revision that introduced each, in the Protection Information Formats section of the NVM Command Set Specification.
 
 @@ 8.15 | Principal | Scenario | tags=test-plan,negative-tests,matrix,coverage
 Q: How would you design a protection-information validation plan for a new enterprise SSD, including negative tests?

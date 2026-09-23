@@ -2,32 +2,32 @@
 
 @@ 13.01 | Basic | Concept | tags=log-pages,lid,overview,discovery
 Q: Which log pages matter for reliability and validation, and what does each one tell you?
-SHORT: Get Log Page (opcode 02h) reads the drive's self-reported state. The ones to know are 01h Error Information, 02h SMART/Health, 03h Firmware Slot, 04h Changed Namespace List, 05h Commands Supported and Effects, 06h Device Self-test, 07h and 08h Telemetry, 09h Endurance Group and 0Dh Persistent Event. In NVMe 1.x only the first three are mandatory, so check what a drive supports before testing it.
+SHORT: Get Log Page (opcode 02h) reads the drive's self-reported state. The ones to know are 01h Error Information, 02h SMART/Health, 03h Firmware Slot, 04h Changed Attached Namespace List, 05h Commands Supported and Effects, 06h Device Self-test, 07h and 08h Telemetry, 09h Endurance Group and 0Dh Persistent Event. Up to 1.4 only 01h to 03h were mandatory. Base 2.3 (Figure 31) adds 00h, 05h and 12h for I/O controllers.
 DEEP:
 | LID | Log page | What a validator uses it for |
 |---|---|---|
 | 01h | Error Information | Tie a failed CQE to a reason, parameter location and LBA |
 | 02h | SMART / Health Information | Wear, temperature, counters, Critical Warning |
 | 03h | Firmware Slot Information | Which image is active, which activates at next reset |
-| 04h | Changed Namespace List | Which NSIDs changed after an attribute-changed event |
+| 04h | Changed Attached Namespace List | Which NSIDs changed, attached, detached or were deleted since the last read |
 | 05h | Commands Supported and Effects | Which opcodes exist and what side effects they have |
 | 06h | Device Self-test | Progress and results of self-test runs |
 | 07h, 08h | Telemetry Host / Controller-Initiated | Vendor internal state snapshots for debug |
 | 09h | Endurance Group Information | Per-group wear, host vs media writes |
 | 0Dh | Persistent Event Log | Power, reset, firmware, format and sanitize history |
 
-- **Others:** 00h Supported Log Pages (NVMe 2.0 and later), 0Ch ANA, 80h Reservation Notification, 81h Sanitize Status. LIDs C0h to FFh are vendor specific.
-- **Discovery:** Identify Controller LPA bits say which optional features exist, the Commands Supported and Effects log lists commands, and LID 00h lists logs on newer drives. An unsupported LID fails with Invalid Log Page (SCT 1, SC 09h).
+- **Others:** 00h Supported Log Pages, 0Ch ANA, 12h Feature Identifiers Supported and Effects, 1Ch Changed Allocated Namespace List, 80h Reservation Notification, 81h Sanitize Status. LIDs C0h to FFh are vendor specific. Older documents call 04h the Changed Namespace List.
+- **Mandatory for an I/O controller (Base 2.3, Figure 31):** 01h, 02h (controller scope), 03h, and also 00h, 05h and 12h, which were optional up to 1.4. 13h (NVMe-MI Commands Supported and Effects) is mandatory only if NVMe-MI Send and Receive are supported. Everything else is optional.
+- **Discovery:** Identify Controller LPA bits say which optional features exist (LPA bit 0 per-namespace SMART, 1 effects log, 2 extended data, 3 telemetry, 4 persistent event, 5 Supported Log Pages and related logs, 6 telemetry data area 4). The Commands Supported and Effects log lists commands, and LID 00h lists logs. An unsupported or reserved LID fails with Invalid Log Page (SCT 1, SC 09h). Controllers built to 2.2 or earlier may return Invalid Field in Command for a reserved LID (Figure 321).
 - **Tools:** `nvme smart-log`, `nvme error-log`, `nvme fw-log`, `nvme effects-log`, `nvme self-test-log`, `nvme telemetry-log`, or the generic `nvme get-log /dev/nvme0 --log-id=<n> --log-len=<bytes>`. nvme-cli 3.0 moves the `*-log` commands under `nvme log` (for example `nvme log smart`) and keeps the old names as deprecated aliases. The command encoding (NUMD, LPO, RAE) is in the Admin Command Set module, and field-level decoding is here.
 FOLLOW:
-- How do you know which logs a drive supports? => Identify Controller LPA and CTRATT bits, LID 00h on NVMe 2.0 drives, and finally an actual Get Log Page that returns Invalid Log Page if the LID is not implemented.
-- Are logs per controller or per namespace? => Mostly per controller. A few take another selector: SMART can be per namespace when LPA says so, and Endurance Group logs select a group.
+- How do you know which logs a drive supports? => LID 00h (Supported Log Pages, LSUPP bit per LID) and the Identify Controller LPA and OAES bits, CTRATT bit 4 for Endurance Groups, and finally an actual Get Log Page that returns Invalid Log Page if the LID is not implemented.
+- Are logs per controller or per namespace? => Each LID has a scope in Figure 206. Error Information, Changed Attached Namespace List, Commands Supported and Effects and ANA are controller scope, Persistent Event is NVM subsystem scope, SMART is controller scope or namespace scope (LPA bit 0), and Endurance Group logs select a group in CDW11 LSI. Controller and subsystem scope logs reject any NSID other than 0 or FFFFFFFFh.
 PITFALL: Treating vendor LIDs (C0h to FFh) as portable. The same LID means different things on different vendors, so parse it only after checking the vendor and any log GUID.
-VERIFY: Which logs are mandatory in your target revision, LPA and CTRATT bit positions, and the exact LID assignments for 80h and above.
 
 @@ 13.02 | Basic | Concept | tags=smart,health,critical-warning,layout
 Q: What is in the SMART / Health Information log page, and what do the Critical Warning bits mean?
-SHORT: Log page 02h is a 512-byte structure. Byte 0 is Critical Warning, bytes 2:1 the composite temperature in Kelvin, then Available Spare, its threshold and Percentage Used. From byte 32 come 128-bit little-endian counters: data units read and written, host commands, busy time, power cycles, power-on hours, unsafe shutdowns, media errors and error log entries. Critical Warning bit 0 is spare, 1 temperature, 2 reliability, 3 read-only, 4 volatile memory backup.
+SHORT: Log page 02h is a 512-byte structure. Byte 0 is Critical Warning, bytes 2:1 the composite temperature in Kelvin, then Available Spare, its threshold and Percentage Used. From byte 32 come 128-bit counters: data units, host commands, busy time, power cycles, power-on hours, unexpected power losses (formerly unsafe shutdowns), media errors and error log entries. Critical Warning bit 0 is spare, 1 temperature, 2 reliability, 3 read-only, 4 volatile memory backup, 5 PMR, 6 personality.
 DEEP:
 | Bytes | Field |
 |---|---|
@@ -39,57 +39,57 @@ DEEP:
 | 79:64, 95:80 | Host Read Commands, Host Write Commands |
 | 111:96 | Controller Busy Time |
 | 127:112, 143:128 | Power Cycles, Power On Hours |
-| 159:144 | Unsafe Shutdowns |
+| 159:144 | Unexpected Power Losses (formerly Unsafe Shutdowns) |
 | 175:160 | Media and Data Integrity Errors |
 | 191:176 | Number of Error Information Log Entries |
 | 195:192, 199:196 | Warning and Critical Composite Temperature Time |
 | 215:200 | Temperature Sensors 1 to 8 (2 bytes each) |
 | 231:216 | Thermal Management T1 and T2 transition counts and times |
+| 239:232, 243:240 | Operational Lifetime Energy Consumed (Wh), Interval Power Measurement |
 
-- **Critical Warning bits:** 0 spare below threshold, 1 temperature over or under a threshold, 2 reliability degraded (significant media errors or an internal error), 3 media placed in read-only mode, 4 volatile memory backup device failed, 5 Persistent Memory Region read-only or unreliable (NVMe 1.4 and later).
-- **Reporting:** the drive can raise a SMART/Health asynchronous event when a bit is set, if the host enabled that bit in Feature 0Bh. Reading the log with RAE = 0 re-arms the event.
-- **Scope:** the host reads it with NSID FFFFFFFFh for controller-wide data. Per-namespace SMART is optional.
+- **Critical Warning bits (Base 2.3, Figure 210):** 0 available spare below threshold, 1 temperature at or over an over-temperature threshold or at or under an under-temperature threshold, 2 NVM subsystem reliability degraded (significant media errors or an internal error), 3 all media placed in read-only mode (not counting namespace write protection), 4 volatile memory backup device failed, 5 Persistent Memory Region read-only or unreliable, 6 indeterminate personality state, 7 reserved. Byte 6 (Endurance Group Critical Warning Summary) covers only 3 of these per Endurance Group: available spare below threshold (bit 0), degraded reliability (bit 2) and read-only (bit 3); bits 1, 4, 5, 6 are reserved there, not a full summary.
+- **Reporting:** the drive can raise a SMART/Health asynchronous event when a bit is set, if the host enabled that bit in Feature 0Bh (SMART / Health Critical Warnings, CDW11 bits 7:0). Reading the log with RAE = 0 clears the event so it can fire again.
+- **Scope:** NSID 0h or FFFFFFFFh returns the controller log, and hosts should use FFFFFFFFh for compatibility with 1.4 and earlier. Per-namespace SMART is optional (LPA bit 0). Base 2.3 defines no namespace-specific fields, so both forms return identical data. Without LPA bit 0, another NSID fails with Invalid Field in Command.
 - **Temperature:** Kelvin, so 311 is 38 C. Sensor and threshold detail is in the Power Management and Thermal module.
 FOLLOW:
-- Is Critical Warning sticky? => The bits reflect current conditions, but when a bit clears is up to the firmware, so a test should record when it sets and when it clears rather than assume.
-- Who sets bit 2? => The firmware, when it judges reliability degraded. The trigger conditions are vendor policy, so read the product's specification.
+- Is Critical Warning sticky? => Base 2.3 says the bits represent the state when the Get Log Page command is processed and may differ from the state when a related event fired. It does not say when a condition stops applying, so a test should record when each bit sets and clears rather than assume.
+- Who sets bit 2? => The firmware, when it judges reliability degraded by significant media errors or an internal error. The trigger thresholds are vendor policy, so read the product's specification.
 PITFALL: Parsing counters as 64-bit values or reading Celsius where the field holds Kelvin. Both give plausible-looking wrong numbers.
-VERIFY: Byte offsets against the Base Specification for your revision, Critical Warning bit 5, and whether the drive supports per-namespace SMART (LPA bit 0).
 
 @@ 13.03 | Basic | Trap | tags=percentage-used,available-spare,endurance,wear
 Q: A drive reports Percentage Used = 100. Has it failed, and how does that field differ from Available Spare?
-SHORT: No. Percentage Used is the vendor's estimate of how much rated endurance has been consumed, based on actual use and the manufacturer's prediction. 100 means the estimate is consumed, not that the drive stopped, and the value may exceed 100 (values above 254 read as 255). Available Spare is separate: the remaining spare capacity as a normalized percentage, compared against Available Spare Threshold.
+SHORT: No. Percentage Used is the vendor's estimate of how much rated endurance has been consumed, based on actual use and the manufacturer's prediction. Base 2.3 says 100 may not indicate a failure and the value is allowed to exceed 100 (above 254 reads as 255). Available Spare is separate: the remaining spare capacity as a normalized percentage, compared against Available Spare Threshold.
 DEEP:
-- **Percentage Used:** an integer, so it moves in coarse steps. For a 3.84 TB drive rated at 7,008 TB written, one step is about 70 TB of host writes. Some revisions say it is updated only once per power-on hour, so do not expect it to move right after a write burst.
-- **Available Spare:** starts at 100 and falls as blocks are retired. Below Available Spare Threshold the drive sets Critical Warning bit 0 and may send an asynchronous event.
+- **Percentage Used:** an integer, so it moves in coarse steps. For a 3.84 TB drive rated at 7,008 TB written, one step is about 70 TB of host writes. Base 2.3 says it shall be updated once per power-on hour (while the controller is not in a sleep state), so do not expect it to move right after a write burst.
+- **Available Spare:** a normalized percentage (0 to 100) of remaining spare capacity, normally 100 on a new drive, falling as blocks are retired. Below Available Spare Threshold (0 to 100) the drive sets Critical Warning bit 0 and an asynchronous event may occur.
 - **Independent:** a drive can show 90 percent used with 100 percent spare (healthy NAND, heavy workload), or 5 percent used with spare below threshold (a bad NAND lot). Watch both.
 - **What the drive does at end of life:** policy is vendor specific. It may keep working past 100, or enter read-only mode (Critical Warning bit 3), or report reliability degraded (bit 2).
 - **Validation rules of thumb:**
-  - Percentage Used should never decrease.
+  - Percentage Used should not decrease in practice. Base 2.3 calls it a vendor specific estimate and does not forbid a decrease, so treat a drop as a finding to ask about.
   - An erase such as Format or Sanitize must not lower it, because wear is physical.
   - Compare it with host bytes written (module 13, Numeric questions) to sanity check the wear model.
 FOLLOW:
-- Can Percentage Used exceed 100? => Yes, the field is allowed to exceed 100 and saturates at 255. Some vendors let drives run past the rated life.
+- Can Percentage Used exceed 100? => Yes, Base 2.3 allows it to exceed 100 and says values above 254 are reported as 255. Some vendors let drives run past the rated life.
 - Is remaining life simply 100 minus Percentage Used? => Only as a rough guide. It assumes the workload and write amplification stay constant, and the vendor's model decides the slope.
-PITFALL: Writing a test that fails the drive at Percentage Used = 100. The specification does not say the drive is dead at that point.
-VERIFY: The exact wording and end-of-life behavior for Percentage Used, its update interval (once per power-on hour in some revisions), and whether the value may decrease.
+PITFALL: Writing a test that fails the drive at Percentage Used = 100. The specification says 100 may not indicate a failure.
+VERIFY: Base 2.3 does not say what a drive does at end of life or whether Percentage Used may decrease.
 
 @@ 13.04 | Intermediate | Concept | tags=smart,counters,data-units,busy-time,unsafe-shutdown
 Q: What exactly does each SMART counter count, and which of them are easy to misread?
-SHORT: All are 128-bit little-endian values that persist for the life of the drive. Data Units are 512-byte units reported in thousands and rounded up, so 1 means up to 512,000 bytes. Host Read and Write Commands count completed commands. Controller Busy Time is in minutes, Power On Hours in hours. Unsafe Shutdowns counts power loss without a shutdown notification. Media and Data Integrity Errors counts unrecovered data integrity errors.
+SHORT: The counters are 128-bit values kept over the life of the controller and across power cycles. Data Units are 512-byte units reported in thousands and rounded up, so 1 means up to 512,000 bytes. Host Read and Write Commands count completed commands. Controller Busy Time is in minutes, Power On Hours in hours. Unexpected Power Losses (formerly Unsafe Shutdowns) counts power loss when CSTS.SHST is not 10b. Media and Data Integrity Errors counts unrecovered errors.
 DEEP:
-- **Data Units Read and Written:** one unit is 1000 x 512 B = 512,000 B. They cover user data and exclude metadata. Because values are rounded up, tiny workloads look larger than they are.
-- **Host Read Commands:** completed read commands. For the NVM command set this includes Compare. **Host Write Commands** counts write commands.
-- **Controller Busy Time:** minutes in which the controller was busy with I/O commands, from submission until all outstanding I/O completes. Busy percent = busy minutes / (POH x 60).
-- **Power Cycles and Power On Hours:** POH may exclude time spent in low-power non-operational states, so it is not wall-clock time.
-- **Unsafe Shutdowns:** incremented when power is lost without a shutdown notification (CC.SHN). A clean CC.SHN shutdown followed by power off does not count.
-- **Media and Data Integrity Errors:** occurrences where the controller detected an unrecovered data integrity error, such as uncorrectable ECC, a CRC failure or an LBA tag mismatch. Correctable ECC events are not counted here.
+- **Data Units Read and Written:** one unit is 1000 x 512 B = 512,000 B. They cover user data and exclude metadata. Because values are rounded up, tiny workloads look larger than they are. A value of 0 means the counter is not reported.
+- **Host Read Commands:** SMART Host Read Commands completed by the controller. **Host Write Commands** counts User Data Out Commands completed. Base 2.3 leaves the list of counted commands to the I/O command set specification.
+- **Controller Busy Time:** minutes during which a command is outstanding on an I/O queue, from the I/O SQ tail doorbell write until the completion is posted. Busy percent = busy minutes / (POH x 60).
+- **Power Cycles and Power On Hours:** POH may exclude time the controller was powered but in a non-operational power state, so it is not wall-clock time.
+- **Unexpected Power Losses (formerly Unsafe Shutdowns):** incremented if, and only if, main power is lost while the controller does not report it is ready to be powered off (CSTS.SHST is not 10b), or while out-of-band Ignore Shutdown processing left the media not shut down. So a shutdown notification only avoids the count if power stays up until SHST reads 10b. Base 2.3 also warns that the next initialization may then take longer.
+- **Media and Data Integrity Errors:** occurrences where the controller detected an unrecovered data integrity error, such as uncorrectable ECC, a CRC failure or an LBA tag mismatch. Errors made by a Write Uncorrectable command may or may not be counted. Correctable ECC events are not counted here.
 - **Number of Error Information Log Entries:** a lifetime count of error log entries, not how many the log currently holds. It lines up with the Error Count in log page 01h (see Status Codes module).
 FOLLOW:
-- Do the counters survive power loss? => They are meant to persist, but firmware often saves them periodically, so the last stretch of activity before an abrupt power loss can be missing. Ask the firmware team for the save interval.
+- Do the counters survive power loss? => Base 2.3 says the log is retained across power cycles unless otherwise specified, but it does not say how often firmware saves it, so the last stretch of activity before an abrupt power loss can be missing. Ask the firmware team for the save interval.
 - Does reading the SMART log change any counter? => It is an admin command, so Host Read Commands (I/O) should not change. Confirm by reading twice on an idle drive.
 PITFALL: Multiplying Data Units by 512 instead of 512,000 and reporting a terabyte-scale drive as having written megabytes.
-VERIFY: Exact counting rules for Host Read/Write Commands (which commands count, when failed commands count), whether Compare and Verify are included, and the POH definition for your revision.
+VERIFY: Which commands count as Host Read and Host Write Commands, whether Compare and Verify are included, and whether failed commands count (NVM Command Set Specification; Base 2.3 defers the list to it).
 
 @@ 13.05 | Intermediate | Numeric | tags=data-units,tbw,dwpd,average-io-size,busy-time
 Q: A 3.84 TB SSD reports Data Units Written = 2,000,000,000, Host Write Commands = 250,000,000,000, Power On Hours = 8,760 and Controller Busy Time = 40,000. What can you compute from it?
@@ -102,7 +102,7 @@ DEEP:
 5. Average write rate: 1.024e15 B / (8,760 x 3,600 s) = 32.5 MB/s, about 117 GB per hour.
 6. Busy time: 8,760 h x 60 = 525,600 min, so 40,000 / 525,600 = 7.6 percent. A queue-depth-1 device is busy any time one command is in flight, so this says little about throughput.
 
-- **Assumptions:** decimal TB (nvme-cli and smartctl print with the same factor), POH equals wall-clock time, and the drive has been at this workload all along.
+- **Assumptions:** decimal TB (nvme-cli and smartctl print with the same factor), POH equals wall-clock time, and the drive has been at this workload all along. The 512,000 B unit is from Base 2.3, 5.2.12.1.3.
 - **Resolution:** one unit is 512,000 B, so a test must move at least 100 units (51.2 MB) to see 1 percent accuracy, and 1 GiB is about 2,097 units.
 - **Reads:** 5,500,000,000 read units would be 2,816 TB. Read and write units use the same size.
 FOLLOW:
@@ -111,64 +111,65 @@ FOLLOW:
 PITFALL: Comparing TB from the SMART log (decimal) with a rating expressed in TiB, or with fio output in MiB, without converting. That is a 10 percent error at the tera scale.
 
 @@ 13.06 | Intermediate | Concept | tags=firmware-slot,changed-ns-list,afi,aen,rae
-Q: What do the Firmware Slot Information and Changed Namespace List logs contain, and how do you use them in tests?
-SHORT: Log 03h is 512 bytes: the Active Firmware Info byte (bits 2:0 active slot, bits 6:4 slot that activates at next reset) followed by seven 8-byte ASCII revision strings. Log 04h is up to 1,024 NSIDs in ascending order, listing namespaces changed since the last read, and a first entry of FFFFFFFFh means more than 1,024 changed. Both pair with an asynchronous event that stays disarmed until the log is read with RAE = 0.
+Q: What do the Firmware Slot Information and Changed Attached Namespace List logs contain, and how do you use them in tests?
+SHORT: Log 03h is 512 bytes: the Active Firmware Info byte (bits 2:0 active slot, bits 6:4 slot that activates at the next Controller Level Reset, 0 meaning not indicated) followed by seven 8-byte ASCII revision strings. Log 04h is up to 1,024 NSIDs in ascending order, listing namespaces changed since the last read, and a first entry of FFFFFFFFh means more than 1,024 changed. Both pair with an asynchronous event that stays pending until the log is read with RAE = 0.
 DEEP:
 - **Firmware Slot log:**
   - AFI = 0x21 means slot 1 is running and slot 2 becomes active at the next reset.
-  - AFI bits 6:4 = 0 means no pending image, the next reset uses the running one.
-  - Bytes 63:8 hold the revision strings FRS1 to FRS7. A blank or zero string means an empty slot.
-  - The revision of the active slot should equal Identify Controller FR.
+  - AFI bits 6:4 = 0 means the controller does not indicate a next slot. Treat it as nothing pending, but confirm against the commit action used.
+  - Bytes 63:8 hold the revision strings FRS1 to FRS7. A zero string means no valid image or an unsupported slot. The slot count (1 to 7) is Identify Controller FRMW bits 3:1, and FRMW bit 0 set means slot 1 is read-only.
+  - The revision of the active slot should equal Identify Controller FR, which holds the currently active firmware revision.
 - **Firmware validation:** commit with an action that defers activation, read the log, reset, read again. The pending slot must appear, then become active. See the Admin Command Set module for the commit actions.
 - **Changed Namespace List:**
-  - Generated for the Namespace Attribute Changed notice, after Namespace Management, Attachment, Format or a capacity change.
+  - Reports, since the last read, attached namespaces whose Identify data changed, plus namespaces newly attached, detached or deleted (Base 2.3, 5.2.12.1.5).
   - 4,096 bytes: up to 1,024 NSIDs, ascending, zero after the last one.
   - If more than 1,024 changed, the first entry is FFFFFFFFh and the rest are zero.
-- **The asynchronous event:** notices are only reported when the host enabled them (Feature 0Bh). Reading with RAE = 1 does not re-arm, so later changes go unreported.
+  - The Changed Allocated Namespace List (1Ch) is the twin for allocated namespaces, whether attached or not.
+- **The asynchronous events:** Attached Namespace Attribute Changed is Notice type, information 00h, enabled by Feature 0Bh CDW11 bit 8 and cleared by reading log 04h with RAE = 0. Firmware Activation Starting is information 01h (bit 9), cleared by reading log 03h with RAE = 0. While an event is pending and uncleared, later changes are not reported again, so polling with RAE = 1 hides them.
 FOLLOW:
-- Does reading the Changed Namespace List clear it? => The list is meant to report changes since it was last read, and the read is what re-arms the event. Check how your drive treats RAE = 1 reads.
-- What does a test expect after Namespace Delete? => The deleted NSID appears in the list and the host gets one notice. Then a subsequent re-read with RAE = 0 must show an empty list.
+- Does reading the Changed Attached Namespace List clear it? => The list covers changes since it was last read, and a read with RAE = 0 clears the event. Base 2.3 does not say whether a RAE = 1 read empties the list, so test how your drive treats it.
+- What does a test expect after Namespace Delete? => A delete received on the Admin queue does not generate the notice on the controller that processed it. Other controllers with the namespace attached do send it (Base 2.3, 8.1.16.2). Check the list per controller, then a re-read with RAE = 0 should be empty.
 PITFALL: Polling this log with RAE = 1 from a monitor. The host stops receiving the event, and a driver that relies on it never rescans.
-VERIFY: FRMW bit meanings (slot 1 read-only, number of slots), whether the Changed Namespace List clears on read with RAE = 1, the AEC bit and notice info values, and the NVMe 2.4 rename to Changed Attached Namespace List (per nvme-cli 3.0 NEWS).
+VERIFY: Whether a RAE = 1 read empties the Changed Attached Namespace List (Base 2.3 does not say), and whether the deleting controller lists the deleted NSID in its own log (Base 2.3 does not say).
 
 @@ 13.07 | Intermediate | Concept | tags=effects-log,commands-supported,csupp,cse,conformance
 Q: What is in the Commands Supported and Effects log, and how would you use it as a conformance oracle?
-SHORT: Log 05h is 4,096 bytes: 256 dwords indexed by admin opcode, 256 dwords indexed by I/O opcode, and 2,048 reserved bytes. Each dword has CSUPP (bit 0), LBCC, NCC, NIC and CCC (bits 1 to 4) effect flags, and a Command Submission and Execution field at bits 18:16. It tells you which commands the drive really implements, so you compare it against the behavior you observe.
+SHORT: Log 05h is 4,096 bytes: 256 dwords indexed by admin opcode, 256 dwords indexed by I/O opcode, and 2,048 reserved bytes. Each dword has CSUPP (bit 0), LBCC, NCC, NIC and CCC (bits 1 to 4) effect flags, and a Command Submission and Execution field at bits 18:16, with UUID selection and scope bits above. It tells you which commands the drive implements, so compare it with observed behavior.
 DEEP:
-- **Layout:** dword N of the first half is admin opcode N, and dword N of the second half is I/O opcode N. Vendor-specific opcodes (admin C0h to FFh, I/O 80h to FFh) also appear here.
+- **Layout:** dword N of the first half is admin opcode N, and dword N of the second half is I/O opcode N. Vendor-specific opcodes (I/O 80h to FFh, and by convention admin C0h to FFh) also appear here. The I/O half describes the command set selected by CC.CSS, or by CDW14.CSI when CC.CSS is 110b.
 - **Bits:** CSUPP supported, LBCC logical block content change, NCC namespace capability change, NIC namespace inventory change, CCC controller capability change. CSE = 001b means the host should not have other commands outstanding to the same namespace, 010b to any namespace.
-- **Newer revisions:** add a UUID selection bit (19) and command scope bits (31:20).
+- **Also in 2.3:** USS (bit 19, UUID selection supported), CSER (bits 15:14, relaxed submission rules: 01b means only no outstanding Admin command affecting any namespace, and a host that understands it ignores CSE) and the CSP scope bits (31:20: namespace, controller, NVM set, Endurance Group, domain, NVM subsystem). CSP is reported only if Identify Controller LPA bit 5 is set.
 - **Consumers:** Linux reads it at controller init and consults the effects when a passthrough command runs, deciding whether to quiesce I/O or rescan namespaces afterwards (check your kernel).
 - **Conformance checks:**
   1. For each CSUPP = 1, issue the command with valid arguments. It must not fail with Invalid Command Opcode (SC 01h).
   2. For each opcode with the entry zero, expect SC 01h.
-  3. Cross-check with Identify Controller bits: OACS (Format, Firmware, Security, Namespace Management, Self-test) and ONCS (Compare, Write Zeroes, Dataset Management, Verify, Write Uncorrectable). They should agree.
+  3. Cross-check with Identify Controller bits: OACS bits 0 to 4 (Security, Format, Firmware, Namespace Management, Self-test) and ONCS bits 0 to 3 and 7 (Compare, Write Uncorrectable, Dataset Management, Write Zeroes, Verify). They should agree. In 2.3 some ONCS bits only say the size-limit fields apply, so a zero bit with a non-zero limit can still mean support.
   4. For LBCC = 1 commands (Write, Write Zeroes, Format), verify that content actually changed.
 FOLLOW:
 - Why is CSE useful to a validator? => It states which commands the drive needs isolated from others, so a stress test can avoid overlapping a Format with I/O on that namespace unless it wants a negative case.
 - Does an opcode appearing here prove it works? => No. It proves the drive claims support. Behavior still has to be tested.
 PITFALL: Trusting Identify and this log independently. When the two disagree, the drive has a conformance bug, and that mismatch is a valuable test finding.
-VERIFY: Bit positions for CSE, UUID selection and scope in your revision, and the ONCS and OACS bit assignments.
+VERIFY: The admin vendor opcode range: Base 2.3 Figure 28 leaves the opcode value blank for admin Vendor Specific, so C0h to FFh is convention.
 
 @@ 13.08 | Intermediate | Concept | tags=self-test,dst,edstt,dsto,log-06h
 Q: How does the Device Self-test command work, and how do you read its log?
-SHORT: The Device Self-test admin command (opcode 14h) starts a short or extended background test, or aborts one, selected by the test code in CDW10. The command completes quickly and the test runs on. Log 06h reports the current operation, its percent complete, and the newest 20 results, each 28 bytes. Identify Controller gives the extended test time in minutes (EDSTT) and DSTO says whether tests run one at a time across controllers.
+SHORT: The Device Self-test admin command (opcode 14h) starts a short or extended background test, or aborts one, selected by the test code in CDW10. The command completes quickly and the test runs on. Log 06h reports the current operation, its percent complete, and the newest 20 results, each 28 bytes. Identify Controller gives the nominal extended test time in minutes (EDSTT), and DSTO says whether only one test may run per NVM subsystem.
 DEEP:
-- **Command:** opcode 14h. CDW10 bits 3:0 select the test: 1 short, 2 extended, Fh abort. NSID selects scope: a namespace, all attached namespaces (FFFFFFFFh), or controller only (0).
-- **Capability:** OACS bit 4 advertises support. EDSTT (Identify Controller bytes 317:316) is the extended test time in minutes, and DSTO bit 0 says only one test can run at a time.
-- **Concurrency:** a second start while one runs fails with Device Self-test In Progress (command specific status, SCT 1 SC 1Dh; generic SC 1Dh is Sanitize In Progress). I/O keeps working during the test, possibly slower.
-- **Log 06h:** byte 0 current operation (bits 3:0), byte 1 completion (bits 6:0, percent), bytes 3:2 reserved, then 20 result entries of 28 bytes from byte 4. Total 564 bytes, newest first.
+- **Command:** opcode 14h. CDW10 bits 3:0 select the test: 1 short, 2 extended, 3 Host-Initiated Refresh (2.3), Eh vendor specific, Fh abort. NSID selects scope: a namespace, all attached namespaces (FFFFFFFFh), or controller only (0). An invalid NSID gives Invalid Namespace or Format and an inactive one Invalid Field in Command (Base 2.3, 5.2.5).
+- **Capability:** OACS bit 4 advertises support. EDSTT (Identify Controller bytes 317:316) is the nominal extended test time in one-minute units in power state 0. DSTO (byte 318) bit 0 (SDSO) set means one test at a time in the whole NVM subsystem, cleared means one per controller.
+- **Concurrency:** starting a test while one is in progress fails with Device Self-test In Progress (command specific status, SCT 1 SC 1Dh; generic SC 1Dh is Sanitize In Progress). Abort while idle succeeds and changes nothing. I/O keeps working during the test, possibly slower.
+- **Log 06h:** byte 0 current operation (bits 3:0: 0 none, 1 short, 2 extended, 3 refresh), byte 1 completion (bits 6:0, percent), bytes 3:2 reserved, then 20 result entries of 28 bytes from byte 4. Total 564 bytes, newest first.
 - **What to test:**
-  1. Short test completes in a bounded time (the specification asks for two minutes or less) and logs result 0.
+  1. Short test completes in a bounded time (the specification says it should take two minutes or less, 8.1.8.1) and logs result 0.
   2. Extended test finishes within EDSTT and percent complete is monotonic.
   3. Abort mid-test produces an entry with result 1.
-  4. Reset, Format or Sanitize during a test aborts it with the matching result code (decode question below).
+  4. A Controller Level Reset aborts a short test (result 2), but an extended test shall persist across the reset and resume (8.1.8.2). Sanitize start aborts either (result 9). Format NVM aborts a test depending on the NSIDs involved (Figure 644, result 4). Decode question below.
   5. A test with an injected media fault ends with a failure result carrying the failing LBA, where the drive designs it to detect that fault.
 FOLLOW:
-- Does the self-test log survive a power cycle? => Results are meant to be retained, but confirm on your drive and revision, since a test suite depends on it.
+- Does the self-test log survive a power cycle? => Base 2.3 does not say. It says an extended test resumes after a reset or power restoration, but not that the 20 results are retained, so confirm on your drive.
 - Is a short test a substitute for a media scan? => No. Coverage is vendor-defined and a pass says only that the tested segments passed.
 PITFALL: Starting a self-test with a strict latency test running and blaming the SSD for the slowdown. Check whether a test is in progress from log 06h first.
-VERIFY: Identify Controller byte offsets for EDSTT and DSTO (317:316 and 318 in Linux nvme.h), the OACS bit, NSID 0 semantics, the short test duration limit, and self-test result retention across power cycles.
+VERIFY: Self-test result retention across power cycles (Base 2.3 does not say).
 
 @@ 13.09 | Advanced | Trap | tags=get-log-page,lpo,numd,rae,chunking,mdts
 Q: You must read a 4 MiB telemetry log in pieces. How do you build each command, and what can go wrong between pieces?
@@ -176,62 +177,63 @@ SHORT: Split the read into chunks no larger than what the controller accepts (MD
 DEEP:
 1. Size: Telemetry data area 3 ends at block DALB3. If DALB3 = 8,191, the log is (8,191 + 1) x 512 = 4,194,304 B = 4 MiB, because the header is block 0.
 2. One command: NUMD = 4,194,304 / 4 - 1 = 1,048,575 = 0x000FFFFF. NUMDL (CDW10 bits 31:16) = 0xFFFF and NUMDU (CDW11 bits 15:0) = 0x000F.
-3. With MDTS = 5 (128 KiB), use 32 chunks. For each: NUMD = 131,072 / 4 - 1 = 32,767 = 0x7FFF, so CDW10 bits 31:16 = 0x7FFF.
+3. With MDTS = 5 and CAP.MPSMIN = 4 KiB (128 KiB), use 32 chunks. MDTS applies to every command that moves data, Get Log Page included (Figure 328). For each chunk: NUMD = 131,072 / 4 - 1 = 32,767 = 0x7FFF, so CDW10 bits 31:16 = 0x7FFF. That needs Log Page Extended Data Support (LPA bit 2). Without it NUMD is only bits 27:16, so at most 4,096 dwords (16 KiB) per command.
 4. LPO for chunk k = k x 131,072. Chunk 5 has LPO = 655,360 = 0x000A0000, so CDW12 = 0x000A0000 and CDW13 = 0.
 5. RAE: chunks 0 to 30 use RAE = 1. Chunk 31 uses your policy. Recent libnvme does this automatically in `nvme_get_log_page`.
 
-- **Torn reads:** SMART counters can tick between chunks. The Error Information log is newest first, so a new entry shifts everything by one and yields a duplicate and a missed entry. Host-initiated telemetry is stable until the next create, and controller-initiated telemetry stays latched until a read with RAE = 0. The Persistent Event Log has an explicit context for this purpose.
-- **Consistency checks:** read the header before and after and compare the generation number, or read the log twice and compare.
-- **Alignment:** LPO must be dword aligned.
+- **Torn reads:** SMART counters can tick between chunks. The Error Information log is newest first, so a new entry shifts everything by one and yields a duplicate and a missed entry. Host-initiated telemetry stays put until the next create, a Firmware Commit or a power on reset, and controller-initiated telemetry stays latched until a read with RAE = 0. The Persistent Event Log has an explicit reporting context for this purpose, and the ANA log has a change count.
+- **Consistency checks:** read the header before and after and compare the generation number (telemetry, Persistent Event Log) or change count (ANA), or read the log twice and compare.
+- **Alignment:** LPO must be dword aligned. For telemetry logs, LPO and length must be multiples of 512 B or the command fails with Invalid Field in Command. A short NUMD is fine for other logs.
 FOLLOW:
 - Do you need chunks if MDTS allows the whole log? => Not for correctness, but many tools use 4 KiB chunks so they never have to consult MDTS. Small chunks widen the window in which a live log can change.
-- What happens if the last chunk goes past the end of the log? => Behavior is not something to rely on, so test it deliberately rather than assume.
+- What happens if a chunk goes past the end of the log? => An offset beyond the log size fails with Invalid Field in Command. A length running past the end returns the whole remainder with undefined contents for the extra dwords (Base 2.3, Figures 201 and 203). So clamp the last chunk.
 PITFALL: Reading every chunk with RAE = 0. The first chunk can release the latched data or re-arm the event, so the following chunks may return a different snapshot.
-VERIFY: Whether Get Log Page is bounded by MDTS on your target revision, the LSP position in CDW10, behavior for LPO beyond the log length, and DALB4 in NVMe 2.0.
 
 @@ 13.10 | Advanced | Concept | tags=telemetry,log-07h,log-08h,data-area,latch
 Q: How do the Host-Initiated and Controller-Initiated Telemetry logs differ, and what would you validate?
-SHORT: Both are vendor-defined snapshots of internal controller state behind a standard header. Host-Initiated (07h) is captured on request when the host sets the create bit in the log specific field, and the host reads data areas 1 to 3 (area 4 in NVMe 2.0). Controller-Initiated (08h) is captured by the drive on an internal event and latched until the host reads it with RAE = 0. Data Generation Numbers show when a new snapshot exists.
+SHORT: Both are vendor-defined snapshots of internal controller state behind a standard 512-byte header. Host-Initiated (07h) is captured when the host sets the create bit in the log specific field, and the host reads data areas 1 to 3 (area 4 too if LPA bit 6 is set). Controller-Initiated (08h) is captured by the drive on an internal event and stays flagged available until the host reads it with RAE = 0. Data Generation Numbers show when a new snapshot exists.
 DEEP:
-- **Header (block 0):** byte 0 LID, bytes 7:5 IEEE OUI of the vendor able to decode the data, then last-block fields DALB1, DALB2, DALB3 (bytes 9:8, 11:10, 13:12) for data areas 1 to 3, and area 4 in NVMe 2.0.
-- **Generation and availability:** byte 381 host-initiated data generation number, byte 382 controller-initiated data available, byte 383 controller-initiated generation number, bytes 511:384 reason identifier.
+- **Header (block 0):** byte 0 LID, bytes 7:5 IEEE OUI of the vendor able to decode the data, then last-block fields DALB1, DALB2, DALB3 (bytes 9:8, 11:10, 13:12) for data areas 1 to 3, and DALB4 at bytes 19:16 when area 4 is supported. Byte 380 is the scope (01h controller, 02h NVM subsystem; 00h not reported is not allowed after 2.0).
+- **Generation and availability, Host-Initiated log:** byte 381 host-initiated data generation number, byte 382 controller-initiated data available, byte 383 controller-initiated generation number, bytes 511:384 reason identifier. In the Controller-Initiated log the layout differs: byte 381 is the scope, 382 is Data Available, 383 the generation number.
 - **Areas:** data area 1 starts at block 1 and each area extends the previous. Size to read = (DALB + 1) x 512 B.
-- **Host-initiated:** create (log specific bit 0 set) captures a new snapshot and bumps the generation number. Reading with the bit clear returns the current snapshot, stable across chunks.
-- **Controller-initiated:** created by the drive on a fatal error or assert. Available = 1 means saved state exists. A notice (Telemetry Log Changed) can tell the host, if enabled.
+- **Host-initiated:** create (CDW10 bit 8, bit 0 of the log specific field, set) captures a new snapshot and bumps the generation number. The data then stays until another create, a Firmware Commit or a power on reset. Reading with the bit clear returns the current snapshot, stable across chunks. If the drive reports MCDAS in LID 00h, CDW10 bits 11:9 can cap the areas created. Area 4 size only counts when the host enabled ETDAS in Host Behavior Support.
+- **Controller-initiated:** created by the drive on a fatal error or assert. Available = 1 means saved state exists. Once set, it is not cleared until a Get Log Page with RAE = 0 completes. Areas 1 to 3 persist across all resets, area 4 may persist across Controller Level Resets, and the field and generation number persist across power cycles. The Telemetry Log Changed notice (Notice type, information 02h, Feature 0Bh CDW11 bit 10) tells the host, if enabled.
 - **Interpretation:** the content is decoded only with vendor tools, so a validator checks structure, not meaning: DALB1 <= DALB2 <= DALB3, sizes within the transfer limits, generation numbers increasing only on new captures, OUI stable.
 - **Commands:** `nvme telemetry-log /dev/nvme0 --output-file=host.bin --host-generate=1 --data-area=3`, or add `--controller-init` for log 08h.
 FOLLOW:
 - Is telemetry safe to request during load? => It should not corrupt data or hang I/O. Measure the latency impact of creating a snapshot under load, since capturing internal state can stall firmware.
 - How do you get controller-initiated telemetry to appear in a test? => Use a vendor fault injection or debug command that triggers the internal event. Then check that available is set and the notice arrives.
 PITFALL: Reading log 08h with RAE = 0 in a monitoring loop. The latch is released and the next event can overwrite the snapshot you wanted for a failure.
-VERIFY: Byte offsets of the generation and availability fields, LPA bits for telemetry and data area 4, the create bit position, the notice type value, and how long the controller keeps its snapshot after a reset.
+VERIFY: Base 2.3 does not define the internal data, so decode it only with the vendor's tool.
 
 @@ 13.11 | Advanced | Concept | tags=persistent-event-log,log-0dh,events,context,history
 Q: What is the Persistent Event Log, and how does it help you reconstruct what happened across resets and power cycles?
 SHORT: Log 0Dh is a drive-kept history that survives power cycles. A 512-byte header carries the event count, total length, power-on hours and identity, followed by timestamped events: SMART snapshots, firmware commits, power-on or reset, hardware errors, namespace changes, Format and Sanitize start and completion, Set Features, thermal excursions and vendor events. It is how you tell an interrupted Format from a completed one.
 DEEP:
-- **Header:** total number of events at bytes 7:4, total log length at 15:8, log revision 16, header length at 19:18, timestamp 27:20, power on hours 43:28, power cycle count 51:44, then vendor, model, serial, NQN, generation number, and a supported events bitmap at bytes 511:480.
-- **Events:** each starts with a header of about 24 bytes holding event type, revision, controller ID and timestamp, then type-specific data. Types include 01h SMART snapshot, 02h firmware commit, 03h timestamp change, 04h power-on or reset, 05h hardware error, 06h namespace change, 07h and 08h Format start and completion, 09h and 0Ah Sanitize start and completion, 0Bh Set Feature, 0Ch telemetry created, 0Dh thermal excursion, DEh vendor.
-- **Reading:** the log specific field is 0 read, 1 establish context and read, 2 release context. The context keeps the log stable while you read it in chunks. Supported events are advertised in the bitmap.
+- **Header:** total number of events at bytes 7:4, total log length at 15:8, log revision (03h) at 16, header length at 19:18 (plus 20 gives the header size), timestamp 27:20, power on hours 43:28, power cycle count 51:44, then PCI VID, SSVID, serial, model, subsystem NQN, generation number at 373:372, reporting context info at 377:374, and a supported events bitmap at bytes 511:480. Events follow from byte 512, most recent first.
+- **Events:** each starts with a 24-byte header holding event type, revision, header length, port, controller ID, timestamp and lengths, then type-specific data. Types include 01h SMART snapshot (at least every 24 power-on hours), 02h firmware commit, 03h timestamp change, 04h power-on or reset, 05h hardware error, 06h namespace change, 07h and 08h Format start and completion, 09h and 0Ah Sanitize start and completion, 0Bh Set Feature, 0Ch telemetry created, 0Dh thermal excursion, 0Eh sanitize media verification, 0Fh personality change, DEh vendor, DFh TCG.
+- **Reading:** the log specific action (CDW10 bits 9:8) is 0 read, 1 establish context and read, 2 release context, 3 establish context if needed and return only the 512-byte header. A read with no context, or an establish when one exists, fails with Command Sequence Error. The context keeps the log stable while you read it in chunks. Compare the generation number before and after the read. Supported events are advertised in the bitmap.
 - **Validation uses:**
   1. Power-loss run: each cut appears as a power-on or reset event, and the count matches your harness.
   2. Format or Sanitize interrupted by power loss: a start event with no completion.
   3. Firmware update: the commit event shows old and new revision, slot and status.
   4. Timestamps: after a Set Features timestamp, events reflect host time.
 FOLLOW:
-- Is the log unbounded? => No. It has a finite area and behavior on overflow is defined by the drive and the specification. Read it periodically in long soak runs, then check the event count against your expectations.
+- Is the log unbounded? => No. Identify Controller PELS gives the maximum size, and which events are dropped when it fills is vendor specific (Base 2.3, 5.2.12.1.14). A controller may also suppress a same-event flood. Read it periodically in long soak runs, then check the event count against your expectations.
 - Why prefer it to the Error Information log? => The error log is a short list of recent command failures. The persistent log is a record of state changes that stays across resets.
-PITFALL: Forgetting to release the context (LSP = 2). A monitoring script that establishes a context and never releases it can block other tools.
-VERIFY: Header offsets, the LSP values, event type numbers, event header length, whether the log is available on your drive (LPA bit 4, NVMe 1.4 and later), and overflow behavior.
+PITFALL: Forgetting to release the context (action 2). A script that establishes a context and never releases it makes later establish attempts fail with Command Sequence Error until a release, a reset or the controller's own timeout.
+VERIFY: Whether a given event type is supported on your drive (bitmap at 511:480, and LPA bit 4 for the log itself).
 
 @@ 13.12 | Advanced | Numeric | tags=endurance-group,waf,media-units,remaining-life,percentage-used
-Q: An enterprise 3.84 TB SSD, rated 1 DWPD for 5 years, shows in its Endurance Group log after one year: Data Units Written 2.0e9, Media Units Written 3.1e9 and Percentage Used 17. Compute WAF, wear versus rating and remaining life.
-SHORT: Host writes are 2.0e9 x 512,000 B = 1,024 TB and media writes 3.1e9 x 512,000 B = 1,587 TB, so WAF is 3.1 / 2.0 = 1.55. The rating is 3.84 TB x 365 x 5 = 7,008 TB, so 1,024 TB is 14.6 percent of it, yet the drive says 17. At the same rate about 4.6 to 4.9 years remain, but only if the workload and WAF stay the same.
+Q: An enterprise 3.84 TB SSD, rated 1 DWPD for 5 years, shows in its Endurance Group log after one year: Data Units Written 1,024,000, Media Units Written 1,587,000 and Percentage Used 17. Compute WAF, wear versus rating and remaining life.
+SHORT: The Endurance Group log counts in billions of bytes, not SMART's 512,000 B units. So host writes are 1,024,000 x 1e9 B = 1,024 TB and media writes 1,587,000 x 1e9 B = 1,587 TB, and WAF is 1,587 / 1,024 = 1.55. The rating is 3.84 TB x 365 x 5 = 7,008 TB, so 1,024 TB is 14.6 percent of it, yet the drive says 17. At the same rate about 4.6 to 4.9 years remain, if workload and WAF stay the same.
 DEEP:
-Endurance Group Information (log 09h) has, among others: Critical Warning (byte 0), Available Spare (3), Threshold (4), Percentage Used (5), Endurance Estimate (47:32), Data Units Read (63:48), Data Units Written (79:64), Media Units Written (95:80), Host Read and Write Commands (111:96, 127:112), Media and Data Integrity Errors (143:128), Error Log Entries (159:144), Total and Unallocated Endurance Group Capacity (175:160, 191:176).
+Endurance Group Information (log 09h, 512 bytes, group chosen by LSI in CDW11, present when CTRATT bit 4 is set) has, among others: Critical Warning (byte 0), Available Spare (3), Threshold (4), Percentage Used (5), Endurance Estimate (47:32), Data Units Read (63:48), Data Units Written (79:64), Media Units Written (95:80), Host Read and Write Commands (111:96, 127:112), Media and Data Integrity Errors (143:128), Error Log Entries (159:144), Total and Unallocated Endurance Group Capacity in bytes (175:160, 191:176).
 
-1. Host bytes: 2.0e9 x 512,000 = 1.024e15 B = 1,024 TB. That is 266.7 drive writes, 0.73 DWPD.
-2. Media bytes: 3.1e9 x 512,000 = 1.587e15 B = 1,587 TB. WAF = 3.1e9 / 2.0e9 = 1.55 (units cancel).
+Units (Base 2.3, 5.2.12.1.10): Endurance Estimate, Data Units Read, Data Units Written and Media Units Written are all in billions of bytes (1 = 1,000,000,000 B), rounded up, and 0 means not reported. Data Units exclude controller-internal traffic such as garbage collection, while Media Units Written includes it. Endurance Estimate assumes a WAF of 1.
+
+1. Host bytes: 1,024,000 x 1e9 = 1.024e15 B = 1,024 TB. That is 266.7 drive writes, 0.73 DWPD.
+2. Media bytes: 1,587,000 x 1e9 = 1.587e15 B = 1,587 TB. WAF = 1,587,000 / 1,024,000 = 1.55 (units cancel).
 3. Rating: 3.84 TB x 365 x 5 = 7,008 TB. Linear expectation: 1,024 / 7,008 = 14.6 percent.
 4. Percentage Used is an integer, so 17 means roughly [17, 18) if the drive truncates. Implied life 1,024 / 0.17 = 6,024 TB down to 1,024 / 0.18 = 5,689 TB, or 81 to 86 percent of the rating.
 5. Reading it: wear follows media writes. 17.5 / 14.6 = 1.2, and 1.55 / 1.2 = 1.3. So the rating probably assumed a WAF near 1.3, and this workload runs at 1.55. That is an inference, not a reported value.
@@ -239,10 +241,9 @@ Endurance Group Information (log 09h) has, among others: Critical Warning (byte 
 
 - **Caveat:** lifetime WAF averages over every workload the drive has seen, including preconditioning, so use deltas between samples for current WAF.
 FOLLOW:
-- Why is Media Units Written more useful than SMART for WAF? => It counts what the media took, including controller writes, so the ratio of media to host writes is WAF. SMART only has host data units.
+- Why is Media Units Written more useful than SMART for WAF? => It counts host and controller writes (garbage collection), so the ratio of media to host writes is WAF. SMART only has host data units, in a different unit.
 - What if a drive lacks the Endurance Group log? => Use vendor or OCP logs that report physical media writes, or estimate WAF from a controlled fio run with a vendor NAND counter.
-PITFALL: Dividing bytes written by capacity and calling the result life used. Percentage Used comes from a vendor model of NAND wear that includes WAF, error rates and program/erase counts.
-VERIFY: The Endurance Group log byte offsets, whether Media Units Written includes controller-initiated writes, units for Endurance Estimate, and CTRATT support for endurance groups.
+PITFALL: Applying SMART's 512,000 B unit to these counters (1,024,000 x 512,000 B is only 0.5 TB, so wear looks trivial), or dividing bytes written by capacity and calling the result life used. Percentage Used comes from a vendor model of NAND wear that includes WAF, error rates and program/erase counts.
 
 @@ 13.13 | Advanced | Debug | tags=unsafe-shutdown,power-loss,smart,media-errors,triage
 Q: After a rack lost power under a write workload, the SSD came back and fio reported read errors. Decode the SMART log before and after and say what you conclude and check next.
@@ -257,22 +258,22 @@ DEEP:
 | data_units_written | 1,204,118 | 1,274,118 |
 | power_cycles | 210 | 211 |
 | power_on_hours | 3,120 | 3,121 |
-| unsafe_shutdowns | 31 | 32 |
+| unsafe_shutdowns (Unexpected Power Losses) | 31 | 32 |
 | media_errors | 0 | 3 |
 | num_err_log_entries | 5 | 8 |
 
-1. Power events: +1 cycle and +1 unsafe shutdown match one cut. If the harness made N cuts, both should rise by N. A shortfall in unsafe shutdowns means a shutdown notification arrived or the drive lost counts.
+1. Power events: +1 cycle and +1 unexpected power loss match one cut. If the harness made N cuts, both should rise by N. A shortfall in the loss counter means the controller had already reported CSTS.SHST = 10b before power dropped (Base 2.3, 5.2.12.1.3), or the drive lost counts.
 2. Spare, wear and temperature are unchanged, so this is not wear-out or thermal.
-3. Media errors +3 with log entries +3: three unrecovered errors, each logged. Read the Error Information log for SCT 2 / SC 81h (unrecovered read error) and the LBAs.
+3. Media errors +3 with log entries +3: three unrecovered errors, each logged. Read the Error Information log for SCT 2 / SC 81h (Unrecovered Read Error, Base 2.3 Figure 106) and the LBAs.
 4. Bit 2 set: the firmware judged reliability degraded. Bit 4 (volatile memory backup) is clear, so the drive did not see a backup failure.
 5. Data units: +70,000 units is 35.8 GB. If fio completed 41.2 GB of writes, the counter is 5.4 GB short. That can be legal if the drive saves counters periodically, but the gap should be bounded and stable.
 6. Judgment: acknowledged and flushed data must survive. UECC on data written before a completed Flush is a real bug (for example a paired-page or open-block protection gap). UECC on data in flight at the cut may be acceptable only as old or new data, not as a read error.
 7. Next: correlate LBAs with the harness oracle, read the Persistent Event Log for the power-on event and any hardware error, pull controller-initiated telemetry, and rerun with Flush/FUA writes.
 FOLLOW:
-- What if unsafe_shutdowns had not increased? => Then the drive did not see the loss as unsafe. Suspect a harness that sent a shutdown notification, a hold-up that kept the controller alive, or counter loss.
+- What if unsafe_shutdowns had not increased? => Then the drive did not see the loss as unexpected. Suspect a harness that completed a shutdown (SHST 10b) first, a hold-up that kept the controller alive, or counter loss.
 - Could the errors be from the host's read path instead? => Check the CQE status first. A media status comes from the drive, while a transport error would show as timeouts or PCIe errors.
 PITFALL: Accepting "power loss, so errors are expected". Loss of un-flushed writes is expected, but unrecovered read errors on previously flushed data are not.
-VERIFY: Whether Critical Warning bit 2 latches or clears, the exact status values in the error log for your drive, and the SMART counter save interval.
+VERIFY: When Critical Warning bit 2 clears, and the SMART counter save interval (Base 2.3 says neither: the bits show the state when the log is read).
 
 @@ 13.14 | Advanced | Debug | tags=self-test,log-06h,result-decode,flba,hex
 Q: An extended self-test log begins with the hex below. Decode the first result entry and say what you do next.
@@ -292,7 +293,7 @@ Bytes 3:0 are the header, then a 28-byte result:
 | 3 | Reserved | 0 |
 | 11:4 | Power On Hours | 0x2BC0 = 11,200 |
 | 15:12 | NSID | 1 |
-| 23:16 | Failing LBA | 0x1D1CA5F0 = 488,416,752 |
+| 23:16 | Failing LBA (I/O command set specific) | 0x1D1CA5F0 = 488,416,752 |
 | 24 | Status Code Type | 2 (media and data integrity) |
 | 25 | Status Code | 0x81 (unrecovered read error) |
 | 27:26 | Vendor specific | 0 |
@@ -306,9 +307,9 @@ Bytes 3:0 are the header, then a 28-byte result:
   5. Escalate with the raw log bytes.
 FOLLOW:
 - Which entry is newest? => Entry 0, directly after the header. Entries with result Fh are unused slots.
-- The result was 0x22 instead. What changed? => Code 2 (extended), result 2: aborted by a controller reset. The test did not judge the media at all.
+- The result was 0x12 instead. What changed? => Code 1 (short), result 2: aborted by a Controller Level Reset. The test did not judge the media at all. An extended test should not end that way, because it shall persist across a Controller Level Reset and resume (Base 2.3, 8.1.8.2).
 PITFALL: Reading the nibbles the wrong way round. Code is bits 7:4 and result is bits 3:0, so 0x72 and 0x27 are different tests with different meanings.
-VERIFY: The nibble assignment and result codes against the Base Specification, and whether FLBA is reported in the format of the namespace.
+VERIFY: Whether FLBA is reported in the LBA format of the namespace (NVM Command Set Specification; Base 2.3 makes the Failing LBA field I/O command set specific).
 
 @@ 13.15 | Principal | Scenario | tags=validation,smart-accuracy,oracle,fault-injection,automation
 Q: How would you validate that a new firmware's SMART/Health log is accurate, and how would you force each field to change?
@@ -316,10 +317,10 @@ SHORT: Treat SMART as a set of claims and give each an oracle. Structural checks
 DEEP:
 1. **Structural:** 512 bytes, reserved bytes zero, 128-bit little-endian, temperature in Kelvin (a 37 where 310 is expected means Celsius), sensors consistent with the composite, threshold fields present.
 2. **Known workload deltas:** snapshot before and after N reads and M writes of known size. Expect commands +N and +M, and data units close to bytes / 512,000, within one unit for rounding. Move at least 100 units so that error is under 1 percent. Cover several namespaces, LBA formats, queues and Compare. Oracle: host counts from fio and an analyzer.
-3. **Timing fields:** POH has one-hour resolution, so run more than 3 hours and check +3 or +4. Busy time should be near zero when idle and rise under load.
+3. **Timing fields:** POH has one-hour resolution, so run more than 3 hours and check +3 or +4. Percentage Used is only updated once per power-on hour. Busy time should be near zero when idle and rise under load.
 4. **Power semantics:**
-   - Clean CC.SHN then power off: power cycles +1, unsafe shutdowns +0.
-   - Abrupt cut: both +1.
+   - Clean CC.SHN, wait for CSTS.SHST = 10b, then power off: power cycles +1, unexpected power losses (unsafe_shutdowns) +0.
+   - Abrupt cut, or a cut before SHST reaches 10b: both +1.
    - After many cuts, counters must never decrease. Allow only a firmware-documented lag on data units.
 5. **Force health fields:**
    - Spare below threshold: vendor bad-block injection, then check Critical Warning bit 0 and the event.
@@ -331,7 +332,7 @@ FOLLOW:
 - What tolerance do you set for data units? => Rounding error of one unit plus any documented counter save lag. Anything larger is a defect until explained.
 - How do you know the host oracle is right? => Cross-check fio against an analyzer or driver trace, and use large transfers so per-command counting differences wash out.
 PITFALL: Only testing the happy path (values go up). The valuable bugs are wraps, resets to zero after a firmware update, wrong units and warning bits that never clear.
-VERIFY: Which commands count as host reads and writes (Verify, Write Zeroes, failed commands), when Critical Warning bits clear, and firmware-specific counter persistence.
+VERIFY: Which commands count as host reads and writes (Verify, Write Zeroes, failed commands; NVM Command Set Specification), and firmware-specific counter save behavior (Base 2.3 says only that the log is retained across power cycles unless otherwise specified).
 
 @@ 13.16 | Principal | Scenario | tags=triage,evidence,log-collection,rae,ordering
 Q: A drive in a test rack stops responding under load. In what order do you collect logs and state so you do not destroy the evidence, and what goes into the bundle?
@@ -339,17 +340,17 @@ SHORT: Capture volatile state first and change nothing until it is saved. Record
 DEEP:
 1. **Freeze:** stop the workload generator but do not reset, unbind the driver or power-cycle. A reset can clear internal state and controller registers.
 2. **Host-side snapshot:** CSTS (CFS, RDY), CC, and whether registers read all ones. PCIe config space, link status and AER registers, `dmesg`, and the analyzer trace.
-3. **If admin queue responds:** SMART, Error Information, Firmware Slot, Self-test log, all with RAE = 1. Feature 0Eh timestamp so drive time maps to host time. Then a host-initiated telemetry create (data area 3), and controller-initiated telemetry with RAE = 1.
+3. **If admin queue responds:** SMART, Error Information, Firmware Slot, Self-test log, all with RAE = 1. Read the Error Information log now, because a controller should clear it on a power cycle or Controller Level Reset (Base 2.3, 5.2.12.1.2). Feature 0Eh timestamp (optional, ONCS bit 6) so drive time maps to host time. Read any existing host-initiated telemetry first, since a new create replaces it, then create one (data area 3), and read controller-initiated telemetry with RAE = 1.
 4. **Avoid consuming:** do not read Changed Namespace List or controller-initiated telemetry with RAE = 0 yet. Do not start a self-test that would change the state.
 5. **If it does not respond:** capture CSTS and AER. Use vendor UART or JTAG debug if available, then reset with the least destructive method (controller reset before power cycle) and note which one.
-6. **After recovery:** Persistent Event Log, error log, SMART deltas, controller-initiated telemetry if available, firmware version.
+6. **After recovery:** Persistent Event Log (retained across resets and power cycles), SMART deltas, controller-initiated telemetry (areas 1 to 3 persist across all resets), firmware version. Do not count on the error log.
 7. **Bundle:** raw logs and parsed views, tool and driver versions, kernel, drive SN, firmware, test config and seed, and a timeline aligned to drive time.
 - **Decision rule:** whatever cannot be regenerated after reset (registers, admin queue state, latched telemetry, host trace) goes first.
 FOLLOW:
 - Why RAE = 1? => It reads without re-arming the event or releasing a latch, so the monitoring agent does not consume what an engineer needs.
 - Should you send a reset if the drive is recoverable by waiting? => First measure how long it stays unresponsive, since Linux timeouts escalate on their own and the delay itself is a symptom to record.
 PITFALL: Letting a health-monitoring agent read logs with RAE = 0 on a schedule. It re-arms events and may release the latch on telemetry before anyone looks at it.
-VERIFY: What survives a controller reset versus a power cycle for telemetry and the Error Information log on your drive, and whether the Timestamp feature is supported (Feature 0Eh).
+VERIFY: What your drive actually keeps across a reset for the Error Information log (Base 2.3 says a controller should clear it) and for host-initiated telemetry (kept until the next create, Firmware Commit or power on reset).
 
 @@ 13.17 | Principal | Cross-layer | tags=ocp,waf,fleet,vendor-log,wear-out
 Q: How would you monitor wear-out and write amplification across a fleet using standard and OCP datacenter logs, and what do you distrust?
@@ -357,7 +358,7 @@ SHORT: Sample the standard SMART counters and, where available, the OCP SMART ex
 DEEP:
 - **Sources:**
   - SMART 02h: Percentage Used, spare, media errors, unsafe shutdowns, temperature time, data units.
-  - Endurance Group 09h on drives that support it: Media Units Written.
+  - Endurance Group 09h on drives that support it: Media Units Written (billions of bytes).
   - OCP SMART / Health extended log (a vendor-range LID such as C0h, identified by a GUID at the end): physical media units written and read, bad NAND block counts, XOR recovery count, uncorrectable and soft ECC counts, thermal throttle status and count, PCIe correctable errors, incomplete shutdowns, percent free blocks, capacitor health. OCP also defines other logs, such as firmware activation history and latency monitor.
 - **Worked example:** sample A host 500 TB and media 720 TB. Sample B a week later: host 512 TB and media 745 TB. Lifetime WAF at B = 745 / 512 = 1.46, which looks fine. Interval WAF = (745 - 720) / (512 - 500) = 25 / 12 = 2.08, so the workload changed to something random and the wear slope is rising by about 43 percent.
 - **Alerts:**

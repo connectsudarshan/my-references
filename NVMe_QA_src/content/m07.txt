@@ -7,20 +7,19 @@ DEEP:
 | | NVMe namespace | SCSI LUN | Partition |
 |---|---|---|---|
 | Created by | Namespace Management (if supported) or fixed by the vendor | Target or array configuration | Host OS partition table |
-| Addressed by | NSID in every command (SQE DW1) plus SLBA | LUN in the CDB or transport | Offset added by the host |
+| Addressed by | NSID in the command (SQE DW1) plus SLBA | LUN in the CDB or transport | Offset added by the host |
 | Discovery | Identify: active NS list (CNS 02h) | REPORT LUNS | Partition table |
 | Own format and protection | Yes (LBAF, PI, metadata) | Per LUN, set by the target | No, inherits the disk |
 
-- **Addressing:** the queue belongs to the controller, not to a namespace. Every command names its target NSID, so one queue pair can carry I/O for many namespaces.
+- **Addressing:** the queue belongs to the controller, not to a namespace. Every command that targets a namespace names its NSID, so one queue pair can carry I/O for many namespaces. A controller shall support access to any attached namespace from any I/O submission queue (Base 2.3, 3.2.1.6).
 - **Per-namespace attributes:** LBA format, metadata and protection settings, thin provisioning, write protection, ANA group, NVM set and Endurance Group.
 - **Linux naming:** nvme0n1 is namespace 1 of nvme0. With native multipath the visible node is a head device, and per-path nodes are hidden.
 - **Reality on shipped drives:** most client SSDs ship with one namespace, NSID 1, covering the full capacity. Enterprise drives often support Namespace Management (OACS bit 3).
-- **Resize:** the namespace management command set defines create and delete, not resize. Changing size means delete and recreate (VERIFY).
+- **Resize:** Namespace Management defines only Create (SEL 0h) and Delete (SEL 1h), so there is no resize (Base 2.3, Figure 383). Changing size means delete and recreate.
 FOLLOW:
-- Where does the host say which namespace a command targets? => In the NSID field of the SQE (command DW1). Admin commands that are not namespace specific use 0 or ignore it.
+- Where does the host say which namespace a command targets? => In the NSID field of the SQE (command DW1). A command that does not use the field must clear it to 0h, and a nonzero value gets Invalid Field in Command unless the command says otherwise (Base 2.3, Figure 92).
 - Does each namespace get its own queues? => No. Queues belong to the controller and carry commands for any namespace attached to it.
 PITFALL: Treating a namespace as a physical slice of NAND. It is a logical view, and the FTL is free to spread it across all dies.
-VERIFY: That no resize operation exists in the Namespace Management command for the spec revision you target.
 
 @@ 7.02 | Basic | Concept | fig=nsmodel | tags=subsystem,controller,private,shared,nmic,attach
 Q: How do controllers, private namespaces and shared namespaces fit together inside an NVM subsystem?
@@ -28,16 +27,17 @@ SHORT: An NVM subsystem holds one or more controllers, the non-volatile media an
 DEEP:
 - **Create, then attach:** creating a namespace only allocates it in the subsystem. It becomes usable by a controller after Namespace Attachment. Only then does it appear in that controller's active list.
 - **Private:** attached to exactly one controller. Trying to attach it to a second one fails with Namespace Is Private (SCT 1, SC 19h).
-- **Shared:** NMIC bit 0 of Identify Namespace is 1. Typical for dual-port or multi-controller drives and for fabrics subsystems. Reservations, ANA and multipath (module 14) build on it.
-- **Sharing is decided at creation:** NMIC is a field of the create data structure, not something attach can change.
-- **Identity across controllers:** the same namespace must report the same NGUID or EUI64 through every controller. Linux uses that to merge paths, and refuses to when identifiers disagree.
-- **Where the controller says so:** CMIC in Identify Controller reports multiple ports, multiple controllers and ANA support.
+- **Shared:** NMIC bit 0 (SHRNS) is 1, which means the namespace may be attached to two or more controllers at once. If it is 0 the namespace is private and can be attached to only one controller at a time. Bit 1 (DISNS) marks a dispersed namespace, which must also be shared (Base 2.3, Figure 335). Typical for dual-port or multi-controller drives and for fabrics subsystems. Reservations, ANA and multipath (module 14) build on it.
+- **Sharing is decided at creation:** NMIC is one of the host-specified fields of the create data structure (Base 2.3, Figure 244 lists it as a create-time value), not something attach can change.
+- **Identity across controllers:** the identifiers are assigned to the namespace at creation and stay fixed for its life (Base 2.3, 5.2.13.2.3), so every controller reports the same NGUID or EUI64. Linux uses that to merge paths, and refuses to when identifiers disagree.
+- **NSID scope:** NSIDs are unique within the NVM subsystem if Namespace Management, ANA Reporting, NVM Sets or the Sanitize Namespace command is supported, so NSID 3 is the same namespace through every controller. Without any of those, only shared namespaces need subsystem-unique NSIDs, and private ones may reuse them (Base 2.3, 3.2.1.6).
+- **Where the controller says so:** CMIC in Identify Controller reports multiple ports (bit 0), multiple controllers (bit 1) and ANA support (bit 3). Bit 2 marks an SR-IOV virtual function (Base 2.3, Figure 328).
 - **What the diagram shows:** the attach lines. Each line is one controller-to-namespace attachment, so a shared namespace has two or more, and a private one has exactly one.
 FOLLOW:
 - Does attaching a private namespace to a second controller make it shared? => No. It fails with Namespace Is Private (119h). Delete and recreate it with NMIC set.
 - How many controllers does a typical dual-port enterprise SSD expose? => Two controllers in one subsystem, one per port, with shared namespaces visible through both.
-PITFALL: Assuming an NSID on controller 0 and the same NSID on controller 1 are always the same data. Only shared namespaces are, and you confirm it by comparing NGUID or EUI64.
-VERIFY: Whether NSIDs are subsystem-scoped for shared namespaces in the revision you target, and the exact NMIC and CMIC bit definitions.
+PITFALL: Assuming an NSID on controller 0 and the same NSID on controller 1 are always the same data. On a drive with none of Namespace Management, ANA, NVM Sets or Sanitize Namespace, two private namespaces may share an NSID, so confirm by comparing NGUID or EUI64.
+VERIFY: The position of NMIC inside the create data structure is defined by the NVM Command Set Specification (Namespace Management host specified fields). Base 2.3 defines only the NMIC bits and the CMIC bits.
 
 @@ 7.03 | Basic | Concept | tags=nsid,broadcast,active,allocated,nn
 Q: What are the NSID rules, and what is the difference between an allocated and an active namespace?
@@ -46,26 +46,26 @@ DEEP:
 | State | Meaning | How to list it |
 |---|---|---|
 | Not allocated | No namespace with that NSID | Not listed anywhere |
-| Allocated, not attached | Created but not attached to this controller | Identify CNS 10h (list), CNS 11h (data) |
+| Allocated, not attached | Created but not attached to this controller | Identify CNS 10h (list of all allocated, attached ones included), CNS 11h (data) |
 | Active | Allocated and attached to this controller | Identify CNS 02h (list), CNS 00h (data) |
 
-- **NN:** the highest NSID value the controller may report. NSIDs need not be contiguous, so do not assume 1..N.
-- **Active list:** CNS 02h returns up to 1024 NSIDs greater than the NSID in the command, ascending, so a host pages by passing the last NSID it saw.
-- **Attached controllers:** CNS 12h lists the controllers a namespace is attached to, and CNS 13h lists the controllers in the subsystem.
+- **NN:** the maximum value of a valid NSID for the subsystem. If MNAN is nonzero, the number of namespaces that can be allocated at once may be smaller than NN (Base 2.3, 3.2.1.6). NSIDs need not be contiguous, so do not assume 1..N.
+- **Active list:** CNS 02h returns up to 1,024 active NSIDs in increasing order, all greater than the NSID in the command. A host pages by passing the last NSID it saw, and 0 starts at NSID 1. NSID FFFFFFFEh or FFFFFFFFh is aborted with Invalid Namespace or Format (Base 2.3, 5.2.13.2.2). CNS 10h pages the allocated list the same way.
+- **Attached controllers:** CNS 12h lists the controllers a namespace is attached to, and CNS 13h lists the I/O controllers in the subsystem. Each returns up to 2,047 controller IDs.
+- **Which status:** unless a command says otherwise, an inactive NSID (allocated but not attached here, or unallocated) is aborted with Invalid Field in Command, and an invalid NSID (0h or above NN) with Invalid Namespace or Format (Base 2.3, 3.2.1.5 and Figure 92).
 - **Without Namespace Management:** the vendor fixes the namespaces, and all of them are normally both allocated and active.
 - **Linux:** the scan uses CNS 02h. A namespace whose Identify data shows NCAP of 0 is treated as not allocated or attached and is skipped.
 FOLLOW:
-- What happens on I/O to an allocated but unattached NSID? => Invalid Namespace or Format, generic status 0Bh.
+- What happens on I/O to an allocated but unattached NSID? => Base 2.3 (3.2.1.5, Figure 92) says Invalid Field in Command, generic status 02h, unless the command says otherwise. Some controllers return Invalid Namespace or Format (0Bh) instead, so a test should accept both and log which.
 - Can NSID 1 be missing while NSID 2 exists? => Yes. After deleting NSID 1, NSID 2 stays. Scripts that loop from 1 and stop at the first gap miss it.
 PITFALL: Hardcoding NSID 1 in test scripts. On managed drives the NSID is whatever create returned.
-VERIFY: Exact CNS 10h to 13h numbering and the 1024-entry list size in the Identify section of the Base Specification.
 
 @@ 7.04 | Intermediate | Concept | tags=nsze,ncap,nuse,thin-provisioning,nsfeat
 Q: What do NSZE, NCAP and NUSE mean, and how does thin provisioning change them?
 SHORT: NSZE is the namespace size in logical blocks, so the last valid LBA is NSZE-1. NCAP is the maximum number of blocks that can be allocated at one time, and NUSE is the number currently allocated. The order is NUSE <= NCAP <= NSZE. With thin provisioning (NSFEAT bit 0 set), NCAP can be below NSZE and NUSE rises as data is written. Without it, NSZE and NCAP normally match.
 DEEP:
 - **Units are blocks:** multiply by the data size of the current LBA format to get bytes. Metadata is not counted in these bytes.
-- **Thin provisioning:** the host sees NSZE blocks, but the controller commits only NCAP. Writes past what can be allocated fail with Capacity Exceeded (generic 81h) even though the LBA is inside NSZE.
+- **Thin provisioning:** the host sees NSZE blocks, but the controller commits only NCAP. Writes past what can be allocated fail with Capacity Exceeded (generic 81h, Base 2.3, Figure 102) even though the LBA is inside NSZE.
 - **NUSE:** grows on Write and Write Uncorrectable, and can fall on Deallocate, Write Zeroes with deallocate, Sanitize and Format. "May be deallocated" is the operative phrase, so NUSE after a Deallocate is not exact.
 - **Reality check:** many drives report NUSE equal to NSZE or NCAP regardless of what has been written. Only assert that NUSE tracks writes when NSFEAT bit 0 is set.
 - **Offsets in the Identify Namespace structure:** NSZE at byte 0, NCAP at 8, NUSE at 16, NSFEAT at 24.
@@ -74,7 +74,7 @@ FOLLOW:
 - Can NCAP exceed NSZE? => No. NCAP cannot be larger than the addressable size. A drive reporting it is violating the spec.
 - What does a freshly created thin namespace report for NUSE? => Zero, since nothing has been written or allocated yet.
 PITFALL: Multiplying NSZE by 512 without checking the LBA format. On a 4 KiB format that under-reports capacity by 8 times.
-VERIFY: The rules tying NCAP to NSZE when thin provisioning is not supported, and whether NUSE must equal NCAP in that case.
+VERIFY: NSZE, NCAP, NUSE and NSFEAT bit 0 are fields of the Identify Namespace structure in the NVM Command Set Specification, and Base 2.3 does not define them. That includes the rules tying NCAP to NSZE when thin provisioning is not supported and whether NUSE must equal NCAP in that case.
 
 @@ 7.05 | Intermediate | Concept | tags=lba-format,lbaf,flbas,lbads,metadata
 Q: How do NLBAF, FLBAS and the LBAF table describe the LBA formats of a namespace?
@@ -89,7 +89,7 @@ DEEP:
 
 (An illustrative list. Real drives vary.)
 - **Entry layout:** bytes 0 to 1 are MS, byte 2 is LBADS, byte 3 bits 1:0 are RP.
-- **Count:** older specs allow 16 formats, newer ones up to 64. The structure has room for 64 entries at bytes 128 to 383.
+- **Count:** older specs allow 16 formats, newer ones up to 64. The structure has room for 64 entries at bytes 128 to 383. Format NVM carries a 6-bit format index, LBAFL in CDW10 bits 3:0 and LBAFU in bits 13:12, and the controller ignores LBAFU unless the host set LBAFEE in the Host Behavior Support feature (Base 2.3, Figure 193).
 - **Current format:** index = FLBAS[3:0] (plus FLBAS[6:5] in the upper bits), and the size in use is 2^lbads.
 - **Metadata placement:** FLBAS bit 4 is 1 for extended LBAs, meaning each block is data plus metadata in one buffer. Otherwise metadata travels in a separate buffer through the metadata pointer. Module 8 covers the details.
 - **Unused entries:** an entry with LBADS below 9 is not a valid size, and entries past NLBAF are not supported.
@@ -97,7 +97,7 @@ FOLLOW:
 - Does RP promise performance? => No. It is a hint: the controller ranks formats, and real results depend on the workload.
 - How does the host find the current sector size? => Read FLBAS, take the index, read that LBAF entry's LBADS, and compute 2^LBADS.
 PITFALL: Reading LBADS as a byte count. It is a power-of-two exponent.
-VERIFY: FLBAS bits 6:5 usage, the maximum LBAF count per spec revision, and the rule for unsupported LBAF entries.
+VERIFY: NLBAF, FLBAS bits 6:5, the LBAF entry layout, the maximum LBAF count per revision and the rule for unsupported entries are in the Identify Namespace section of the NVM Command Set Specification, not in Base 2.3.
 
 @@ 7.06 | Intermediate | Debug | tags=identify-ns,decode,hex,nvme-cli
 Q: You capture the start of an Identify Namespace response. Decode it and say what you would check.
@@ -118,67 +118,70 @@ DEEP:
 7. LBAF 2 at byte 136: MS 0, LBADS 12, RP 0. Capacity = 468,843,606 x 4096 = 1,920,383,410,176 B.
 
 - **Cross-check:** `nvme id-ns /dev/nvme0n1` prints the same fields and marks the in-use format, for example `lbaf 2 : ms:0 lbads:12 rp:0 (in use)`.
-- **Things to verify on a real drive:** NUSE <= NCAP <= NSZE, capacity within TNVMCAP, and NMIC agreeing with CMIC in Identify Controller. NMIC shared on a single-controller drive is suspicious.
+- **Things to verify on a real drive:** NUSE <= NCAP <= NSZE, capacity within TNVMCAP, and NMIC agreeing with CMIC in Identify Controller. NMIC shared on a single-controller drive is suspicious. EUI64 (bytes 127:120) and NGUID (bytes 119:104) are big endian, unlike the numeric fields above.
 FOLLOW:
 - Which fields would change after Format NVM to LBAF 0? => FLBAS to 00h, and NSZE and NCAP become 3,750,748,848 with the same byte capacity. NUSE returns to 0 or the drive default.
 - Why does DLFEAT matter for a read-after-deallocate test? => It says what value you may expect back from a block that really was deallocated.
-PITFALL: Reading multi-byte fields big endian off a hex dump. NVMe is little endian throughout.
-VERIFY: DLFEAT and NSFEAT bit meanings, and the LBAF entry position, in the Identify Namespace figure of the NVM Command Set Specification.
+PITFALL: Reading multi-byte fields big endian off a hex dump. NVMe fields are little endian, except EUI64, NGUID (Base 2.3, 4.5.4 and 4.5.5) and PI tuples, which are big endian.
+VERIFY: NSZE, NCAP, NUSE, NSFEAT, FLBAS, MC, DPC, DPS, DLFEAT and the LBAF entry position are defined by the Identify Namespace figure of the NVM Command Set Specification. Base 2.3 confirms NMIC bit 0 (SHRNS) and the EUI64 and NGUID byte positions.
 
 @@ 7.07 | Intermediate | Concept | tags=nguid,eui64,uuid,csi,identifiers,wwid
 Q: Which identifiers does a namespace have, and how does the host read and use them?
 SHORT: A namespace can report an EUI64 (8 bytes), an NGUID (16 bytes), a UUID (16 bytes) and a Command Set Identifier. EUI64 and NGUID also sit in Identify Namespace, at bytes 120 and 104. The Namespace Identification Descriptor list (Identify CNS 03h) returns all of them as descriptors with type 1 for EUI64, 2 for NGUID, 3 for UUID and 4 for CSI. Hosts use them as the persistent name of the namespace, because the NSID alone is not stable identity.
 DEEP:
-- **Descriptor format:** a 4-byte header (type, length, two reserved bytes) then the identifier. Lengths are 8, 16, 16 and 1. A type of 0 ends the list in the 4096-byte buffer.
-- **Why not NSID:** NSIDs are local. Delete and recreate a namespace and you can get the same NSID for different data. The identifiers stay with the namespace.
+- **Descriptor format:** a 4-byte header (NIDT, NIDL, two reserved bytes) then the identifier. Lengths are 8, 16, 16 and 1. An NIDL of 0 ends the list in the 4096-byte buffer, and a controller shall not return two descriptors of the same type (Base 2.3, 5.2.13.2.3).
+- **Why not NSID:** NSIDs are local. Delete and recreate a namespace and you can get the same NSID for different data, and NSIDs may even change across power off, although keeping them static is recommended (Base 2.3, 3.2.1.6). The identifiers stay with the namespace.
 - **Linux usage:** it builds a `wwid` for sysfs and /dev/disk/by-id from the UUID if present, else the NGUID, else the EUI64, else a composite of vendor ID, serial, model and NSID. It also merges controllers into one multipath node by matching identifiers.
-- **Uniqueness:** identifiers are meant to be globally unique. The NSFEAT bit 3 flag says a non-zero NGUID or EUI64 is never reused.
+- **Requirements (Base 2.3, 4.7.1.4 and 5.2.13.2.3):** at creation the controller shall report a globally unique identifier in the EUI64, the NGUID or a type 3 UUID descriptor. If EUI64 and NGUID are both zero, a UUID descriptor is required. The CSI descriptor is required when CAP.CSS.IOCSS is set. Identifiers stay fixed for the life of the namespace and are preserved across format and controller reset. A zero EUI64 or NGUID must not have a type 1 or type 2 descriptor.
+- **Reuse:** NSFEAT bit 3 (UIDREUSE) set means a non-zero NGUID or EUI64 is never reused for a new namespace after the original is deleted. Cleared means it may be reused. The bit must be cleared if both are zero (Base 2.3, Figure 335).
+- **Byte order:** EUI64 and NGUID are big endian (Base 2.3, 4.5.4 and 4.5.5). The UUID follows RFC 9562 (4.5.6).
 - **Age of the fields:** EUI64 appeared with NVMe 1.1 and NGUID with 1.2, and the Linux driver gates on that. Namespace UUID descriptors came later.
 - **Command:** `nvme ns-descs /dev/nvme0 -n 1` prints the descriptor list.
 FOLLOW:
 - Which identifier should a validation script use as the key? => The NGUID or EUI64 when non-zero, with UUID if present. Fall back to serial plus NSID and flag the drive.
 - Can EUI64 and NGUID both be present? => Yes, and both must be consistent between the Identify structure and the descriptor list.
-PITFALL: Accepting all-zero identifiers as valid. Zero means not reported, and two drives with zero IDs are indistinguishable.
-VERIFY: Which identifiers the spec requires by version, and the exact wording of the reuse rule in NSFEAT.
+PITFALL: Accepting all-zero identifiers as valid. Zero means not reported, and two drives with zero IDs are indistinguishable. A zero EUI64 and NGUID is legal only if the namespace reports a UUID descriptor.
+VERIFY: The revisions that introduced EUI64, NGUID and the UUID descriptor are not given in Base 2.3. The NSFEAT bit 3 flag in the NVM Command Set Identify Namespace structure is also defined there, and Base 2.3 confirms it for the CNS 08h structure.
 
 @@ 7.08 | Intermediate | Concept | tags=namespace-management,namespace-attachment,create,delete,attach,detach
 Q: How do Namespace Management and Namespace Attachment work, and what does each return?
-SHORT: Namespace Management (admin opcode 0Dh) creates or deletes a namespace, chosen by SEL in CDW10. Create sends a 4 KiB host-specified structure with NSZE, NCAP, FLBAS, DPS, NMIC and more, and returns the new NSID in CQE DW0. The namespace is allocated but not attached. Namespace Attachment (opcode 15h) attaches or detaches it from a list of controllers. Support is advertised by OACS bit 3.
+SHORT: Namespace Management (admin opcode 0Dh) creates (SEL 0) or deletes (SEL 1) a namespace. Create sends a 4 KiB host-specified structure with NSZE, NCAP, FLBAS, DPS, NMIC and more, and returns the new NSID in CQE DW0. The namespace is allocated but not attached. Namespace Attachment (opcode 15h) attaches or detaches it from a list of controllers. Support is advertised by OACS bit 3 (NMS).
 DEEP:
-1. Check OACS bit 3, then read TNVMCAP and UNVMCAP from Identify Controller.
-2. Create: fill the data structure and send. The controller picks the NSID and returns it in DW0.
-3. Attach: send CDW10 SEL 0 with a controller list buffer (a count, then 16-bit controller IDs) and the NSID.
-4. The host learns of the change through the Namespace Attribute Changed event (if enabled in Async Event Configuration), reads the Changed Namespace List log (04h) and rescans.
-5. Detach and delete when done. Delete of an attached namespace also detaches it.
+1. Check OACS bit 3 (NMS), then read TNVMCAP and UNVMCAP from Identify Controller.
+2. Create: fill the data structure, put the command set in CDW11 bits 31:24 (CSI, 0 is NVM) and send. The NSID field must be 0, and the controller picks the NSID and returns it in DW0.
+3. Attach: send CDW10 SEL 0 with a 4,096-byte controller list (a count, then up to 2,047 16-bit controller IDs) and the NSID. The controller stops at the first bad entry and reports its byte offset in the Command Specific Information field of the Error Information log entry.
+4. The host learns of the change through the Attached Namespace Attribute Changed notice (event 00h, Async Event Configuration bit 8) and the Allocated Namespace Attribute Changed notice (event 09h, bit 19). It then reads the Changed Attached Namespace List log (04h) or the Changed Allocated Namespace List log (1Ch) and rescans. Older revisions called the event Namespace Attribute Changed and log 04h the Changed Namespace List. A controller that processes a delete on its own Admin queue does not send itself the event.
+5. Detach and delete when done. Delete of an attached namespace also detaches it from every controller, but the host should detach first (Base 2.3, 5.2.21). Delete with NSID FFFFFFFFh deletes all namespaces in the subsystem.
 
 | Status | Value | Typical cause |
 |---|---|---|
-| Invalid Format | 10Ah | Bad FLBAS in create |
-| Namespace Insufficient Capacity | 115h | NCAP exceeds UNVMCAP |
-| Namespace Identifier Unavailable | 116h | Requested NSID cannot be used |
+| Invalid Format | 10Ah | Bad format index in create, or PI requested without enough metadata resources |
+| Namespace Insufficient Capacity | 115h | The create needs more unallocated capacity than is left. The Error Information entry's Command Specific Information gives the bytes needed |
+| Namespace Identifier Unavailable | 116h | The number of namespaces supported has been exceeded |
 | Namespace Already Attached | 118h | Attach twice |
 | Namespace Is Private | 119h | Attach a private namespace to a second controller |
 | Namespace Not Attached | 11Ah | Detach when not attached |
-| Thin Provisioning Not Supported | 11Bh | NSFEAT thin request on a drive without it |
-| Controller List Invalid | 11Ch | Malformed or unknown controller IDs |
+| Thin Provisioning Not Supported | 11Bh | Thin provisioning requested on a drive without it |
+| Controller List Invalid | 11Ch | Malformed or unknown controller IDs, or a list that contains an Administrative controller |
 
-- **Effects:** the Commands Supported and Effects log marks these with Namespace Inventory Change and Controller Capability Change. Linux uses those to rescan after passthrough commands.
+- **More codes:** 124h ANA Group Identifier Invalid (create), 127h Namespace Attachment Limit Exceeded (attach beyond MAXCNA or MAXDNA), 129h I/O Command Set Not Supported (create or attach) and 12Ah I/O Command Set Not Enabled (attach). All are SCT 1 (Base 2.3, Figures 381 and 386).
+- **Effects:** the Commands Supported and Effects log (05h) has effect bits such as Namespace Inventory Change (NIC, bit 3) and Controller Capability Change (CCC, bit 4). Linux uses them to rescan after passthrough commands. Attach and detach persist across all resets (Base 2.3, 5.2.20).
 - **nvme-cli:** `create-ns`, `attach-ns`, `detach-ns`, `delete-ns`, `list-ns`, `list-ctrl` (newer versions use `nvme ns create` and so on).
 FOLLOW:
-- Is a created namespace usable immediately? => No. It is allocated only, so I/O returns Invalid Namespace or Format until it is attached.
+- Is a created namespace usable immediately? => No. It is allocated only, so it is an inactive NSID and I/O fails until it is attached. Base 2.3 says Invalid Field in Command for that, and some controllers return Invalid Namespace or Format.
 - Which data buffer does attach need? => A controller list: the number of entries followed by the controller IDs.
 PITFALL: Forgetting the attach step in a script and then debugging why a namespace that create reported as successful is not visible.
-VERIFY: The create data structure field list and offsets, the CDW11 CSI field, delete-implies-detach behavior, and nvme-cli command names in your version.
+VERIFY: Base 2.3 Figure 385 defines only bytes 511:0 of the create structure as I/O command set specific, so the NSZE, NCAP, FLBAS, DPS, NMIC, ANAGRPID, NVMSETID and ENDGID layout is in the NVM Command Set Specification. Base 2.3 does not say which effect bits these two commands must set. Check the nvme-cli command names in your version.
 
 @@ 7.09 | Advanced | Numeric | tags=capacity,tnvmcap,unvmcap,granularity,thin
 Q: A 1.92 TB drive reports TNVMCAP of 1,920,383,410,176 bytes. Split it into four equal 4 KiB-format namespaces. What are NSZE, NCAP and UNVMCAP afterwards?
-SHORT: Total blocks are 1,920,383,410,176 / 4096 = 468,843,606. A quarter is 117,210,901.5, so use 117,210,901 blocks (about 480.1 GB) for each namespace, which leaves 2 blocks, or 8192 bytes, in UNVMCAP. If the drive advertises a 1 GiB granularity, each rounds down to 447 units and about 533 MB stays unallocated. Non-thin means NCAP equals NSZE.
+SHORT: Total blocks are 1,920,383,410,176 / 4096 = 468,843,606. A quarter is 117,210,901.5, so use 117,210,901 blocks (about 480.1 GB) for each namespace, which leaves 2 blocks, or 8192 bytes, in UNVMCAP. If the drive reports a 1 GiB allocation unit (assumed), the host asks for 447 units each and about 533 MB stays unallocated. Non-thin means NCAP equals NSZE.
 DEEP:
 1. Assumption: 4096-byte LBADS, no metadata, no thin provisioning, and metadata or FTL reserve not deducted from TNVMCAP.
 2. Blocks in total: 1,920,383,410,176 / 4096 = 468,843,606.
 3. Per namespace: floor(468,843,606 / 4) = 117,210,901 blocks = 480,095,850,496 bytes.
 4. Four namespaces: 468,843,604 blocks. Unallocated: 2 blocks = 8192 B, so UNVMCAP goes from 1,920,383,410,176 to 8192.
-5. With granularity (assumed 1 GiB = 262,144 blocks of 4 KiB): floor(117,210,901 / 262,144) = 447 units. NSZE = 447 x 262,144 = 117,178,368 blocks = 479,962,595,328 bytes. Four of them use 1,919,850,381,312 bytes, leaving 533,028,864 bytes.
+5. With granularity (assumed 1 GiB = 262,144 blocks of 4 KiB) the host picks a multiple of the unit, because the controller may round a request up to the next unit boundary (Base 2.3, 8.1.16): floor(117,210,901 / 262,144) = 447 units. NSZE = 447 x 262,144 = 117,178,368 blocks = 479,962,595,328 bytes. Four of them use 1,919,850,381,312 bytes, leaving 533,028,864 bytes.
 6. Thin variant: NSZE 468,843,606 with NCAP 117,210,901 on each of four namespaces is a 4:1 oversubscription. UNVMCAP still falls by NCAP x 4096 per namespace.
 
 | Format | NSZE for the same 1.92 TB |
@@ -186,13 +189,13 @@ DEEP:
 | 512 B | 3,750,748,848 |
 | 4096 B | 468,843,606 |
 
-- **Validation:** UNVMCAP after create should equal UNVMCAP before minus NCAP x LBADS, within any granularity rounding. After delete it must return exactly.
+- **Validation:** UNVMCAP after create is expected to fall by about NCAP x LBADS, within any granularity rounding. The controller decides how much NVM capacity a namespace uses, and that need not equal block size times block count (Base 2.3, 8.1.16), so treat exact equality as a vendor claim to confirm. After delete it should return to the value before the create.
 - **nvme-cli hint:** its SI-unit options round to 1 MiB unless the controller recommends another granularity.
 FOLLOW:
 - What if the format carries 8 bytes of metadata per block? => Whether capacity accounting includes metadata is controller specific. Measure UNVMCAP change and do not assume.
-- How would you check granularity? => Identify Namespace Granularity List (CNS 16h) and ensure NSZE and NCAP are multiples of the reported values.
+- How would you check granularity? => Identify Namespace Granularity List (CNS 16h, reported when CTRATT bit 7 is set) and ensure NSZE and NCAP are multiples of the reported values.
 PITFALL: Computing from the marketing capacity. 1.92 TB is a rounded label, so use TNVMCAP from Identify Controller.
-VERIFY: Whether UNVMCAP accounts for metadata bytes and per-namespace overhead, and the granularity descriptor layout and rounding rule.
+VERIFY: The Namespace Granularity List layout and its rounding rule are in the NVM Command Set Specification (Base 2.3, 5.2.13.2.13, defers to it). Base 2.3 does not say whether UNVMCAP accounts for metadata bytes and per-namespace overhead. It leaves that to the controller.
 
 @@ 7.10 | Advanced | Trap | tags=dlfeat,deallocate,dulbe,npdg,read-value
 Q: After a Deallocate or a Write Zeroes with the Deallocate bit, does a read return zeros? What does DLFEAT tell you?
@@ -209,31 +212,31 @@ FOLLOW:
 - Does Write Zeroes always return zeros? => Without the Deallocate bit the blocks must read as zeros. With it, the controller may deallocate, and the result follows DLFEAT.
 - Why check NUSE after deallocating? => It should fall on a thin namespace, but not necessarily by the range size, so use it only as a soft signal.
 PITFALL: Asserting zeros after every Deallocate, which flags a compliant drive as failing.
-VERIFY: The exact definition of NPDG and NPDA (zero-based or in blocks), DULBE status code and enabling, and DLFEAT bit 4 semantics in the NVM Command Set Specification.
+VERIFY: NPDG and NPDA (zero-based or in blocks), DLFEAT bit meanings, and the DULBE enabling bit are in the NVM Command Set Specification. Base 2.3 only lists FID 05h (Error Recovery) and status 87h (SCT 2) as defined there (Figure 32, Figure 106).
 
 @@ 7.11 | Advanced | Trap | tags=broadcast,ffffffff,nsid,format,flush,features
 Q: A colleague says NSID FFFFFFFFh always means all namespaces. Where is that true, and where is it a trap?
-SHORT: FFFFFFFFh is defined per command, and each command applies its own meaning. Format NVM and Set Features can target all namespaces, and Get Log Page uses it for controller-wide data such as SMART. Flush and Namespace Management delete may accept it, but that depends on advertised support. Read and Write do not accept it and should fail, typically with Invalid Namespace or Format. A test matrix per opcode is the right approach.
+SHORT: FFFFFFFFh is defined per command. Format NVM accepts it unless FNA bit 3 is set, Flush only if VWC.FB is 11b, Set Features for controller-scope or attached namespaces, Get Log Page SMART for controller data, and Namespace Management delete removes every namespace. Read and Write do not accept it and fail with Invalid Field in Command unless a command says otherwise (Base 2.3, Figure 92). Build a test matrix per opcode.
 DEEP:
 | Command | NSID FFFFFFFFh | Note |
 |---|---|---|
-| Format NVM | All namespaces | If the controller reports FNA bit 0, a format of one applies to all |
-| Set Features | All namespaces, for namespace-specific features | Feature must be per-namespace, else Feature Not Namespace Specific (10Fh) |
-| Get Log Page | Controller-wide or global data | SMART is per-controller unless LPA says per-namespace |
-| Flush | All namespaces if supported | Support reported in Identify Controller (VWC field) |
-| Namespace Management delete | May delete all | Check support first |
-| Read, Write, Compare | Not allowed | Error status, typically 0Bh |
+| Format NVM | All namespaces attached to the controller, or all in the subsystem if FNA bit 0 (FNS) is set | FNA bit 3 (FNVMBS) set means broadcast is not supported: Invalid Field in Command (Figure 192) |
+| Set Features | Controller-scope feature: sets it for the controller. Namespace-scope feature: sets it on all attached namespaces | Invalid Field in Command if the MDS bit is set. A specific valid NSID on a controller-scope feature gives Feature Not Namespace Specific (10Fh) (Base 2.3, 4.4) |
+| Get Log Page | Controller log page for SMART / Health (0h also works) | A specific NSID is accepted only if LPA bit 0 is set, else Invalid Field in Command (5.2.12.1.3) |
+| Flush | All attached namespaces if VWC.FB = 11b | FB = 10b: Invalid Namespace or Format (7.2) |
+| Namespace Management delete | Deletes all namespaces in the subsystem | Completes successfully if there are none (5.2.21) |
+| Read, Write, Compare | Not allowed | Invalid Field in Command per Figure 92 (0Bh on some drives) |
 
-- **Trap 1:** FNA bit 0 set means a Format NVM to one namespace formats all of them, so a script that formats NSID 1 wipes namespace 2 too.
-- **Trap 2:** on a non-supporting drive, a broadcast Flush returns an error, while on a supporting one it flushes everything. A cache-consistency test that relies on it must check support first.
-- **Trap 3:** Identify with this value has its own rules, which changed between spec revisions, so do not extrapolate from other commands.
+- **Trap 1:** FNA bit 0 (FNS) set means a Format NVM to one namespace formats all namespaces in the subsystem, so a script that formats NSID 1 wipes namespace 2 too. SENS (bit 1) does the same for secure erase.
+- **Trap 2:** on a drive with VWC.FB = 10b a broadcast Flush returns Invalid Namespace or Format, while with 11b it flushes all attached namespaces. A cache-consistency test that relies on it must check FB first.
+- **Trap 3:** Identify has per-CNS rules. The active and allocated lists (CNS 02h, 03h, 07h, 10h, 11h) abort FFFFFFFFh with Invalid Namespace or Format, CNS 12h uses Invalid Field in Command, and CNS 00h, 05h and 08h return the common capability structure if Namespace Management is supported (Base 2.3, 5.2.13.2). Do not extrapolate from other commands.
 - **What to automate:** for each opcode, send NSID 0, FFFFFFFFh and NN+1, and compare against a table of expected status per advertised capability.
 - **Linux:** `nvme smart-log` uses the broadcast NSID by default, and `nvme flush` takes a namespace ID.
 FOLLOW:
-- What status do you expect for a Read with NSID FFFFFFFFh? => An error, most likely Invalid Namespace or Format (0Bh). Some implementations return Invalid Field (02h), so accept both and log which.
-- Why would a controller reject a broadcast on a feature? => The feature is not namespace specific, so there is nothing to broadcast to.
+- What status do you expect for a Read with NSID FFFFFFFFh? => Invalid Field in Command (02h) per Figure 92 and Figure 589 note 2. Some drives return Invalid Namespace or Format (0Bh), so accept both and log which. NSID 0h or above NN gives 0Bh.
+- Why would a controller reject a broadcast on a feature? => Set Features with FFFFFFFFh on a namespace-scope feature is aborted when the MDS bit is set, and Get Features with it is aborted with Invalid Namespace or Format, because a Get cannot return many values.
 PITFALL: Testing broadcast behavior on one opcode and generalizing it to the rest.
-VERIFY: FNA bit 0 semantics, VWC flush broadcast bits, Namespace Management delete with FFFFFFFFh, and Identify behavior for NSID FFFFFFFFh in your spec revision.
+VERIFY: Which I/O commands defined in the NVM Command Set Specification (Read, Write, Compare) override the Figure 92 default for FFFFFFFFh.
 
 @@ 7.12 | Intermediate | Debug | tags=inactive-nsid,invalid-namespace,cqe,detach,rescan
 Q: After a detach, reads to the namespace fail. Decode the CQE and walk through how you would find the cause.
@@ -257,8 +260,9 @@ VERIFY: Whether Identify Namespace of an allocated-but-unattached or unallocated
 
 @@ 7.13 | Advanced | Concept | tags=nvm-set,endurance-group,ana,granularity,anagrpid
 Q: How do NVM sets, Endurance Groups and ANA groups relate to a namespace, and where do you see them?
-SHORT: A namespace points to the groupings it belongs to through Identify Namespace fields: ANAGRPID at byte 92, NVMSETID at byte 100 and ENDGID at byte 102. An Endurance Group is a pool of media with a shared endurance budget. An NVM Set is a subset of one for isolation. An ANA group is a set of namespaces that share an access state across controllers. Namespace creation can place a namespace into these groups.
+SHORT: A namespace points to the groupings it belongs to through Identify Namespace fields: ANAGRPID, NVMSETID and ENDGID (Base 2.3, Figure 335, CNS 08h). An Endurance Group is a pool of media with a shared endurance budget. An NVM Set is a subset of one for isolation. An ANA group is a set of namespaces that share an access state across controllers. Namespace creation can place a namespace into these groups.
 DEEP:
+- **Byte positions:** ANAGRPID is bytes 7:4, NVMSETID bytes 11:10 and ENDGID bytes 13:12 of the I/O Command Set Independent Identify Namespace structure. Older text and the legacy NVM Command Set specific structure (CNS 00h) place the same fields at bytes 92, 100 and 102, so check which structure a hex dump or driver came from.
 - **Endurance Group:** a set of NVM whose wear is tracked as a unit, with its own Endurance Group Information log page (09h). Capacity is allocated within a group.
 - **NVM Set:** a collection of media within an Endurance Group intended to isolate workloads, so one tenant's writes do not disturb another's latency. Namespaces are created in a set.
 - **ANA group:** namespaces that always change access state together (optimized, non-optimized, inaccessible). Module 14 covers ANA.
@@ -273,11 +277,11 @@ FOLLOW:
 - Where would you read per-group wear? => The Endurance Group Information log page (09h) through Get Log Page, one entry per group. See the reliability module.
 - Does a namespace belong to more than one Endurance Group? => No. It belongs to one group, and one NVM set within it.
 PITFALL: Assuming isolation between namespaces exists. Only NVM sets and Endurance Groups give a media-level boundary, and namespaces in the same set share it.
-VERIFY: CNS values for NVM Set List (04h) and the Endurance Group list (19h), the field offsets in your revision, the Endurance Group log page ID, and how the controller treats a zero ANAGRPID in the create structure.
+VERIFY: How the controller treats a zero ANAGRPID in the create structure (the NVM Command Set Specification's Namespace Management host specified fields). Base 2.3 confirms CNS 04h (NVM Set List), CNS 19h (Endurance Group List), the Endurance Group Information log page ID (09h) and the byte offsets above.
 
 @@ 7.14 | Advanced | Concept | tags=csi,command-set,identify,cns,zns
 Q: How does Command Set Identifier based identification work in NVMe 2.0, and which Identify commands use it?
-SHORT: Each namespace belongs to one I/O command set, named by a Command Set Identifier: 0 for NVM, 1 for Key Value and 2 for Zoned. Identify CNS 00h returns the NVM layout. For other command sets the host uses CNS 05h (namespace), 06h (controller) and 07h (active list), with the CSI in CDW11 bits 31:24, plus CNS 08h for the command-set-independent structure. Set Features 19h selects which command sets the controller uses.
+SHORT: Each namespace belongs to one I/O command set, named by a Command Set Identifier: 0 for NVM, 1 for Key Value, 2 for Zoned, and 3 for the Subsystem Local Memory Command Set added in Base 2.3 (Figure 327). Identify CNS 00h returns the NVM layout. For other command sets the host uses CNS 05h (namespace), 06h (controller) and 07h (active list), with the CSI in CDW11 bits 31:24, plus CNS 08h for the command-set-independent structure. Set Features 19h selects which command sets the controller uses.
 DEEP:
 | CNS | Returns |
 |---|---|
@@ -296,8 +300,7 @@ DEEP:
 FOLLOW:
 - Does a ZNS namespace still show NSZE and NCAP? => Yes, through the NVM-style fields. The zone fields come from the CNS 05h structure.
 - Which structure does a pre-2.0 host understand? => Only CNS 00h and the NVM layout, so ZNS namespaces may need a 2.0-aware host.
-PITFALL: Parsing every namespace with CNS 00h. Fine for NVM, incomplete for ZNS and Key Value.
-VERIFY: CSI value assignments beyond 0 to 2, the CNS 1Ch content, Set Features 19h layout, and whether CNS 00h works on non-NVM namespaces in your revision.
+PITFALL: Parsing every namespace with CNS 00h. Fine for NVM, incomplete for ZNS, Key Value and the newer Subsystem Local Memory Command Set. If the namespace's I/O command set does not support the CNS value used, the controller aborts with Invalid I/O Command Set (Base 2.3, 5.2.13.2).
 
 @@ 7.15 | Principal | Scenario | tags=test-design,lifecycle,fault-injection,model,capacity-leak
 Q: Design a validation plan for namespace management: create, attach, detach and delete under load and power loss.

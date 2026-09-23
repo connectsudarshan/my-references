@@ -273,7 +273,7 @@ DEEP:
 
 **Post-recovery checklist:** ready within the limit, no Read Only or Offline zones appeared unexpectedly, Report Zones state in the allowed set, no zone left open, WP within the bounds from the ledger, read-back of everything below WP and of the region above it, then continue writing at WP and finally Reset the zone. The last step catches a WP that reads well but that the firmware cannot write to.
 
-**Triggers:** use firmware markers or NAND-operation triggers with a swept delay (see the NVMe page, power-loss coverage question), and confirm each cut from SMART Unsafe Shutdown and Power Cycle counts and a logged marker.
+**Triggers:** use firmware markers or NAND-operation triggers with a swept delay (see the NVMe page, power-loss coverage question), and confirm each cut from SMART Unexpected Power Losses (formerly Unsafe Shutdowns) and Power Cycle counts and a logged marker.
 FOLLOW:
 - Why keep writing after recovery? => A bad open block or stale free-pool state only shows on the next program, not in the report or the read-back.
 - Which windows need a NAND-level trigger? => Program and erase in progress and Finish padding. Host-side timing cannot land there reliably.

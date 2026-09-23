@@ -44,21 +44,21 @@ SHORT: An NVM subsystem is the whole storage device as the host sees it: control
 DEEP:
 | Entity | Identity | Consumer SSD (typical) | Enterprise SSD (typical) |
 |---|---|---|---|
-| Subsystem | NQN (Identify Controller SUBNQN, 256 bytes) | 1 | 1 |
+| Subsystem | NQN (Identify Controller SUBNQN, 256-byte field, NQN up to 223 bytes) | 1 | 1 |
 | Port | PCIe port or fabric address | 1 | 1 or 2 |
 | Controller | CNTLID (16 bits, unique in the subsystem) | 1 | 1 to many |
 | Namespace | NSID (32 bits) | 1 | 1 to many |
 
-- **Controller types:** Identify Controller has a controller type field: I/O controller (1), Discovery controller (2), Administrative controller (3). A plain SSD exposes I/O controllers.
+- **Controller types:** the Identify Controller CNTRLTYPE field (byte 111) reports I/O controller (1), Discovery controller (2) or Administrative controller (3). Value 0 is reserved from revision 1.4 on. A plain SSD exposes I/O controllers.
 - **Namespace:** has its own size, LBA format, and protection settings. A **private** namespace is attached to one controller, a **shared** one to several.
-- **NSID values:** 0 is never valid. FFFFFFFFh is the broadcast value ("all namespaces") for the commands that define it.
-- **Reset scope:** NVM Subsystem Reset resets every controller in the subsystem, while CC.EN=0 resets one controller.
+- **NSID values:** 0 is never valid, and neither is any NSID above the Identify Controller NN value. FFFFFFFFh is the broadcast value ("all namespaces") for the commands that define it (Base 2.3, 3.2.1.2, Figures 142 and 589).
+- **Reset scope:** NVM Subsystem Reset resets every controller in the subsystem (or in the domain, for a multi-domain subsystem), while CC.EN=0 resets one controller.
 - **Port:** a dual-port SSD has two PCIe ports in one subsystem. On fabrics, a port is a transport address such as an IP and TCP port.
 FOLLOW:
 - Can two controllers see the same namespace? => Yes, if it is a shared namespace attached to both. The host then coordinates with reservations, ANA and multipath (module 14).
 - Where is a namespace listed for a controller? => Identify with the active namespace list CNS returns the NSIDs attached to that controller (module 7 has the CNS values).
 PITFALL: Equating a namespace with a partition. A namespace is defined and formatted by the controller, has its own LBA format and metadata setup, and is not a host filesystem concept.
-VERIFY: Controller type encodings and which revisions define Discovery and Administrative controllers, and which commands accept NSID FFFFFFFFh.
+VERIFY: Which revision introduced the Administrative controller type (Base 2.3 does not say).
 
 @@ 1.04 | Basic | Trap | tags=form-factor,m.2,u.2,sata,protocol,class-code
 Q: Is NVMe a form factor or a connector? What does an M.2 slot tell you about the protocol?
@@ -80,7 +80,7 @@ FOLLOW:
 - Someone says "PCIe SSD" in a bug report. Is it NVMe? => Very likely, but confirm with the class code. 0108h/02h is NVMe, and 0106h/01h is AHCI.
 - What does NVMe over Fabrics do to the form factor question? => Nothing physical. The host speaks the same protocol over RDMA, TCP or FC to a remote subsystem, and no local PCIe device is involved.
 PITFALL: Writing "M.2 drive" in a test plan or bug report when you mean "NVMe drive". They are different axes, and results for one do not transfer to the other.
-VERIFY: Programming interface values 02h (NVM Express) and 01h (AHCI 1.0) in the PCI code and ID assignment specification.
+VERIFY: Class code 0108h with programming interface 02h (NVM Express) and 0106h with 01h (AHCI 1.0) are defined in the NVMe over PCIe Transport Specification (PCI Header section) and the PCI-SIG Code and ID Assignment specification, not in Base 2.3.
 
 @@ 1.05 | Intermediate | Concept | tags=spec-family,nvme-2.0,command-sets,transports,nvme-mi
 Q: Which documents make up the NVMe specification family, and what changed with the 2.0 restructuring?
@@ -88,23 +88,24 @@ SHORT: Through the 1.4 line NVMe was one monolithic Base specification, with NVM
 DEEP:
 | Document | What it owns |
 |---|---|
-| Base | Architecture, controller properties, queueing model, Admin command set, Identify, features, log pages, Fabrics commands |
+| Base | Architecture, controller properties (register fields, Base 3.1.4), queueing model, Admin command set, Identify, features, log pages, Fabrics commands |
 | NVM Command Set | Read, Write, Flush, Compare, Dataset Management, Copy, protection information, LBA formats |
 | ZNS Command Set | Zones, Zone Append, Zone Management Send and Receive |
 | Key Value Command Set | Store, Retrieve, List, Delete on keys instead of LBAs |
 | PCIe transport | How the controller registers map into BAR0, doorbells, MSI-X, PCIe-specific behavior |
 | RDMA and TCP transports | How capsules and data map onto each fabric |
 | NVMe-MI | Out-of-band management over SMBus or I2C, and MCTP over PCIe |
+| Boot | Constructs and guidelines for booting from NVMe (also in the Base 2.3 family figure) |
 
-- **Newer command sets:** the current family also lists command sets such as Subsystem Local Memory and Computational Programs, added in later 2.x revisions.
+- **Newer command sets:** Base 2.3 (Figure 327) assigns Command Set Identifiers to NVM (00h), Key Value (01h), Zoned Namespace (02h), Subsystem Local Memory (03h) and Computational Programs (04h).
 - **Fibre Channel:** the FC mapping is defined by the FC-NVMe standards from INCITS T11 rather than by an NVMe transport document.
-- **Revisions:** 2.0 was released in June 2021. Base 2.1 came in 2024, and 2.2 and 2.3 followed in 2025. Check nvmexpress.org for the current revision, since ECNs and TPs are folded in over time.
+- **Revisions:** 2.0 was released in June 2021. Base 2.1 came in 2024, and 2.2 and 2.3 followed in 2025 (the 2.3 cover page is dated July 31, 2025). Check nvmexpress.org for the current revision, since ECNs and TPs are folded in over time.
 - **Practical effect:** a requirement about Read lives in the NVM Command Set specification, one about Create I/O Queue in Base, and one about doorbell layout in the PCIe transport specification. Cite the right document and revision in every test.
 FOLLOW:
 - Where would you find the Zone Append opcode? => In the ZNS Command Set specification. It is an I/O opcode (7Dh) that exists only in a ZNS namespace.
 - Where are the Fabrics commands, such as Connect, defined in 2.x? => In the Base specification, with the transport bindings in the RDMA and TCP transport specifications. Before 2.0 they lived in the separate NVMe over Fabrics specification.
 PITFALL: Citing "NVMe 1.4 section X" for a 2.x feature, or hunting for command-set details in Base. Under 2.x the same question may be split across two or three documents.
-VERIFY: Whether register definitions sit in Base (as "properties") with the BAR0 mapping in the PCIe transport spec, the release dates of 2.1 to 2.3, and which command sets the current revision lists.
+VERIFY: The release dates of 2.0 to 2.2 (Base 2.3 shows only its own date), and the Zone Append opcode 7Dh (Zoned Namespace Command Set Specification).
 
 @@ 1.06 | Intermediate | Concept | tags=host,controller,roles,command-flow,pull-model
 Q: Walk through the roles of host and controller for one I/O command at a high level.
@@ -142,22 +143,22 @@ DEEP:
 | Get Features | 0Ah |
 | Asynchronous Event Request | 0Ch |
 
-The I/O opcodes are Flush 00h, Write 01h and Read 02h. Admin and I/O are separate opcode spaces, so opcode 01h means Create I/O SQ on the admin queue and Write on an I/O queue.
+The I/O opcodes are Flush 00h (defined in Base, Figure 589), Write 01h and Read 02h (NVM Command Set specification). Admin and I/O are separate opcode spaces, so opcode 01h means Create I/O SQ on the admin queue and Write on an I/O queue.
 
 - **Admin queue:** size comes from AQA (12-bit fields, so up to 4096 entries), base addresses from ASQ and ACQ. It is set up before CC.EN is set to 1 (module 2).
 - **Why separate:** management keeps working when I/O queues are full, stuck or torn down. The admin queue creates and deletes I/O queues, aborts stuck commands and delivers asynchronous events.
-- **Queue count:** Set Features Number of Queues carries the requested counts in CDW11 (0-based). The completion returns the allocated counts in dword 0, which the host must read rather than assume.
-- **Create order:** the CQ comes first because an SQ names the CQ it completes into. Creating the SQ first fails with Completion Queue Invalid.
+- **Queue count:** Set Features Number of Queues carries the requested counts in CDW11 (0-based). The completion returns the allocated counts in dword 0, which the host must read rather than assume. The controller may grant fewer or more than requested (Base 2.3, 5.2.26.2.1).
+- **Create order:** the CQ comes first because an SQ names the CQ it completes into. Creating the SQ first fails with Completion Queue Invalid (a CQ ID of 0 or out of range gives Invalid Queue Identifier instead).
 - **Linux:** the driver logs the outcome, for example `nvme nvme0: 16/0/0 default/read/poll queues`.
 FOLLOW:
 - Can one CQ serve several SQs? => Yes. Each SQ is bound to exactly one CQ, but a CQ may collect completions from many SQs. Linux normally uses one CQ per SQ.
-- What if the host asks for more queues than the controller supports? => The controller grants fewer and reports the granted counts in the completion. The host must size its queue set from that result.
+- What if the host asks for more queues than the controller supports? => The controller may grant fewer (or more, if it allocates in units) and reports the granted counts in the completion. The host must size its queue set from that result.
 PITFALL: Assuming the requested queue count was granted. The driver or test must read the allocated counts from the completion.
-VERIFY: Whether Set Features Number of Queues is rejected (Command Sequence Error) once I/O queues exist, and the full opcode list against the Base specification.
+VERIFY: Write 01h and Read 02h opcodes in the NVM Command Set Specification (Base 2.3 defines only Flush among the I/O opcodes shown).
 
 @@ 1.08 | Intermediate | Debug | tags=identify,nvme-cli,id-ctrl,cmic,mdts,sqes,version
 Q: You run `nvme id-ctrl` on a new SSD and see the output below. What can you conclude about its architecture?
-SHORT: The version field 0x20000 decodes to NVMe 2.0.0. CMIC 0x3 says the subsystem has multiple ports and multiple controllers, so expect a dual-port style drive. CNTLID 1 is this controller's identity, and the controller type says I/O controller. MDTS 5 limits transfers to 128 KiB with 4 KiB pages. SQES and CQES 0x66 and 0x44 mean fixed 64-byte commands and 16-byte completions. NN is an NSID upper bound, not a count of namespaces.
+SHORT: The version field 0x20000 decodes to NVMe 2.0.0. CMIC 0x3 sets MPORTS and MCTRS: the subsystem may hold several ports and controllers, so expect a dual-port style drive. CNTLID 1 is this controller's identity, and the controller type says I/O controller. MDTS 5 limits transfers to 128 KiB with 4 KiB pages. SQES and CQES 0x66 and 0x44 mean fixed 64-byte commands and 16-byte completions. NN is an NSID upper bound, not a count of namespaces.
 DEEP:
 ```
 $ sudo nvme id-ctrl /dev/nvme0 | egrep "^(vid|mn|fr|cmic|mdts|cntlid|ver|cntrltype|sqes|cqes|nn|subnqn) "
@@ -177,43 +178,42 @@ subnqn    : nqn.2019-01.com.example:ssd:SN0001
 | Field | Value | Meaning |
 |---|---|---|
 | ver | 0x20000 | Major in bits 31:16, minor in 15:8, tertiary in 7:0, so 2.0.0 |
-| cmic | 0x3 | Bit 0: multiple PCIe ports. Bit 1: multiple controllers. Shared namespaces and multipath are possible |
+| cmic | 0x3 | Bit 0 MPORTS: more than one port possible. Bit 1 MCTRS: two or more controllers possible. Bit 2 is FT (SR-IOV virtual function), bit 3 ANARS. Shared namespaces and multipath are possible |
 | cntlid | 1 | Controller ID within the subsystem. It does not prove other controllers exist, CMIC bit 1 says that |
 | cntrltype | 1 | I/O controller |
 | mdts | 5 | 2^5 times the minimum page size (CAP.MPSMIN, 4 KiB if 0) = 128 KiB. A value of 0 means no limit reported |
 | sqes, cqes | 0x66, 0x44 | Low nibble is the required size and high nibble the maximum, as powers of two: 2^6 = 64 B and 2^4 = 16 B |
-| nn | 32 | Largest valid NSID, not the number of namespaces that exist |
+| nn | 32 | Largest valid NSID, not the number of namespaces that exist (the MNAN field gives the supported count) |
 
 - **Next commands:** `nvme list-subsys` to see the controllers and paths, `nvme id-ns /dev/nvme0n1` for the namespace, `nvme id-ctrl -H` for decoded bits.
 - **Log it:** record vid, mn, sn, fr, ver, cmic, mdts, oacs, oncs and subnqn at the start of every test run. They explain results and gate which tests apply.
 FOLLOW:
 - The same output shows `mdts : 0`. What does that mean for a test? => The controller reports no transfer limit. The practical limit is then set by the host driver or vendor documentation, so probe with large I/O instead of assuming.
-- Why print sqes and cqes at all? => A device with a different required or maximum entry size breaks a host that assumes 64 and 16 bytes. Sizes are chosen by the host in CC.
+- Why print sqes and cqes at all? => The required (minimum) sizes shall be 64 B and 16 B, but the maximum may be larger on controllers with proprietary extensions, and the host picks the actual size in CC.IOSQES and CC.IOCQES. Log both nibbles.
 PITFALL: Reading nn as the number of namespaces present. Use the active namespace list from Identify to count them.
-VERIFY: NN wording in the current Base revision, the SQES and CQES nibble meaning, and the CMIC bit assignments (bit 2 relates to SR-IOV).
 
 @@ 1.09 | Advanced | Concept | tags=command-set,css,csi,zns,key-value,cc-css
 Q: How does a controller advertise, and a host select, command sets, and how does ZNS relate to the NVM command set?
-SHORT: CAP.CSS advertises support: one bit for the NVM command set, one for "one or more I/O command sets", one for admin-only. Software selects with CC.CSS before enabling the controller. Each namespace then reports a Command Set Identifier (CSI): 0 for NVM, 1 for Key Value, 2 for Zoned Namespace. The same opcode number can mean different commands in different command sets, so the namespace's CSI decides the interpretation.
+SHORT: CAP.CSS advertises support: one bit for the NVM command set, one for "one or more I/O command sets", one for admin-only. Software selects with CC.CSS before enabling the controller, and with 110b the I/O Command Set Profile feature (19h) picks the combination in use. Each namespace reports a Command Set Identifier (CSI): 0 NVM, 1 Key Value, 2 Zoned Namespace. The same opcode can mean different commands in different command sets, so the CSI decides.
 DEEP:
 | Field | Value | Meaning |
 |---|---|---|
-| CAP.CSS bit 0 (CAP bit 37) | 1 | NVM command set supported |
-| CAP.CSS bit 6 (CAP bit 43) | 1 | One or more I/O command sets supported |
-| CAP.CSS bit 7 (CAP bit 44) | 1 | No I/O command set (admin only) |
+| CAP.CSS bit 0 (CAP bit 37), NCSS | 1 | NVM command set supported |
+| CAP.CSS bit 6 (CAP bit 43), IOCSS | 1 | One or more I/O command sets supported |
+| CAP.CSS bit 7 (CAP bit 44), NOIOCSS | 1 | No I/O command set (admin only) |
 | CC.CSS (bits 6:4) | 000b, 110b, 111b | NVM only, all supported I/O command sets, admin only |
-| CSI | 0, 1, 2 | NVM, Key Value, Zoned Namespace |
+| CSI | 0, 1, 2, 3, 4 | NVM, Key Value, Zoned Namespace, Subsystem Local Memory, Computational Programs (Base 2.3, Figure 327) |
 
-- **Host sequence:** read CAP.CSS. If the I/O command sets bit is set, write CC.CSS=110b with CC.EN=0, enable, then read namespace descriptors (the CSI descriptor) and the command-set-specific Identify structures.
+- **Host sequence (Base 3.5.1):** read CAP.CSS. NOIOCSS set means CC.CSS=111b, else IOCSS set means 110b, else NCSS means 000b, all written with CC.EN=0. After enable: Identify I/O Command Set (CNS 1Ch), Set Features I/O Command Set Profile (FID 19h) to choose a combination, then for each enabled command set the Active NSID list with that CSI (CNS 07h). Each namespace also has a CSI descriptor (NIDT 4h).
 - **ZNS:** a CSI 2 namespace reuses Read and Write semantics from the NVM command set and adds zones: Zone Management Send (79h), Zone Management Receive (7Ah), and Zone Append (7Dh). Writes must land at the zone's write pointer.
 - **Key Value:** opcode 01h is Write in the NVM command set but Store in the KV command set. Only the namespace's command set tells you which.
 - **Linux:** the kernel selects CSI-aware setup automatically and exposes zoned namespaces through the zoned block layer (`blkzone`, `nvme zns` in nvme-cli).
-- **Validation angle:** test each opcode against a namespace of the wrong command set, and check that a host that selected NVM only never gets to see a ZNS namespace.
+- **Validation angle:** test each opcode against a namespace of the wrong command set. Check that CNS 07h with a CSI that is not supported or not enabled fails with Invalid Field in Command, and that attaching a namespace of a non-enabled command set fails with I/O Command Set Not Enabled.
 FOLLOW:
-- Can one controller expose an NVM namespace and a ZNS namespace at once? => Yes, when CC.CSS selects all supported I/O command sets. Each namespace carries its own CSI.
+- Can one controller expose an NVM namespace and a ZNS namespace at once? => Yes, when CC.CSS selects all supported I/O command sets and the I/O Command Set Profile combination includes both. Each namespace carries its own CSI.
 - When can CC.CSS change? => Only while CC.EN is 0, together with the other configuration fields such as the page size and arbitration mechanism. Change it and re-enable.
 PITFALL: Assuming an I/O opcode value has one meaning everywhere. Decode opcodes with the namespace's CSI.
-VERIFY: CAP.CSS and CC.CSS encodings, the CSI descriptor type in the namespace identification list, whether namespaces of unselected command sets are hidden, and the rule that CC.CSS is writable only while CC.EN is 0.
+VERIFY: ZNS opcodes 79h, 7Ah and 7Dh and the write pointer rule (Zoned Namespace Command Set Specification), Key Value Store opcode 01h (Key Value Command Set Specification), and whether Active Namespace ID list CNS 02h hides namespaces of command sets that are not enabled (Base 2.3 does not say).
 
 @@ 1.10 | Advanced | Scenario | tags=dual-port,multipath,nqn,nguid,nsid,duplicate-identity
 Q: After connecting a second path to a dual-port SSD, the same 3.84 TB namespace shows up twice, as /dev/nvme0n1 and /dev/nvme1n1. Is it a bug, and what could go wrong?
@@ -234,7 +234,7 @@ DEEP:
 - **What goes wrong:** two block devices over one namespace bypass the host's cache coherence and can corrupt a filesystem. Failover tests (path down, ANA state changes) are then invalid too.
 - **Where it goes deeper:** ANA, reservations and path failover are in module 14.
 FOLLOW:
-- What identifies the same namespace across controllers? => The subsystem NQN together with the NSID, and the globally unique identifiers (NGUID, EUI-64, UUID) in the namespace descriptors.
+- What identifies the same namespace across controllers? => The subsystem NQN together with the NSID, and the globally unique identifiers (NGUID, EUI-64, UUID) in the namespace descriptors, which stay fixed for the life of the namespace (Base 2.3, 5.2.13.2.3).
 - Would a single-port SSD ever show two controllers? => Yes, if it exposes multiple functions, for example SR-IOV virtual functions or several physical functions. Each function is its own controller.
 PITFALL: Concluding "same NSID, same namespace". NSIDs are unique only inside one subsystem, and two drives both start at NSID 1.
 VERIFY: sysfs attribute names on the target kernel and how the kernel reports duplicate namespace identifiers.
@@ -267,6 +267,7 @@ DEEP:
 | 0x00010400 | 1.4.0 |
 | 0x00020000 | 2.0.0 |
 | 0x00020100 | 2.1.0 |
+| 0x00020300 | 2.3.0 |
 
 - **Two places:** the VS register in BAR0 is readable before the controller is enabled, and Identify Controller VER is read later. They should agree, and a mismatch is a defect.
 - **Capability fields:** CAP (page sizes, command sets, timeouts), Identify Controller OACS (optional admin commands), ONCS (optional NVM commands such as Compare, Write Zeroes, Dataset Management, Verify, Copy), LPA (log page attributes), and the Commands Supported and Effects log page (LID 05h).
@@ -277,7 +278,7 @@ FOLLOW:
 - Can a drive report VS 2.0 and still lack the Copy command? => Yes. Copy is optional and is advertised in ONCS.
 - What do you do about a VS and VER mismatch? => File it as a defect, and find out which value each host stack keys off (Linux reads VS at init) so you know which hosts are affected.
 PITFALL: Treating "NVMe 2.0" as an implicit feature checklist. Even mandatory items changed between revisions, so discover, then test.
-VERIFY: ONCS and OACS bit positions, the LID for Commands Supported and Effects, and which features became mandatory in which revision.
+VERIFY: Which features became mandatory in which revision. Base 2.3 has no per-revision table and points to nvmexpress.org (revision changes page). Individual fields state it, for example controller type nonzero from 1.4 and CRTO mandatory from 2.0.
 
 @@ 1.13 | Advanced | Cross-layer | tags=pcie,failure-ownership,csts,all-ones,timeouts,triage
 Q: Which failures are reported by PCIe and which by NVMe, and how do you tell from the host which layer failed?
@@ -296,6 +297,7 @@ DEEP:
 - **What Linux prints:** on a dead device the driver logs a line such as `nvme nvme0: controller is down; will reset: CSTS=0xffffffff, PCI_STATUS=0xffff`. All ones in both registers means the config and MMIO reads are failing, so it is the link.
 - **Timeout defaults:** the driver's `nvme_core.io_timeout` is 30 seconds and the admin timeout is 60 seconds, so a link problem can look like a long silent hang before anything is logged.
 - **Cross-layer trap:** CC.EN=0 resets the controller but does not fix a dead link, so a reset loop that never recovers points below NVMe.
+- **CFS is silent:** the fatal status condition is not signaled by an interrupt. The host finds it through timeouts or repeated errors, so it must read CSTS then (Base 2.3, 9.5).
 FOLLOW:
 - Why is a timeout the usual symptom of a link problem? => The doorbell or the completion is lost, so the driver only sees a command that did not finish within the timeout.
 - Can NVMe report a PCIe problem? => Only indirectly. Some vendor or OCP log pages carry PCIe error counters, and CSTS.CFS may be set when the controller detects its own fault, but the host cannot rely on either.
@@ -333,7 +335,7 @@ DEEP:
 3. **Capability layer:** read VS, CAP, Identify (OACS, ONCS, CSI), and log pages. Tests declare what they need, for example `requires: oncs.copy`. A missing capability produces "not applicable" with a reason, reported separately from pass.
 4. **Behavior deltas:** command-set selection and CSI, changed Identify structures, namespace types, and any field that became reserved or deprecated. Old tests that assert an error for an opcode that is now valid become wrong.
 5. **Negative and boundary:** reserved bits set, invalid NSID, unsupported CSI, unsupported opcode in each command set, with the expected status (Invalid Field, Invalid Namespace or Format, Invalid Command Opcode) and the DNR bit.
-6. **Revision watch:** tag each test with the spec revision and re-run the coverage diff whenever the drive or the spec revision changes.
+6. **Revision watch:** tag each test with the spec revision and re-run the coverage diff whenever the drive or the spec revision changes. Base 2.3 points to the nvmexpress.org revision changes page for what changed and what is mandatory.
 
 - **Metrics:** requirement coverage, capability-skip rate, defects per requirement, and for each escape found after release, which requirement was missing.
 - **Ambiguity:** when the spec text is unclear, record the interpretation in the test, and raise it with the vendor or the NVMe technical channels rather than deciding silently.
@@ -346,18 +348,19 @@ PITFALL: Counting tests instead of requirements, or gating on the version number
 Q: Design boundary tests for the architectural queue limits, and quantify what "maximum" means in memory and in commands.
 SHORT: The spec ceilings are 65,535 I/O queue pairs, 65,536 entries per queue (CAP.MQES is a 16-bit 0-based field), and 4096 entries for the admin queue. A full set of 65,535 SQs of 65,536 entries needs 256 GiB of host memory, plus 64 GiB for CQs, so no real system goes near it. Test what the device advertises: MQES, granted queue counts, and the status returned exactly at and beyond each boundary.
 DEEP:
-1. **Queue ceiling:** QIDs 1 to 65,535 give 65,535 I/O queues. The Number of Queues result is 0-based, so the largest usable value is 65,534.
+1. **Queue ceiling:** QIDs 1 to 65,535 give 65,535 I/O queues. Number of Queues is 0-based, so the largest value a host may request is 65,534. A request of 65,535 should be aborted with Invalid Field in Command (Base 2.3, 5.2.26.2.1).
 2. **SQ memory:** 65,535 x 65,536 x 64 B = 274,873,712,640 B, which is 256.0 GiB.
 3. **CQ memory:** the same count and depth at 16 B is about 64 GiB.
 4. **Realistic:** 64 queues x 1024 entries gives 64 x 1024 x 64 B = 4 MiB of SQ and 1 MiB of CQ. Linux defaults to a depth of 1024 (`io_queue_depth`) and about one queue per CPU.
-5. **Commands in flight:** the command identifier is 16 bits, so at most 65,536 distinct CIDs per SQ (fewer if a value is reserved). The device's own resource limit is usually far lower.
+5. **Commands in flight:** the command identifier is 16 bits, but FFFFh should not be used (the Error Information log uses it for "no command"), so at most 65,535 outstanding commands per SQ, the same figure Base 2.3 gives in 4.2.1. The device's own limit is usually far lower (Identify Controller MAXCMD, optional on PCIe).
 
 | Boundary test | Expected result |
 |---|---|
-| Request more queues than the device supports | Success, granted count is clipped and never above the request |
-| Create queue with the largest legal size (MQES) | Success |
-| Create queue one entry above MQES | Invalid Queue Size (command-specific status 02h) |
-| Create SQ with a QID beyond the granted count, or a duplicate QID | Invalid Queue Identifier (command-specific status 01h) |
+| Request more queues than the device supports | Success. The granted count may differ from the request (fewer, or more if the controller allocates in units), so use the returned value |
+| Request 65,535 queues in either count field (FFFFh, 0-based) | Invalid Field in Command (should) |
+| Create queue with QSIZE = MQES (MQES + 1 entries) | Success |
+| Create queue with QSIZE = MQES + 1, or QSIZE = 0 | Invalid Queue Size (command-specific status 02h) |
+| Create SQ with QID 0, a QID beyond the granted count, or a duplicate QID | Invalid Queue Identifier (command-specific status 01h) |
 | Create SQ referencing a CQ that does not exist | Completion Queue Invalid (command-specific status 00h) |
 | Fill every SQ with distinct command IDs | All complete, none lost, no CQ overwrite |
 | Stop consuming a CQ (no head doorbell update) | Controller stops posting and does not overwrite unread entries |
@@ -365,6 +368,5 @@ DEEP:
 - **Tooling:** the kernel driver never asks for extreme values, so use SPDK, a custom userspace driver or a bare-metal host to reach these corners.
 FOLLOW:
 - Why cannot you reach these corners with the Linux driver? => It requests min(CPUs, controller limits) queues at a fixed default depth. Corner values need a driver you control.
-- What if the host writes a doorbell index outside the queue? => The behavior is a robustness area to check against the spec. The controller may report an error through an asynchronous event, so test it as a negative case and confirm the drive does not hang.
+- What if the host writes a doorbell index outside the queue? => If an Asynchronous Event Request is outstanding, the controller posts an Error Status event (Invalid Doorbell Write Value). The host must then delete and recreate the queue, and an SQ that saw the error consumes no further commands (Base 2.3, 3.3.1.2). Test it as a negative case and confirm the drive does not hang.
 PITFALL: Testing only the values Linux uses, so the boundary handling in firmware is never run.
-VERIFY: Status names and values for queue creation failures, the maximum granted queue count rule, whether any CID value (for example FFFFh) is reserved, and the controller's required behavior on a full CQ and on an out-of-range doorbell write.

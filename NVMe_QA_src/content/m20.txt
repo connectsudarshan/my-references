@@ -29,13 +29,13 @@ DEEP:
 4. **Store results per requirement:** pass, fail, not applicable (with the capability bit that made it so), or blocked.
 5. **Track interpretation:** where the spec is ambiguous, log the reading you adopted, who agreed and the clarification you asked for. That log is what settles arguments with firmware.
 
-- **Capability gating:** read ONCS, OACS, CAP and the Identify fields first. If the drive does not claim Write Zeroes, the test is that Write Zeroes fails with Invalid Command Opcode, not that the test is skipped.
+- **Capability gating:** read ONCS, OACS, CAP and the Identify fields first, and the Commands Supported and Effects log (05h), whose CSUPP bit is the per-opcode answer. If the drive does not claim a command, the test is that the command fails with Invalid Command Opcode (generic 01h, Base 2.3, 4.2.3.1), not that the test is skipped. Beware that in 2.3 an ONCS bit can be clear while the command is supported: for Write Zeroes, Dataset Management and Write Uncorrectable a non-zero size-limit field (WZSL, DMRL/DMSL/DMRSL, WUSL) also means supported.
 - **Coverage question it answers:** "which requirements have no test" and "which tests trace to nothing", which is usually dead weight.
 FOLLOW:
 - What do you do when the drive supports something it does not advertise? => File it as a finding. Either the Identify data is wrong or the feature is partly implemented, and a host driver trusting Identify will behave differently.
 - How do you handle spec revisions? => Diff the revisions, mark changed requirements, and re-run only the linked tests. That is the payoff of IDs.
 PITFALL: Counting tests instead of requirements. 5,000 tests that all touch the same twenty requirements is not coverage.
-VERIFY: Names of the optional support fields (ONCS for NVM commands, OACS for admin commands) and their bit meanings in the Identify Controller structure for your revision.
+VERIFY: Bit meanings of ONCS and OACS in the revision your drive claims (Base 2.3, Figure 328: OACS at bytes 257:256, ONCS at 521:520; a drive built to an older revision may follow older bit wording).
 
 @@ 20.03 | Basic | Concept | tags=conformance,unh-iol,integrators-list,ocp,interoperability,compliance
 Q: What do NVMe conformance and interoperability programs (UNH-IOL, OCP requirements, vendor suites) tell you, and what do they not tell you?
@@ -56,7 +56,7 @@ VERIFY: Current names and scope of the UNH-IOL NVMe testing service and Integrat
 Q: How do you design positive, negative and boundary tests for one NVMe command, and what is the oracle?
 SHORT: Split each input field into equivalence classes (valid, boundary, invalid), pick values at every edge, and write the expected outcome from the spec before running: Success or one specific status code. The oracle also checks side effects. A rejected command must not change data or state, and the controller must remain healthy and answer the next good command.
 DEEP:
-Take a Write with SLBA and NLB on a namespace of NSZE blocks. NLB is zero-based, so NLB = 0 means one block.
+Take a Write with SLBA and NLB on a namespace of NSZE blocks. NLB is zero-based, so NLB = 0 means one block. The NSID rows follow Base 2.3, 3.2.1.5. MDTS is a power of two in units of CAP.MPSMIN (0 = no limit), it includes interleaved metadata when CTRATT.MEM is 0, and an oversize command is aborted with Invalid Field in Command (Identify Controller, MDTS). SC 80h itself is defined in the NVM Command Set Specification.
 
 | Case | SLBA / blocks | Expected |
 |---|---|---|
@@ -67,16 +67,18 @@ Take a Write with SLBA and NLB on a namespace of NSZE blocks. NLB is zero-based,
 | 64-bit wrap | FFFFFFFFFFFFFFFFh / 2 | LBA Out of Range, no wraparound |
 | Exactly MDTS | max size the drive allows | Success |
 | One block over MDTS | max + 1 block | Invalid Field in Command (02h) |
-| NSID inactive or above NN | any | Invalid Namespace or Format (0Bh). NSID 0 and FFFFFFFFh vary by command, see VERIFY |
+| NSID 0, or above NN | any | Invalid Namespace or Format (0Bh) |
+| NSID valid but not attached (or unallocated) | any | Invalid Field in Command (02h), unless the command says otherwise |
+| NSID FFFFFFFFh (broadcast) | Read or Write | See VERIFY |
 
-- **Side-effect oracle:** after every rejected write, read the target range and its neighbors and confirm no change. Read the error log to see whether the failure was recorded (implementation dependent, see VERIFY), and send a good command to prove the queue still works.
+- **Side-effect oracle:** after every rejected write, read the target range and its neighbors and confirm no change. Read the error log to see whether the failure was recorded, and send a good command to prove the queue still works. The spec ties the log to the CQE: an Error Information entry is provided when the completion has the More (M) bit set, so expect a matching entry (SQID, CID, status) when M = 1 and require nothing when M = 0 (Base 2.3, 5.2.12.1.2).
 - **Interactions:** fields combine. Test the boundary of one field while a second sits at its own edge, for example a maximum-size transfer that ends exactly on the last LBA.
 - **Expected results are data:** keep them in a table the test reads. Then a spec clarification changes one row, not fifty scripts.
 FOLLOW:
 - Where do you get the expected status when the spec allows more than one? => Encode a set of allowed codes and record which one this firmware returns, so a change of behavior in a later build is flagged even though both are legal.
 - Why include the 64-bit wrap case? => A firmware that computes SLBA + NLB in 64 bits can wrap to a small number and accept a request that should be rejected, writing to LBA 0 or corrupting metadata.
 PITFALL: Checking only that a bad command "fails". A validator that accepts any error hides drives that return the wrong error, which host drivers act on differently.
-VERIFY: Exact status returned for NSID 0 and for a broadcast NSID on Read and Write in your spec revision, and whether the Error Information log must record every failed command.
+VERIFY: The status for a broadcast NSID (FFFFFFFFh) on Read and Write, and the LBA Out of Range and NLB rules, in the NVM Command Set Specification. Base 2.3 does not require the Error Information log to record every failed command, only when the CQE M bit is set.
 
 @@ 20.05 | Intermediate | Concept | tags=fuzzing,mutation,stateful,oracle,seed,minimization
 Q: How do you fuzz an NVMe controller in a way that produces reproducible, meaningful failures instead of noise?
@@ -189,7 +191,7 @@ FOLLOW:
 - Why not rely on `fio --verify`? => It is good for volume, but its pattern checks answer "match or not". A tailored header lets you separate misdirected from stale from torn without guessing from a hexdump.
 - How does PI change this? => PI gives the drive a per-block check. Keep the host-side pattern anyway, because PI does not catch stale but self-consistent data. See the Data Protection module.
 PITFALL: Reading back through the page cache. Without direct I/O the verify may never touch the SSD, so use O_DIRECT and confirm at the device with the SMART data units read counters.
-VERIFY: Exact 4 KiB block count of your DUT from NSZE and the LBA format, and how your fio version's verify header records offset and checksum.
+VERIFY: Exact 4 KiB block count of your DUT from NSZE and the LBA format (Identify Namespace fields for the NVM Command Set are defined in the NVM Command Set Specification), and how your fio version's verify header records offset and checksum.
 
 @@ 20.10 | Advanced | Numeric | tags=statistics,sample-size,rule-of-three,confidence,poisson,power-cycle
 Q: How many clean cycles do you need to claim a power-loss or reset bug is fixed, and what does a campaign of a given size tell you?
@@ -218,7 +220,7 @@ PITFALL: Declaring success after a few clean runs of a rare bug. A 1 percent bug
 
 @@ 20.11 | Advanced | Cross-layer | tags=power-loss,spor,coverage,cut-points,nand,plp,recovery
 Q: How do you get real coverage of power-loss windows, rather than just a large number of power cycles?
-SHORT: Random cuts mostly land in long idle or streaming phases. To cover the risky windows, trigger cuts from firmware state or NAND operation events, enumerate every cut point in simulation, vary the power fall profile, and include nested cuts during recovery. Verify each cut happened using SMART unsafe-shutdown counts, and measure coverage as the fraction of distinct windows hit, not cycle count.
+SHORT: Random cuts mostly land in long idle or streaming phases. To cover the risky windows, trigger cuts from firmware state or NAND operation events, enumerate every cut point in simulation, vary the power fall profile, and include nested cuts during recovery. Verify each cut happened using the SMART unexpected-power-loss count, and measure coverage as the fraction of distinct windows hit, not cycle count.
 DEEP:
 - **Risky windows in SSD firmware:**
   - L2P journal or checkpoint writes and superblock updates.
@@ -233,13 +235,13 @@ DEEP:
   4. Exhaustive in simulation: run a scenario with K NAND operations K times, cutting at each. No silicon rig can do this.
   5. Nested: cut during recovery, several times in a row.
 - **Fall profile:** an instant relay cut and a slow ramp or brown-out are different tests. Use a programmable supply, and record hold-up behavior for drives with power-loss protection.
-- **Oracles:** the data ledger from the integrity question, plus the recovery contract: CSTS.RDY within the limit, no fatal status, Unsafe Shutdowns incremented by exactly one, no leftover error log entries, and a bounded time to first I/O.
+- **Oracles:** the data ledger from the integrity question, plus the recovery contract: CSTS.RDY within the limit (CAP.TO, or the CRTO timeouts on 2.x controllers), no fatal status, Unexpected Power Losses incremented by exactly one, no leftover error log entries (the spec says the Error Information log should be cleared on power cycle), and a bounded time to first I/O.
 - **Coverage report:** window by window with counts and the minimum hits per window, not a global number of cycles.
 FOLLOW:
-- How do you know a cut really happened at the intended point? => Log the marker and its timestamp, compare Unsafe Shutdowns and Power Cycles in SMART before and after, and keep the analyzer or scope capture for a sample.
+- How do you know a cut really happened at the intended point? => Log the marker and its timestamp, compare Unexpected Power Losses (previously named Unsafe Shutdowns) and Power Cycles in SMART before and after, and keep the analyzer or scope capture for a sample.
 - What is different for a drive with power-loss protection? => Acknowledged cached data is expected to survive, so the oracle is stricter. Without PLP only flushed or FUA data is guaranteed. See the NVM Command Set module for the legal post-cut states.
 PITFALL: Reporting "10,000 power cycles, zero failures" with no cut-point distribution. Most of those cycles may have hit the same idle window.
-VERIFY: SMART field names and update timing for Unsafe Shutdowns and Power Cycles, and the multi-level NAND page-pair behavior with your NAND vendor.
+VERIFY: When your firmware updates and persists the Unexpected Power Losses and Power Cycles counters (Base 2.3 defines them in the SMART log, bytes 127:112 and 159:144, and says UPL is incremented if and only if main power is lost while CSTS.SHST is not 10b, but does not say when the counters are stored), and the multi-level NAND page-pair behavior with your NAND vendor.
 
 @@ 20.12 | Advanced | Concept | tags=reset,matrix,pairwise,combinatorial,invariants,power-cycle
 Q: How do you build a reset and power-cycle test matrix that is complete enough to trust and small enough to run?
@@ -254,9 +256,9 @@ DEEP:
 - **Size:** 6 x 5 x 3 x 3 x 2 = 540 cases. At 2 minutes each that is 18 hours. A pairwise set covers every pair of values across every two factors in about 30 rows in a quick greedy generation (1 hour). Higher-strength coverage for the suspect pair (event by activity) costs a few more.
 - **Always add single-factor extremes:** reset during the first admin command, reset while the controller is still initializing, back-to-back resets.
 - **Invariants after every case:**
-  1. CSTS.RDY within the CAP.TO limit, no fatal status.
-  2. Identify data, namespace attachment and persistent configuration as specified for that reset class.
-  3. Volatile features return to default or saved values as specified.
+  1. CSTS.RDY within the CAP.TO limit (it covers RDY going 1 to 0 and 0 to 1), no fatal status.
+  2. Identify data, namespace attachment and persistent configuration as specified for that reset class. Attach and detach state persists across all resets (Base 2.3, 5.2.20), and namespace identifier descriptors are preserved across a Controller Level Reset (5.2.13.2.3).
+  3. After a Controller Level Reset, features that are not saveable and not persistent return to default and saveable ones to the saved value, or default if none is saved, unless the feature says otherwise (Figures 125, 126 and 403). I/O queues are gone, and AQA, ASQ and ACQ survive only a Controller Reset (3.7.2).
   4. Data written and flushed before the event is intact, anything else legal per the atomicity rules.
   5. No completions arrive for commands that the reset discarded, and no stale interrupts.
   6. SMART counters moved by the expected amounts.
@@ -264,7 +266,7 @@ FOLLOW:
 - Why is pairwise enough? => Most interaction bugs involve two factors. It is a heuristic, so raise the strength or add explicit cases where triage history shows three-way interactions.
 - What do you do about state that differs by reset class? => Table it from the spec, per class, and let the invariant checker read the table. See the Status Codes module for the reset hierarchy and the Registers module for CC.EN and NSSR.
 PITFALL: Testing each reset only from idle. Resets during Format, GC and firmware commit are where the state machines diverge.
-VERIFY: What each reset class (controller level, NVM subsystem, PCIe function level, fundamental) preserves and clears for features, queues and namespace attachment in your spec revisions.
+VERIFY: What PCIe Function Level Reset and Conventional (fundamental) Reset clear in the PCIe registers and NVMe properties, in the NVMe over PCIe Transport Specification. The controller level and NVM subsystem cases are in Base 2.3, 3.7.
 
 @@ 20.13 | Advanced | Concept | tags=soak,stress,long-duration,wraparound,endurance,leaks
 Q: What does a soak or stress test find that short tests cannot, and how do you test long-duration bugs without waiting months?
@@ -344,7 +346,7 @@ DEEP:
 1. **Inputs:** NVMe Base, NVM and Zoned Namespace Command Set specs at fixed revisions. Read Identify Namespace zoned data (zone operation characteristics, optional zoned command support, max active and open resources, reset and finish recommended limits), the controller's zone append size limit, and zone size and capacity from Report Zones.
 2. **Risk ranking:** state machine and resource limits, write pointer rules, Zone Append, zone capacity versus zone size, power-loss write pointer recovery, firmware-initiated Read Only or Offline transitions on NAND failures, coexistence with conventional namespaces, host compatibility.
 3. **Oracle:** a Python reference model of zone state (Empty, Implicitly Opened, Explicitly Opened, Closed, Full, Read Only, Offline), write pointer, and active and open counts. Random sequences of Open, Close, Finish, Reset, Offline, Write and Append. After each command compare status and the zone report with the model. Invariants: write pointer moves forward until Reset, open and active counts stay within limits, Append returns the assigned LBA in the completion and data reads back there.
-4. **Negative tests (command-specific status, SCT 1):** Zone Boundary Error (B8h), Zone Is Full (B9h), Zone Is Read Only (BAh), Zone Is Offline (BBh), Zone Invalid Write (BCh, write not at the write pointer), Too Many Active Zones (BDh), Too Many Open Zones (BEh), Invalid Zone State Transition (BFh).
+4. **Negative tests (command-specific status, SCT 1, values listed in Base 2.3 Figure 104):** Zoned Boundary Error (B8h), Zone Is Full (B9h), Zone Is Read Only (BAh), Zone Is Offline (BBh), Zone Invalid Write (BCh, write not at the write pointer), Too Many Active Zones (BDh), Too Many Open Zones (BEh), Invalid Zone State Transition (BFh).
 5. **Transition table:** 7 states x 7 actions is 49 cells, each with an expected outcome. Exit criterion: every cell exercised at least N times.
 6. **Power loss and reset:** cut at write, append, finish and reset boundaries, check write pointer recovery against the acknowledged and flushed data, and the state of open zones after a reset.
 7. **Fault injection:** NAND program or erase failure mid-zone should produce a defined Read Only or Offline transition with correct reports and no data loss below the write pointer.
@@ -354,7 +356,7 @@ FOLLOW:
 - What do you reuse from conventional-namespace validation? => Self-describing data pattern (with generation per LBA range), reset matrix, soak monitors and evidence bundle. New work is the zone model and negative status coverage.
 - What is the hardest bug class here? => State divergence after a power cut or NAND failure: the drive reports a zone state or write pointer that disagrees with the data on media.
 PITFALL: Testing only the happy path of sequential writes. Most bugs live in the transitions and the resource limits.
-VERIFY: Status code values, zone state transitions after a controller reset (open zones to Closed), the encoding of max active and open resources (zero-based, all ones for no limit), and Append completion field layout in the NVMe Zoned Namespace Command Set Specification.
+VERIFY: In the NVMe Zoned Namespace Command Set Specification: when each B8h to BFh status applies (Base 2.3 Figure 104 only lists the values and names), zone state transitions after a controller reset (open zones to Closed), the encoding of max active and open resources (zero-based, all ones for no limit), and Append completion field layout.
 
 @@ 20.17 | Principal | Trap | tags=oracle,mutation,false-pass,seeded-bugs,test-quality,page-cache
 Q: A nightly suite has been green for three months, yet a data-loss bug reaches the field. In how many ways can a test pass without testing, and how do you prove the suite can fail?

@@ -73,8 +73,8 @@ b += [text(10, 326, 'Slot 0 holds the data entry', 'xs d', 'start'), text(10, 34
       text(10, 354, 'would have held.', 'xs d', 'start')]
 b += [text(10, 384, 'Final list page: all slots', 'xs d', 'start'), text(10, 398, 'may hold data, no link.', 'xs d', 'start')]
 
-b += [text(380, 430, 'Only PRP1 may have an offset. PRP2 used as a data pointer and every list entry are page aligned.', 'xs d'),
-      text(380, 445, 'The controller decides page or list from the transfer size, never from the value in PRP2.', 'xs d')]
+b += [text(380, 430, 'PRP1 may have any byte offset. As a data pointer PRP2 is page aligned; as a list pointer it may have a', 'xs d'),
+      text(380, 445, 'qword offset, shortening that first list page. Every other list entry stays page aligned (Base 2.3, 4.3.1).', 'xs d')]
 add('prp', 'PRP1, PRP2 and list chaining',
     'The cases by page count, then the 3-or-more case in detail at 4 KiB pages: PRP2 points to a list page of 512 8-byte slots, and when more entries follow, the last slot is a link (blue arrow) to the next list page and the displaced data entry moves to its slot 0.',
     svg(760, 456, 'PRP1 and PRP2 pointing to data pages and to chained PRP list pages', ''.join(b)))

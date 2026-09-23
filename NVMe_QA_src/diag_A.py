@@ -57,7 +57,7 @@ rows = [
     ('10h', 'INTMC', 'mask clear, pin/MSI', '4 B', 'tl', 24),
     ('14h', 'CC', 'controller configuration', '4 B', 'tl', 24),
     ('18h', '', 'reserved', '', 'grp', 24),
-    ('1Ch', 'CSTS', 'status: RDY, CFS, SHST', '4 B', 'dl', 24),
+    ('1Ch', 'CSTS', 'status: RDY, CFS, SHST, NSSRO, PP, ST', '4 B', 'dl', 24),
     ('20h', 'NSSR', 'subsystem reset trigger', '4 B', 'tl', 24),
     ('24h', 'AQA', 'admin queue sizes', '4 B', 'tl', 24),
     ('28h', 'ASQ', 'admin SQ base address', '8 B', 'tl', 32),
@@ -127,13 +127,13 @@ for y0 in (14, 74, 134, 194, 254):
     b += [arrow(BX + BW / 2, y0 + 40, BX + BW / 2, y0 + 60, 'lna')]
 b += [arrow(BX + BW / 2, 354, BX + BW / 2, 374, 'lng'), text(BX + BW / 2 + 10, 368, 'RDY = 1', 'xs gr', 'start')]
 b += [rect(BX, 374, BW, 58, 'pl'), text(BX + 14, 407, '6', 's ac'), text(BX + BW / 2 + 8, 392, 'Admin commands on queue 0', 's h'),
-      text(BX + BW / 2 + 8, 406, 'Identify Controller, Set Features (Number of Queues),', 'xs d'),
+      text(BX + BW / 2 + 8, 406, 'Identify, Set Features (Number of Queues), MSI-X setup,', 'xs d'),
       text(BX + BW / 2 + 8, 420, 'Create I/O CQ, Create I/O SQ, Identify namespaces, AERs', 'xs d')]
 # right column
 NX = 432
 b += [text(NX, 30, 'why this order', 's h', 'start')]
 b += [text(NX, 92, 'A reset that is still running must', 'xs d', 'start'), text(NX, 106, 'finish before you write config.', 'xs d', 'start')]
-b += [text(NX, 152, 'Write these before EN: the controller may', 'xs d', 'start'), text(NX, 166, 'fetch from them as soon as RDY = 1.', 'xs d', 'start')]
+b += [text(NX, 152, 'Write these before EN: the controller may fetch', 'xs d', 'start'), text(NX, 166, 'from them once RDY = 1 (a Controller Reset keeps them).', 'xs d', 'start')]
 b += [text(NX, 212, 'Some drivers do this and step 4 in one', 'xs d', 'start'), text(NX, 226, 'CC write.', 'xs d', 'start')]
 b += [arrow(BX + BW, 334, 424, 334, 'lnr'), text(420, 322, 'no', 'xs rd', 'end')]
 b += [rect(432, 310, 308, 48, 'er'), text(586, 329, 'Timeout after CAP.TO x 500 ms', 's h'), text(586, 345, 'treat the controller as failed', 'xs d')]

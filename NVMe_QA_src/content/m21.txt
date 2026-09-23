@@ -8,8 +8,8 @@ DEEP:
 |---|---|---|---|
 | 1. Function present? | Vendor ID in config space, LnkSta | All ones | Link, slot power or device gone |
 | 2. Controller alive? | CSTS and CC, read only after step 1 passes | CFS = 1, or RDY fell unexpectedly | Controller firmware |
-| 3. Status SCT 2 | CQE, error log, SMART media errors | Media and data integrity failure | Media or FTL |
-| 3. Status 04h Data Transfer Error | AER, IOMMU fault log | A DMA to or from host memory failed | Link or host memory path |
+| 3. Status SCT 2 | CQE, error log, SMART media errors | Media and data integrity failure (80h write fault, 81h unrecovered read) | Media or FTL. The end-to-end check codes 82h to 84h and 88h can also come from bad host PI or a corrupted transfer |
+| 3. Status 04h Data Transfer Error | AER, IOMMU fault log | A DMA to or from host memory failed (a PCIe master or target abort maps here, Base 2.3, 9.3) | Link or host memory path |
 | 3. Status 01h, 02h, 0Bh | Error log Parameter Error Location | The command was wrong | Host, unless a legal command was rejected |
 | 4. Timeout, CQE in host memory | CQ dump, MSI-X mask and PBA | Completion posted, host not woken | Host interrupt path, or firmware signaling |
 | 4. Timeout, no SQE fetch | Analyzer, or SSD log | Doorbell lost or queue not polled | Link, host BAR access or firmware |
@@ -17,6 +17,7 @@ DEEP:
 | 5. Success, wrong data | Raw reread, PI check, stamped pattern | Same bad data on every read, or data that varies | Media or FTL, or transport and host buffer |
 
 - **Cheapest first:** a config read and a CSTS read cost nothing and run in the failing system. The analyzer comes last.
+- **CFS raises no interrupt:** a controller that cannot post CQEs sets CSTS.CFS and goes quiet, so on timeouts or repeated errors the host has to read CSTS itself. The spec then says to try a Controller Reset and, if CFS persists, an NVM Subsystem Reset when supported (Base 2.3, 9.5). Capture evidence before either.
 - **Stop at the lowest anomalous layer**, as the PCIe page method says. The exception: a firmware hang leaves every layer below it clean, so clean link plus readable CSTS plus no CQE is a positive controller finding.
 - **Buckets chain:** a link event can end as a timeout, then a reset, then CFS. Use the earliest timestamp to find the cause.
 - **Each bucket has an owner:** host software, platform or hardware, firmware, or NAND and FTL. The verdict decides who receives the evidence.
@@ -37,7 +38,7 @@ DEEP:
 | `I/O tag N (cid) opcode 0x2 (I/O Cmd) QID Q timeout, aborting` | The controller is alive and the command did not finish | Read CSTS, check the CQ for the CID, then trace the command |
 | `... timeout, completion polled` | The CQE was in the queue and the interrupt never came | Interrupt path and firmware signaling, not the data path |
 | `invalid id N completed on queue Q` | A CQE whose CID is not outstanding | Firmware duplicate or wrong CID, or stale CQ memory |
-| `Device not ready; aborting initialisation, CSTS=0x0` | CC.EN set and RDY never rose | Measure time to ready against CAP.TO |
+| `Device not ready; aborting initialisation, CSTS=0x0` | CC.EN set and RDY never rose | Measure time to ready against CAP.TO (and CRTO on 2.x controllers, see the power-cut question) |
 | `critical medium error, dev nvme0n1, sector S` | A media status (SCT 2) was returned | Error log and SMART media counters |
 | `Disabling device after reset failure` | Reset did not bring the controller back, namespaces removed | Everything before it: why the reset failed |
 
@@ -64,16 +65,16 @@ timeout 30 nvme telemetry-log /dev/nvme0 --controller-init --output-file=tel_ci.
 timeout 10 nvme id-ctrl /dev/nvme0 -H > idctrl.txt
 timeout 10 nvme get-feature /dev/nvme0 -f 0x02 -H     # also 0x0c APST, 0x04 temperature threshold
 ```
-- **Why this order:** the kernel ring buffer wraps, AER status bits are sticky until cleared, and volatile controller state (telemetry, an assert dump) can vanish with the next reset or power cycle.
+- **Why this order:** the kernel ring buffer wraps, AER status bits are sticky until cleared, and controller state can vanish with the next reset or power cycle. The spec says the Error Information log should be cleared on power cycle and on any Controller Level Reset (Base 2.3, 5.2.12.1.2). Telemetry Controller-Initiated data areas 1 to 3 shall persist across all resets, but a vendor assert dump has no such guarantee.
 - **Wrap every admin command in a timeout.** A wedged controller will hang the tool as well, and a hung capture script loses the rest of the bundle. If the first admin command hangs, stop and go to hardware access.
-- **Read logs without clearing events.** A Get Log Page without the retain-asynchronous-event option re-arms the event, so a later read no longer shows what the first one saw.
+- **Read logs without clearing events.** A Get Log Page with RAE = 0 (the nvme-cli default) clears the matching asynchronous event, so the controller may report the next one, and it consumes state for some logs: the Changed Attached Namespace List holds changes since the last read, and Telemetry Controller-Initiated Data Available stays 1 until a RAE = 0 read completes. Set RAE = 1 for the capture (`--rae` on the nvme-cli commands that offer it). Also do not set the Create Telemetry Host-Initiated Data bit, which makes the controller capture a new snapshot (Base 2.3, 5.2.2, 5.2.12).
 - **Also record:** kernel, BIOS and drive firmware versions, slot, temperature, the fio command line and seed, and the wall-clock time, so the failure can be lined up with other logs.
 - **Then and only then:** reset, rescan or power cycle, noting which one you used and how the drive came back.
 FOLLOW:
 - The drive is unreachable and admin commands hang. What can you still capture? => Config space, the sysfs link state, the kernel log, the host-side test records, and via UART or JTAG the firmware's own state if the rig has them.
 - Should a capture script include a Format or a self-test? => No. It must be read-only. Anything that changes drive state belongs to a separate stage that runs after the bundle is saved.
 PITFALL: Rebooting first because the drive "needs" it. The unsafe-shutdown count, the sticky bits and the assert context are gone after that.
-VERIFY: nvme-cli option names (telemetry-log flags, --rae, output format) on your version, and which log page IDs your product supports.
+VERIFY: nvme-cli option names (telemetry-log flags, --rae, output format) on your version, and which log pages your product supports (Supported Log Pages, LID 00h, lists them).
 
 @@ 21.04 | Intermediate | Concept | tags=minimum-repro,bug-report,reproducibility,determinism,amplification
 Q: What makes a minimum repro and a good NVMe bug report, and why do firmware teams reject weak ones?
@@ -106,7 +107,9 @@ DEEP:
 - **First three actions:**
   1. Read config space, then CSTS and CC. All ones means a link problem, CSTS = 3 means a fatal, CSTS = 0 means the reset left it not ready.
   2. Save the kernel log with timestamps, then the error log, SMART, firmware log, and any controller-initiated telemetry or vendor log, and check for a pending Persistent Internal Error event.
-  3. Record the command: LBA format index, secure erase setting, metadata and PI options, the namespace, and the host timeout. Note whether Identify Namespace shows a format still in progress.
+  3. Record the command: LBA format index, secure erase setting, metadata and PI options, the namespace, and the host timeout. Note whether the Format Progress Indicator (byte 03 of the I/O Command Set Independent Identify Namespace, CNS 08h: FPIS bit 7, RFNVM bits 6:0 = percent remaining) shows a format still in progress.
+- **What the spec lets you ask mid-format:** the controller should keep answering Identify, Get Features, Keep Alive, Abort, Async Event Request, queue create and delete, and Get Log Page for Error Information, SMART / Health, Changed Attached Namespace List and a few others. Other Admin and I/O commands for the affected namespaces may be aborted with Format In Progress (84h, DNR cleared) (Base 2.3, 5.1 Figure 143, 5.2.10). A controller that answers none of them is stuck, not busy.
+- **Recovery order per the spec:** Controller Reset first, then an NVM Subsystem Reset if CFS persists and NSSR is supported. NSSR can drop the PCIe link and crash hosts that use firmware-first error handling. A Persistent Internal Error event (Error status 03h) says the same, and CFS may be set with it (Base 2.3, 9.5 and 5.2.2). Capture before doing either.
 - **Evidence and timeline:** was CFS set before the host timeout fired, or only after the host reset the controller mid-format? That single fact separates a firmware fatal from a recovery bug.
 
 | Rank | Cause | Signature |
@@ -122,7 +125,7 @@ FOLLOW:
 - The failure happens only when the LBA size changes from 512 B to 4096 B. What does that suggest? => The namespace size and mapping tables are rebuilt for the new format, so suspect sizing or table initialization for the new geometry. Compare with a same-format run.
 - Is a long Format a hang? => Not necessarily. Compare the run time with the host timeout and the Format Progress Indicator in Identify Namespace before calling it stuck.
 PITFALL: Resetting the drive to "see if it comes back" before saving the assert context. The reset destroys exactly what the firmware team needs.
-VERIFY: The nvme-cli default timeout for format (600000 ms in the 2.x source), the Format Progress Indicator location, and the CFS clearing rules in the NVMe Base Specification.
+VERIFY: The nvme-cli default timeout for format (600000 ms in the 2.x source). Base 2.3 has no CFS clearing rule beyond the reset value after a Controller Level Reset (3.7.2) and the recovery advice in 9.5.
 
 @@ 21.06 | Intermediate | Scenario | tags=timeout,queue-depth,resources,cq-full,lost-completion,sweep
 Q: fio runs clean up to a moderate queue depth, but at high depth on many queues some I/Os time out. How do you triage it?
@@ -138,7 +141,7 @@ DEEP:
 | Rank | Cause | Signature |
 |---|---|---|
 | 1 | Firmware resource exhaustion: command contexts, DMA descriptors, PRP list buffers, CID tracking | Fails above a fixed total of outstanding commands, the same number every run |
-| 2 | CQ backpressure with a shared or small CQ, or a wrong full test | Fails when the CQ is shared or smaller than the sum of SQs (see the Queues module) |
+| 2 | CQ backpressure with a shared or small CQ, or a wrong full test | Fails when the CQ is shared or smaller than the sum of SQs (see the Queues module). With a full CQ the controller may stop fetching that CQ's SQs, but must keep serving SQs on other CQs (Base 2.3, 3.3.1.2.1) |
 | 3 | Wake-up race at low occupancy or at wrap | Fails at any depth, worse at low depth, `completion polled` |
 | 4 | Long internal stall from GC or thermal action | Timeout only after a long latency growth, correlates with load duration |
 | 5 | Host limits: IOMMU mapping space, tag depth beyond MQES, driver bug | Reproduces only on one host or kernel |
@@ -148,15 +151,16 @@ FOLLOW:
 - Depth 127 passes and depth 128 fails on every run. What do you tell firmware? => The exact count and the smallest repro, and ask which pool has that size. A constant limit is a strong lead.
 - Failure appears only with 8 jobs, not 1 job at the same total depth. What next? => Suspect per-queue or cross-queue state, such as shared CQ, arbitration or per-core structures, and compare a single-queue run at the same depth.
 PITFALL: Raising the host timeout to "give it time". A command that is lost stays lost, and the test then hides a defect that a real host would hit.
-VERIFY: Whether your controller may stop fetching or only stop posting when the CQ is full, and the Linux timeout and tag-depth defaults on your kernel.
+VERIFY: The Linux timeout and tag-depth defaults on your kernel.
 
 @@ 21.07 | Intermediate | Debug | tags=power-cycle,admin-timeout,ready,recovery,power-loss,first-boot
 Q: After abrupt power cuts the first admin command sometimes hangs or the controller never becomes ready. How do you find the cause?
 SHORT: Time the whole bring-up after a cut: power good, PERST# release, first config read, CC.EN write, CSTS.RDY, first admin CQE. If RDY never rises, the controller misses its own CAP.TO promise or is hung. If RDY rises and an admin command still hangs, the ready promise was broken. Vary the off time, the dirty state at the cut and a clean shutdown, and see whether ready time scales with the recovery work.
 DEEP:
 - **Symptoms:** `Device not ready; aborting initialisation, CSTS=0x0`, or `opcode 0x6 (Admin Cmd) QID 0 timeout, reset controller` on the first Identify. It happens after abrupt cuts and not after clean shutdown, and not on every cut.
-- **First three actions:** read config space and CSTS to see that the link is up and what state the controller is in. Confirm the cut was really abrupt (SMART unsafe shutdowns rose by one). Poll CSTS with the driver unbound for many times CAP.TO, and record when, or whether, RDY rises.
+- **First three actions:** read config space and CSTS to see that the link is up and what state the controller is in. Confirm the cut was really abrupt (the SMART Unexpected Power Losses count, formerly Unsafe Shutdowns, rose by one). Poll CSTS with the driver unbound for many times CAP.TO, and record when, or whether, RDY rises.
 - **Evidence:** the bring-up timeline for four cases: clean shutdown then cold boot, abrupt cut then cold boot, warm reboot, and FLR. Also the amount of dirty data and the drive's fill at the cut, and the log from the previous boot.
+- **What the spec promises:** CAP.TO is the worst-case time to wait for CSTS.RDY to change after CC.EN changes, in 500 ms units (FFh = 127.5 s), and it explicitly includes the delay after an abrupt shutdown or loss of main power. The SMART log entry for Unexpected Power Losses adds that initialization after such a loss may take longer. Controllers of revision 2.0 and later also report CRTO: CRWMT (RDY plus all namespaces and media ready) and CRIMT (RDY in Controller Ready Independent of Media mode, selected with CC.CRIME), both in 500 ms units, and CAP.TO mirrors the one for the active mode, capped at FFh. A controller that hits a failure during initialization must still set RDY by CRWMT and, if the Persistent Event log is supported, log a Controller Ready Timeout Exceeded event (Base 2.3, 3.1.4.1, 3.5.3, 3.5.4, 5.2.12.1.3).
 
 | Rank | Cause | Signature |
 |---|---|---|
@@ -166,12 +170,11 @@ DEEP:
 | 4 | Rig timing: power reapplied before the rails and capacitors have discharged | Failure rate depends on off time |
 | 5 | Host or BIOS enumeration timing | Config reads fail or CRS, also on warm boots |
 
-- **Discriminating experiment:** repeat with off times of about 0.1 s, 1 s and 10 s, with an idle drive and with the drive under a 60 s random-write load at the cut, and with a normal shutdown followed by a cut. Plot time to ready for each. If it follows dirty state, it is recovery time (rank 1) and CAP.TO must cover the worst case. If RDY is 1 and the admin command still hangs, the ready promise is broken (rank 2).
+- **Discriminating experiment:** repeat with off times of about 0.1 s, 1 s and 10 s, with an idle drive and with the drive under a 60 s random-write load at the cut, and with a normal shutdown followed by a cut. Plot time to ready for each. If it follows dirty state, it is recovery time (rank 1) and CAP.TO must cover the worst case. If RDY is 1 and the admin command still hangs, the ready promise is broken (rank 2). In the default Controller Ready With Media mode every command must work once RDY is 1. In Independent of Media mode Identify and other commands outside Figure 84 must work at RDY, while Figure 84 commands (Format, Firmware Commit, some Get Log Page, Sanitize and others) and commands on attached namespaces may return Admin Command Media Not Ready (24h) or Namespace Not Ready (82h) with DNR cleared until CRWMT. A retryable status is legal, a hang is not (Base 2.3, 3.5.3).
 FOLLOW:
-- RDY rises at 14 s and CAP.TO says 10 s. Fix the host? => Fix the drive. CAP.TO is the device's promise, so it must advertise at least the worst case. A longer host wait is only a diagnostic.
-- How do you know the cut was hard enough? => The SMART unsafe shutdown count should increase by one per cut. If it does not, the rig is not cutting power hard enough.
+- RDY rises at 14 s and CAP.TO says 10 s. Fix the host? => Fix the drive. CAP.TO is the device's promise and covers the abrupt-shutdown case, so it must advertise at least the worst case. On a 2.x drive read CRTO too, since CAP.TO mirrors CRWMT or CRIMT capped at FFh. A longer host wait is only a diagnostic.
+- How do you know the cut was hard enough? => The SMART Unexpected Power Losses count should increase by one per cut. It counts only power loss while CSTS.SHST is not 10b, so a cut after a completed shutdown does not count. If it does not rise, the rig is not cutting power hard enough or the drive shut down first.
 PITFALL: Testing after a clean shutdown or after a very long off time only. The interesting recovery path runs only after a real unclean cut with data in flight.
-VERIFY: Whether a controller may legally exceed CAP.TO after an unsafe shutdown, the CRTO fields in NVMe 2.x, and the Unsafe Shutdowns field in the SMART log.
 
 @@ 21.08 | Intermediate | Trap | tags=deallocate,trim,dlfeat,zeros,dsm,granularity
 Q: A filesystem check finds blocks that read as zeros where data was expected, and the workload issues trims. How do you decide between a legal deallocate, a host bug and a firmware bug?
@@ -204,30 +207,30 @@ Q: After a controller reset a namespace disappears from the host. How do you fin
 SHORT: Compare the kernel's view with the controller's own answers. Issue Identify with the Active Namespace ID list and the Allocated list through raw passthrough. If the controller still lists it and Identify Namespace is intact, the host lost it, through a failed reset, a scan racing recovery, or a changed identifier. If the controller no longer lists it, firmware lost or detached it, and the reset type decides where.
 DEEP:
 - **Symptoms:** `/dev/nvme0n1` gone after `nvme reset`, an FLR, a hot reset or a power cycle. Other tools show the controller.
-- **First three actions:** check dmesg for `Disabling device after reset failure` or a failed scan. Run `nvme list-ns /dev/nvme0` and `nvme list-ns /dev/nvme0 -a`. Run `nvme id-ns /dev/nvme0 -n 1` and compare NSZE, NCAP, NGUID and EUI64 with the values before the reset.
+- **First three actions:** check dmesg for `Disabling device after reset failure` or a failed scan. Run `nvme list-ns /dev/nvme0` (Active Namespace ID list, CNS 02h) and `nvme list-ns /dev/nvme0 -a` (Allocated Namespace ID list, CNS 10h). Run `nvme id-ns /dev/nvme0 -n 1` and compare NSZE, NCAP, NGUID and EUI64 with the values before the reset. An all-zero Identify Namespace for an inactive NSID is normal controller behavior, not an error, so read it as "not attached" (Base 2.3, 3.2.1.6 and 5.2.13.2.8).
 - **Evidence:** the reset type, before and after copies of the lists and Identify Namespace, the Changed Namespace List log, and timestamps of the scan against controller ready.
 
 | Rank | Cause | Signature |
 |---|---|---|
 | 1 | Host marked the namespaces dead because the reset failed | dmesg reset failure, controller lists them |
-| 2 | Scan raced controller recovery: Identify or first I/O got Namespace Not Ready or timed out | Rescan later finds it, controller answers normally |
-| 3 | Firmware did not persist creation or attachment state, for one reset type or after an unsafe shutdown | Active list empty or shorter, only after PERST#, NSSR or a cut |
-| 4 | Identifiers changed across the reset, so udev, multipath or LVM see a new device | Same NSID, different NGUID or EUI64 |
+| 2 | Scan raced controller recovery: Identify or first I/O got Namespace Not Ready (82h, DNR cleared) or timed out | Rescan later finds it, controller answers normally. RDY may rise before namespaces are ready (CC.EN text, Base 2.3, 3.5.3) |
+| 3 | Firmware did not persist creation or attachment state, for one reset type or after an unsafe shutdown | Active list empty or shorter, only after PERST#, NSSR or a cut. Attach and detach must persist across all resets (Base 2.3, 5.2.20) |
+| 4 | Identifiers changed across the reset, so udev, multipath or LVM see a new device | Same NSID, different NGUID or EUI64. The identifier descriptors are fixed for the namespace's life and preserved across a Controller Level Reset (5.2.13.2.3) |
 | 5 | Another host detached or reformatted a shared namespace | Multi-host setup, Changed Namespace event unseen |
 
 - **Discriminating experiment:** build a matrix of reset type (CC.EN, FLR, NSSR, hot reset, PERST#, power cycle) by state (idle, mid-write, after clean shutdown, after unsafe cut). For each cell, record the controller's raw lists and Identify data before and after, and the kernel's view. Rank 1 and 2 show correct controller data. Rank 3 and 4 show changed controller data, and the cell names the reset path with the bug.
 FOLLOW:
 - Rescan brings the namespace back. What was it? => The controller had it, so the host lost or skipped it. Check whether the scan raced controller readiness, and how long the drive needed after reset.
-- Only the NGUID changed after a power cycle. What breaks? => Anything keyed on it, such as multipath grouping, udev by-id names and fleet inventory. Identifiers should be stable across resets.
+- Only the NGUID changed after a power cycle. What breaks? => Anything keyed on it, such as multipath grouping, udev by-id names and fleet inventory. The spec says the identifiers are assigned at creation and stay fixed for the namespace's life, so a change is a firmware bug (Base 2.3, 5.2.13.2.3).
 PITFALL: Looking at `nvme list` only. It shows the kernel's view, so a host problem and a firmware problem look identical.
-VERIFY: Which resets a created and attached namespace must survive, and what Identify Namespace returns for a not-active NSID, in the NVMe Base Specification.
+VERIFY: Base 2.3 says attach and detach persist across all reset events (5.2.20) but does not separately say that a created namespace must survive an unsafe shutdown. The Identify Namespace (CNS 00h) layout itself is in the NVM Command Set Specification.
 
 @@ 21.10 | Principal | Cross-layer | tags=spor,power-loss,miscompare,nand,paired-page,oracle,firmware
 Q: After sudden power loss cycles, verification finds miscompares. How do you classify them and separate a test bug, a firmware ordering bug and a NAND-level effect?
 SHORT: Classify each bad LBA by its stamp: an older version of the same LBA, another LBA's data, a torn mix, or an uncorrectable read. Apply the committed and in-doubt model to decide if it is a failure at all. Then check where the failing LBAs sit: bad LBAs that were not being written at the cut point to NAND-level damage, such as an interrupted upper-page program corrupting data on the same wordline.
 DEEP:
 - **Symptoms:** after power-up some LBAs return a value that is neither the committed one nor any in-doubt one, or an uncorrectable read status (SCT 2, 81h).
-- **First three actions:** confirm the cut was real (unsafe shutdowns rose) and that the host log survived off the drive under test. Wait for CSTS.RDY and read everything twice. Apply the state model from the NVM Command Set module: committed value plus in-doubt writes.
+- **First three actions:** confirm the cut was real (SMART Unexpected Power Losses rose) and that the host log survived off the drive under test. Wait for CSTS.RDY and read everything twice. Apply the state model from the NVM Command Set module: committed value plus in-doubt writes.
 - **Classify each failing LBA using its stamp (LBA, write ID, sequence, CRC):**
 
 | Observation | Meaning | Likely owner |
@@ -246,7 +249,7 @@ FOLLOW:
 - The failing LBAs were all written 20 minutes before the cut. What does that suggest? => Not the cut-time write itself. Look for collateral damage to old data, or a checkpoint or garbage-collection ordering problem in recovery.
 - Data is wrong only after the first read and fine after the second. What now? => The value changed after settling, so suspect read-retry or a media state that recovers, and record it against block age and temperature.
 PITFALL: Judging the read-back against the last acknowledged write. That flags legal outcomes and misses the difference between lost writes, torn writes and collateral damage.
-VERIFY: The Flush and FUA rules for what "durable" requires, the atomic write parameters, and the NAND paired-page behavior for your part from the vendor.
+VERIFY: The Flush and FUA rules for what "durable" requires and the AWUPF and NAWUPF atomic write rules (NVM Command Set Specification, Atomic Operation section; Base 2.3 only carries the AWUPF field in Identify Controller), and the NAND paired-page behavior for your part from the vendor.
 
 @@ 21.11 | Advanced | Debug | tags=firmware-update,commit,fw-download,activation,slot,cqe
 Q: Firmware updates fail intermittently: sometimes the commit errors, sometimes the drive keeps running the old image after a reset. How do you triage it?
@@ -255,22 +258,22 @@ DEEP:
 - **Symptoms:** `nvme fw-commit` returns an error, or Success followed by a reset and the old revision.
 - **First three actions:** save each CQE, not just the tool's summary. Read the Firmware Slot log (03h) and the firmware revision before and after. Hash the image and record the download parameters (chunk size, offsets, slot, commit action).
 - **Evidence:** the CQE of every Download and Commit, the slot log before and after each step, the reset type used, and the log from the boot after activation.
-- **Decode example.** A Firmware Image Download with an offset that is not a multiple of the granularity: DW3 = 0x8005000A. Phase 1, SC 02h (Invalid Field), SCT 0, DNR set, CID 0Ah. Deterministic, so it is a tool error.
+- **Decode example.** A Firmware Image Download with an offset that is not a multiple of the granularity: DW3 = 0x8005000A. Phase 1, SC 02h (Invalid Field), SCT 0, DNR set, CID 0Ah. The spec allows either Invalid Field in Command or Overlapping Range (SCT 1, 14h) for a misaligned offset or length (Base 2.3, 5.2.9). Deterministic, so it is a tool error.
 
 | Rank | Cause | Signature |
 |---|---|---|
-| 1 | Tool or parameters: chunk above MDTS, offset not a multiple of FWUG, NUMD off by one, wrong slot, commit issued before download finished | Deterministic Invalid Field or Invalid Firmware Slot, fails the same way each time |
-| 2 | Image rejected: signature, product or version check, downgrade prevention, truncation | Invalid Firmware Image (SCT 1, SC 07h) |
+| 1 | Tool or parameters: chunk above MDTS, offset not a multiple of FWUG, NUMD off by one, wrong slot, commit issued before download finished | Deterministic Invalid Field (02h), Overlapping Range (14h), Invalid Firmware Slot (06h, also read-only slots) or Invalid Firmware Image (07h) for a commit with no complete image, fails the same way each time |
+| 2 | Image rejected: signature, product or version check, downgrade prevention, truncation | Invalid Firmware Image (SCT 1, SC 07h). An image that does not start at offset 0, has gaps or overlaps is invalid by definition, and a Controller Level Reset between download and commit discards the pieces (Base 2.3, 3.11) |
 | 3 | Commit succeeded but a higher-scope reset was needed and the host did a lesser one | Status 10Bh, 110h or 111h treated as an error, or the wrong reset used |
-| 4 | New image failed to boot and the controller fell back to the old one | Reset ok, slot log shows old active slot, a firmware image load event or vendor log entry |
-| 5 | Live activation exceeded the time allowed or commands stalled | Timeouts during activation, CSTS.PP set for too long |
+| 4 | New image failed to boot and the controller fell back to the old one | Reset ok, slot log shows old active slot, a Firmware Image Load Error event (Error status 05h, the controller reverts to the previous or a baseline image, Base 2.3, 3.11) or vendor log entry |
+| 5 | Live activation exceeded the time allowed or commands stalled | Timeouts during activation, CSTS.PP set for longer than MTFA, or status 12h (activation would exceed MTFA, image committed but not activated) |
 
 - **Discriminating experiment:** replay the identical image with two independent tools (nvme-cli, a vendor tool, SPDK) and compare the CQEs. Then repeat the commit with each reset scope in turn (controller reset, NSSR, PCIe reset, power cycle) and read the slot log after each. Rank 1 disappears with another tool, rank 3 disappears with the named reset.
 FOLLOW:
-- Commit returns Success and the slot log shows the new image as next but the revision is old. Is it a bug? => Not yet. The image takes effect only after the right reset. Do that reset and read the revision again.
+- Commit returns Success and the slot log shows the new image as next (AFI Next Active Firmware Slot, bits 6:4, 0 = not indicated) but the revision is old. Is it a bug? => Not yet. The image takes effect only after the right reset. Do that reset and read the revision again.
 - The revision is old after the right reset and the slot log shows the old slot active. What do you capture? => The vendor boot log and the error log, and repeat with a known-good image to prove the process works.
 PITFALL: Trusting the commit status as proof of activation, or treating a "committed, reset needed" status as a failed update.
-VERIFY: The CQE status values for commit and their names, FWUG units, the meaning of commit actions 1 and 2, and nvme-cli flag names on your version.
+VERIFY: nvme-cli flag names on your version.
 
 @@ 21.12 | Advanced | Cross-layer | tags=link-downtrain,timeout,lnksta,correlation,pcie,retrain,timeline
 Q: Some servers show a link that trained below the SSD's capability and also NVMe timeouts. How do you tell whether the downtrain caused the timeouts, followed them, or is unrelated?
@@ -288,13 +291,13 @@ DEEP:
 | LBMS or ABMS set with no errors | Speed change happened, by hardware or software, find the initiator |
 
 - **Ranked causes:** (1) marginal channel or equalization, failing at the higher rate under temperature or load. (2) A reset or hot-plug retrain that did not reach the higher speed. (3) Platform policy or a Target Link Speed setting. (4) The SSD requesting a lower speed on its own.
-- **Reset scope note:** a controller reset (CC.EN) does not retrain the link. A retrain at that moment came from a different event. See the PCIe page (Reset module).
+- **Reset scope note:** a controller reset (CC.EN) does not retrain the link, since that Controller Level Reset leaves transport state such as the PCIe registers alone (Base 2.3, 3.7.2). A retrain at that moment came from a different event. See the PCIe page (Reset module).
 - **Discriminating experiment:** force the link to the lower speed and run the same workload for the same time. Timeouts gone means margin at the higher speed, so measure lane margin at both ends. Timeouts unchanged means they are not speed-related, so follow the NVMe path (module 9).
 FOLLOW:
 - Timeouts stop after the drive downtrained. Fixed? => No. It is a workaround that hides lost margin and halves throughput. Find the cause and record the yield at the intended speed.
 - The downtrain appears only after `nvme reset`. Why? => The reset alone leaves the link. Look for a hot reset, FLR-triggered retraining, or the host's error recovery, and read what triggered the retrain.
 PITFALL: Assuming the downtrain is the cause because it is the visible anomaly. The timestamps decide which came first.
-VERIFY: The conditions that set Link Bandwidth Management Status and Link Autonomous Bandwidth Status, and how the platform's Target Link Speed and hardware autonomous speed change behave.
+VERIFY: The conditions that set Link Bandwidth Management Status and Link Autonomous Bandwidth Status, and how the platform's Target Link Speed and hardware autonomous speed change behave, in the PCI Express Base Specification (not covered by NVMe Base 2.3).
 
 @@ 21.13 | Advanced | Numeric | tags=performance,steady-state,gc,waf,slc-cache,thermal,hours
 Q: A random-write test holds 400K IOPS and then falls to 90K IOPS after 55 minutes. Use the numbers to decide between GC, SLC cache exhaustion and thermal throttling, and say what SMART data confirms it.
@@ -305,7 +308,7 @@ Assumptions: 3.84 TB (3.84e12 B) drive, 4 KiB random writes, NAND write bandwidt
 2. Time to write the capacity once: 3.84e12 / 1.638e9 = 2,344 s = 39 minutes.
 3. At the drop: 55 x 60 x 1.638e9 = 5.41 TB = 1.41 x capacity.
 4. After the drop: 90,000 x 4096 = 0.369 GB/s. If NAND program bandwidth is the limit, the host rate falls by WAF: 1.638 / 0.369 = 4.4.
-5. Confirm from counters: WAF = NAND bytes written / host bytes written, from deltas over the run (host writes and NAND or media units written in vendor or OCP logs, or the Endurance Group log where supported).
+5. Confirm from counters: WAF = NAND bytes written / host bytes written, from deltas over the run. The Endurance Group Information log (LID 09h) has Data Units Written (host) and Media Units Written (host plus controller writes such as GC), both in units of 1,000,000,000 bytes, and 0 means not reported. The SMART log Data Units Written is host only, in units of 1000 x 512 B (rounded up), so it needs a vendor or OCP log for NAND writes (Base 2.3, 5.2.12.1.3 and 5.2.12.1.10).
 
 | Cause | Where the drop lands | Test |
 |---|---|---|
@@ -320,7 +323,7 @@ FOLLOW:
 - The drop is at 5.4 TB with cooling and also with a lower rate. Which cause? => GC. Bytes written, not time or temperature, set the drop.
 - How would trim or over-provisioning change it? => More free space lowers WAF, so the drop comes later and is smaller. A full-range trim should restore fresh-out-of-box behavior for a while.
 PITFALL: Comparing a fresh drive with a preconditioned one, or two runs from different starting states. GC behavior depends on fill and history.
-VERIFY: Which log page and field names your drive uses for host and NAND writes, the size of a Data Unit in the SMART log (1000 x 512 B), and the SLC cache size and policy from vendor documentation.
+VERIFY: Whether your drive reports Media Units Written in the Endurance Group Information log or only in a vendor or OCP log, and the SLC cache size and policy from vendor documentation.
 
 @@ 21.14 | Principal | Scenario | tags=swap-test,statistics,host-vs-device,interaction,design-of-experiments
 Q: A failure happens about once in 200 reboots on one host with one drive. Design the experiment that shows whether the fault follows the drive, the host, or the combination, and say how many trials it takes.

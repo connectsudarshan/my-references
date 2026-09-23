@@ -2,98 +2,100 @@
 
 @@ 12.01 | Basic | Concept | tags=security-send,security-receive,secp,tcg,discovery
 Q: What are the Security Send and Security Receive commands, and what do the fields in them mean?
-SHORT: They are admin commands (opcodes 81h and 82h) that tunnel a security protocol's own messages to the controller, so NVMe itself does not need to know what the messages mean. Command Dword 10 carries the Security Protocol (SECP), two protocol-specific bytes (SPSP) and an NVMe Security Specific Field (NSSF). Dword 11 carries the transfer or allocation length. Support is advertised by OACS bit 0.
+SHORT: They are admin commands (opcodes 81h and 82h) that tunnel a security protocol's own messages to the controller, so NVMe itself does not need to know what the messages mean. Command Dword 10 carries the Security Protocol (SECP), two protocol-specific bytes (SPSP) and an NVMe Security Specific Field (NSSF). Dword 11 carries the transfer or allocation length. Support is advertised by OACS bit 0 (Base 2.3, Figures 394 to 399).
 DEEP:
 The controller acts as a transport. The payload is defined by another standard: TCG Storage, RPMB, IEEE 1667, or SPDM. The host sends a request with Security Send and collects the reply with Security Receive.
 | Field | Where | Meaning |
 |---|---|---|
 | SECP | CDW10 bits 31:24 | Which security protocol the payload belongs to |
-| SPSP | CDW10 bits 23:8 | Protocol-specific value (for TCG this includes the ComID) |
-| NSSF | CDW10 bits 7:0 | NVMe-specific: for the NVMe-defined protocol EAh it selects the RPMB target |
-| TL / AL | CDW11 | Transfer length (Send) or allocation length (Receive), in bytes |
+| SPSP | CDW10 bits 23:8 (SPSP1 in 23:16, SPSP0 in 15:8) | Protocol-specific value (for TCG this includes the ComID) |
+| NSSF | CDW10 bits 7:0 | NVMe-specific and used only with protocol EAh, where SPSP 0001h makes it the RPMB target. Reserved for every other protocol |
+| TL / AL | CDW11 | Transfer length (Send) or allocation length (Receive), in bytes (SPC-5 with INC_512 cleared) |
 
-- **Discovery:** Security Receive with SECP 00h asks which protocols are supported. It is how tools such as `sedutil` find out whether a drive speaks TCG.
-- **TCG:** protocols 01h and 02h carry TCG Storage traffic, and the drive-level features (Opal, Pyrite, Enterprise) are all reached this way.
-- **RPMB:** protocol EAh, see the RPMB question below.
+- **Discovery:** Security Receive with SECP 00h returns the security protocols the controller supports. It is not tied to any Security Send, and it is how tools such as `sedutil` find out whether a drive speaks TCG. An unsupported SECP on Receive, or a reserved one on Send, fails with Invalid Field in Command.
+- **TCG:** protocols 01h and 02h carry TCG Storage traffic (assigned in SPC-5 and the TCG documents, not in the Base spec), and the drive-level features (Opal, Pyrite, Enterprise) are all reached this way.
+- **NVMe-defined protocol EAh:** SPSP 0001h is RPMB (see the RPMB question below) and SPSP 0002h is CDP Authentication (Base 2.3, Figure 396).
 - **Linux:** the driver registers a security-send/receive callback when OACS bit 0 is set and `CONFIG_BLK_SED_OPAL` is built, which lets `sed-opal` unlock a drive on resume. `nvme security send` and `nvme security recv` issue raw commands.
-- **Send then Receive:** a reply is only valid for the matching Send. A validator must keep the pair together and must not interleave another host's session on the same protocol.
+- **Send then Receive:** which Receive answers which Send is defined by the security protocol. Receive data may be lost after a loss of communication or a Controller Level Reset, so a validator should keep each pair together. For RPMB, Base 2.3 (8.1.23) says to issue one command at a time and wait for its completion.
 FOLLOW:
 - Where do you check support before sending? => Identify Controller OACS bit 0 for the commands, then Security Receive with SECP 00h for the protocol list.
-- Does Security Send need a namespace? => Some protocols are per namespace, and the command's NSID field exists for that. Most drive-level TCG traffic is addressed to the controller.
+- Does Security Send need a namespace? => Whether NSID is used is protocol specific (Base 2.3, Figure 142 note 7). RPMB commands require NSID cleared to 0h, and TCG usage of NSID is defined in the TCG documents.
 PITFALL: Treating Security Send as an erase or lock command. It only carries bytes, and the effect depends on what the protocol inside them says.
-VERIFY: SECP value assignments (00h, 01h, 02h, EAh) and which of them the NVMe specification defines itself, plus the NSSF and SPSP field positions in CDW10.
+VERIFY: SECP values 00h, 01h and 02h and the SPSP meanings for them are defined in SPC-5 and the TCG specifications, which the Base spec only references. Base 2.3 itself defines only EAh (Figure 396).
 
 @@ 12.02 | Basic | Concept | fig=eraseops | tags=format,sanitize,deallocate,crypto-erase,scope
 Q: Deallocate, Format NVM, Sanitize and crypto erase all "erase" a drive. How do they differ in scope and in what they guarantee?
-SHORT: Deallocate is a hint about specific LBAs and guarantees nothing about the media. Format NVM works per namespace (or on all of them) and only promises secure erase if you ask for it with SES. Sanitize works on the whole NVM subsystem, including caches and unattached namespaces, and survives power loss. Crypto erase destroys the encryption key, so the ciphertext is left in place but is useless.
+SHORT: Deallocate is a hint about specific LBAs and guarantees nothing about the media. Format NVM works per namespace (or on all of them, if FNA says so) and only promises secure erase if you ask for it with SES. Sanitize works on the whole NVM subsystem, including caches and unattached namespaces, and survives power loss. Crypto erase destroys the encryption key, leaving useless ciphertext. Base 2.3 also has Sanitize Namespace (opcode 8Ch), a crypto erase of one namespace.
 DEEP:
 | Operation | Scope | Physical guarantee | Survives power loss |
 |---|---|---|---|
 | Dataset Management deallocate | Listed LBA ranges | None, it is a hint | Not applicable |
-| Format NVM, SES=0 | One namespace (or all) | None: layout changes, data unreachable | Vendor specific |
-| Format NVM, SES=1 or 2 | One namespace (or all if FNA says so) | User data erased, including caches and deallocated LBAs | Test it, the spec is less explicit than for Sanitize |
-| Sanitize block erase or overwrite | Entire NVM subsystem | Media erased or overwritten | Yes, continues after reset |
-| Sanitize crypto erase, Opal Revert or GenKey | Subsystem, or one locking range | Key destroyed, ciphertext remains | Yes once the key change is committed |
+| Format NVM, SES=0 | One namespace, or all (FNS bit) | None: the controller shall not return the old data (Base 2.3, 5.2.10), but the media is not erased | Base 2.3 does not say |
+| Format NVM, SES=1 or 2 | One namespace, or all (SENS bit) | User data erased wherever it lives, including caches and deallocated LBAs | Test it, Base 2.3 does not say (unlike Sanitize) |
+| Sanitize block erase or overwrite | Entire NVM subsystem | Media erased or overwritten | Yes, continues after reset and power cycle |
+| Sanitize crypto erase | Subsystem (Sanitize) or one namespace (Sanitize Namespace) | Key destroyed, ciphertext remains | Yes, continues after reset and power cycle |
+| TCG Revert or GenKey | One locking range, or the whole SP | Key destroyed, ciphertext remains | Test it (TCG specifications) |
 
-- **Scope is the first question:** Format can be limited to one namespace. Sanitize cannot. A Sanitize on a drive with two namespaces destroys both, attached or not.
+- **Scope is the first question:** Format can be limited to one namespace. The Sanitize command cannot: on a drive with two namespaces it destroys both, attached or not. Only Sanitize Namespace (optional, crypto erase only) targets a single namespace. Neither touches firmware, RPMB or boot partitions (Base 2.3, 8.1.26, Figure 704).
 - **Guarantee is the second:** logical operations (Deallocate, Format SES=0) change the mapping. Physical ones (block erase, overwrite, key destruction) change the media or the key.
 - **Speed is the third:** crypto erase takes seconds, block erase takes seconds to minutes, and overwrite takes hours. That is why fleets prefer crypto erase on drives that encrypt everything.
 - **Reading back proves less than you think.** See the Trap question on zero reads.
 FOLLOW:
-- Which of them can a host abort once started? => None of the sanitize actions. Format NVM is a single command, and it too runs to completion or to an error.
+- Which of them can a host abort once started? => None of the sanitize actions: a sanitize operation in progress cannot be aborted and continues across resets and power cycles (Base 2.3, 8.1.26). Format NVM is a single command, and it too runs to completion or to an error.
 - Which is fastest on a self-encrypting drive? => Crypto erase, because it only replaces a key.
 PITFALL: Assuming `blkdiscard` or `mkfs` is secure erase. Discard is a Deallocate hint, and a filesystem format only rewrites metadata.
-VERIFY: Whether Format with SES=0 must change the readable contents, and the current wording for "secure erase" across Format and Sanitize in the NVM Command Set Specification.
+VERIFY: What an audit read returns after Format or Sanitize is defined in the NVM Command Set Specification, not in Base 2.3, and so is Dataset Management deallocate. Base 2.3 does not say whether a Format survives power loss.
 
 @@ 12.03 | Basic | Concept | tags=sanitize,sanact,sanicap,global,background
 Q: What does the Sanitize command do, which actions does it offer, and what stays the same across all of them?
-SHORT: Sanitize (admin opcode 84h) makes user data in the whole NVM subsystem unrecoverable. The actions are Block Erase, Overwrite and Crypto Erase, plus Exit Failure Mode, selected by SANACT. SANICAP in Identify Controller says which are supported. The command completes once the operation has started. Work continues in the background, survives power loss and resets, and progress is read from log page 81h.
+SHORT: Sanitize (admin opcode 84h) makes user data in the whole NVM subsystem unrecoverable. SANACT selects Block Erase, Overwrite, Crypto Erase, Exit Failure Mode or Exit Media Verification State, and SANICAP in Identify Controller says which erase types are supported. The command completes once the operation has started. Work continues in the background, survives power loss and resets, and progress is read from log page 81h. Sanitize Namespace (8Ch) is a crypto erase of one namespace.
 DEEP:
-- **Actions (SANACT, CDW10 bits 2:0):** 1 = Exit Failure Mode, 2 = Block Erase, 3 = Overwrite, 4 = Crypto Erase. Later revisions add 5 = Exit Media Verification State.
-- **SANICAP (Identify Controller):** bit 0 crypto erase, bit 1 block erase, bit 2 overwrite. Higher bits describe no-deallocate behavior.
-- **Scope:** every namespace in the NVM subsystem, attached or not, plus caches and other places user data can hide. A Persistent Memory Region must be disabled first, or the command fails with Sanitize Prohibited While Persistent Memory Region is Enabled (SCT 1, SC 23h).
-- **Asynchronous:** the completion means "accepted and started". Poll Sanitize Status (log 81h) or wait for the Sanitize Operation Completed event (NVM command set specific event, info 01h).
+- **Actions (SANACT, CDW10 bits 2:0, Base 2.3, Figure 388):** 1 = Exit Failure Mode, 2 = Block Erase, 3 = Overwrite, 4 = Crypto Erase, 5 = Exit Media Verification State. Sanitize Namespace (Figure 391) accepts only 1, 4 and 5.
+- **SANICAP (Identify Controller, Figure 328):** bit 0 crypto erase (CES), bit 1 block erase (BES), bit 2 overwrite (OWS), bit 3 media verification for the subsystem (VERS), bit 4 for a namespace (NVERS), bit 29 No-Deallocate Inhibited (NDI) and bits 31:30 No-Deallocate Modifies Media After Sanitize (NODMMAS). SANICAP is non-zero whenever Sanitize is supported.
+- **Scope:** every namespace in the NVM subsystem, attached or not, plus caches and other places user data can hide. A Persistent Memory Region must be disabled first, or the command fails with Sanitize Prohibited While Persistent Memory Region is Enabled (SCT 1, SC 23h). It is also aborted with Namespace Is Write Protected (SC 20h) if any namespace is write protected.
+- **Asynchronous:** the completion means "accepted and started". Poll Sanitize Status (log 81h) or wait for the Sanitize Operation Completed event (I/O Command Specific Status type, information 01h, Event Specific Parameter 0 for the subsystem; Figure 155). Base 2.3 (8.1.26.3) says to limit polling, for example to once every several minutes, so it does not slow the operation.
 - **While it runs:** commands that touch user data are aborted with Sanitize In Progress (SC 1Dh). A failed sanitize leaves the drive returning Sanitize Failed (SC 1Ch) to such commands until recovery.
 - **Not abortable:** there is no host command that cancels it. A reset does not stop it either.
 - **Tools:** `nvme sanitize /dev/nvme0 -a 2` starts a block erase, and `nvme sanitize-log /dev/nvme0` reads the status.
 FOLLOW:
-- Does Sanitize erase firmware or the SMART log? => Its promise is about user data. Firmware and wear history are not user data, so confirm in a test that, for example, Percentage Used does not reset.
+- Does Sanitize erase firmware or the SMART log? => Its promise is about user data. Firmware is unaffected, and log pages and features may be modified only to prevent deriving user data (Base 2.3, Figure 704). Wear history is not user data, so treat a reset of Percentage Used as a finding.
 - Where is the Sanitize command's bit layout? => See the Numeric question on encoding CDW10 and CDW11.
 PITFALL: Treating the Success CQE as "sanitize done". The completion only says the operation began.
-VERIFY: SANICAP bits beyond 2 (no-deallocate fields), the Sanitize Operation Completed event type and info values, and whether a host can request a sanitize while a PMR is enabled on your revision.
 
 @@ 12.04 | Intermediate | Concept | tags=format-nvm,ses,fna,lbaf,pi
 Q: What does Format NVM do, what do its CDW10 fields mean, and how does FNA change its behavior?
-SHORT: Format NVM (admin opcode 80h) reformats a namespace. CDW10 selects the LBA format (LBAF), where metadata sits (MSET), whether and where protection information is used (PI, PIL), and the secure erase setting (SES: 0 none, 1 user data erase, 2 crypto erase). FNA in Identify Controller tells whether a format applies to all namespaces, whether SES applies to all, and whether crypto erase is supported.
+SHORT: Format NVM (admin opcode 80h) reformats a namespace. CDW10 selects the LBA format (LBAFL, with upper bits in LBAFU) and the secure erase setting (SES: 0 none, 1 user data erase, 2 crypto erase). Metadata placement (MSET) and protection information (PI, PIL) are defined by the I/O command set. FNA in Identify Controller tells whether a format applies to all namespaces (FNS), whether secure erase does (SENS), whether crypto erase is supported (CRYES) and whether NSID FFFFFFFFh is refused (FNVMBS).
 DEEP:
 | Field | CDW10 bits | Meaning |
 |---|---|---|
-| LBAF | 3:0 (upper bits at 13:12 in newer revisions) | Index into the LBA format table |
-| MSET | 4 | 0 separate metadata buffer, 1 extended LBA |
-| PI | 7:5 | 0 off, 1 to 3 = Type 1 to 3 |
-| PIL | 8 | 0 last bytes of metadata, 1 first bytes |
-| SES | 11:9 | 0 none, 1 user data erase, 2 cryptographic erase |
+| LBAFL | 3:0 | Low 4 bits of the format index into the LBA format table |
+| LBAFU | 13:12 | High 2 bits of the index, ignored unless LBAFEE = 1 in the Host Behavior Support feature |
+| MSET | 4 | I/O Command Set specific (NVM: 0 separate metadata buffer, 1 extended LBA) |
+| PI | 7:5 | I/O Command Set specific (NVM: 0 off, 1 to 3 = Type 1 to 3) |
+| PIL | 8 | I/O Command Set specific (NVM: 0 last bytes of metadata, 1 first bytes) |
+| SES | 11:9 | 0 none, 1 user data erase, 2 cryptographic erase (Base 2.3, Figure 193) |
 
-- **FNA bit 0:** a format of any namespace formats all of them, so every namespace shares one format.
-- **FNA bit 1:** any secure erase in a Format applies to every namespace, so a SES=1 on NSID 1 wipes NSID 2 as well.
-- **FNA bit 2:** crypto erase is supported. SES=2 on a drive without it should fail as an invalid field.
-- **FNA bit 3:** Format does not accept NSID FFFFFFFFh (newer revisions).
+- **FNA bit 0 (FNS):** a format without secure erase of any namespace formats every namespace in the NVM subsystem, so all share one format. With FNS clear, NSID FFFFFFFFh formats all namespaces attached to the controller.
+- **FNA bit 1 (SENS):** any secure erase in a Format applies to every namespace in the NVM subsystem, so a SES=1 on NSID 1 wipes NSID 2 as well. SENS decides the scope when SES is non-zero, and FNS when it is zero (Figure 192).
+- **FNA bit 2 (CRYES):** crypto erase is supported. Base 2.3 does not say which status SES=2 gets when this bit is clear.
+- **FNA bit 3 (FNVMBS):** Format refuses NSID FFFFFFFFh with Invalid Field in Command, and FNS and SENS are then clear.
 - **SES=1:** all user data erased, wherever it lives, including caches and deallocated space. The resulting contents are indeterminate (zeros, ones and so on). If all data is encrypted the controller may implement it as a crypto erase.
-- **SES=0:** no secure-erase promise. The old data is unreachable through the new format, and nothing more is guaranteed about the media.
-- **During the format:** I/O to the namespace returns Format In Progress (SC 84h). Identify Namespace FPI can report percent remaining if supported.
+- **SES=0:** no secure-erase promise. After success the controller shall not return any previous user data of the affected namespaces (5.2.10), and nothing more is guaranteed about the media.
+- **During the format:** I/O to an affected namespace may be aborted with Format In Progress (SC 84h, Do Not Retry clear), and Admin commands not listed in Figure 143 may be too. The Format Progress Indicator in the I/O Command Set independent Identify Namespace (FPI, byte 3: bit 7 FPIS, bits 6:0 percent remaining) reports progress if supported.
+- **Other aborts:** Namespace Is Write Protected if the scope includes a write protected namespace, and Command Sequence Error if I/O commands are still being processed for it.
 - **Afterwards:** re-read Identify Namespace, because block size, NSZE, NCAP and FLBAS can change. See module 7 for the LBA format side.
 FOLLOW:
 - Does Format change the NSID? => No. NSID and identifiers stay, but data, format and sizes change.
 - What timeout should a script use? => A long one, measured on your largest capacity. The Linux admin timeout defaults to 60 s and nvme-cli has its own --timeout option, so check both before blaming the drive.
-PITFALL: Formatting "namespace 1" on a drive with FNA bit 0 or bit 1 set and losing the others too.
-VERIFY: CDW10 bit positions and the upper LBAF bits, the exact FNA bit list (bit 3 in particular), what SES=2 returns when unsupported, and the FPI encoding (bit 7 supported, low bits percent remaining).
+PITFALL: Formatting "namespace 1" on a drive with FNA bit 0 (FNS) or bit 1 (SENS) set and losing the others too.
+VERIFY: The PI, PIL and MSET encodings and how a format index maps to an LBA format are I/O Command Set specific (NVM Command Set Specification). Base 2.3 does not say which status a SES=2 request gets when CRYES is clear.
 
 @@ 12.05 | Intermediate | Numeric | tags=cdw10,encoding,format,sanitize,nvme-cli
 Q: Encode Command Dword 10 and 11 for a Format NVM with LBA format 3, PI type 1 and user data erase, and for a Sanitize block erase with unrestricted exit and no deallocate. Then decode SCDW10 = 0x00000133.
 SHORT: Format: LBAF 3 gives 0x3, PI 1 in bits 7:5 gives 0x20, SES 1 in bits 11:9 gives 0x200, so CDW10 = 0x223. Sanitize block erase is SANACT 2, AUSE bit 3 gives 0x8, NDAS bit 9 gives 0x200, so CDW10 = 0x20A. SCDW10 0x133 decodes as Overwrite (3), pass count 3, invert pattern between passes set, restricted mode, deallocate allowed.
 DEEP:
 1. **Format:** LBAF = 3, MSET = 0 (bit 4), PI = 1 in bits 7:5 = 1 x 0x20 = 0x20, PIL = 0 (bit 8), SES = 1 in bits 11:9 = 1 x 0x200 = 0x200. Sum: 0x3 + 0x20 + 0x200 = 0x223.
-2. **Sanitize:** SANACT = 2 (bits 2:0) = 0x2, AUSE = 1 (bit 3) = 0x8, OWPASS ignored (bits 7:4), OIPBP ignored (bit 8), NDAS = 1 (bit 9) = 0x200. Sum: 0x20A. CDW11 (the overwrite pattern) is ignored for block erase.
+2. **Sanitize:** SANACT = 2 (bits 2:0) = 0x2, AUSE = 1 (bit 3) = 0x8, OWPASS ignored (bits 7:4), OIPBP ignored (bit 8), NDAS = 1 (bit 9) = 0x200, EMVS = 0 (bit 10). Bits 31:11 are reserved. Sum: 0x20A. CDW11 (the overwrite pattern) is ignored for block erase.
 3. **Decode 0x133:** bits 2:0 = 3 (Overwrite), bit 3 = 0 (AUSE clear, restricted completion), bits 7:4 = 3 (three overwrite passes), bit 8 = 1 (invert pattern between passes), bit 9 = 0 (deallocate after sanitize allowed).
 4. **What it means:** the same command, sent with CDW11 = 0xDEADBEEF, writes that 32-bit pattern, then its inverse, then the pattern again.
 
@@ -103,13 +105,14 @@ nvme format /dev/nvme0n1 --lbaf=3 --pi=1 --ses=1
 nvme sanitize /dev/nvme0 --sanact=2 --ause --no-dealloc
 nvme sanitize /dev/nvme0 --sanact=3 --owpass=3 --oipbp --ovrpat=0xDEADBEEF
 ```
-- **Overwrite pass count:** a value of 0 means 16 passes, so a test that leaves OWPASS at 0 gets the slowest possible case.
+- **Overwrite pass count:** a value of 0 means 16 passes (Base 2.3, Figure 388), so a test that leaves OWPASS at 0 gets the slowest possible case.
 - **SCDW10 in the log:** it echoes the CDW10 that started the operation, so the log is proof of what was actually requested.
 FOLLOW:
 - What would 0x204 be? => SANACT 4 (crypto erase) with NDAS set.
+- Does NDAS always keep the media allocated? => Only if SANICAP No-Deallocate Inhibited (NDI) is clear. If NDI is set, the command is aborted with Invalid Field in Command while Sanitize Config NODRM is 0, and with NODRM = 1 it runs but deallocates anyway (SOS = 4 in log 81h).
 - Can you reuse Format's bit layout for Sanitize? => No. In Format bits 11:9 are SES. In Sanitize bit 9 is NDAS. Each command has its own layout.
 PITFALL: Copying one command's bit positions to the other. Format's SES starts at bit 9, while Sanitize's OIPBP is bit 8 and NDAS is bit 9.
-VERIFY: Sanitize CDW10 bits above 9 (Enter Media Verification State and Purge Request in recent revisions), and OWPASS = 0 meaning 16 passes in your spec revision.
+VERIFY: The PI value encoding (1 = Type 1) used for Format CDW10 is defined in the NVM Command Set Specification, not in Base 2.3.
 
 @@ 12.06 | Intermediate | Concept | tags=sanitize-status,log-81h,sprog,sstat,eto
 Q: What is in the Sanitize Status log page (81h), and how do you read progress, result and estimated times?
@@ -123,18 +126,24 @@ DEEP:
 | 8 | ETO (4 B) | Seconds for an overwrite (defined for 16 passes) |
 | 12 | ETBE (4 B) | Seconds for a block erase |
 | 16 | ETCE (4 B) | Seconds for a crypto erase |
-| 20 to 31 | ETOND, ETBEND, ETCEND | The same estimates when no-deallocate media modification applies |
+| 20 | ETODMM (4 B) | Overwrite estimate when No-Deallocate Modifies Media After Sanitize is 10b |
+| 24 | ETBENMM (4 B) | Block erase estimate, same condition |
+| 28 | ETCENMM (4 B) | Crypto erase estimate, same condition |
+| 32 | ETPVDS (4 B) | Seconds for Post-Verification Deallocation, if entered |
+| 36 | SSI (1 B) | Sanitize State Information: bits 7:4 failure state (FAILS), bits 3:0 current state (SANS) |
+| 40 | MNSOIP (4 B) | Max concurrent namespace sanitize operations (Sanitize Namespace); FFFFFFFFh for a namespace target |
+| 44 | STNSID (4 B) | NSID of the sanitization target, 0h if the target is the subsystem |
 
+- **SSTAT full layout (Base 2.3, Figure 302):** bits 15:11 reserved, bit 10 Namespace Data Erased (NDE), bit 9 Media Verification Canceled (MVCNCLD), bit 8 GDE, bits 7:3 OPC, bits 2:0 SOS.
 - **Reading SPROG:** 0x8000 is exactly 50 percent. Do not treat it as linear in time, since erase and write phases differ.
 - **Estimate encoding:** 0 means the operation is expected to be completed in the background by the time the Sanitize command completes, and FFFFFFFFh means no estimate is reported.
 - **Global Data Erased:** set when nothing has been written to the subsystem since manufacture or since the last successful sanitize. It is a claim worth testing: write one LBA and the bit must clear.
-- **Newer fields:** later revisions add a post-verification deallocation estimate and a Sanitize State Information byte for the media verification states.
-- **Reading it:** `nvme sanitize-log /dev/nvme0`. Reading with RAE clear can consume a pending event, as with other logs.
+- **Sanitize Namespace target:** a Get Log Page with NSID set to an allocated namespace requests this log scoped to that namespace (ETO/ETBE/ETCE/ETODMM/ETBENMM/ETCENMM/MNSOIP read FFFFFFFFh, and STNSID echoes the NSID). NSID 0h or FFFFFFFFh requests the subsystem-scoped log.
+- **Reading it:** `nvme sanitize-log /dev/nvme0`. Reading with RAE cleared clears the pending Sanitize Operation Completed event (Base 2.3, Figure 155).
 FOLLOW:
 - SPROG reads FFFFh and SSTAT is 1. Is the drive 99.998 percent done? => No. FFFFh is the "not running" value, and SSTAT says it is complete.
 - Is ETO a limit? => No, it is an estimate. Use it for timeout design, not as a pass or fail limit.
 PITFALL: Trusting SPROG alone. Read SSTAT first, because SPROG is meaningless unless the status is "in progress".
-VERIFY: Field offsets and widths of the fields after ETCE, the exact SSTAT bit assignments in your revision, the ETO 16-pass definition, and whether reading the log clears the pending Sanitize Operation Completed event.
 
 @@ 12.07 | Intermediate | Concept | tags=tcg,opal,pyrite,enterprise,sed,psid,locking
 Q: What are TCG Opal, Pyrite and Enterprise, and how do they relate to NVMe security commands and crypto erase?
@@ -166,14 +175,14 @@ DEEP:
 
 - **Support:** NWPC bit 0 means No Write Protect and Write Protect are supported. Bit 1 adds "until power cycle", and bit 2 adds permanent.
 - **Set and read:** `nvme set-feature /dev/nvme0 -f 0x84 -n 1 -v 1` requests Write Protect on NSID 1, and `nvme get-feature` reads the current state.
-- **Blocked commands:** those that change data or the format: Write, Write Zeroes, Write Uncorrectable, Dataset Management deallocate, Copy (destination) and Format NVM. Reads and Identify keep working.
-- **Persistence:** the "until power cycle" state is dropped at the next power cycle by design. Check on the DUT whether plain Write Protect survives a power cycle and whether it needs the Save bit.
+- **Blocked commands (Base 2.3, Figure 671):** any command not on the allowed list that specifies a write protected NSID, or that would modify a write protected namespace, is aborted with Namespace Is Write Protected (SC 20h): Write, Write Zeroes, Write Uncorrectable, Copy, Dataset Management Deallocate, Format NVM and Sanitize of an affected namespace. Explicitly allowed regardless of protection: Read, Compare, Verify, Flush (completes with no effect but still commits cache), Identify, Get Log Page, Get/Set Features, and the four Reservation commands.
+- **Persistence (Base 2.3, Figure 669):** No Write Protect, Write Protect and Permanent Write Protect all persist across power cycles and Controller Level Resets. Only Write Protect Until Power Cycle drops, and only on a power cycle (it survives a Controller Level Reset). This is defined by the state, not by the Save bit; the feature itself is not saveable.
 - **Validation:** for each supported state, try every data-changing command and every read-type command, cycle power, and check the state again. The permanent state is a one-way test, so do it only on a sacrificial unit.
 FOLLOW:
 - How does this differ from an Opal write lock? => Write Protect is an NVMe feature on a namespace. An Opal lock is a TCG state on an LBA range, and the two can be combined.
-- Does Write Protect stop a Sanitize? => Do not assume. Sanitize acts on the subsystem, so test the interaction and read the spec before you rely on it.
+- Does Write Protect stop a Sanitize? => Yes for that namespace: if any namespace is write protected, Sanitize is aborted with Namespace Is Write Protected (Base 2.3, 5.2.22).
 PITFALL: Testing only Write and forgetting Deallocate, Write Zeroes and Format, all of which change what a read returns.
-VERIFY: The exact list of commands blocked in each state, allowed state transitions (which states can move back to No Write Protect), whether SC 20h carries DNR, and the CDW11 field layout of FID 84h.
+VERIFY: Whether SC 20h carries DNR set or clear, Base 2.3 does not say.
 
 @@ 12.09 | Advanced | Concept | tags=rpmb,replay-protected,hmac,write-counter,security-send
 Q: How does RPMB work over NVMe, and why is it replay protected?
@@ -191,7 +200,9 @@ FOLLOW:
 - Why not just password protect the region? => A password can be sniffed and replayed. The counter and nonce make each message single-use.
 - Who holds the key? => The host side (often a secure element or trusted OS), and the device stores its copy. Anyone with the key can write, so key handling is the real security.
 PITFALL: Validating RPMB with a fixed nonce or ignoring the write counter. A test that never checks freshness cannot find a replay bug.
-VERIFY: RPMBS field encoding (units, authentication method values, total size in 128 KiB units, access size in 512 B units and whether they are zero based), the data frame layout, the result codes, and the counter width.
+
+RPMBS (Identify Controller, Base 2.3, Figure 328) is 0-based in both size fields: ASZE (bits 31:24) is 512 B units, TSZE (bits 23:16) is 128 KiB units, AUTHM (bits 5:3) has only value 000b defined (HMAC SHA-256), and NRPMBU (bits 2:0) is the target count, 0 meaning no RPMB support. The RPMB Data Frame (Figure 694) is 256 bytes plus any Data field: stuff bytes, MAC/Key, RPMB Target (byte 223, must match NSSF or the command fails Invalid Field in Command), Nonce, Write Counter (4 bytes), Address, Sector Count, Result and Request/Response Message type. Operation Result (Figure 692) bit 7 is Write Counter Status (expired), bits 6:0 are OPSTAT (00h success, 01h general failure, 02h authentication failure, 03h counter failure, 04h address failure, 05h write failure, 06h read failure, 07h key not programmed, 08h invalid DCB).
+VERIFY: Base 2.3 does not state the exact power-loss atomicity guarantee for a torn RPMB write (old data plus old counter, or new data plus new counter); confirm against the DUT's documentation.
 
 @@ 12.10 | Advanced | Concept | tags=boot-partition,bpinfo,bprsel,bpmbl,firmware-commit
 Q: What are NVMe Boot Partitions, how does a host read one before the controller is enabled, and how are they written?
@@ -202,15 +213,15 @@ DEEP:
   - BPRSEL: read size (bits 9:0, 4 KiB units), read offset (bits 29:10, 4 KiB units) and partition ID (bit 31).
   - BPMBL: 4 KiB aligned base of the host memory buffer that receives the data.
 - **Read flow:** set BPMBL, write BPRSEL, poll BPINFO.BRS for 2 (or 3 for error). Each read moves a limited number of 4 KiB units, so a large image takes a loop.
-- **Why it exists:** an embedded platform can boot from the drive before it has an NVMe driver or admin queues. The read mechanism is designed to work before the controller is enabled.
+- **Why it exists:** an embedded platform can boot from the drive before it has an NVMe driver or admin queues. Base 2.3 (8.1.3.1) says a Boot Partition may be read any time the NVM subsystem is powered, whether or not CC.EN is set to 1.
 - **Write flow:** Firmware Image Download into the controller, then Firmware Commit with CA = 6 and the Boot Partition ID, and later CA = 7 to make it the active one. BPINFO.ABPID shows the result.
 - **Protection:** the Boot Partition Write Protection Config feature (FID 85h) has states for unlocked, locked, locked until power cycle and control by RPMB. It is newer than the basic feature and needs a revision check.
 - **Tests:** size vs BPSZ, read status transitions, read of both partitions after each update, the active ID after a reset, and an interrupted update at every step.
 FOLLOW:
-- Does a boot partition appear as a namespace? => No. It is outside the namespace LBA space, so Format does not touch it. Whether Sanitize does is a spec question to check.
+- Does a boot partition appear as a namespace? => No. It is outside the namespace LBA space, so Format does not touch it. Sanitize does not either: Figure 704 lists Boot Partition as "No effect" for both an NVM subsystem sanitize and a namespace sanitize.
 - What if the two partitions differ? => The active partition is what the platform boots from, so validate that switching the active ID and resetting changes what is read.
 PITFALL: Testing the read path only once after a write. The state to check is the read after reset and power cycle, and the survivability of the inactive copy.
-VERIFY: Register offsets and bit fields, whether reads must happen with CC.EN = 0, whether a Sanitize leaves boot partitions untouched on your revision, the maximum read size semantics, and FID 85h states and revision.
+VERIFY: The maximum practical read size a given controller allows per BPRSEL operation (the register field itself caps BPRSZ at 1023 x 4 KiB, but Base 2.3 does not require an implementation to support the full field width in one transfer).
 
 @@ 12.11 | Advanced | Trap | tags=trap,read-zeros,deallocate,dlfeat,ndas,crypto-erase
 Q: After a Sanitize completes, every LBA reads back as zeros and your colleague signs off "verified erased". What is wrong with that?
