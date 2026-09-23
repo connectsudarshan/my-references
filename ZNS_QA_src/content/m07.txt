@@ -24,7 +24,7 @@ FOLLOW:
 - Is Zone Invalid Write the same as writing to a Full zone? => No. Zone Is Full is about the zone's state. Zone Invalid Write means the zone accepts writes but the SLBA is not the write pointer.
 - Which of the eight does Linux treat specially? => Only the two Too Many codes get their own block status. The rest become a generic I/O error (see 7.03).
 PITFALL: Memorising B8h to BFh as a flat list. In an interview or a triage, the useful skill is mapping code to cause: state problem, address problem, length problem, resource problem or media problem.
-VERIFY: The status names and the per-command lists of which command may return which code, in the ZNS Command Set Specification. The SC values B8h to BFh match Linux include/linux/nvme.h. B6h and B7h match libnvme and QEMU, and the spec revision that introduced them needs a check.
+Confirmed against ZNS 1.4, Figure 11 for the status names and the per-command status figures in section 3.3-3.4. B6h and B7h (ZRWA) were introduced by TP4153, which this Revision 1.4 explicitly incorporates (see the spec's front matter), so all eight codes are native to ZNS 1.4; older hosts written against ZNS 1.0-1.3 may only recognize B8h-BFh.
 
 @@ 7.02 | Basic | Concept | tags=write,status,zone-state,invalid-write,boundary
 Q: What does a Write return for each zone state and for each kind of bad address or length?
@@ -42,13 +42,12 @@ DEEP:
 - **Resources first:** a correct write to an Empty or Closed zone can still fail with Too Many Active Zones or Too Many Open Zones (module 6).
 - **The last write:** a write that ends exactly at ZSLBA + ZCAP succeeds and makes the zone Full. The next write returns Zone Is Full.
 - **Address-specific writes only:** the write pointer check applies to commands that name an LBA. Zone Append names the zone start instead, so it never returns Zone Invalid Write (5.06).
-- **Free oracle:** a rejected write must not move the write pointer, so a Report Zones right after any failure should equal the one before.
-- **Gap addresses:** an SLBA between ZCAP and the end of the zone is not writable. The exact status in a zone that is not yet Full is worth a directed test and a VERIFY.
+- **Free oracle, with a caveat:** a command aborted outright (Zone Boundary Error, Zone Invalid Write, or a zone-state abort) writes nothing and leaves the write pointer unchanged. That is different from a write that starts executing and then fails partway (e.g. a media error): the spec allows the write pointer there to land inside the range, one past it, or become invalid (ZNS 1.4, 2.1.1.2.1.1). The "no side effect" oracle applies only to the outright-aborted cases.
+- **Gap addresses:** an SLBA between ZCAP and the end of the zone is not writable (confirmed, Annex A.5); since the write pointer can never itself sit in that gap without the zone first becoming Full, such an SLBA never equals the write pointer, so the write is aborted with Zone Invalid Write.
 FOLLOW:
 - Which status means the host and the device disagree about the write pointer? => Zone Invalid Write. Every other zone status is about state, length or resources.
 - Does Zone Invalid Write put the zone into an error state? => No. The zone stays as it was, and the next correct write succeeds.
 PITFALL: Expecting one status per bad write. A write with several faults at once can return more than one legal status (7.11).
-VERIFY: The status for an SLBA inside the capacity gap of a non-Full zone, that a rejected write leaves the write pointer unchanged, and which write-like commands are address-specific, in the ZNS Command Set Specification.
 
 @@ 7.03 | Basic | Cross-layer | tags=linux,block-layer,errno,dnr,nvme-cli,tracing
 Q: How does a zone error status reach a Linux application, and what is lost on the way?
@@ -88,14 +87,14 @@ DEEP:
 
 - **No Read Only status for reads:** Zone Is Read Only exists only for writes. Reads of a Read Only zone succeed, which is how the host evacuates data.
 - **Why success above the WP:** unlike SMR drive models, ZNS allows it, and the value comes from DLFEAT (3.11 has the full state table and the encodings).
-- **Linux never spans zones:** the driver sets the request chunk size to the zone size, so the block layer splits I/O at zone boundaries. The Read Across Zone Boundaries bit matters only for passthrough, SPDK and other user-space stacks.
+- **Linux never spans zones:** the driver sets the request chunk size to the zone size, so the block layer splits I/O at zone boundaries. The Read Across Zone Boundaries bit matters only for passthrough, SPDK and other user-space stacks. RAZB is OZCS bit 0 (ZNS 1.4, Figure 49); OZCS bit 1 is ZRWASUP.
 - **Media error is real loss:** Unrecovered Read Error means that range is gone. The host recovers from redundancy, and does not retry in a loop.
-- **Capacity gap:** what a read between ZCAP and the end of the zone returns is a directed test to add. Module 3 records it as an unwritten-block read.
+- **Capacity gap:** confirmed (Annex A.5): LBAs between ZCAP and the end of the zone "behave like deallocated blocks when read", i.e. return the unwritten-block value, with no NAND access implied.
 FOLLOW:
 - How do you test Read Across Zone Boundaries? => Read Identify to learn the bit, then read across the boundary and expect success or Zone Boundary Error to match the bit. Include a case where the second zone is Offline.
 - Which read status must a validator never accept in a Read Only zone? => Zone Is Read Only, because it applies to writes. A valid read should succeed.
 PITFALL: Treating a read above the write pointer as an error to be asserted. It is legal and returns the unwritten value.
-VERIFY: The DLFEAT and OZCS bit assignments, the read result for LBAs between ZCAP and zone end, and what a cross-zone read returns when one of the zones is Offline, in the NVM and ZNS Command Set Specifications.
+VERIFY: DLFEAT (the unwritten-block read value encoding) is an NVM Command Set field, not ZNS-specific. What a cross-zone read returns when only the second zone touched is Offline is not spelled out beyond the single-zone rule in 2.1.1.2.1.2.
 
 @@ 7.05 | Intermediate | Trap | tags=boundary,capacity,partial-write,write-sizing
 Q: A 128-block write starts 100 blocks before the zone capacity. Does the device write 100 blocks and fail the rest?
@@ -119,7 +118,7 @@ FOLLOW:
 - How does the host know the remaining space without Report Zones? => From its shadow: ZCAP minus (WP minus ZSLBA), provided the shadow is trusted (7.12).
 - Is the error also used when the write would cross into the next zone? => Yes. Any write longer than the space left in its zone gets it.
 PITFALL: Retrying the same write. It fails the same way until the host shortens it or picks another zone.
-VERIFY: Whether the length check is against zone capacity or zone size in the spec wording, and that a Zone Boundary Error leaves state and WP unchanged.
+Confirmed (ZNS 1.4, 2.1.1.2.1.1 and Annex A.5, Figure 64): the length check is against zone capacity, not zone size ("the Number of Logical blocks exceeds the remaining number of logical blocks in that zone", with the zone's highest usable LBA defined as ZSLBA + ZCAP - 1). A command aborted outright with Zone Boundary Error leaves the zone state and write pointer unchanged.
 
 @@ 7.06 | Intermediate | Concept | tags=read-only,offline,media,evacuation,degraded
 Q: Why does a controller move a zone to Read Only or Offline, and what does the host keep in each state?
@@ -143,7 +142,7 @@ FOLLOW:
 - Can the host bring a Read Only zone back? => Not with Zone Management commands. Recovery, if any, is vendor specific or a format.
 - Should a validator require Zone Is Read Only for the write that caused the fault? => No. Accept the media error or the zone status, and require the zone status from the next command on.
 PITFALL: Assuming Read Only means all earlier data is safe. The zone went bad because the media misbehaved, so verify readability during evacuation and keep a second copy where the data matters.
-VERIFY: Which status the write that triggers the transition returns, whether written data must remain readable in Read Only, and any Read Only to Offline transition the controller may make on its own, in the ZNS Command Set Specification.
+The table above is confirmed against ZNS 1.4, 2.1.1.2.1.2 (reads succeed except in Offline) and 3.4.3.1.1-3.4.3.1.6 (Close/Finish/Open/Reset abort with Invalid Zone State Transition from Read Only or Offline; only Offline Zone is valid from Read Only). VERIFY: which status the write that triggers the Read Only transition itself returns, and any Read Only to Offline transition the controller makes on its own, are vendor/media-specific and not addressed by the spec.
 
 @@ 7.07 | Intermediate | Concept | tags=retry,dnr,policy,linux,backoff
 Q: Which zone errors should a host retry, and how do DNR and the Linux retry logic interact with them?
@@ -248,7 +247,7 @@ VERIFY: None for the arithmetic. Confirm the actual ZCAP and ZSZE on your drive,
 
 @@ 7.11 | Advanced | Trap | tags=precedence,multi-fault,allowed-set,oracle,characterization
 Q: A write has the wrong SLBA and also hits a Full, Read Only or Offline zone, or runs past capacity. Which status does the device return, and how should a validator treat it?
-SHORT: The specification defines each error on its own, and as far as I could confirm it gives no complete precedence order for combinations, so different devices may return different legal statuses for the same command. A validator should assert an allowed set for multi-fault commands, for example Zone Is Full or Zone Invalid Write for a wrong-SLBA write to a Full zone, and an exact code only where a single fault applies.
+SHORT: ZNS 1.4 does not say. It defines each error on its own and gives no precedence order for combinations, so different devices may return different legal statuses for the same command. A validator should assert an allowed set for multi-fault commands, for example Zone Is Full or Zone Invalid Write for a wrong-SLBA write to a Full zone, and an exact code only where a single fault applies.
 DEEP:
 | Command | Faults present | Statuses to allow |
 |---|---|---|

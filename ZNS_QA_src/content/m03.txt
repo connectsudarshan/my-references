@@ -13,7 +13,7 @@ FOLLOW:
 - Can one namespace mix conventional and zoned regions? => No. A zoned namespace (Command Set Identifier 2h) contains only zones. Conventional and zoned namespaces coexist as separate namespaces (module 2).
 - Must Zone Size be a power of two? => Not that I could confirm in the spec text (see VERIFY), but the Linux NVMe driver source I checked rejects non-power-of-two zone sizes, so real hosts effectively assume it.
 PITFALL: Equating a zone with a NAND erase block. Zone Size and capacity are host-facing numbers and firmware is free to stripe a zone over many blocks and dies.
-VERIFY: Whether the ZNS spec requires uniform Zone Size and a namespace size that is a multiple of it, and the reserved Zone Type codes.
+VERIFY: ZNS 1.4 does not say whether the namespace size must be an exact multiple of Zone Size (Annex A.5 only shows equal-size zones, with no stated multiple rule). Zone Type 2h (Sequential Write Required) is the only defined value; all others are reserved (ZNS 1.4, Figure 38).
 
 @@ 3.02 | Basic | Concept | tags=write-pointer,wp,sequential,invalid-write
 Q: What is the write pointer, and how does it move?
@@ -32,7 +32,7 @@ FOLLOW:
 - Can the WP move backward? => Only via Reset Zone in normal operation. After unexpected power loss it may come back lower than the host last saw if the data was not durable (see 3.15).
 - Does a Flush or FUA change the WP? => No. The WP advances on successful write completion. Durability of that data follows the usual Flush and FUA rules.
 PITFALL: Expecting the WP in the write completion. Only Zone Append returns an LBA, so a host that does not track the WP must call Report Zones.
-VERIFY: The exact durability guarantee the spec gives for WP and data after unexpected power loss.
+VERIFY: ZNS 1.4 gives no zone-specific durability guarantee for the WP after an Unexpected Power Loss; that is governed by the NVMe Base Specification's volatile write cache and unexpected-power-loss rules (see the NVMe page).
 
 @@ 3.03 | Basic | Concept | tags=zone-size,zone-capacity,zsze,zcap,vzc
 Q: What is the difference between Zone Size and Zone Capacity?
@@ -42,13 +42,13 @@ DEEP:
 - **Why they differ:** capacity follows what the media can hold after bad blocks, parity and firmware reserves. Zone Size is chosen for fast address arithmetic on the host (shift instead of divide).
 - **Variable Zone Capacity:** the Zone Operation Characteristics field has a bit (VZC) that says capacity may differ from zone to zone. If it is 0, all zones have the same capacity. The Linux NVMe driver source I checked refuses namespaces with any Zone Operation Characteristics bit set.
 - **Writes past capacity:** a write that would cross ZSLBA + ZCAP is aborted (Zone Boundary Error in the QEMU model), and the zone is Full when the WP reaches ZSLBA + ZCAP.
-- **Reads in the gap:** handled like reads of unwritten blocks, not as an error (zonedstorage.io).
+- **Reads in the gap:** the LBAs from offset ZCAP to ZSZE-1 behave like deallocated blocks on a read and are not allowed to be written (ZNS 1.4, Annex A.5).
 - **Capacity accounting:** usable space is the sum of ZCAP, not NSZE (worked in 3.08).
 FOLLOW:
 - Why not just make capacity equal to size? => Zone Size is a power of two for host math, while capacity tracks superblock geometry, which rarely is.
 - Which value decides when a zone is Full? => Capacity. Reaching ZSLBA + ZCAP fills the zone even though ZSZE more addresses exist.
 PITFALL: Filling to Zone Size in a test. The last ZSZE - ZCAP LBAs are not writable, so a host or test that plans on ZSZE hits a boundary error.
-VERIFY: Whether Zone Capacity can change after Reset Zone when VZC is 1, and the exact status for a write that starts inside the gap.
+VERIFY: Zone Capacity can change on Reset Zone when VZC is 1 (ZNS 1.4, 3.4.3.1.5 and Annex A.5, confirmed). A write starting inside the gap fails as Zone Invalid Write (start not at WP) or Zone Is Full once the zone has reached capacity; there is no separate gap-specific status.
 
 @@ 3.04 | Intermediate | Concept | tags=zone-descriptor,report-zones,zone-attributes,extension
 Q: What is inside a zone descriptor, and how is a Report Zones buffer laid out?
@@ -73,7 +73,7 @@ FOLLOW:
 - Do the Report Zones filter codes equal the state codes? => No. The Zone Receive Action Specific Field uses 0 all, 1 Empty, 2 Implicit Open, 3 Explicit Open, 4 Closed, 5 Full, 6 Read Only, 7 Offline, so Full, Read Only and Offline are 5, 6, 7 in the filter but Eh, Dh, Fh in the state field. Linux nvme.h swaps 5 and 6 (see 4.08).
 - How does the host pick extended or plain? => The Zone Receive Action: 0 is a normal report, 1 is an extended report (libnvme, SPDK and QEMU; Linux nvme.h defines only 0).
 PITFALL: Reading the state from the low nibble of byte 1, or decoding the filter code as a state code.
-VERIFY: Zone Attributes Information bit layout (added in a later ZNS revision than 1.0) and which bytes are reserved in your target revision. Filter codes 5 = Full, 6 = Read Only: see the VERIFY line in 4.08.
+Confirmed against ZNS 1.4, Figure 38: Zone Attributes Information is bits 3:2 Reset Recommended Time Limit selector, bits 1:0 Finish Recommended Time Limit selector, bits 7:4 reserved. Filter codes 5 = Full, 6 = Read Only match the spec table exactly (Figure 35; see 4.08).
 
 @@ 3.05 | Intermediate | Concept | fig=zstates | tags=zone-states,state-machine,open,active
 Q: What are the seven zone states, and what can be done in each?
@@ -98,7 +98,7 @@ FOLLOW:
 - Which states count toward the active limit? => Implicitly Opened, Explicitly Opened and Closed.
 - Can an Empty zone become Full without any writes? => Yes, through Finish Zone, or through a controller action.
 PITFALL: Treating Closed as unusable. A Closed zone keeps its WP and data, still counts as active, and a write reopens it (needing an open resource).
-VERIFY: Code assignments 1h to 4h and Dh to Fh (they match SPDK and the Linux headers) and that 0h and 5h to Ch are reserved, in the ZNS Zone Descriptor figure.
+Confirmed against ZNS 1.4, Figure 38: 0h reserved, 1h Empty, 2h Implicitly Opened, 3h Explicitly Opened, 4h Closed, 5h to Ch reserved, Dh Read Only, Eh Full, Fh Offline.
 
 @@ 3.06 | Intermediate | Concept | tags=transitions,write,open,close,finish,reset,offline
 Q: Walk through the host-driven state transitions: what does each command do in each state?
@@ -116,28 +116,27 @@ DEEP:
 
 "err" is Invalid Zone State Transition (SCT 1, SC BFh). Cells marked * are expected behavior that must be confirmed against the spec text.
 - **Resources:** Empty to Imp Open needs one open and one active resource, Closed to Imp Open needs one open. Failure gives Too Many Open Zones (BEh) or Too Many Active Zones (BDh), unless the controller closes another implicitly open zone to make room (module 6).
-- **Reset side effects:** WP becomes ZSLBA and the attribute bits ZDEV, FZR, RZR and ZFC are cleared.
+- **Reset side effects:** WP becomes ZSLBA and the attribute bits ZDEV, FZR, RZR, ZFC and ZRWAV are all cleared (ZNS 1.4, 3.4.3.1.5).
 - **Select All:** the Zone Management Send Select All flag applies an action to every zone it is valid for (module 4).
 FOLLOW:
 - Which transition frees an open resource but keeps the active one? => Close Zone (open to Closed).
 - Does Reset Zone on a Read Only zone recover the space? => No. It fails with Invalid Zone State Transition, and only Offline Zone is allowed from Read Only.
 PITFALL: Assuming every wrong-state action fails. Reset on Empty, Close on Closed and Offline on Offline succeed as no-ops, so the oracle needs an exact expected result per cell, including "state and WP unchanged" for rejected ones.
-VERIFY: The starred cells, especially Finish on Full, Open on Explicitly Opened, and Close on Empty or Full, in the Zone Management Send section.
+Confirmed against ZNS 1.4, 3.4.3.1.1 to 3.4.3.1.5: Finish on Full is a no-op, Open on Explicitly Opened is a no-op, and Close on Empty or Full is Invalid Zone State Transition, exactly as starred above.
 
 @@ 3.07 | Intermediate | Concept | tags=implicit-open,explicit-open,resources,eviction
 Q: What is the difference between an implicitly and an explicitly opened zone, and why does it matter?
-SHORT: A zone is implicitly opened when a write reaches an Empty or Closed zone, and explicitly opened when the host sends Open Zone. Both use an open and an active resource. The difference is who may end it: the controller may implicitly close an Implicitly Opened zone to free an open resource, but never closes an Explicitly Opened one. Only the host or a fault does that.
+SHORT: A zone is implicitly opened when a write reaches an Empty or Closed zone, and explicitly opened when the host sends Open Zone. Both use an open and an active resource. The difference is who may end it: when Open resources run out but Active resources are still available, the controller shall close an Implicitly Opened zone to make room; it can never do that to an Explicitly Opened one. Only the host or a fault ends an Explicitly Opened zone.
 DEEP:
 - **Why open explicitly:** Open Zone reserves the resource up front. If the limits are hit, the failure is at the Open command (Too Many Open Zones or Too Many Active Zones) instead of in the middle of a data stream.
-- **Eviction:** when a write needs an open resource and all are used, the controller may move one Implicitly Opened zone to Closed. Which one is up to the device (the QEMU model closes the oldest).
+- **Eviction is mandatory, not best-effort:** per ZNS 1.4, 2.1.1.4.1, if MAR is greater than MOR and the unavailable resource is Open, the controller shall select one Implicitly Opened zone and transition it to Closed before proceeding, if at least one exists; only if none exists does it abort with Too Many Open Zones. If MAR equals MOR, there is no such path: Active resources run out first and the command aborts with Too Many Active Zones. Which zone is chosen when several qualify is still vendor specific.
 - **Visibility:** the host sees an eviction only by reading the zone state again (2h became 4h). No completion reports it, so a host that tracks state itself must resync.
 - **One-way:** Implicit to Explicit exists (Open Zone on an implicitly open zone). Explicit to Implicit does not. An Explicitly Opened zone leaves only through Close, Finish, Reset or a controller fault.
 - **Validation test:** with the open limit at N, open N zones explicitly and write to a fresh Empty zone. Expect Too Many Open Zones, since nothing can be evicted. Repeat with N-1 explicit and the rest implicit and expect success with one zone quietly Closed.
 FOLLOW:
 - Can the host tell that the controller closed a zone? => Only through Report Zones state.
 - Does Close Zone release the active resource? => No. Only Finish, Reset, or a transition to Read Only or Offline take the zone out of the active count.
-PITFALL: Assuming the device will always make room. Explicit opens pin their resources, so a host that opens MOR zones explicitly has no headroom for another.
-VERIFY: Whether the spec obliges the controller to close an implicitly open zone before returning Too Many Open Zones (may versus shall).
+PITFALL: Assuming the device will always make room. Explicit opens pin their resources, so a host that opens MOR zones explicitly has no headroom for another, and eviction is only guaranteed when MAR is strictly greater than MOR.
 
 @@ 3.08 | Intermediate | Numeric | tags=zone-count,zslba,wp,capacity,arithmetic
 Q: A 64 GiB zoned namespace uses 4 KiB LBAs, Zone Size 0x10000 and Zone Capacity 0xDC00. How many zones are there, where does zone 100 start, and where is its WP after 40 writes of 1 MiB plus three writes of 4 KiB?
@@ -156,7 +155,7 @@ FOLLOW:
 - How does the zone lookup change if Zone Size is not a power of two? => The host divides instead of shifting: zone = LBA / ZSZE, and offset = LBA mod ZSZE.
 - What does the state look like after write number 1,760 of 128 KiB? => Full, and Report Zones shows state Eh.
 PITFALL: Sizing the dataset from NSZE. A 64 GiB namespace stores 55 GiB, and a host GC or capacity plan that ignores the gap runs out of zones early.
-VERIFY: That the namespace size must be an exact multiple of Zone Size in the spec (the example assumes it).
+VERIFY: ZNS 1.4 does not say the namespace size must be an exact multiple of Zone Size (the example assumes it for clean arithmetic; Annex A.5 does not state the requirement either way).
 
 @@ 3.09 | Advanced | Concept | tags=controller-transitions,power-cycle,reset,initial-state
 Q: Which transitions does the controller make on its own, and what happens to open zones across a power cycle or controller reset?
@@ -180,13 +179,13 @@ FOLLOW:
 - Why does ZDEV = 1 force Closed even when WP = ZSLBA? => Because the zone carries host data in its descriptor extension, so it is not "nothing written" and must not be silently emptied.
 - Which resets apply? => As I read the spec, the initial state is set by an NVM Subsystem Reset or when all controllers report shutdown processing complete. A Controller Level Reset (CC.EN 1 to 0) is not in that list, and QEMU closes zones only on shutdown, so record what the drive does on CC.EN and on CC.SHN separately.
 PITFALL: Expecting Explicitly Opened zones to survive as Explicitly Opened. A test that reserves resources and then power cycles must re-open afterwards.
-VERIFY: The exact list of events that trigger the initial-state rules (NVM Subsystem Reset, shutdown complete on all controllers, and whether a Controller Level Reset counts), and the Full-after-NVM-Subsystem-Reset condition, in the ZNS state-machine section.
+Confirmed against ZNS 1.4, 2.1.1.3: the initial-state rules trigger only on an NVM Subsystem Reset or on all controllers reporting shutdown processing complete (ST=0, SHST=10b); a Controller Level Reset (CC.EN 1 to 0) is explicitly not one of the listed triggers. Full-after-reset is allowed when the most recent state was already Full, or when the reset itself transitioned the zone to Full.
 
 @@ 3.10 | Advanced | Concept | tags=zone-attributes,zfc,fzr,rzr,zdev,excursion
 Q: What do the zone attribute bits ZFC, FZR, RZR and ZDEV mean, and how should a host and a validator treat them?
-SHORT: ZFC (bit 0) says the controller finished the zone itself. FZR (bit 1) and RZR (bit 2) mean the controller recommends the host Finish or Reset the zone. ZDEV (bit 7) says a zone descriptor extension is valid. FZR and RZR are advisory hints tied to media health or data-retention limits, not errors, and they clear when the host acts (Reset Zone clears all four bits).
+SHORT: ZFC (bit 0) says the controller finished the zone itself. FZR (bit 1) and RZR (bit 2) mean the controller recommends the host Finish or Reset the zone. ZDEV (bit 7) says a zone descriptor extension is valid. FZR and RZR are advisory hints tied to media health or data-retention limits, not errors, and Reset Zone clears all of ZDEV, FZR, RZR, ZFC and ZRWAV together.
 DEEP:
-- **ZFC:** set when the controller moved an active zone to Full without a host command, a Zone Active Excursion. Data below the old WP is intact and the zone takes no more writes. The device must advertise this in Zone Operation Characteristics (ZAE), and the host should be told through a zone-information-changed event (module 6).
+- **ZFC:** set when the controller moved an active zone to Full without a host command, a Zone Active Excursion. Data below the old WP is intact and the zone takes no more writes. The device must advertise this in Zone Operation Characteristics (ZAE), and the host should be told through a Zone Descriptor Changed asynchronous event (ZNS 1.4, Figure 43; module 6).
 - **FZR:** the controller would like the zone filled or Finished, for example because a partly written zone has been open too long for its NAND. The Identify Namespace data holds finish recommended limits (FRL and further limits).
 - **RZR:** the controller would like the zone reset, for example because stored data has aged or degraded. Reset limits (RRL and further limits) live in Identify Namespace data.
 - **Zone Attributes Information (newer revisions):** selects which of the limit fields applies to this zone.
@@ -196,7 +195,7 @@ FOLLOW:
 - Does FZR change the zone state? => No. The zone stays in its state until the host acts, though the controller may escalate per its limits (for example by finishing it and setting ZFC).
 - How do you test FZR? => Leave a zone partly written for longer than the advertised finish limit and check the bit appears. It is device-specific, so report it as informational unless the vendor defines the trigger.
 PITFALL: Failing a test on FZR or RZR being set. These are advisory, and a validator should log them and check only that Reset or Finish clears them.
-VERIFY: Bit positions, units of FRL and RRL and the exact clearing rules in the ZNS Zone Descriptor and Identify Namespace sections.
+Confirmed against ZNS 1.4, 5.4 and 5.5: RRL and FRL (and RRL1-3, FRL1-3) are in seconds, and if a zone is in Read Only or Offline, RZR and FZR shall both be cleared to 0.
 
 @@ 3.11 | Advanced | Trap | tags=read,unwritten,dlfeat,dulbe,boundary,offline
 Q: What does a Read return in each zone state and above the write pointer? Does reading above the WP fail?
@@ -218,7 +217,7 @@ FOLLOW:
 - Which status does DULBE return? => Deallocated or Unwritten Logical Block (SCT 2, SC 87h; NVME_SC_UNWRITTEN_BLOCK in Linux), only if the feature is enabled and supported.
 - Why might a device return stale data above the WP? => It is a firmware bug when a Reset did not invalidate the mapping. Reads there must give the unwritten value.
 PITFALL: Writing "read above WP must fail" into an oracle. That is a different drive class's rule and it flags a compliant ZNS device.
-VERIFY: Whether ZNS requires or merely allows Unwritten Block errors above the WP, the OZCS bit position (bit 0), and behavior when a cross-zone read includes an Offline zone.
+Confirmed against ZNS 1.4: OZCS bit 0 is Read Across Zone Boundaries (Figure 49), and a read that touches an Offline zone aborts with Zone Is Offline regardless of how many zones it spans (2.1.1.2.1.2, Figure 17). Whether the unwritten-block behavior above the WP is an error or a defined read value is governed by the NVM Command Set Specification's Deallocated or Unwritten Logical Blocks section, not by ZNS itself; VERIFY that against the NVM Command Set spec.
 
 @@ 3.12 | Advanced | Cross-layer | tags=wp-invalid,full,linux,blkzone,units,report
 Q: Report Zones on the device shows a Full zone with WP = 0x4DC00, but blkzone shows a different write pointer for the same zone. Which one is right, and what is the second difference to watch for?
@@ -238,7 +237,7 @@ VERIFY: Kernel behavior for Read Only and Offline WP on the version you test, an
 
 @@ 3.13 | Advanced | Debug | tags=report-zones,dump,invariants,triage,violation
 Q: You get the report-zones dump below (4 KiB LBAs, ZSZE 0x10000, ZCAP 0xDC00, MOR 4, MAR 8, ZOC = 0). Which zones violate the spec, and how would you confirm each?
-SHORT: Zones 2, 7 and 8 are violations. Zone 2 is open with WP at ZSLBA + ZCAP when it must be Full. Zone 7 is Closed with WP past ZSLBA + ZCAP. Zone 8 is Empty with WP not at ZSLBA. Zone 4 sets ZFC even though ZOC = 0, which is also suspect. Zones 3, 5 and 6 are legal but need explanation.
+SHORT: Zones 2, 4, 7 and 8 are violations. Zone 2 is open with WP at ZSLBA + ZCAP when it must be Full. Zone 4 sets ZFC even though ZOC = 0 does not advertise Zone Active Excursions, which the spec forbids. Zone 7 is Closed with WP past ZSLBA + ZCAP. Zone 8 is Empty with WP not at ZSLBA. Zones 3, 5 and 6 are legal but need explanation.
 DEEP:
 | Zone | ZSLBA | ZCAP | WP | ZS byte | ZA |
 |---|---|---|---|---|---|
@@ -256,7 +255,7 @@ DEEP:
 2. Zone 1: WP - ZSLBA = 0x200 = 512 LBAs (2 MiB). Fine.
 3. **Zone 2 (violation):** WP = ZSLBA + ZCAP = 0x2DC00 in an open state. Reaching capacity must make the zone Full.
 4. **Zone 3 (legal):** Closed with WP = ZSLBA arises from Open then Close with no data. It still counts as active, and after a reset it would return as Empty (ZDEV = 0).
-5. **Zone 4 (suspect):** ZFC = 1 means the controller finished the zone, which needs the Zone Active Excursions bit, and ZOC = 0 here. WP is invalid in Full and is ignored.
+5. **Zone 4 (violation):** ZFC = 1 means the controller finished the zone via a Zone Active Excursion, which requires the ZAE bit set in ZOC; ZOC = 0 here, so ZFC shall not be set (ZNS 1.4, 5.6). WP is invalid in Full and is ignored.
 6. **Zones 5 and 6:** WP is invalid, so ignore it. Read Only rejects writes and Reset. Offline rejects reads and writes.
 7. **Zone 7 (violation):** WP 0x7F000 exceeds ZSLBA + ZCAP = 0x7DC00 by 0x1400 = 5,120 LBAs, into the unmapped gap.
 8. **Zone 8 (violation):** Empty demands WP = ZSLBA, but WP is 0x100 (256 LBAs) higher.
@@ -265,7 +264,7 @@ FOLLOW:
 - How do you tell if zone 2 is a stale report or a real internal state? => Send a 1-block write at the WP. Zone Is Full means state was Full and the report is stale, Zone Boundary Error means the state is open with WP at the end (a state-update bug), success means data past capacity was accepted (severe).
 - Zone 8 shows Empty with a WP off by 256 LBAs. What would you read? => The LBAs at ZSLBA and ZSLBA + 0x100, plus the trace of the preceding Reset. Suspect a Reset that cleared state but not the WP, or a stale cache in report generation.
 PITFALL: Treating zone 3 as a bug. Closed with no data is reachable and legal, but it consumes an active resource, which is why resource tests must count it.
-VERIFY: Whether ZFC may ever be set when ZOC does not advertise Zone Active Excursions, in the Zone Attributes definition.
+Confirmed against ZNS 1.4, 4.1.5.1 (ZAE bit) and 5.6: if ZAE is cleared to 0 in ZOC, the controller shall not perform a Zone Active Excursion, so ZFC must never be set. Zone 4 (ZOC = 0, ZFC = 1) is therefore a genuine device defect, not merely "suspect."
 
 @@ 3.14 | Principal | Concept | tags=shadow-model,invariants,oracle,automation,coverage
 Q: How would you design a zone-state model and invariant checker for a ZNS validation framework?
@@ -285,7 +284,7 @@ FOLLOW:
 - Why not seed the model from the device report? => A device that consistently lies (state and WP both wrong the same way) would never be caught. The oracle must come from the spec and completions.
 - How do you handle an unexpected but legal Closed zone? => Record it as an informational eviction, resync the shadow to Closed, and check resource counts.
 PITFALL: Asserting exact equality where the spec allows a set of outcomes, which produces flaky failures that get ignored and hide real bugs.
-VERIFY: Zero-based MAR and MOR encoding and the "no limit" value in the ZNS Identify Namespace section.
+Confirmed against ZNS 1.4, Figure 49: MAR and MOR are both 0's based, and FFFFFFFFh in either field means no limit.
 
 @@ 3.15 | Principal | Scenario | tags=power-loss,wp,durability,flush,fua,triage
 Q: After a sudden power cut in the middle of a sequential write stream, Report Zones shows a zone Closed with a WP lower than the host last saw. Is that a bug, and how do you triage it?
@@ -311,7 +310,7 @@ VERIFY: The durability and WP-rollback rules the ZNS spec and NVM Command Set gi
 Q: During an endurance run a few zones go Read Only. How do you root-cause it, and how do you design a test for that behavior?
 SHORT: Read Only means the controller stopped accepting writes to the zone, typically after NAND program or erase failures or lost redundancy, while data stays readable. Record when each zone changed, correlate with the SMART and health log and vendor logs, copy the data out, then send Offline Zone. For validation, inject NAND faults on chosen blocks and assert the exact state, status and resource behavior.
 DEEP:
-1. **Detect:** a write failing with Zone Is Read Only (BAh), a zone-information-changed event (module 6), or periodic reports. The host cannot trust the WP field, so use its own record of the last completed write.
+1. **Detect:** a write failing with Zone Is Read Only (BAh), a Zone Descriptor Changed asynchronous event (module 6), or periodic reports. The host cannot trust the WP field, so use its own record of the last completed write.
 2. **Evidence:** timestamp of first appearance, Percentage Used and Available Spare, Media and Data Integrity Errors, Critical Warning bit 3 (media in read-only mode, namespace-wide, a related but different signal), and the vendor NAND log (bad blocks, die, program-fail counts).
 3. **Causes:** program or erase failure with no spare left for the zone's stripe, wear-out, an injected fault left active, or a firmware bug that latched the state wrongly.
 4. **Validate the behavior:**
@@ -350,4 +349,4 @@ FOLLOW:
 - The drive ships with no Offline zones. How do you cover Offline? => Use a vendor fault or a factory-offline namespace. If neither exists, record it as an explicit coverage gap with an owner, not a silent skip.
 - What is 1-switch coverage? => Coverage of every sequence of two consecutive transitions, not only each single transition.
 PITFALL: Covering success paths only. Roughly half the matrix is rejected actions, and each must be checked for exact status and no side effects.
-VERIFY: The complete list of Zone Management Send actions in your ZNS revision, since the action count changes the matrix size.
+Confirmed against ZNS 1.4 (Figure 40, 3.4.3.1): six state-changing Zone Send Actions exist (Close, Finish, Open, Reset, Offline, Set Zone Descriptor Extension), plus Flush Explicit ZRWA Range (module 11), which does not by itself change zone state. The 9-action matrix above also folds in Write, Zone Append and Read as non-Zone-Management-Send operations that still drive the state machine.

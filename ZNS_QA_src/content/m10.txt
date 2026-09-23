@@ -87,7 +87,7 @@ Geometry: 4 KiB LBAs, ZSZE = 0x10000, ZCAP = 0xDC00, so zone 2 starts at 0x20000
 | Read 8 blocks at 0x2DBFC (spans ZCAP, same zone) | Success, blocks at or above ZCAP return the unwritten value |
 | Read 8 blocks at 0x2FFFC (spans into zone 3) | Success if Read Across Zone Boundaries is 1 and both zones are readable, else Zone Boundary Error |
 | Read 8 blocks ending past the namespace end | LBA Out of Range |
-| Zone management with SLBA = ZSLBA + 1 | Invalid Field in Command |
+| Zone management with SLBA = ZSLBA + 1 | Invalid Field in Command (ZNS 1.4, 3.4.3) |
 | Zone management with SLBA at the namespace size | LBA Out of Range |
 
 - **Side effects:** after every rejected command, report the zone and read back the neighbors. Nothing may change.
@@ -98,7 +98,7 @@ FOLLOW:
 - Why test the gap between ZCAP and ZSZE? => It is addressable space that must never hold data. Firmware that sizes zones by ZSZE instead of ZCAP fails only there.
 - Why record which of two defensible statuses the drive returns? => A later change of behavior is then flagged even though both codes are legal.
 PITFALL: Testing boundaries only on Empty zones and only with Write. The same LBA and length can produce a different status in each state and command.
-VERIFY: The status for a write to an LBA above ZCAP that is not at the WP, the order of state and range checks, and the Read Across Zone Boundaries bit, in the ZNS Command Set Specification.
+VERIFY: The status for a write to an LBA above ZCAP that is not at the WP, and the order of state and range checks, in the ZNS Command Set Specification. (Read Across Zone Boundaries is OZCS bit 0, ZNS 1.4, Figure 49.)
 
 @@ 10.05 | Intermediate | Concept | tags=report-zones,filters,pagination,partial,extended,zrasf
 Q: How do you test Report Zones itself: filters, partial reports, extended reports and pagination?
@@ -116,7 +116,7 @@ FOLLOW:
 - Why check that the filters add up to the unfiltered report? => A filter that silently drops or double counts a state would hide inside a spot check.
 - Why use awkward chunk sizes? => Firmware loops over descriptors in batches, and off-by-one bugs appear when the chunk does not divide the zone count.
 PITFALL: Treating a report taken with commands in flight as an exact snapshot. It is a valid sample of some instant, so assert bounds, not equality.
-VERIFY: ZRASF encodings for Full and Read Only (05h and 06h), Partial Report header semantics, and the status for reserved ZRA or ZRASF values and for an SLBA inside a zone (see 4.02 and 4.08).
+VERIFY: Partial Report header semantics, and the status for reserved ZRA or ZRASF values and for an SLBA inside a zone (see 4.02 and 4.08). (ZRASF Full and Read Only are confirmed as 05h and 06h, ZNS 1.4, 3.4.2, Figure 35.)
 
 @@ 10.06 | Intermediate | Concept | tags=capability,profile,gating,zoc,ozcs,zdes,mar,mor
 Q: How do you keep one ZNS suite valid across drives with different optional features, and what do you test when a feature is absent?

@@ -17,7 +17,7 @@ The per-zone record is `struct blk_zone`:
 | cond | Zone condition |
 | non_seq, reset | SMR-era hints, left at 0 by the NVMe driver |
 
-Condition codes are 0 NOT_WP (conventional), 1 EMPTY, 2 IMP_OPEN, 3 EXP_OPEN, 4 CLOSED, 0xD READONLY, 0xE FULL, 0xF OFFLINE. They match the NVMe Zone State values because the driver copies the upper nibble of the descriptor's ZS byte.
+Condition codes are 0 NOT_WP (conventional), 1 EMPTY, 2 IMP_OPEN, 3 EXP_OPEN, 4 CLOSED, 0xD READONLY, 0xE FULL, 0xF OFFLINE. They match the NVMe Zone State (ZS) values in the Zone Descriptor's Zone State Attributes byte (ZNS 1.4, Figure 38: 1h Empty, 2h Implicitly Opened, 3h Explicitly Opened, 4h Closed, Dh Read Only, Eh Full, Fh Offline) because the driver copies the upper nibble of that byte.
 
 | ioctl (magic 0x12) | Number | Argument |
 |---|---|---|
@@ -124,7 +124,7 @@ FOLLOW:
 - Which open flags for a write test? => Pass O_DIRECT (zbd_open forwards flags to open). Buffered writes are reordered by the page cache.
 - What does a range with length 0 mean? => Everything from the offset to the end of the device capacity.
 PITFALL: Passing sectors to libzbd or LBAs to blkzone. The call succeeds and acts on the wrong zone.
-VERIFY: lsblk zone columns and blkzone option letters on your util-linux version, the zbd CLI subcommands in your libzbd release, and the ZRASF state values (Full 05h, Read Only 06h) in the ZNS Command Set Specification.
+VERIFY: lsblk zone columns and blkzone option letters on your util-linux version, and the zbd CLI subcommands in your libzbd release. The ZRASF state values are confirmed: Full 05h, Read Only 06h (ZNS 1.4, 3.4.2, Figure 35).
 
 @@ 9.06 | Intermediate | Concept | tags=fio,zonemode-zbd,max-open-zones,zone-reset,append
 Q: How does fio's zonemode=zbd work, and which options matter for a ZNS test?

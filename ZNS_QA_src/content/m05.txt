@@ -37,11 +37,12 @@ DEEP:
 - **Passthrough:** in Linux use the 64-bit ioctl (`NVME_IOCTL_IO64_CMD`); the 32-bit passthrough returns only DW0. `nvme zns zone-append` shows the assigned LBA in verbose mode (`-v`).
 - **Errors:** when the status is not success, the result field carries no valid ALBA. Do not consume it.
 - **Data transfer:** PRP or SGL and the metadata pointer work as for Write, subject to ZASL (5.04).
+- **CDW12 bits:** LR is bit 31, FUA bit 30, PRINFO bits 29:26, PIREMAP bit 25, STC bit 24, DTYPE bits 23:20, CETYPE bits 19:16, NLB bits 15:00 (ZNS 1.4, Figure 26).
+- **Reference tag fields:** the Initial Logical Block Reference Tag and Storage Tag are split: the upper bits are CDW2/3 bits 47:00 (LBTU) and the lower 32 bits are CDW14 (LBTL) (Figure 24, Figure 29). CDW15 holds LBATM (31:16) and LBAT (15:00) (Figure 30).
 FOLLOW:
 - What goes in the LBA field when appending to zone 7? => The first LBA of zone 7 (its ZSLBA), never a mid-zone LBA.
 - How does a sector-based OS see the result? => Linux converts the returned LBA to a sector and stores it in the completed request, so the bio's start sector becomes the assigned location.
 PITFALL: Reading only DW0. It works on small test namespaces and silently truncates once the ALBA passes 2^32.
-VERIFY: CDW12 bit positions for FUA, LR and PIREMAP, and CDW14 and CDW15 field roles, in the ZNS Command Set specification.
 
 @@ 5.03 | Basic | Trap | tags=write,ordering,zone-invalid-write
 Q: Can I keep several Writes outstanding to one zone if I submit them in LBA order?
@@ -72,6 +73,7 @@ DEEP:
 2. With MPSMIN = 0 (4 KiB pages): ZASL 0 means use MDTS, 1 is 8 KiB, 3 is 32 KiB, 5 is 128 KiB, 7 is 512 KiB.
 3. With 4 KiB LBAs, ZASL 5 allows 32 blocks, so NLB (zero-based) is at most 31.
 4. Linux computes the append limit in 512-byte sectors as `1 << (zasl + 3)` (assumes 4 KiB pages) and falls back to the transfer limit when ZASL is 0. A target such as the Linux nvmet reports the smaller of MDTS and the append limit.
+5. ZASL is a one-byte field in the ZNS-specific Identify Controller structure; the spec states it "includes the length of metadata if metadata is interleaved with the stored logical block data" (ZNS 1.4, 4.1.5.2), so interleaved metadata counts against the limit. Separate (non-interleaved) metadata buffers are not addressed by this wording.
 
 **Why splitting matters:** a large Write can be cut into ordered chunks and the result is one contiguous range. A large append cut into several appends comes back as several ALBAs, which need not be adjacent when other appends interleave. A record bigger than ZASL therefore needs extent-based indexing, or serialization of its chunks (submit the next after the previous CQE), or a Write path.
 
@@ -80,7 +82,7 @@ FOLLOW:
 - MDTS is 512 KiB and ZASL is 4. What is the largest append? => 64 KiB (2^4 x 4 KiB with MPSMIN 0). The smaller limit governs appends.
 - What does ZASL = 0 tell you? => No separate append limit is declared, so MDTS applies.
 PITFALL: Sizing appends by MDTS. The append limit can be far smaller, and exceeding it fails the whole command.
-VERIFY: Whether metadata bytes count toward ZASL, the exact unit wording (MPSMIN) in the ZNS Identify Controller definition, and that an over-limit append returns Invalid Field in Command.
+VERIFY: That an over-limit append returns Invalid Field in Command (base NVMe transfer-size behavior, not restated in the ZNS spec), and how ZASL is treated with a separate, non-interleaved metadata buffer.
 
 @@ 5.05 | Intermediate | Concept | tags=ordering,atomicity,alba,completion
 Q: What ordering and placement guarantees does Zone Append give, and what does it not give?
@@ -106,7 +108,7 @@ FOLLOW:
 - A is submitted before B. Can B get the lower ALBA? => Yes, whenever there is any concurrency. Only waiting for A's CQE before submitting B makes the order deterministic.
 - Is the ALBA the first or the last block? => The first: the lowest LBA holding the data of that command. The data occupies ALBA through ALBA + NLB.
 PITFALL: Deriving an ordering rule from QD 1 tests, where ALBA order trivially equals submission order.
-VERIFY: Atomicity statement for Zone Append versus AWUPF/NAWUPF in the ZNS and NVM Command Set specifications.
+Confirmed: the ZNS spec states explicitly that the AWUN, NAWUN, NABSN, AWUPF, NAWUPF and NABSPF atomicity parameters apply to Zone Append exactly as defined in the NVM Command Set Specification (ZNS 1.4, 3.4.1); the command gets no atomicity guarantee beyond those.
 
 @@ 5.06 | Intermediate | Concept | tags=status,boundary,zone-state,implicit-open
 Q: How do zone state and zone capacity affect Zone Append, and what status does each failure produce?
@@ -132,7 +134,7 @@ FOLLOW:
 - Is Zone Boundary Error also used for Writes? => Yes, a Write that extends past the writable capacity gets the same status.
 - Where does the Full transition happen? => As part of the completion of the append that brings the write pointer to the end of the zone capacity.
 PITFALL: Retrying a Zone Boundary Error append on the same zone. It fails again at that size, so allocate a new zone or split the record.
-VERIFY: Status for an append that starts in range but ends beyond the zone capacity, and whether a failed append can leave an implicit-open side effect.
+Confirmed (ZNS 1.4, 2.1.1.2.1.1 and 2.1.1.3.1): an append that starts in range but would run past the zone capacity gets Zone Boundary Error, and no implicit-open side effect occurs, since the Empty-to-Implicitly-Opened transition requires a write operation to actually write one or more logical blocks, which a boundary failure never does.
 
 @@ 5.07 | Intermediate | Cross-layer | tags=host,index,mapping,recovery
 Q: What must the host keep because of Zone Append, and how does it survive a crash?
@@ -241,19 +243,21 @@ See the NVMe page (E2E Data Protection module) for PI basics. PI adds 8 bytes pe
 
 | PIREMAP | Host supplies | Stored on media | Typical use |
 |---|---|---|---|
-| 0 | Tags as they should be stored | Unmodified | Type 3 PI, or no reference tag checking |
-| 1 | ILBRT relative to ZSLBA | ILBRT + (ALBA - ZSLBA) + block index | Type 1 or 2 with reference tag checks on reads |
+| 0 | Tags as they should be stored | Unmodified | Type 2 or 3 PI, or no reference tag checking. Rejected for Type 1 (see below) |
+| 1 | ILBRT = ZSLBA (masked to the tag width) | ILBRT + (ALBA - ZSLBA) for the first LBA, then +1 per subsequent LBA | Type 1 or 2 with reference tag checks on reads. Rejected for Type 3 |
 
 Example: ZSLBA 80000h, ALBA 81200h. The offset is 1200h = 4,608 blocks. With ILBRT = 00080000h, the first stored reference tag is 00081200h.
 
+Confirmed, not vendor-specific (ZNS 1.4, 3.4.1 and Figure 26, CDW12 bit 25): if PIREMAP is cleared to 0 and the namespace is formatted for Type 1 protection, the controller shall abort the command with Invalid Protection Information (SCT 1h, SC 81h). Symmetrically, if PIREMAP is set to 1 and the namespace is formatted for Type 3 protection, the controller shall also abort with Invalid Protection Information. For Type 1 with PIREMAP set to 1, the host should set ILBRT to the low-order bits of ZSLBA sized to the reference tag width; if ILBRT does not match, the controller shall abort with Invalid Protection Information before any data is written.
+
 - **Linux:** sets the remap bit only when appending with reference tag checking enabled.
 - **Validator matrix:** PRACT 0 and 1, PRCHK bits, PIREMAP 0 and 1, PI type, and extended versus separate metadata buffers. Read back each case with reference tag checking and expect no Reference Tag Check Error (SCT 2h, SC 84h). Negative case: corrupt the host-supplied tags and expect the write-side check to fail.
-- **ZASL:** confirm whether metadata counts toward the append size limit.
+- **ZASL:** metadata counts toward the append size limit when interleaved with the logical block data (5.04).
 FOLLOW:
 - Does PIREMAP change the guard or application tag? => No. Only the reference tag values written to media.
-- With PRACT=1 who generates the tags? => The controller, so the host buffer carries no PI bytes. ILBRT and PIREMAP presumably still set the reference tag base, so keep ILBRT zone-relative (VERIFY).
-PITFALL: Type 1 PI with PIREMAP clear, then expecting reads to pass reference tag checks. The stored tags follow the address the host guessed, not the assigned one (some controllers, for example QEMU, instead reject this combination at write time with Invalid Protection Information).
-VERIFY: PIREMAP bit position (CDW12 bit 25 per Linux NVME_RW_APPEND_PIREMAP), whether Type 1 with PIREMAP clear is rejected (Invalid Protection Information, SCT 1h SC 81h, as QEMU does) or accepted, the exact remap formula, which values the write-side check compares against, PRACT interaction, and metadata versus ZASL, all in the ZNS Command Set specification.
+- With PRACT=1 who generates the tags? => The controller, so the host buffer carries no PI bytes; ILBRT and PIREMAP still set the reference tag base the same way.
+PITFALL: Type 1 PI with PIREMAP clear. The spec requires the controller to reject this combination outright with Invalid Protection Information, not silently write tags at the guessed address.
+VERIFY: PRACT's precise interaction with the ILBRT check when PIREMAP is set to 1 is not spelled out beyond the general PRACT behavior in the NVM Command Set Specification.
 
 @@ 5.12 | Advanced | Trap | tags=address-prediction,report-zones,write-pointer,coverage
 Q: A host submits four 8-block appends to an empty zone and assumes they land at ZSLBA, +8, +16, +24. Why is that wrong, and what does Report Zones show mid-flight?

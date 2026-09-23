@@ -56,10 +56,10 @@ DEEP:
 - **Cost:** a Reset erases every block of the zone (see 4.14 for the timing model). A reset storm after a bulk delete competes with foreground I/O, so queue resets and rate-limit them.
 - **Related trap:** a block-layer discard (REQ_OP_DISCARD) is not a Reset Zone. Space reclaim on zoned storage is a store or filesystem job that issues explicit zone resets. f2fs and btrfs zoned mode do this themselves, and f2fs turns its section-sized discards into resets (9.09).
 FOLLOW:
-- Can a host use Dataset Management deallocate on a ZNS namespace? => Support and effect are command-set and product dependent, and it does not move a write pointer. Do not rely on it for space accounting. VERIFY it in the ZNS spec.
+- Can a host use Dataset Management deallocate on a ZNS namespace? => ZNS 1.4 adds only one rule for it: abort with Zone Is Offline if the range touches an Offline zone (3.3.3). It defines no special deallocate effect on zone space accounting or the write pointer, so do not rely on it for reclaim; that is Reset Zone's job alone.
 - How do you validate the live-byte accounting? => After a random delete and write workload, walk the index, sum live bytes per zone, and compare with the counters. Any drift eventually causes a wrong Reset (data loss) or a leaked zone (capacity loss).
 PITFALL: Resetting a zone based on the counter without waiting for outstanding readers and relocations. That converts an accounting bug into data loss.
-VERIFY: How Dataset Management deallocate behaves on zoned namespaces in the NVM and ZNS command set specifications, and whether your kernel forwards block-layer discard to zoned NVMe devices.
+VERIFY: How Dataset Management deallocate behaves on zoned namespaces in the NVM Command Set Specification (ZNS 1.4 adds no deallocate-specific accounting rule), and whether your kernel forwards block-layer discard to zoned NVMe devices.
 
 @@ 12.04 | Intermediate | Scenario | tags=write,append,design,queue-depth,ordering
 Q: You are designing the write path of a log-structured store. How do you decide between Write and Zone Append, and how many zones do you keep open?
@@ -293,7 +293,7 @@ FOLLOW:
 - Can ALBA go backwards within one queue? => Yes. Placement order is not submission order across or within queues, so only overlap and containment are invariants (5.05).
 - Is an ALBA on a failed append meaningful? => No. Ignore the result field on any non-success status.
 PITFALL: Concluding the firmware is at fault from the ALBA alone. First prove the CQE belongs to the command you think.
-VERIFY: The CQE dword layout for Zone Append (result in dwords 0 and 1), that the passthrough ioctl in use returns 64 bits, and the nvme tracepoint field names on your kernel.
+VERIFY: That the passthrough ioctl in use returns 64 bits, and the nvme tracepoint field names on your kernel. (The ALBA CQE layout is confirmed: dword 0 is ALBA bits 31:00, dword 1 is bits 63:32, undefined on non-success status. ZNS 1.4, 3.4.1.2.)
 
 @@ 12.12 | Advanced | Debug | tags=too-many-open,under-load,gc,rollover,arbiter,resources
 Q: The store sees Too Many Open Zones only under heavy load, about once an hour, and a retry a millisecond later works. How do you find the cause and fix it?

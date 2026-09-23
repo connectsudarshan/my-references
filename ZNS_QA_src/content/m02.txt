@@ -45,7 +45,7 @@ FOLLOW:
 - Can zones in one namespace have different sizes? => No. Zone size is a namespace-wide constant. Only capacity may differ per zone, and only when the Variable Zone Capacity bit in ZOC is set.
 - Why is the write pointer an LBA and not a byte offset? => All NVMe addressing is in logical blocks, and the size of a block depends on the LBA format in use.
 PITFALL: Assuming the whole address range up to ZSZE is usable. The gap between ZCAP and ZSZE is address space with no storage behind it.
-VERIFY: Whether NSZE must be an exact multiple of ZSZE, and the WP validity per zone state (module 3).
+VERIFY: ZNS 1.4 does not state whether NSZE must be an exact multiple of ZSZE (Annex A.5 shows equal zones but does not require the total to divide evenly). WP validity per zone state is resolved in module 3 (Figure 4: valid only in Empty, Implicitly Opened, Explicitly Opened and Closed).
 
 @@ 2.04 | Intermediate | Concept | tags=cap-css,cc-css,command-set-selection,init
 Q: How does a host enable zoned command sets: what do CAP.CSS and CC.CSS do?
@@ -112,7 +112,7 @@ FOLLOW:
 - What are MAR and MOR used for? => They bound how many zones can be active and open at once, so the host must budget zones. Module 6 covers this.
 - What does RAZB change? => It says whether one read may span the boundary of two zones. Module 7 covers the read rules.
 PITFALL: Reading MAR or MOR as counts. They are zeroes-based, and FFFFFFFFh is a sentinel for no limit.
-VERIFY: The byte offsets above (checked against the Linux and SPDK structure definitions, confirm in the ZNS command set specification), the units and meaning of RRL and FRL, and any ZRWA related OZCS bits added after the base ZNS revision.
+Confirmed against ZNS 1.4, Figure 49: all byte offsets above match exactly (ZOC 01:00, OZCS 03:02, MAR 07:04, MOR 11:08, RRL 15:12, FRL 19:16, LBAFEi at 2816+16i). RRL and FRL are in seconds. OZCS also carries a ZRWA Supported (ZRWASUP) bit at bit 1, alongside RAZB at bit 0.
 
 @@ 2.07 | Intermediate | Numeric | tags=zone-size,zone-capacity,lba-math,geometry
 Q: A namespace reports ZSZE=0x80000, ZCAP=0x6C000 for every zone, 4 KiB LBAs and 512 zones. Work out the sizes, the start of zone 3, and where LBA 2,050,000 falls.
@@ -160,7 +160,7 @@ FOLLOW:
 - Is a normal Write still allowed on a zoned namespace? => Yes. It succeeds only at the write pointer of a zone that can accept it, so the host must serialize writes to a zone.
 - Which commands can move a write pointer? => Write, Write Zeroes, Zone Append and a Copy destination, plus Zone Management Send actions such as Finish and Reset. Read, Compare, Verify and Flush do not.
 PITFALL: Concluding from the opcode table that Write Zeroes or Copy work everywhere. They are optional and follow the write rules, so check the effects log.
-VERIFY: Mandatory versus optional status of each command in the NVM and ZNS command set specifications, Dataset Management deallocate and Write Zeroes behavior on zoned namespaces, and the write-cannot-cross rules for Copy destinations.
+Confirmed against ZNS 1.4: Zone Management Send and Receive are Mandatory and Zone Append is Optional for a ZNS I/O controller (Figure 9). Write Zeroes carries the same zone-specific statuses as Write, so it is fully subject to the write-pointer rules (Figure 21). A Copy command aborts with Zone Boundary Error if either its source range or its destination range spans more than one zone (Figure 14). Dataset Management only marks blocks deallocated; it does not move the write pointer or change zone state the way Reset Zone does (2.1.1.5). Mandatory/optional status of the underlying NVM Command Set commands (Compare, Verify, DSM) stays with the NVM Command Set Specification.
 
 @@ 2.09 | Advanced | Debug | tags=nvme-cli,id-ns,zoc,linux,decode
 Q: `nvme zns id-ns` shows the values below, and Linux has no /dev/nvme0n1 block device for the namespace. Decode the output and explain why.
@@ -209,7 +209,7 @@ FOLLOW:
 - What happens when the host sends an append above ZASL? => The controller should reject it as an invalid field. Confirm the status and DNR in the spec. The block layer normally splits before sending.
 - Is ZASL the same as the maximum write size? => No. Normal Writes are limited by MDTS only. ZASL applies to Zone Append.
 PITFALL: Treating ZASL as a byte count or a block count. It is an exponent in units of the minimum page size.
-VERIFY: The relation between ZASL and MDTS, the unit definition (CAP.MPSMIN based), the status code for an oversized append, and the Linux handling of MPSMIN greater than 0.
+Confirmed against ZNS 1.4, Figure 51: ZASL is in units of CAP.MPSMIN, reported as a power of two, and its value shall be less than or equal to MDTS; 0h means MDTS governs. The exact status code for an oversized append is not zone-specific in the ZNS spec (it falls to the NVMe Base Specification's data-transfer-size handling), and Linux's MPSMIN>0 handling stays an implementation detail to verify on the kernel under test.
 
 @@ 2.11 | Advanced | Trap | tags=zone-size,power-of-two,lba-format,linux
 Q: Trap: firmware wants zone size 0x60000 blocks to match a 3-die stripe. Is that legal, and what happens on Linux and on a 512B/4K reformat?

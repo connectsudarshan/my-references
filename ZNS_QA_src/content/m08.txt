@@ -29,7 +29,7 @@ FOLLOW:
 - Can a firmware update change ZCAP? => Treat it as a breaking change. Validation should compare Identify and Report Zones output before and after an update, with data present.
 - Is ZCAP equal to ZSZE ever possible? => Yes, when the geometry is a power of two with nothing reserved, for example 16 dies x 4 planes x 16 MiB = 1 GiB. It is the simplest case for hosts, but rare.
 PITFALL: Treating the gap as a defect. The defect would be a write accepted in the gap, or unequal ZCAP between zones with the VZC bit clear.
-VERIFY: Whether a device with the VZC bit set may change a zone's capacity after Reset Zone, and the status for a write that starts inside the gap.
+Confirmed (ZNS 1.4, 3.4.3.1.5): with the Variable Zone Capacity bit set, the controller may change a zone's Zone Capacity field on a successful Reset Zone, signaled by the Zone Capacity Changed bit in the completion queue entry. A write starting inside the gap gets Zone Invalid Write, since the write pointer can never sit there (7.02).
 
 @@ 8.03 | Basic | Concept | tags=write-buffer,program-unit,flush,fua,plp,mor
 Q: What does the write buffer do in a ZNS SSD, and when can the controller complete a write?
@@ -72,7 +72,7 @@ Assumptions: 6 channels x 2 dies = 12 dies, 4 planes, 1,024 pages of 16 KiB per 
 Peak rate = dies x 192 KiB / 0.8 ms (die-limited, six 1.2 GB/s channels would allow 7.2 GB/s).
 - **Consequence:** wider zones favor a few big sequential writers and make Reset and Finish expensive. Narrow zones favor many writers and need a larger MOR and more buffer.
 FOLLOW:
-- Why not size the zone to 768 MiB exactly? => Zone size that is not a power of two does not appear to be forbidden by the interface, but it breaks shift-based host math and the Linux driver rejects it (see 2.11).
+- Why not size the zone to 768 MiB exactly? => Confirmed: the ZSZE field definition (ZNS 1.4, Figure 50) only requires it be non-zero, with no power-of-two requirement in the spec text. A non-power-of-two zone size breaks shift-based host math and the Linux driver rejects it (see 2.11), which is a driver constraint, not a spec one.
 - What changes if the drive has 16 dies? => The stripe becomes 1 GiB, a power of two, and ZCAP can equal ZSZE if nothing is reserved.
 PITFALL: Reporting usable capacity from NSZE. Sum ZCAP instead, and expect a smaller number.
 VERIFY: Nothing here is spec-defined geometry. Real NAND page sizes, plane counts, program times and reserved fractions come from the vendor datasheet.

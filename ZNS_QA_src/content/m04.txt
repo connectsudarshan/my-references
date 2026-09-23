@@ -24,29 +24,29 @@ FOLLOW:
 - Why does the SLBA have to be a zone start? => The action applies to a whole zone. A mid-zone address is ambiguous, so the controller rejects it rather than rounding.
 - Is Zone Management Send an admin command? => No. It is an I/O command. Do not confuse it with nvme-cli's admin passthrough wording.
 PITFALL: Passing any LBA inside the zone and assuming the controller will round down. It rejects it.
-VERIFY: ZSA 11h (Flush Explicit ZRWA) and the CDW13 bit 9 option name and meaning in the NVMe Zoned Namespace Command Set Specification 1.1; the exact status returned for a misaligned SLBA.
+Confirmed against ZNS 1.4, Figure 40 and 3.4.3: ZSA 11h is Flush Explicit ZRWA Range, CDW13 bit 9 (ZSASO) is ZRWAA (ZRWA Allocation) for Open Zone and Set Zone Descriptor Extension, and a misaligned SLBA (not a zone start, action not Flush, Select All clear) gives Invalid Field in Command.
 
 @@ 4.02 | Basic | Concept | tags=zone-mgmt-recv,report-zones,zra,zrasf,partial
 Q: What does Zone Management Receive do, and how is a Report Zones command built?
-SHORT: Zone Management Receive (opcode 7Ah) returns zone information to a host buffer. CDW10-11 hold the SLBA, CDW12 holds NUMD (the buffer size in dwords, zero-based), and CDW13 holds the Zone Receive Action ZRA (bits 7:0, 00h Report Zones, 01h Extended Report Zones), the action specific filter ZRASF (bits 15:8) and the Partial Report bit (bit 16). The buffer is a 64-byte header followed by 64-byte descriptors.
+SHORT: Zone Management Receive (opcode 7Ah) returns zone information to a host buffer. CDW10-11 hold the SLBA, CDW12 holds NDW (Number of Dwords, the buffer size in dwords, zero-based), and CDW13 holds the Zone Receive Action ZRA (bits 7:0, 00h Report Zones, 01h Extended Report Zones), the action specific field ZRAS (bits 15:8, the state filter) and the Partial Report bit ZRASPF (bit 16). The buffer is a 64-byte header followed by 64-byte descriptors.
 DEEP:
 - **Header:** the first 8 bytes are the Number of Zones. The remaining 56 bytes are reserved.
 - **Descriptors:** one 64-byte zone descriptor per reported zone, in ascending LBA order. Extended Report Zones appends the zone descriptor extension (ZDES bytes) to every descriptor.
-- **SLBA:** the report starts at the zone that contains SLBA. Hosts pass a zone start LBA.
-- **NUMD:** a 4 KiB buffer is NUMD = 1023 (4096 / 4 - 1). The buffer must fit the header, so 64 bytes is the smallest useful size. Also observe MDTS.
-- **Filter (ZRASF):** 00h reports every zone, 01h to 07h select by state (details in the descriptor question).
+- **SLBA:** the report starts at the zone that contains SLBA (confirmed: ZNS 1.4, 3.4.2.1.1 reports zones whose ZSLBA is at or above the ZSLBA of the zone containing the given SLBA), so a host may pass any LBA in the target zone, not only its start.
+- **NDW:** a 4 KiB buffer is NDW = 1023 (4096 / 4 - 1). The buffer must fit the header, so 64 bytes is the smallest useful size. Also observe MDTS.
+- **Filter (ZRAS):** 00h reports every zone, 01h to 07h select by state (details in the descriptor question).
 - **Partial Report:** it changes what the header count means (see the batching question). Linux always sets it.
 - **No side effects:** the command changes no zone state.
 ```
 /* what Linux sends for one chunk */
 opcode = 0x7a; nsid = N; slba = zone_start;
-numd = bytes/4 - 1; zra = 0; zrasf = 0; partial = 1;
+ndw = bytes/4 - 1; zra = 0; zras = 0; partial = 1;
 ```
 FOLLOW:
 - What happens if the buffer holds fewer descriptors than zones match? => The controller fills what fits. The host repeats from the next zone. See the batching question.
 - Which value in the header do you trust? => Number of Zones, interpreted according to the Partial Report bit you sent.
-PITFALL: Setting NUMD to the byte count instead of dwords minus one. The controller then reports a buffer four times too large, or you overrun your own allocation.
-VERIFY: Whether SLBA may point inside a zone for Report Zones (report starts at that zone) or must be a zone start, and the exact ZRA reserved-value status.
+PITFALL: Setting NDW to the byte count instead of dwords minus one. The controller then reports a buffer four times too large, or you overrun your own allocation.
+Confirmed against ZNS 1.4, 3.4.2.1.1: SLBA may point inside a zone (the report starts at that zone). ZRA values 02h to FFh are reserved (3.4.2, Figure 35).
 
 @@ 4.03 | Basic | Concept | tags=reset-zone,erase,write-pointer,empty
 Q: What does Reset Zone do, and how is it different from an erase or a TRIM?
@@ -56,13 +56,13 @@ DEEP:
 - **Reset of an Empty zone:** a successful no-op. Reset of a Read Only or Offline zone fails with Invalid Zone State Transition.
 - **Not TRIM:** a deallocate hint may be ignored and leaves the zone's state alone, so the FTL still has to garbage-collect. Reset is a mandatory, whole-zone state change, so the device knows every block in the zone is dead and can erase without moving any data.
 - **Not an immediate erase:** the controller may return success before the NAND blocks are erased, as long as the zone now behaves as Empty. Latency therefore depends on the implementation and how much data the zone held.
-- **CQE feedback:** bit 0 of completion dword 0 reports whether the zone capacity changed (ZCAPC) for namespaces with variable zone capacity.
+- **CQE feedback:** bit 0 of completion dword 0 is Zone Capacity Changed (ZCC), reporting whether the zone capacity changed for namespaces with variable zone capacity.
 - **Host consequence:** the write amplification of a zoned workload is decided by how often the host resets live data, not by device-side GC.
 FOLLOW:
 - Can Reset be used as a secure erase? => No. See the trap question on Reset and stale data. Use Sanitize or a crypto erase for that.
 - Why is Reset on an Empty zone not an error? => Idempotent actions succeed when the zone is already in the target state. That lets hosts retry safely after an unknown outcome.
 PITFALL: Assuming a reset that returned success has erased flash. The zone is logically Empty, and the erase may still be queued.
-VERIFY: Which zone attributes (ZFC, FZR, RZR, ZDEV) Reset clears, and bit 0 of completion dword 0 (Zone Capacity Changed) for Reset in the ZNS spec.
+Confirmed against ZNS 1.4, 3.4.3.1.5 and 3.4.3.2: Reset clears ZDEV, FZR, RZR, ZFC and ZRWAV, and bit 0 of completion dword 0 (ZCC, Zone Capacity Changed) is set only when the Variable Zone Capacity bit is 1 and the capacity actually changed.
 
 @@ 4.04 | Intermediate | Concept | tags=finish-zone,full,write-pointer,resources
 Q: What does Finish Zone do, and why would a host use it?
@@ -103,7 +103,7 @@ FOLLOW:
 - Is Close on an Empty zone an error? => Yes. The ZNS spec text I retrieved lists Close on Empty, Full, Read Only and Offline as Invalid Zone State Transition, and QEMU agrees. Some SMR standards treat it as a no-op, so do not port that oracle.
 - What state does Open on an Implicitly Open zone give? => Explicitly Open, with no resource change.
 PITFALL: Learning the matrix from Linux behavior. Linux never issues most of these on its own, so the kernel will not show you the error cases.
-VERIFY: Every cell of this table against the zone state figures in the NVMe Zoned Namespace Command Set Specification, especially Close on Empty, Open on Full, and the effect of Reset and Finish on Read Only zones.
+Confirmed against ZNS 1.4, 3.4.3.1.1 to 3.4.3.1.6: every cell above matches, including Close on Empty (Invalid Zone State Transition), Open on Full (Invalid Zone State Transition), and Reset and Finish both failing on Read Only and Offline zones.
 
 @@ 4.06 | Intermediate | Concept | tags=select-all,bulk,reset-all
 Q: What does the Select All bit do, and which zones does each action touch?
@@ -119,15 +119,14 @@ DEEP:
 
 - **Skip, not fail:** Empty zones for Reset, Full zones for Finish, and so on are ignored. A Select All on a namespace with no eligible zone still succeeds.
 - **Empty is never selected:** Open-all does not open Empty zones, which would burn active resources. Finish-all does not fill the empty zones.
-- **Resources:** Open-all is limited by the open and active limits. Whether it stops with an error part-way, and how many zones stay opened, is a behavior to test rather than assume.
+- **Resources:** Open-all is limited by the open and active limits.
 - **Cost:** Reset-all is one command but one erase per eligible zone. It is the longest-running zone command by far (see the Reset-all numeric question).
-- **Atomicity:** do not assume a bulk operation is all-or-nothing. If a zone fails part-way, earlier zones may already have changed.
+- **Atomicity on resource shortage:** confirmed by ZNS 1.4, 2.1.1.4: if there are insufficient Active, Open or ZRWA resources for the requested transitions, the command is aborted and no zone state transition occurs at all, for that command. So a resource-limited Open-all fails cleanly with none of the target zones changed, not with some already opened.
 - **Linux:** the block layer sets Select All only for a Reset-all request. Open-all, Close-all and Finish-all are sent as individual zone commands.
 FOLLOW:
 - What is in the SLBA field with Select All? => It is ignored, so the host normally sends 0.
 - What does a Reset-all do to zones that are Read Only? => Nothing. They are skipped and stay Read Only.
-PITFALL: Expecting Select All to fail when a zone is in the wrong state. It silently skips those zones, so success does not mean every zone changed.
-VERIFY: The exact zone set for each Select All action (especially Finish and Reset), whether SLBA must be zero, and the partial-completion behavior on error, in the ZNS Command Set Specification.
+PITFALL: Expecting Select All to fail when a zone is in the wrong state. It silently skips those zones, so success does not mean every zone changed. Do not assume the reverse either: a resource-shortage failure is all-or-nothing by spec, not partial.
 
 @@ 4.07 | Intermediate | Concept | tags=nvme-cli,blkzone,passthru,tools
 Q: How do you issue and read zone management commands from nvme-cli and Linux?
@@ -156,7 +155,7 @@ VERIFY: Exact subcommand names and option letters on your nvme-cli version (nvme
 
 @@ 4.08 | Intermediate | Concept | tags=zone-descriptor,report-zones,zrasf,write-pointer,attributes
 Q: How do you decode a zone descriptor from Report Zones, and what do the filter values mean?
-SHORT: A descriptor is 64 bytes. Byte 0 holds the zone type (2h = Sequential Write Required), byte 1 bits 7:4 the zone state, byte 2 the zone attributes. Bytes 8 to 15 are Zone Capacity, 16 to 23 the Zone Start LBA and 24 to 31 the Write Pointer, all in LBAs and little-endian. The ZRASF filter selects zones by state: 00h all, 01h Empty, 02h Implicitly Open, 03h Explicitly Open, 04h Closed, 05h Full, 06h Read Only, 07h Offline.
+SHORT: A descriptor is 64 bytes. Byte 0 holds the zone type (2h = Sequential Write Required), byte 1 bits 7:4 the zone state, byte 2 the zone attributes. Bytes 8 to 15 are Zone Capacity, 16 to 23 the Zone Start LBA and 24 to 31 the Write Pointer, all in LBAs and little-endian. The ZRAS filter selects zones by state: 00h all, 01h Empty, 02h Implicitly Open, 03h Explicitly Open, 04h Closed, 05h Full, 06h Read Only, 07h Offline.
 DEEP:
 State codes in byte 1 (bits 7:4): 1 Empty, 2 Implicitly Open, 3 Explicitly Open, 4 Closed, Dh Read Only, Eh Full, Fh Offline. Attributes in byte 2: bit 0 ZFC (finished by controller), bit 1 FZR (finish recommended), bit 2 RZR (reset recommended), bit 3 ZRWAV, bit 7 ZDEV (extension valid).
 
@@ -172,12 +171,12 @@ Worked decode, with LBA size 4 KiB:
 5. WP = 0x00100800, so 0x800 = 2048 LBAs written (8 MiB), and the next write must start there.
 
 - **WP validity:** the WP is meaningful for Empty, Open and Closed zones. For Full, Read Only and Offline it is not (QEMU returns all ones, and Linux substitutes start + length for Full).
-- **Filter caveat:** 05h = Full and 06h = Read Only, in the spec table as I retrieved it and in libnvme, SPDK and QEMU. Linux nvme.h names 05h Read Only and 06h Full (swapped, as of the source I read), and the Linux nvmet target filters with that enum. The Linux host only ever sends 00h, so only a target or a validator that sends 05h or 06h sees the difference.
+- **Filter caveat:** confirmed against ZNS 1.4, Figure 35: 05h = Full and 06h = Read Only, matching libnvme, SPDK and QEMU. Linux nvme.h names 05h Read Only and 06h Full (swapped, as of the source I read), and the Linux nvmet target filters with that enum. The Linux host only ever sends 00h, so only a target or a validator that sends 05h or 06h sees the difference.
 FOLLOW:
 - Does ZCAP change with the zone state? => Not normally. For namespaces with variable capacity it can change on a Reset.
 - Why can ZSLBA plus ZCAP be less than the next zone's start? => Zone size can exceed zone capacity. The LBAs in between exist but are not usable.
 PITFALL: Reading the state from the whole byte. The state is the top nibble, so Implicitly Open shows up as 20h, not 02h.
-VERIFY: ZRASF 05h = Full and 06h = Read Only (libnvme, SPDK, QEMU and the spec table agree, Linux nvme.h and nvmet disagree; test the actual drive with both values), whether newer revisions add filter codes above 07h (QEMU rejects them), the ZS and ZT bit positions, and the WP contents for Full, Read Only and Offline zones against the ZNS Command Set Specification.
+VERIFY: Whether the Linux nvme.h and nvmet swap of 05h/06h against the ZNS 1.4 table (confirmed correct at 05h=Full, 06h=Read Only) still applies on the kernel under test, and the WP byte contents actually returned for Full, Read Only and Offline zones on your device (the spec only says the field is invalid, not what value appears).
 
 @@ 4.09 | Advanced | Debug | tags=status-codes,cqe,invalid-zone-state-transition,dnr,too-many-open
 Q: A Reset Zone completes with a CQE status field of 0x837F (dword 3 bits 31:16). Decode it and say what it tells you about the zone.
@@ -206,7 +205,7 @@ FOLLOW:
 - Why is DNR set? => The command cannot succeed until the zone state changes, so retrying does the same thing. A host that retries in a loop is wrong.
 - What would Finish return on the same zone? => The same Invalid Zone State Transition, since Read Only takes only Offline.
 PITFALL: Reading 0x837F as a generic command failure, or reading it as all of dword 3. SCT 1 plus SC BFh names the exact reason, and it narrows the zone's state to two possibilities for Reset.
-VERIFY: Whether the controller must set DNR for Invalid Zone State Transition, and the SC values BDh, BEh and BFh in the NVMe ZNS Command Set Specification (they match Linux include/linux/nvme.h, where they appear as 0x1bd to 0x1bf).
+Confirmed against ZNS 1.4, Figure 11: BDh Too Many Active Zones, BEh Too Many Open Zones, BFh Invalid Zone State Transition (matching Linux include/linux/nvme.h at 0x1bd to 0x1bf). VERIFY: whether the controller must set DNR for Invalid Zone State Transition is a NVMe Base Specification question (ZNS 1.4 does not itself mandate DNR).
 
 @@ 4.10 | Advanced | Debug | tags=state-machine,sequence,prediction,select-all,oracle
 Q: Given six zones in known states and a command sequence, predict every completion status and the final states.
@@ -236,14 +235,14 @@ FOLLOW:
 - Which extra step would test idempotency? => Repeat step 10 (Offline on an Offline zone). It must succeed with no change.
 - How would you catch a device that fails Select All half way? => Compare the Report Zones state of every zone to the model after each bulk command.
 PITFALL: Predicting Select All by looking only at the zone the SLBA points to. The SLBA is ignored, and every eligible zone changes.
-VERIFY: Step 1 (Close on Empty) and step 3 (Open on Full) against the ZNS spec transition figures.
+Confirmed against ZNS 1.4: step 1 (Close on Empty, 3.4.3.1.1 c) and step 3 (Open on Full, 3.4.3.1.4 c) both give Invalid Zone State Transition, as predicted.
 
 @@ 4.11 | Advanced | Numeric | tags=report-zones,batching,mdts,numd,partial-report
 Q: How many Report Zones commands are needed to read all zones of a namespace with 65,536 zones, and how do you loop safely?
 SHORT: Assume MDTS allows 512 KiB per command. The 64-byte header leaves (524,288 - 64) / 64 = 8,191 descriptors per command, so 65,536 zones need 9 commands (about 4 MiB in total). With Extended Report Zones and a 64-byte extension each entry is 128 bytes, giving 4,095 per command and 17 commands. The loop restarts each time from the last returned ZSLBA plus the zone size.
 DEEP:
 Assumptions: 65,536 zones (for example 16 TiB with 256 MiB zones), MDTS = 512 KiB, no filter.
-1. NUMD for 512 KiB = 524,288 / 4 - 1 = 131,071 (0x1FFFF).
+1. NDW (CDW12, Number of Dwords) for 512 KiB = 524,288 / 4 - 1 = 131,071 (0x1FFFF).
 2. Descriptors per command = (524,288 - 64) / 64 = 8,191.
 3. Commands = ceil(65,536 / 8,191) = 9.
 4. Data = 65,536 x 64 B = 4 MiB, plus 9 headers.
@@ -256,12 +255,12 @@ Loop rules:
 - Next SLBA = last returned ZSLBA + zone size (from Identify), not + zone capacity.
 - Stop when the returned count is zero or SLBA reaches the namespace size.
 - With a filter, zones are not contiguous, but the same rule still works because the report only lists zones at or after SLBA.
-- The report is not a snapshot. Zones can change between batches (see the Zone Information Changed event in the resources module), so re-report suspect zones.
+- The report is not a snapshot. Zones can change between batches (see the Zone Descriptor Changed event in the resources module), so re-report suspect zones.
 FOLLOW:
 - Why not one big buffer? => MDTS limits the transfer, and a large physically contiguous buffer is harder to allocate.
 - How do you get the zone count without reading every descriptor? => Send one Report Zones with Partial Report = 0 and only a header-sized buffer, and read Number of Zones.
 PITFALL: Advancing by ZCAP. When capacity is smaller than the zone size, the loop lands inside a zone and either skips or repeats one.
-VERIFY: The exact meaning of Number of Zones for Partial Report = 0 and 1, and whether a Report Zones SLBA inside a zone is accepted.
+Confirmed against ZNS 1.4, 3.4.2.2.1 and 3.4.2.1.1: with Partial Report 0, Number of Zones is the count matching the filter from SLBA onward (which can exceed the buffer); with Partial Report 1, it is the count of complete descriptors actually transferred. A Report Zones SLBA is accepted anywhere inside a zone.
 
 @@ 4.12 | Advanced | Trap | tags=reset-zone,dlfeat,secure-erase,stale-data,read
 Q: After Reset Zone, a test reads the zone and expects zeros. It passes on drive A and fails on drive B. Is drive B broken?
@@ -295,7 +294,7 @@ FOLLOW:
 - Does Set Zone Descriptor Extension count as writing to the zone? => No. It writes no zone data and leaves WP alone. It still leaves the zone Closed.
 - How does an Empty zone with an extension differ from one without? => It is Closed, not Empty, so it counts as an active zone.
 PITFALL: Setting extensions on many Empty zones ahead of time. Each one takes an active slot, and a host can hit the active limit before writing a byte.
-VERIFY: Whether Reset clears the extension and ZDEV, whether the extension is persistent across power cycles, and the ZDES units and the ZDES = 0 behavior in the ZNS Identify Namespace data structure.
+Confirmed against ZNS 1.4, 5.3 and 3.4.3.1.5: the extension stays associated (and ZDEV set) until the zone transitions to Empty or Offline, so it survives a power cycle that leaves the zone Closed or Full; Reset explicitly clears ZDEV and drops the association. A ZDES of 0h makes Set Zone Descriptor Extension abort with Invalid Field in Command (2.1.1.4/4.1.5.1).
 
 @@ 4.14 | Principal | Numeric | tags=reset-all,latency,timeout,nand-erase,parallelism
 Q: Estimate how long a Reset-all takes on a full namespace, and when does it trigger a host timeout?
@@ -343,7 +342,7 @@ SHORT: Build an executable model of zone state, write pointers, attributes and r
 DEEP:
 1. **Model:** per zone: state, WP, capacity, attributes, extension. Namespace: open and active counts against MOR and MAR. The transition table in this module is its core.
 2. **Matrix:** 6 actions x 7 states for single-zone commands (42 cells), 5 Select All actions over mixed populations, and each cell checked for the exact SCT/SC and for no side effects on other zones.
-3. **Field cases:** SLBA inside a zone, at the last LBA of the namespace, past it, reserved ZSA and ZRA values, Select All with Set Zone Descriptor Extension, a wrong data length for Set Zone Descriptor Extension, and NUMD too small.
+3. **Field cases:** SLBA inside a zone, at the last LBA of the namespace, past it, reserved ZSA and ZRA values, Select All with Set Zone Descriptor Extension, a wrong data length for Set Zone Descriptor Extension, and NDW too small.
 4. **Reaching Read Only and Offline:** they need media faults. Use an emulator (QEMU ZNS) for the model itself, and on real hardware use a vendor fault-injection command or NAND error injection. If neither exists, record the two rows as not covered instead of skipping them silently.
 5. **Resources:** fill up to MOR and MAR, then Open, Set Zone Descriptor Extension and implicit open by write. Check the exact errors and that a failed Open leaves no half-open state.
 6. **Sequences:** random command sequences (seeded, logged) with a diff against the model after each step, and shrink a failing sequence to a minimal one.

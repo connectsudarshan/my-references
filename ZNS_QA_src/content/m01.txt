@@ -55,7 +55,7 @@ FOLLOW:
 - Why does that matter to a firmware validator? => Host tools such as blkzone and fio zonemode=zbd behave the same across SMR and ZNS, so test infrastructure is reusable.
 - Does flash have SMR's overlap problem? => No. Its constraint is page-order programming and block erase, but the resulting host contract looks similar.
 PITFALL: Assuming ZNS inherited conventional or sequential-write-preferred zones. NVMe ZNS defines only sequential write required zones.
-VERIFY: ZBC and ZAC zone type names and the 256 MiB typical zone size; ZNS zone types in the Zoned Namespace Command Set Specification.
+Confirmed: ZNS 1.4 defines exactly one zone type, Sequential Write Required (2h); every other value is reserved (Figure 38). VERIFY: ZBC and ZAC zone type names and the 256 MiB typical zone size stay with the T10/T13 standards, outside the ZNS spec.
 
 @@ 1.04 | Intermediate | Concept | tags=host-managed,host-aware,drive-managed,models
 Q: Compare drive-managed, host-aware and host-managed zoned devices. Where does ZNS fit?
