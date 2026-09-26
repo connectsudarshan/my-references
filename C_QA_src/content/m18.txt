@@ -1,0 +1,438 @@
+# Module 18: Principal-Level Systems Design in C
+
+@@ 18.01 | Basic | Concept | tags=pool-allocator,fragmentation
+Q: What is a fixed-block memory pool allocator, and why does it give O(1) alloc/free with no fragmentation across its own blocks?
+SHORT: A pool pre-carves a fixed-size storage array into N equal-size blocks and threads them into a singly linked free list, using each free block's own bytes to store the "next" pointer; alloc pops the list head and free pushes back onto it, both O(1), and since every block is the same size a freed block is always immediately reusable, so there is no fragmentation between blocks.
+DEEP:
+- Contrast with a general-purpose allocator (module 8): malloc/free must search or coalesce variable-size free chunks, which is why realloc/malloc complexity is not guaranteed constant and why long-running heaps can fragment (many small free chunks too scattered to satisfy a later larger request). A fixed-block pool sidesteps this entirely by never varying block size.
+- The "free list inside free blocks" trick costs zero extra memory for bookkeeping: a free block is not in use, so its own storage is available to hold the next-pointer, and only a free block is ever read as a pointer this way (module 18.04 shows the real code).
+- The trade-off this design accepts (state it unprompted in an interview, see 18.13): the pool can only satisfy requests up to its fixed block size, and its total capacity is fixed at init time (N blocks); it is deterministic and fast, not general-purpose.
+FOLLOW:
+- Why is this pattern common in firmware/ISR contexts specifically? => Its O(1), bounded-time alloc/free with no internal locking search makes it safe and predictable to call from time-critical or interrupt contexts, unlike a general allocator whose worst-case search/coalesce time is harder to bound.
+- What happens when the pool is exhausted (all N blocks in use)? => alloc must return NULL (or a designated failure value); a well-designed caller checks this every time, since a pool has no way to grow itself at runtime by definition.
+PITFALL: Sizing pool blocks to fit today's largest object without margin; a later, slightly larger object either needs a second pool sized for it or forces a redesign, since a fixed-block pool cannot serve a request larger than its block size.
+
+@@ 18.02 | Basic | Concept | fig=ringbuffer | tags=ring-buffer,spsc
+Q: What is a single-producer/single-consumer (SPSC) ring buffer, and why size it as a power of two?
+SHORT: It is a fixed-size circular array with a head index (where the producer writes next) and a tail index (where the consumer reads next), each owned by exactly one side so neither needs a lock against the other; sizing the capacity as a power of two lets the wrap-around use a fast bitwise AND mask (index & (capacity-1)) instead of a modulo, and lets head/tail simply keep incrementing forever, relying on unsigned integer wraparound to still land in range through the mask.
+DEEP:
+- "Single-producer/single-consumer" is the key safety property: the producer only ever writes `head` (and the slot it points to), the consumer only ever writes `tail` (and reads the slot it points to); neither side writes the other's index, so there is no shared mutable state that needs a lock for this specific access pattern, only for the case where both sides might read the other's index concurrently, which itself needs care about memory ordering across threads/cores (a topic module 18.08 flags, pointing to the C Advanced page).
+- Power-of-two capacity: with capacity C a power of two, `index % C` is exactly `index & (C - 1)` for unsigned index, a single fast bitwise AND instead of a division; letting head/tail increment past C without ever explicitly wrapping them (they wrap naturally at the unsigned integer type's own range, e.g. 2^32) and only masking at the point of indexing into the array is both simpler and avoids a separate "have I wrapped" comparison.
+- The design still needs one more decision to disambiguate "empty" from "full" when head and tail can be numerically equal after masking; 18.06's implementation and 18.07's trap cover the two common ways to solve that.
+FOLLOW:
+- Does the ring buffer need any locking at all for the true single-producer/single-consumer case on one core? => No explicit mutex is needed for the index/slot ownership itself, though on multi-core hardware the two sides still need a memory barrier/ordering guarantee that a written slot is visible before its index update is seen by the other side, which is a cross-thread memory-model concern, not a C-language one.
+- What happens if you actually have two producers writing concurrently? => The SPSC design breaks immediately, since both would race to write `head` and could overwrite each other's slot or corrupt the index; that needs a real multi-producer-safe design (locking or an atomic-CAS-based approach), out of scope for the single-producer case this module covers.
+PITFALL: Sizing the ring buffer to a non-power-of-two capacity "because that is the number of items I need" and then either using the slower modulo operator or, worse, forgetting to wrap at all (18.07/18.09 show exactly this failure mode).
+
+@@ 18.03 | Basic | Concept | tags=event-dispatch,function-pointers
+Q: What is a generic event/callback dispatch system in C, and how does it build on the function-pointer patterns from module 12?
+SHORT: It is a table mapping each event type to zero or more registered (function pointer, context pointer) pairs; raising an event walks that event's registered callbacks and invokes each with the event data and its own opaque context, the same struct-of-function-pointers-plus-void*-context idiom module 12 covers for a single interface, generalized to a many-to-many registry instead of one fixed vtable.
+DEEP:
+- The core building block is identical to module 12's callback/vtable pattern: a function pointer type (e.g. `void (*)(int event_id, void *ctx)`) plus a `void *ctx` the callback owner supplies at registration time, so one handler function can serve multiple independent registrations (e.g. the same logging handler registered for several different event sources, each with its own context pointer).
+- What is new here relative to a single callback: a small registry (an array or table, indexed by event type, each slot able to hold multiple registered handlers) plus register/unregister/dispatch functions to manage it, turning a single callback slot into a many-handlers-per-event publish/subscribe-style system (18.11 shows the real code).
+- This pattern is common in firmware for decoupling: the code detecting a condition (e.g. an ISR setting a flag, or a driver noticing a state change) does not need to know who cares about it; it just dispatches the event, and any number of independently-written handlers can subscribe.
+FOLLOW:
+- Should dispatch itself ever be called directly from an ISR? => Only if every registered handler is itself safe to run in interrupt context (short, non-blocking, no calls to non-reentrant functions, module 17's ISR rules); the safer default in firmware is dispatching from normal (non-ISR) context after an ISR has only queued the event, e.g. via the ring buffer pattern in 18.14.
+- How is this different from a plain switch statement dispatching on event type? => A switch statement is fixed at compile time and only one place can handle each case; a callback table lets independent, possibly unrelated modules register interest in the same event at runtime without editing a central switch statement.
+PITFALL: Growing the registry unbounded (e.g. a dynamically resizing array of handlers) inside a system that also needs deterministic, bounded-time dispatch; a fixed-capacity table sized at design time (with a defined behavior on overflow, like 18.01's pool) keeps the same determinism guarantees firmware code usually needs.
+
+@@ 18.04 | Intermediate | Scenario | tags=pool-allocator,free-list
+Q: Implement a real fixed-block memory pool allocator (init, alloc, free) and show it actually running.
+SHORT: Thread every block into a free list at init by storing each free block's "next" pointer in its own first bytes; alloc pops the list head (or returns NULL if empty), free pushes a block back onto the head; both are O(1) with no search.
+DEEP:
+```c
+#include <stdio.h>
+#include <stddef.h>
+
+#define POOL_BLOCK_SIZE 32
+#define POOL_BLOCK_COUNT 8
+
+typedef struct pool {
+    unsigned char storage[POOL_BLOCK_COUNT][POOL_BLOCK_SIZE];
+    void *free_list;
+} pool_t;
+
+void pool_init(pool_t *p) {
+    p->free_list = NULL;
+    for (int i = POOL_BLOCK_COUNT - 1; i >= 0; i--) {
+        void *block = p->storage[i];
+        *(void **)block = p->free_list;   /* stash next-pointer in the free block itself */
+        p->free_list = block;
+    }
+}
+void *pool_alloc(pool_t *p) {
+    if (!p->free_list) return NULL;
+    void *block = p->free_list;
+    p->free_list = *(void **)block;
+    return block;
+}
+void pool_free(pool_t *p, void *block) {
+    *(void **)block = p->free_list;
+    p->free_list = block;
+}
+
+int main(void) {
+    pool_t pool;
+    pool_init(&pool);
+    void *blocks[POOL_BLOCK_COUNT + 1];
+    int i;
+    for (i = 0; i < POOL_BLOCK_COUNT; i++) {
+        blocks[i] = pool_alloc(&pool);
+        printf("alloc %d -> %s\n", i, blocks[i] ? "ok" : "NULL");
+    }
+    void *overflow = pool_alloc(&pool);
+    printf("alloc %d (pool exhausted) -> %s\n", i, overflow ? "ok" : "NULL");
+    pool_free(&pool, blocks[3]);
+    void *reused = pool_alloc(&pool);
+    printf("after freeing blocks[3], next alloc reuses it: %s\n", reused == blocks[3] ? "yes" : "no");
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -g` and run, it printed all 8 allocations as `ok`, the 9th as `NULL` (pool correctly exhausted), and confirmed `blocks[3]` was reused exactly on the next alloc after being freed.
+FOLLOW:
+- Why does pool_init walk the array backward (index N-1 down to 0)? => Purely cosmetic here (either direction produces a valid free list); walking backward makes the first pool_alloc return storage[0], which some designs prefer for predictable/debuggable allocation order.
+- Is storing the next-pointer inside the free block itself safe? => Yes, as long as POOL_BLOCK_SIZE >= sizeof(void*) (checked at design time, e.g. via a static assertion), since that memory is guaranteed unused while the block is on the free list; it is never read as a pointer once the block is handed out by alloc.
+PITFALL: Writing past a block's declared size while it is allocated, which (depending on layout) can corrupt the next free block's stashed pointer even though nothing in the pool's own logic looks wrong.
+
+@@ 18.05 | Intermediate | Numeric | tags=pool-sizing,pointer-size
+Q: For the memory pool in 18.04 (32-byte blocks, 8 blocks), work out the total storage cost and confirm the free-list trick has room to fit.
+SHORT: Total storage is 8 * 32 = 256 bytes for the block array; the free-list trick needs sizeof(void*) = 8 bytes (on this 64-bit platform) of scratch space inside each free block, and 32 >= 8, so every block has 24 bytes of slack beyond the pointer, easily enough, with the pool_t struct itself adding one more pointer field (the free_list head) plus its own alignment padding.
+DEEP:
+Worked calculation:
+1. Block array size: `POOL_BLOCK_COUNT * POOL_BLOCK_SIZE` = 8 * 32 = 256 bytes, laid out as one contiguous `unsigned char[8][32]` array.
+2. Per-block overhead for the free-list pointer: `sizeof(void*)`, confirmed as 8 bytes on this platform by compiling and running `printf("%zu\n", sizeof(void*));`, which printed `8`.
+3. Constraint check: each block must be at least large enough to hold that pointer: 32 >= 8, satisfied with 24 bytes of margin per block for the block's actual payload once allocated (a caller can use up to all 32 bytes once the block is handed out by pool_alloc, since the pointer is only stored there while the block sits on the free list, not while it is in use).
+4. Struct-level overhead: `pool_t` adds one `void *free_list` member (8 more bytes) on top of the 256-byte array, for a total object size of 256 + 8 = 264 bytes before any compiler-inserted padding (the array's own alignment is 1, from `unsigned char`, and the trailing pointer needs 8-byte alignment, so the compiler may insert up to 7 padding bytes between them depending on the array's total size modulo 8; here 256 is already a multiple of 8, so no padding is needed and the real size is exactly 264 bytes).
+5. General formula for capacity planning: total pool bytes = `block_count * block_size + sizeof(void*)` (plus at most `alignof(void*) - 1` padding bytes), and the design constraint is always `block_size >= sizeof(void*)`.
+FOLLOW:
+- What if a design wanted blocks smaller than sizeof(void*), e.g. 4-byte blocks? => The free-list-inside-the-block trick no longer fits; the free list would need a separate index-based representation (e.g. a bitmap of free/used blocks, or a free list of array indices stored in a separate small array) instead of storing a raw pointer in each block.
+- Does this sizing calculation change on a 32-bit target? => Yes, sizeof(void*) would typically be 4 there instead of 8, loosening the block_size >= sizeof(void*) constraint and changing the struct's total byte count and padding accordingly; always confirm pointer size on the actual target, not assume 8.
+PITFALL: Assuming sizeof(void*) is always 8 across every target; it is implementation-defined and commonly 4 on 32-bit embedded targets, which changes both the minimum viable block size and the struct layout math.
+
+@@ 18.06 | Intermediate | Scenario | fig=ringbuffer | tags=ring-buffer,power-of-two
+Q: Implement a real SPSC ring buffer sized as a power of two, with push/pop, and show it correctly filling, emptying, and wrapping.
+SHORT: Keep head and tail as plain unsigned counters that only ever increase; mask each with (CAPACITY - 1) to get the actual array index, and compute fullness as (head - tail) so the code never needs an explicit wrap-around branch.
+DEEP:
+```c
+#include <stdio.h>
+#include <stdbool.h>
+
+#define RB_CAPACITY 8   /* must be a power of two */
+
+typedef struct {
+    int      buf[RB_CAPACITY];
+    unsigned head;   /* next slot to write (producer) */
+    unsigned tail;   /* next slot to read  (consumer) */
+} ring_t;
+
+void rb_init(ring_t *rb) { rb->head = 0; rb->tail = 0; }
+static unsigned rb_count(const ring_t *rb) { return rb->head - rb->tail; }
+bool rb_full(const ring_t *rb)  { return rb_count(rb) == RB_CAPACITY; }
+bool rb_empty(const ring_t *rb) { return rb->head == rb->tail; }
+
+bool rb_push(ring_t *rb, int v) {
+    if (rb_full(rb)) return false;
+    rb->buf[rb->head & (RB_CAPACITY - 1)] = v;   /* mask replaces % for power-of-two size */
+    rb->head++;
+    return true;
+}
+bool rb_pop(ring_t *rb, int *out) {
+    if (rb_empty(rb)) return false;
+    *out = rb->buf[rb->tail & (RB_CAPACITY - 1)];
+    rb->tail++;
+    return true;
+}
+
+int main(void) {
+    ring_t rb;
+    rb_init(&rb);
+    for (int i = 0; i < RB_CAPACITY; i++) printf("push %d -> %s\n", i, rb_push(&rb, i) ? "ok" : "full");
+    printf("push %d -> %s (should be full)\n", RB_CAPACITY, rb_push(&rb, RB_CAPACITY) ? "ok" : "full");
+    int v;
+    for (int i = 0; i < 3; i++) { rb_pop(&rb, &v); printf("pop -> %d\n", v); }
+    for (int i = 0; i < 3; i++) rb_push(&rb, 100 + i);
+    printf("count after wrap-around pushes = %u\n", rb_count(&rb));
+    while (rb_pop(&rb, &v)) printf("drain -> %d\n", v);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -g` and run, it filled all 8 slots, correctly reported the 9th push as `full`, popped 0/1/2, pushed 100/101/102 into the freed slots (wrapping the index past the array's physical end back to the front), reported `count after wrap-around pushes = 8` (full again), and drained 3,4,5,6,7,100,101,102 in exact FIFO order.
+FOLLOW:
+- Why is rb_count computed as head - tail (unsigned subtraction) instead of an if/else on which is larger? => Because head and tail are unsigned and only ever increase (never reset), unsigned subtraction wraps correctly even once head has numerically wrapped past tail at the 2^32 boundary, giving the correct count with no branch; this only works because both counters are the same unsigned width and neither is ever decremented or reset independently.
+- What is the largest usable capacity with this exact head/tail scheme? => Any power of two up to half the counter type's range is safe in the sense that rb_count's result stays unambiguous; in practice firmware ring buffers use capacities far smaller than that limit, so it is rarely the binding constraint.
+PITFALL: Reserving no distinction between "head==tail means empty" and "head==tail means full" by using masked indices directly as the comparison instead of the unmasked, ever-increasing counters; 18.07 shows exactly the bug that causes.
+
+@@ 18.07 | Intermediate | Trap | tags=ring-buffer,full-empty-ambiguity
+Q: A ring buffer implementation compares masked head/tail indices directly to detect full and empty, and it silently wastes one slot of capacity. What is happening?
+SHORT: If both "empty" and "full" are detected by comparing head and tail after masking into [0, CAPACITY), the two states become indistinguishable at head==tail, so the common workaround is to declare the buffer full one slot early (when advancing head would make it equal tail), which correctly avoids the ambiguity but silently caps real usable capacity at CAPACITY-1, not CAPACITY.
+DEEP:
+```c
+#include <stdio.h>
+#include <stdbool.h>
+#define CAP 4
+typedef struct { int buf[CAP]; unsigned head, tail; } naive_rb_t;
+bool push(naive_rb_t *rb, int v) {
+    unsigned next = (rb->head + 1) % CAP;
+    if (next == rb->tail) return false;  /* reserves 1 slot to keep full != empty */
+    rb->buf[rb->head] = v;
+    rb->head = next;
+    return true;
+}
+bool pop(naive_rb_t *rb, int *out) {
+    if (rb->head == rb->tail) return false;  /* empty */
+    *out = rb->buf[rb->tail];
+    rb->tail = (rb->tail + 1) % CAP;
+    return true;
+}
+int main(void) {
+    naive_rb_t rb = {0};
+    int accepted = 0;
+    for (int i = 0; i < CAP; i++) accepted += push(&rb, i);
+    printf("pushed %d of %d requested (capacity looks like %d, not %d)\n", accepted, CAP, CAP - 1, CAP);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -g` and run, it printed `pushed 3 of 4 requested (capacity looks like 3, not 4)`, confirming the array declared with 4 slots only ever holds 3 items at once with this scheme, because the 4th push would make `next == tail`, which the code must reject to keep "full" distinguishable from "empty" using only masked-index comparison.
+The two standard fixes: (1) accept the wasted slot (declare the true usable capacity as CAP-1 from the start, which is simple and what most embedded ring buffers actually do), or (2) track head/tail as ever-increasing unsigned counters and mask only at the point of array indexing, as in 18.06, which uses `head - tail` (unmasked) for the count/full/empty checks and therefore wastes no slot at all.
+FOLLOW:
+- Why does 18.06's scheme not need to waste a slot? => Because it compares the unmasked, ever-increasing head and tail counters (not the masked array indices) to determine count/full/empty, so head==tail unambiguously means empty and head-tail==CAPACITY unambiguously means full, with no state that could mean both.
+- Is wasting one slot ever the better engineering choice anyway? => Sometimes, for simplicity or when porting from a reference implementation that already does it; the real requirement is that whichever scheme is chosen, the actual usable capacity is documented correctly, since silently getting CAP-1 when a caller assumed CAP is a capacity-planning bug waiting to surface as unexpected drops.
+PITFALL: Sizing a ring buffer's CAP to exactly the number of items a producer burst is expected to need, using the naive modulo scheme, and then discovering in the field that the true usable capacity is one less than planned.
+
+@@ 18.08 | Advanced | Cross-layer | tags=memory-ordering,threads
+Q: Is the SPSC ring buffer from 18.06 safe if the producer and consumer run on different CPU cores, not just different execution contexts on one core?
+SHORT: The single-writer-per-index property (only the producer writes head, only the consumer writes tail) still holds, but on truly separate cores you additionally need a memory-ordering guarantee that a slot's data write becomes visible to the other core before that side's index update becomes visible, which plain C11 volatile/sig_atomic_t does not provide by itself; that cross-core visibility question is the C Advanced page's memory-ordering/atomics territory, not this page's.
+DEEP:
+- On a single core (one producer context and one consumer context that never truly run simultaneously, e.g. an ISR and the main loop on the same core), the compiler-ordering guarantees this page already covers (volatile forcing real, ordered accesses, per module 17) are enough: the ISR either has not run yet or has fully finished by the time the main loop observes its updated head, because they cannot be mid-execution at the same instant on one core.
+- On separate cores running truly concurrently, a plain, non-atomic write to `head` and a plain read of it on another core have no standard C11 guarantee about when (or even whether, from an optimizer's perspective) that write becomes visible to the other core; this is a hardware/memory-model question (cache coherency, memory barriers/fences) layered on top of, not replaced by, the C language's own sequencing rules.
+- The correct multi-core version of this same ring buffer typically uses C11 `_Atomic` head/tail with explicit acquire/release memory ordering (or the target's own barrier intrinsics in a pre-C11/embedded toolchain) so that the consumer's acquire-load of head cannot see a "new" head value without also seeing the corresponding slot write that happened-before it. This is exactly the kind of cross-thread memory-ordering design this page's sibling "C Advanced" page's concurrency modules cover in depth; this page treats the ring buffer's index/slot-ownership logic (correct on one core, or between compiler-ordered contexts like an ISR and its interrupted code) as the C-language-level contribution, and defers the multi-core memory-model layer to that page.
+- Practically for firmware: an ISR-to-main-loop ring buffer on a single-core microcontroller only needs this page's volatile/ordering treatment; a ring buffer shared between two cores of a multi-core SoC needs the additional atomics/barrier layer, and conflating the two is a common real design mistake.
+FOLLOW:
+- Does making head and tail volatile fix the multi-core case? => No; volatile only affects compiler-generated reordering/elision at the language level, not the hardware's own memory visibility ordering across cores, which needs actual memory barriers or C11 atomics with the right memory order, not just volatile.
+- Where should a candidate go to study the multi-core-safe version of this exact data structure? => The C Advanced page's memory-ordering and atomics modules, which this page intentionally defers to rather than re-teaching, per this page's own scope.
+PITFALL: Assuming a ring buffer that is provably correct for an ISR-and-main-loop pairing on one core is automatically also correct when the same producer/consumer roles are moved onto two separate CPU cores; the index-ownership argument still holds, but a new visibility requirement is added that the single-core version never needed to satisfy.
+
+@@ 18.09 | Advanced | Debug | tags=ring-buffer,wrap-bug
+Q: A ring buffer's push never wraps its head index back into range. Find the bug, show the real corruption it causes, and fix it.
+SHORT: push increments head unconditionally without ever taking it modulo the capacity, so after enough pushes and pops head walks past the array's last valid index and writes out of bounds; because the overwritten memory happens to be the struct's own head/tail/count fields (declared right after buf), the result is silent state corruption rather than an immediate crash.
+DEEP:
+Buggy:
+```c
+#include <stdio.h>
+#include <stdbool.h>
+#define CAP 5
+typedef struct { int buf[CAP]; unsigned head, tail, count; } rb_t;
+bool push(rb_t *rb, int v) {
+    if (rb->count == CAP) return false;
+    rb->buf[rb->head] = v;
+    rb->head = rb->head + 1;      /* BUG: never wraps */
+    rb->count++;
+    return true;
+}
+bool pop(rb_t *rb, int *out) {
+    if (rb->count == 0) return false;
+    *out = rb->buf[rb->tail];
+    rb->tail = (rb->tail + 1) % CAP;
+    rb->count--;
+    return true;
+}
+int main(void) {
+    rb_t rb = {0};
+    int v;
+    for (int i = 0; i < 3; i++) push(&rb, i);   /* head: 0,1,2,3   count=3 */
+    for (int i = 0; i < 2; i++) pop(&rb, &v);   /* tail: 0,1,2     count=1 */
+    push(&rb, 10);  /* buf[3]=10, head=4 */
+    push(&rb, 11);  /* buf[4]=11, head=5 */
+    push(&rb, 12);  /* buf[5]=12 <- out of bounds: head never wrapped */
+    printf("head=%u count=%u\n", rb.head, rb.count);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -g -fsanitize=address` and run, it printed `head=13 count=4` -- not a crash. ASan did not flag it either, because `buf[5]` lands not in a redzone but exactly on the struct's own `head` field, which is declared immediately after `buf[5]` in memory: the write of value 12 into "buf[5]" actually overwrote `head` itself with 12, and the very next line's `rb->head = rb->head + 1` then read that just-corrupted value (12) and stored 13, matching the observed output exactly. This is a realistic and dangerous failure mode: a wrap-around bug silently corrupting adjacent state with no fault at all, because the out-of-bounds write happened to land inside the same object rather than past its allocation.
+Fixed:
+```c
+#include <stdio.h>
+#include <stdbool.h>
+#define CAP 5
+typedef struct { int buf[CAP]; unsigned head, tail, count; } rb_t;
+bool push(rb_t *rb, int v) {
+    if (rb->count == CAP) return false;
+    rb->buf[rb->head] = v;
+    rb->head = (rb->head + 1) % CAP;   /* FIX: wrap using modulo capacity */
+    rb->count++;
+    return true;
+}
+bool pop(rb_t *rb, int *out) {
+    if (rb->count == 0) return false;
+    *out = rb->buf[rb->tail];
+    rb->tail = (rb->tail + 1) % CAP;
+    rb->count--;
+    return true;
+}
+int main(void) {
+    rb_t rb = {0};
+    int v;
+    for (int i = 0; i < 3; i++) push(&rb, i);
+    for (int i = 0; i < 2; i++) pop(&rb, &v);
+    push(&rb, 10); push(&rb, 11); push(&rb, 12);
+    printf("head=%u count=%u (correctly wrapped)\n", rb.head, rb.count);
+    while (pop(&rb, &v)) printf("pop -> %d\n", v);
+    return 0;
+}
+```
+Compiled and run the same way, it printed `head=1 count=4 (correctly wrapped)` followed by draining `2, 10, 11, 12` in correct order, with no sanitizer report.
+FOLLOW:
+- Why did ASan not catch the buggy version? => The out-of-bounds write landed within the same stack object (rb_t), on another one of its own fields, not past the object's allocated redzone-guarded boundary; ASan's redzones guard the edges of an allocation/object, not internal field boundaries within one object.
+- What review habit would have caught this without running anything? => Noticing that push's index update has no modulo/mask at all while pop's does, an asymmetry between two functions that should both wrap the same way; code review comparing the two side by side, not just reading push in isolation, is the cheap catch here.
+PITFALL: Trusting a clean ASan/Valgrind run as proof of ring-buffer correctness; this exact bug corrupts a same-object field silently and triggers neither tool, which is why a design/code review catching the missing modulo matters as much as dynamic testing here.
+
+@@ 18.10 | Advanced | Scenario | tags=pool-allocator,size-classes
+Q: How would you extend the fixed-block pool allocator to serve a handful of different fixed sizes (size classes) instead of just one?
+SHORT: Run several independent single-size pools side by side (e.g. 16, 32, 64, 128-byte pools), and have a thin front-end alloc function pick the smallest pool whose block size is >= the request, falling back to the next larger pool (or failing) if that size class is exhausted; each pool keeps the exact same O(1) free-list logic from 18.04 internally, so the design only adds a size-class selection step, not new allocation machinery.
+DEEP:
+- Structure: one `pool_t`-like instance per size class, each with its own storage array, block size, and free list, exactly as in 18.04; a top-level `multi_pool_alloc(size_t requested_size)` picks the smallest size class with `block_size >= requested_size` and calls that pool's own alloc.
+- Internal fragmentation trade-off to state explicitly: a 20-byte request served from a 32-byte size class wastes 12 bytes inside that block (this is "internal fragmentation," distinct from the cross-block "external fragmentation" a general allocator suffers and that fixed-block pools avoid entirely); more size classes reduce internal waste but increase the number of separate pools to size and manage, a direct capacity-planning trade-off.
+- Free must know (or be told) which size class a given pointer belongs to, to push it back onto the right pool's free list; common approaches are storing a small size-class tag just before the returned pointer (a "header," at the cost of a few bytes per allocation and complicating alignment) or requiring the caller to pass the size class back into free explicitly (cheaper, but pushes a correctness burden onto every call site).
+- This is deliberately the same shape as a real-world fixed-size-class allocator design (the kind used in some embedded RTOS memory managers): a small, fixed set of pools rather than one pool, chosen so allocation remains O(1) and bounded while still serving a reasonable range of request sizes without falling back to a general-purpose allocator's unbounded search/coalesce behavior.
+FOLLOW:
+- Why not just always allocate from the largest size class to avoid needing a size tag on free? => That defeats the purpose: every allocation would waste space up to the largest block's size regardless of how small the actual request was, giving up exactly the space efficiency multiple size classes exist to provide.
+- Is this design still deterministic/bounded-time like the single-pool version? => Yes, as long as picking the size class itself is O(1) (a small fixed number of size classes checked in order, or a direct lookup) rather than a search over an unbounded or growing set of classes.
+PITFALL: Choosing size classes far apart (e.g. 16, 256, 4096 bytes) "to cover everything with few pools," which maximizes internal fragmentation for any request that falls in the wide gaps between classes; real designs tune class sizes to the actual request-size distribution the system produces.
+
+@@ 18.11 | Advanced | Concept | tags=event-dispatch,callback-table
+Q: Implement a real generic event/callback dispatch system: register multiple handlers per event type and dispatch to all of them.
+SHORT: A 2D table (event type by handler slot) holds (function pointer, context) pairs; register finds the first empty slot for that event type and fills it, dispatch walks every non-empty slot for the given event type and calls each handler with its own stored context.
+DEEP:
+```c
+#include <stdio.h>
+
+#define MAX_HANDLERS 4
+#define EVT_DATA_READY 0
+#define EVT_ERROR      1
+#define EVT_COUNT      2
+
+typedef void (*event_cb_t)(int event_id, void *ctx);
+typedef struct { event_cb_t cb; void *ctx; } handler_slot_t;
+static handler_slot_t table[EVT_COUNT][MAX_HANDLERS];
+
+int event_register(int event_id, event_cb_t cb, void *ctx) {
+    if (event_id < 0 || event_id >= EVT_COUNT) return -1;
+    for (int i = 0; i < MAX_HANDLERS; i++) {
+        if (table[event_id][i].cb == NULL) {
+            table[event_id][i].cb = cb;
+            table[event_id][i].ctx = ctx;
+            return 0;
+        }
+    }
+    return -1;   /* table full */
+}
+void event_dispatch(int event_id) {
+    if (event_id < 0 || event_id >= EVT_COUNT) return;
+    for (int i = 0; i < MAX_HANDLERS; i++) {
+        if (table[event_id][i].cb) table[event_id][i].cb(event_id, table[event_id][i].ctx);
+    }
+}
+
+static void on_data_ready(int event_id, void *ctx) { printf("handler A: event=%d ctx=%s\n", event_id, (const char *)ctx); }
+static void on_data_ready2(int event_id, void *ctx) { (void)ctx; printf("handler B: event=%d\n", event_id); }
+
+int main(void) {
+    event_register(EVT_DATA_READY, on_data_ready, "sensor1");
+    event_register(EVT_DATA_READY, on_data_ready2, NULL);
+    event_dispatch(EVT_DATA_READY);
+    event_dispatch(EVT_ERROR);   /* no handlers registered: dispatches nothing, no crash */
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -g` and run, it printed `handler A: event=0 ctx=sensor1` then `handler B: event=0`, confirming both handlers registered for EVT_DATA_READY ran in registration order, and that dispatching EVT_ERROR (no handlers registered) safely did nothing.
+FOLLOW:
+- Why does event_dispatch check table[event_id][i].cb for NULL before calling it? => Because unused slots start (via static storage's zero-initialization) as NULL function pointers; calling through a NULL function pointer is undefined behavior, so every slot must be checked before being called through.
+- How would you support unregistering a specific handler? => Search for the matching (cb, ctx) pair (or a caller-supplied registration handle/index returned by event_register) and set that slot's cb back to NULL, making it available for a future event_register call again.
+PITFALL: Relying on static (zero-initialized) storage for the table without confirming that in this design NULL is never itself a valid callback value; if some real system used a sentinel other than NULL to mean "empty," the zero-initialization guarantee would not automatically produce it.
+
+@@ 18.12 | Advanced | Numeric | tags=alignment,_Alignof,pool-sizing
+Q: A pool needs to hold a struct with mixed-size members. Work out its size, its alignment requirement, and the padded block size a pool must use.
+SHORT: For struct { uint8_t cmd; uint32_t param; uint16_t seq; }, sizeof is 12 bytes and _Alignof is 4 (dictated by its widest-aligned member, the uint32_t); since 12 is already a multiple of 4, the padded block size a pool should use is also 12 bytes, with no extra rounding needed here.
+DEEP:
+```c
+#include <stdio.h>
+#include <stdint.h>
+#include <stddef.h>
+typedef struct { uint8_t cmd; uint32_t param; uint16_t seq; } record_t;
+int main(void) {
+    printf("sizeof(record_t)=%zu  _Alignof(record_t)=%zu\n", sizeof(record_t), _Alignof(record_t));
+    size_t block_size = sizeof(record_t);
+    size_t align = _Alignof(record_t);
+    size_t padded_block = ((block_size + align - 1) / align) * align;
+    printf("raw block=%zu bytes, rounded up to alignment %zu -> padded block=%zu bytes\n", block_size, align, padded_block);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -g` and run, it printed `sizeof(record_t)=12  _Alignof(record_t)=4` and `raw block=12 bytes, rounded up to alignment 4 -> padded block=12 bytes`.
+The math behind why sizeof is 12, not 7 (1+4+2): `cmd` takes 1 byte at offset 0, `param` (a uint32_t) requires 4-byte alignment so the compiler inserts 3 padding bytes before it, placing it at offset 4; `seq` (a uint16_t) needs only 2-byte alignment and fits immediately after `param` at offset 8; the struct's own overall size must be a multiple of its alignment (4, from the widest member), and 8 + 2 = 10 is not a multiple of 4, so 2 trailing padding bytes are added, giving a total of 12 (module 6 covers this padding-and-offset reasoning in full depth). The general rounding formula used above, `((size + align - 1) / align) * align`, is the standard integer round-up-to-a-multiple pattern and is exactly what a pool must apply to its own declared block size if it is choosing a block size independently of `sizeof` a specific struct, to guarantee every block address the pool hands out satisfies that struct's `_Alignof` requirement (6.5.3.4p3 defines `_Alignof` as yielding a type's alignment requirement).
+FOLLOW:
+- Why must the pool's storage array itself also start at an address that is a multiple of the struct's alignment, not just each block be that many bytes apart? => Because alignment is a property of an address, not just a spacing between blocks; if the array's own base address were misaligned, every block's address would inherit that same misalignment even with correctly-sized/spaced blocks, so the storage array's own declared type or an explicit alignment specifier must guarantee base alignment too.
+- Would using a union of the pool's stored type and a pointer (for the free-list next-pointer trick) ever change this alignment math? => It can only increase the required alignment/size (a union's alignment is the maximum of its members' alignments, and its size is at least the size of its largest member, rounded up to that alignment), never decrease it, so it is a safe way to guarantee both the payload type's and the pointer's alignment needs are met simultaneously by construction.
+PITFALL: Computing a pool's block size from a struct's member sizes added up by hand (1+4+2=7) instead of trusting sizeof/_Alignof, and under-sizing every block by exactly the padding the compiler actually inserts.
+
+@@ 18.13 | Principal | Concept | tags=allocator-tradeoffs,design-review
+Q: An interviewer asks you to compare a fixed-block pool allocator against malloc/free for a firmware subsystem. What trade-offs do you state unprompted?
+SHORT: Pool: O(1) bounded alloc/free, no cross-block fragmentation, safe near ISR-adjacent code, but fixed capacity and block sizes decided at design time, with internal fragmentation on undersized requests. malloc/free: flexible sizes and dynamic capacity, but unbounded worst-case time, possible external fragmentation, and generally unsafe from an ISR. It is a determinism-vs-flexibility trade-off, not strictly one being better.
+DEEP:
+A Principal-level comparison, stated as trade-offs rather than a verdict:
+- Time complexity and determinism: pool alloc/free are both O(1) with a small, fixed instruction count every single time (pop/push a linked list head); malloc/free's complexity depends on allocator internals (free-list search, possible coalescing, possible OS calls like brk/mmap for growth) and is not guaranteed bounded, which matters directly for real-time/interrupt-adjacent firmware code where a worst-case-time guarantee is often a hard requirement, not a nicety.
+- Fragmentation: a pool cannot fragment across its own blocks (every block is interchangeable), only waste space inside an oversized block relative to a smaller request (internal fragmentation, 18.10); malloc/free can suffer external fragmentation (many small free chunks, too scattered to satisfy a later larger request) after enough varied alloc/free cycles, a failure mode that can appear only after long uptime, making it a poor fit for a device expected to run for months without restart.
+- Capacity planning: a pool's total capacity (N blocks of size S) is fixed at design/init time and must be sized for the worst case the system will ever need concurrently; malloc/free's heap can (within available memory) serve however much is requested at the time, at the cost of that same unpredictability in success/failure and timing.
+- Safety in constrained contexts: a pool's alloc/free have no hidden shared non-reentrant state beyond the pool's own free-list pointer (which the design controls and can make ISR-safe with care), while malloc/free's internal bookkeeping is generally not safe to call from an ISR at all (module 17's reentrancy discussion applies directly).
+- The actual Principal-level answer is a recommendation matched to the subsystem's actual needs, stated explicitly: use a pool (or a small set of size-classed pools, 18.10) for any allocation pattern with a bounded, known-in-advance set of sizes and a hard timing requirement (buffer pools for DMA descriptors, message objects, ISR-queued events); reserve malloc/free for truly variable-size, non-time-critical allocations where flexibility outweighs the loss of determinism, and never mix the two by, for example, letting a pool "fall back" to malloc on exhaustion without explicitly re-deriving the timing guarantees that fallback path no longer has.
+FOLLOW:
+- Is it ever reasonable to use malloc/free during a rarely-hit initialization path even in an otherwise pool-only firmware design? => Often yes, since a one-time, non-time-critical startup allocation does not carry the same real-time/ISR-safety requirements as steady-state operation; the key is being explicit that this specific call site is exempt from the rest of the system's determinism guarantee, not silently mixing allocators without that distinction being documented.
+- What would make you choose several size-classed pools over one large-block pool instead of malloc/free? => When the actual request-size distribution is known and clustered into a few common sizes (18.10), several size classes reclaim most of the space efficiency a general allocator would otherwise be needed for, while keeping every allocation's timing bounded, unlike malloc/free.
+PITFALL: Presenting the pool allocator as an unconditionally superior design; an interviewer is specifically listening for the stated trade-offs (fixed capacity, internal fragmentation, design-time sizing) alongside the real benefits, not a one-sided pitch.
+
+@@ 18.14 | Principal | Scenario | tags=logging-pipeline,integration-design
+Q: Design a full pipeline: an ISR producing events, a ring buffer carrying them, and a consumer task dispatching them through a callback table, end to end.
+SHORT: The ISR does the minimum -- read the hardware event, package a small fixed-size record, and push it onto an SPSC ring buffer (18.06) -- then returns; a normal-context consumer task drains that buffer in a loop and calls event_dispatch (18.11) for each popped event, so every registered handler runs outside interrupt context, with a pool allocator (18.01/18.04) available for payloads too large to fit inline.
+DEEP:
+End-to-end design, stating each junction's own contract explicitly (the way a Principal design review expects):
+1. Producer side (ISR): on the hardware interrupt, read whatever registers/state describe the event (module 17's volatile MMIO access), fill a small fixed-size `struct event { int type; uint32_t data; }` (or similar, sized to fit the ring buffer's element type directly, no dynamic allocation inside the ISR since that would violate module 17's ISR-safety rules), and call `rb_push` on the shared ring buffer. If `rb_push` returns false (buffer full), the ISR must have an explicit, decided policy -- drop the event and increment a dropped-event counter is the usual firmware choice, never block waiting for space, since blocking in an ISR is itself the violation module 17 warns against.
+2. The ring buffer's contract: single producer (only this ISR writes head), single consumer (only the consumer task writes tail), fixed capacity sized generously enough (from a measured or worst-case event rate) that the drop path is rare in practice, not a normal-case behavior.
+3. Consumer side (normal-context task, e.g. the main loop or an RTOS task): loop calling `rb_pop`; for each popped event, call `event_dispatch(event.type)` (extended if needed to also pass `event.data` through to each handler) so every handler registered for that event type runs here, in normal context, free to call printf, malloc, take locks, or do anything else module 17 forbids inside the ISR itself.
+4. If an event's payload does not fit inline in the fixed-size ring buffer element (e.g. a variable-length log message), do not grow the ring buffer element size to the worst case; instead have the ISR pull a fixed-size block from a memory pool (18.01/18.04) sized for the common payload case, fill it, and push only a pointer/handle to that block through the ring buffer; the consumer task, after processing, returns the block to the pool. This keeps the ring buffer's element size small and fast while still supporting larger payloads through the pool's own fixed-size (and therefore ISR-safe, O(1)) alloc/free.
+5. State the capacity/latency trade-offs explicitly, unprompted: ring buffer capacity bounds how many events can be "in flight" between an ISR burst and the consumer task getting scheduled; pool capacity bounds how many larger payloads can be in flight simultaneously; both are finite, both need sizing against a measured or worst-case burst rate, and both need an explicit, tested drop/reject policy for the case where that sizing is exceeded, rather than an unhandled failure path discovered later in the field.
+6. Testing this design end to end means exercising all three failure edges deliberately: ring buffer full (verify drop-and-count behavior, not corruption), pool exhausted (verify the ISR's fallback, e.g. drop the oversized-payload event while still delivering the fixed-size ring buffer record if the design allows a "payload missing" event), and normal steady-state throughput (verify the consumer task keeps up with the measured worst-case event rate with margin).
+FOLLOW:
+- Why must the ISR's drop policy on a full ring buffer be an explicit design decision rather than left as "whatever rb_push happens to return"? => Because silently dropping data has real system consequences (a missed sensor reading, an undercounted error) that a review needs to sign off on knowingly, and because the alternative (blocking) is unacceptable in an ISR, an explicit, documented drop-and-count policy is the only remaining safe choice, not a default to fall into unexamined.
+- Could the consumer task itself be another interrupt handler instead of normal context? => Only if every registered event handler is itself ISR-safe per module 17's rules, which defeats much of the point of deferring work out of interrupt context in the first place; the standard reason to build this whole pipeline is precisely to let handler logic run in normal context.
+PITFALL: Sizing the ring buffer and the pool independently without reasoning about their combined worst case (a burst that fills both simultaneously), then discovering in the field that events are dropped at a lower real event rate than either capacity number alone would suggest.
+
+@@ 18.15 | Principal | Trap | tags=ring-buffer,capacity-review
+Q: In a design review, a ring buffer is declared with CAPACITY = 100 "so it can hold at least 100 events," using the power-of-two masking scheme from 18.06. What should you flag immediately?
+SHORT: The masking scheme (index & (CAPACITY - 1)) is only correct when CAPACITY is a power of two; 100 is not, so the mask silently computes wrong indices (aliasing multiple logical slots onto the same array slot) instead of failing to compile or crashing obviously, which is exactly the kind of review-time catch that prevents a very hard-to-diagnose field bug.
+DEEP:
+Why this specific mistake is dangerous rather than just wrong:
+- `index & (100 - 1)` is `index & 99` (binary 0110 0011), which does not mask cleanly into `[0, 100)` the way it would for a power of two like 128 (`index & 127`, cleanly `[0, 128)`); for many index values, `index & 99` produces a result that is not even always less than 100 in the way a correct modulo would guarantee, and different index values that a correct `% 100` would map to different slots can collide onto the same masked result, silently aliasing two logically different queue positions onto one array slot.
+- This is worse than an out-of-bounds crash: it produces plausible-looking, in-bounds, wrong results (data from one event overwriting another's slot before it was consumed), which can pass casual testing (low traffic, no observed collision) and then corrupt data intermittently under higher load in the field, matching the exact "silent corruption, timing/load-dependent" failure signature module 16 and 17 both warn about for different underlying reasons.
+- The two correct fixes: round the declared capacity up to the next power of two (128 here) and accept the extra headroom, keeping the fast mask; or keep CAPACITY = 100 exactly but switch to true modulo (`index % CAPACITY`) throughout, accepting the slightly higher per-operation cost of a division instead of a mask. Either is correct; silently keeping the mask with a non-power-of-two capacity is the one combination that is wrong.
+- A Principal-level review flags this from reading the two numbers alone (CAPACITY=100, masking scheme in use) without needing to run anything, precisely because "is CAPACITY a power of two" is a fast, mechanical, always-worth-checking fact whenever a mask-based ring buffer implementation is reused with a new capacity constant.
+FOLLOW:
+- Why might this bug pass initial testing? => At low, non-colliding traffic patterns the aliasing may never actually cause two live events to land on the same masked slot at overlapping times, so functional tests at light load can pass cleanly while the same code corrupts data under a heavier, more realistic load.
+- Is there a compile-time way to catch "capacity is not a power of two" automatically rather than relying on manual review? => Yes, a `static_assert((CAPACITY & (CAPACITY - 1)) == 0, "capacity must be a power of two")` at the point CAPACITY is defined turns this exact mistake into a compile error instead of a silent runtime bug, and is good practice to add alongside any mask-based ring buffer implementation.
+PITFALL: Copying a mask-based ring buffer implementation into a new context and changing only the capacity constant to "whatever number the new use case needs," without re-verifying the power-of-two constraint the masking scheme silently depends on.
+
+@@ 18.16 | Principal | Concept | tags=interview-method,systems-design
+Q: What method should you actually follow when presenting a C systems-design answer (like the pool allocator or ring buffer here) at the Principal level?
+SHORT: State the constraints first (timing/determinism requirements, memory budget, concurrency model), then the data structure and why it satisfies exactly those constraints, then its complexity/determinism properties explicitly, then the failure modes and how they are handled, and finally the trade-offs you accepted -- in that order, unprompted, rather than jumping straight to code.
+DEEP:
+A concrete method, applied to this module's own examples as illustration:
+1. State the constraints before proposing a design: for the pool allocator, that might be "ISR-safe, O(1), bounded number of same-size objects in flight"; for the ring buffer, "single producer, single consumer, bounded latency, fixed max in-flight events." Naming these first shows the interviewer you are designing to requirements, not pattern-matching to a memorized data structure.
+2. Present the data structure and connect each of its properties back to a stated constraint: the pool's free-list-in-the-block trick gives O(1) alloc/free with zero bookkeeping overhead, which satisfies the ISR-safety and boundedness constraints named in step 1; the ring buffer's power-of-two mask and single-writer-per-index discipline satisfy the bounded-latency and single-producer/consumer constraints.
+3. State complexity and determinism explicitly, not just "it's fast": O(1) worst-case, not just average-case, and say why (no search, no loop bounded by data size, just fixed pointer/index arithmetic) -- this distinction (worst-case vs amortized/average) is exactly what a firmware timing requirement cares about and what interviewers listen for.
+4. Name the failure modes and their handling before being asked: pool exhaustion returns NULL/failure (18.01), ring buffer full returns false and the caller must have a decided drop/backpressure policy (18.14), and say what happens next in the system for each (a rejected allocation logged and handled how, a dropped event counted how) rather than leaving "and then what?" unanswered.
+5. State the trade-offs accepted, unprompted, the same habit 18.13 models for the pool-vs-malloc comparison specifically: fixed capacity chosen at design time versus dynamic flexibility, internal fragmentation versus external fragmentation, determinism versus general-purpose usability -- naming what was given up, not just what was gained.
+6. Only then, code: by the time code appears, the interviewer already knows why this data structure, why it is safe in this context, what its complexity guarantees are, and what happens when it fails; the code itself (as in 18.04/18.06/18.11) becomes a confirmation of a design already justified in words, not a substitute for that justification.
+This ordering is itself the answer to "how do you present a Principal-level systems design": constraints, structure-to-constraint mapping, complexity/determinism, failure modes, trade-offs, then code -- and stating each step's content unprompted is what distinguishes a Principal-level answer from a correct but merely competent one.
+FOLLOW:
+- What is the single most common gap in an otherwise-correct design answer at this level? => Skipping the failure-mode and trade-off steps (4 and 5) and stopping at "here is a data structure that works," which answers "can you build this" but not "do you understand what you gave up and what happens when it breaks," the actual substance of a Principal-level evaluation.
+- Does this method apply outside of allocator/ring-buffer-style questions? => Yes, the same constraints-first, failure-modes-explicit, trade-offs-stated structure applies to any systems-design question in C (or any language); the specific data structures in this module are the vehicle for demonstrating the method, not the method itself.
+PITFALL: Treating "and here is the code" as the end of the answer; a Principal-level review is evaluating the reasoning that produced and justifies the code at least as much as the code's correctness.

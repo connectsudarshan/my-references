@@ -1,0 +1,466 @@
+# Module 13: Compilation, Linking & the Build Pipeline
+
+@@ 13.01 | Basic | Concept | fig=buildpipeline | tags=phases,preprocessor,linker
+Q: What are the four phases that turn a .c file into an executable, and what does each one produce?
+SHORT: Preprocess (macro/include expansion -> .i), compile (-> assembly .s), assemble (-> object code .o with symbols+relocations), link (resolve symbols across .o files and libraries -> executable). C11 5.1.1.2 describes this as translation phases 1-7 plus a final linking phase.
+DEEP:
+The standard (5.1.1.2) folds this into "translation phases", but toolchains expose it as four commands you can run by hand.
+
+- 1. Preprocess: `gcc -E hello.c -o hello.i` expands `#include`, macros, conditionals. Pure text in, pure text out.
+- 2. Compile: `gcc -S hello.i -o hello.s` turns C into target assembly. Type checking and diagnostics happen here.
+- 3. Assemble: `gcc -c hello.s -o hello.o` turns assembly into an ELF (or other) object file: machine code plus a symbol table and relocation entries for anything not yet resolved.
+- 4. Link: `gcc hello.o -o hello` resolves every external reference against other .o files and libraries, producing a runnable image (5.1.1.2's final bullet: "all external object and function references are resolved").
+
+Real run, on a file with one global `int gvar = 42;`:
+```c
+#include <stdio.h>
+int gvar = 42;
+int main(void) {
+    printf("gvar=%d\n", gvar);
+    return 0;
+}
+```
+`gcc -std=c11 -Wall -Wextra -E hello.c -o hello.i` produced a 547-line `.i` file (all of stdio.h's declarations pulled in). `nm hello.o` after assembling shows:
+```
+0000000000000000 D gvar
+0000000000000000 T main
+                 U printf
+```
+`D` = defined in `.data` (gvar is initialized and nonzero), `T` = defined in `.text` (main's code), `U` = undefined, to be resolved by the linker (printf lives in libc). Running the final binary prints `gvar=42`.
+FOLLOW:
+- Why does gvar show up as D and not B (bss)? => Because it has a nonzero initializer; only zero-initialized or uninitialized file-scope objects go in .bss, which does not take space in the object file.
+- Can you skip straight from .c to .o? => Yes, `gcc -c hello.c -o hello.o` runs all three earlier phases internally; the separate commands just make each stage's output visible.
+PITFALL: Assuming a clean compile means the program will link; compiling only checks phases 1-3, linking is a separate step that can still fail with unresolved symbols.
+VERIFY: C11 5.1.1.2
+
+@@ 13.02 | Basic | Concept | tags=translationunit,tus
+Q: What is a translation unit, and why does a multi-file C program need the concept?
+SHORT: A translation unit is one source file after preprocessing (all its #includes expanded inline). Each .c file is compiled into its own translation unit and object file independently; the linker is what stitches multiple translation units into one program.
+DEEP:
+C11 6.9p4 defines it exactly this way: "the unit of program text after preprocessing is a translation unit, which consists of a sequence of external declarations."
+
+- Each `.c` file, plus everything its headers pull in, is compiled in isolation. The compiler for translation unit A has no visibility into translation unit B's local (`static`) names or its internal logic; it only sees what B's headers declare.
+- This is why a function defined in `b.c` and used in `a.c` needs a *declaration* visible to `a.c` (usually via a header), but the *definition* lives in exactly one translation unit.
+- A header is not itself a translation unit; it only becomes part of one when `#include`d into a `.c` file.
+- Practical consequence: two translation units can each define a `static` (file-scope, internal-linkage) function or variable with the same name with zero conflict, because internal linkage confines that identifier to its own translation unit (6.2.2p2).
+FOLLOW:
+- Does the compiler see across translation units during compilation? => No; only the linker sees all of them together, and only at the level of external symbols, not full type information.
+- What forces a rebuild of a translation unit? => Any change to the .c file itself or to any header it (transitively) includes, since the preprocessed text changes.
+PITFALL: Believing the compiler will catch a type mismatch between a function's definition in one .c file and a mismatched declaration in another; without a shared, correct header, that is left to the linker (which does not check types) or to whole-program tools like LTO.
+VERIFY: C11 6.9 paragraph 4
+
+@@ 13.03 | Basic | Concept | tags=errors,toolchain
+Q: What is the practical difference between a compile-time error and a link-time error?
+SHORT: A compile error means one translation unit is malformed on its own (syntax, type mismatch, undeclared identifier) and stops at phase 2. A link error means every translation unit compiled fine individually, but the linker could not make their external references agree: usually "undefined reference" (never defined anywhere) or "multiple definition" (defined more than once).
+DEEP:
+Compile errors are local: the compiler only needs the one translation unit (plus its headers) to detect them. Examples: `error: expected ';'`, `error: 'foo' undeclared`, `error: incompatible types`.
+
+Link errors are global: they only appear once the linker tries to unify symbol references across every object file and library on the command line. The two classic ones:
+
+- Undefined reference: some `.o` has a `U` (undefined) entry in `nm` for a symbol that no other `.o` or library defines. Compiling that `.o` alone succeeded because a *declaration* (prototype) satisfied the compiler; only the linker actually requires the *definition* to exist.
+- Multiple definition: two translation units both provide an external definition for the same identifier. C11 6.9p5 requires exactly one external definition program-wide for an identifier that is used; providing two is a constraint the linker (not the compiler) enforces.
+
+A useful mental model: the compiler enforces C's syntax and type rules one file at a time; the linker enforces C's *linkage* rules (6.2.2) across the whole program.
+FOLLOW:
+- Can a program compile every file individually but never link? => Yes, that is the normal case for any program split across files: each .o compiles fine, and linking is where cross-file symbol resolution is checked.
+- Does the linker check function signatures? => No; C object files carry no type information for functions, only names, so a mismatched declaration/definition pair link successfully and misbehave at runtime instead of being caught.
+PITFALL: Treating "it compiled" as "it is correct"; a header/definition mismatch across translation units is invisible to both the compiler and the (typeless) linker.
+
+@@ 13.04 | Intermediate | Concept | tags=linkage,extern,static
+Q: How do extern and static at file scope control which symbols a translation unit exposes to the linker?
+SHORT: A file-scope declaration with no storage-class specifier, or with extern, has external linkage: the same identifier in another translation unit refers to the same object/function, and the linker must find exactly one definition. static at file scope gives internal linkage: the identifier is private to that translation unit, so other files can reuse the same name with no clash (C11 6.2.2).
+DEEP:
+Two files, `a.c` and `b.c`:
+```c
+/* a.c */
+static int counter = 0;   /* internal linkage: private to a.c */
+int shared_total = 100;   /* external linkage: visible elsewhere */
+void bump(void) { counter++; shared_total += counter; }
+```
+```c
+/* b.c */
+extern int shared_total;  /* declaration only, refers to a.c's definition */
+void bump(void);
+int main(void) { bump(); bump(); return 0; }
+```
+After compiling both and running `nm`:
+```
+a.o: 0000000000000000 T bump
+     0000000000000000 b counter        <- lowercase b: local symbol, .bss
+     000000000000002e T report
+     0000000000000000 D shared_total   <- uppercase D: global, .data
+b.o:                  U bump
+                       U shared_total
+```
+Lowercase letters (`b`, `t`, `d`) in `nm` output mean internal linkage; uppercase (`B`, `T`, `D`) mean external. `counter` cannot collide with a same-named symbol in another file; `shared_total` must be defined exactly once program-wide or the link fails.
+
+`extern` on a declaration does not create storage; it only asserts "this identifier is defined somewhere with external linkage" (6.2.2p4-5). The actual reservation of storage happens at the one file-scope definition.
+FOLLOW:
+- What happens if b.c also writes `int shared_total;` instead of `extern int shared_total;`? => It becomes a second (tentative) definition of the same external identifier; whether that links depends on the compiler's -fcommon setting, see 13.08.
+- Does a function declared with no storage-class specifier default to internal or external linkage? => External; 6.2.2p5 says a function identifier with no storage-class specifier is linked exactly as if declared extern.
+PITFALL: Forgetting `static` on a file-scope helper function or global meant to be private, which silently exposes it as an external symbol and risks a multiple-definition clash if another translation unit picks the same name.
+VERIFY: C11 6.2.2 paragraphs 2-5
+
+@@ 13.05 | Intermediate | Debug | tags=multipledefinition,headers
+Q: Linking two files that both #include the same header fails with "multiple definition of `config_flag'". What is wrong with the header, and how do you fix it?
+SHORT: The header defines a global variable (int config_flag = 0;) instead of only declaring one. Every .c file that includes it gets its own external definition, so linking two or more of them violates the one-external-definition rule (C11 6.9p5). Fix: declare `extern int config_flag;` in the header, and put the one real definition (with initializer) in exactly one .c file.
+DEEP:
+Reproduced exactly:
+```c
+/* bad_hdr.h */
+int config_flag = 0;   /* BAD: a definition, not a declaration */
+```
+```c
+/* x.c */          #include "bad_hdr.h"
+int main(void) { return config_flag; }
+/* y.c */          #include "bad_hdr.h"
+void touch(void) { config_flag = 1; }
+```
+Compiling `x.o` and `y.o` each succeeds. Linking them gives exactly this real error:
+```
+/usr/bin/ld: y.o:(.bss+0x0): multiple definition of `config_flag';
+x.o:(.bss+0x0): first defined here
+collect2: error: ld returned 1 exit status
+```
+Each translation unit's `#include` re-pastes the same defining declaration in, so both `x.o` and `y.o` carry their own external definition of `config_flag` -- exactly the situation 6.9p5 forbids for an identifier that is used in an expression.
+
+The fix separates declaration from definition:
+```c
+/* good_hdr.h */
+extern int config_flag;   /* declaration: no storage, just a promise */
+```
+```c
+/* config.c */
+int config_flag = 0;      /* the one and only definition */
+```
+Now every other `.c` file includes `good_hdr.h` to get the declaration, and only `config.c` provides the definition, satisfying "exactly one external definition" program-wide.
+FOLLOW:
+- Would making config_flag `static` in the header fix it? => It changes the symptom (each translation unit gets its own private copy with internal linkage, no link error) but breaks the intent of sharing one flag across files; every file would see its own independent flag.
+- Why does the error mention `.bss` here even though the source wrote `= 0`? => The compiler folds an explicit zero-initializer for a file-scope object into the same zero-initialized section as an uninitialized one; it is still a full external definition either way.
+PITFALL: Defining any non-const object in a header without extern; every translation unit that includes the header re-defines it, which either fails to link or (with -fcommon) silently merges into one shared object depending on compiler defaults, see 13.08.
+VERIFY: C11 6.9 paragraph 5
+
+@@ 13.06 | Intermediate | Numeric | tags=objectfile,sizes,sections
+Q: `size hello.o` on the module 13.01 example prints `text 140  data 4  bss 0  dec 144`. What does each column mean, and why is data exactly 4 and bss exactly 0?
+SHORT: text/data/bss are byte counts of the object file's .text (code), .data (initialized globals), and .bss (zero/uninitialized globals) sections; dec is their sum. data=4 because the single global `int gvar = 42;` is a 4-byte nonzero-initialized int, which must be stored in the file; bss=0 because there are no zero-initialized or uninitialized globals in that translation unit.
+DEEP:
+`readelf -S hello.o` on the real object file lists, among others:
+```
+[1] .text     PROGBITS  ... size 0x8c (offset shown, size in later column)
+[3] .data     PROGBITS  ...
+[4] .bss      NOBITS    ...
+[5] .rodata   PROGBITS  ...
+```
+and `size hello.o` reduces that to the classic three-column summary:
+```
+   text    data     bss     dec     hex filename
+    140       4       0     144      90 hello.o
+```
+- .text (140 bytes here): the machine code for `main`'s prologue, the call to `printf`, and epilogue. It is read-only and shared between all processes running the binary.
+- .data (4 bytes): storage for `gvar`. It occupies real space in the file because the linker/loader must reproduce the value 42, not just zero it.
+- .bss (0 bytes here): would hold zero-initialized or uninitialized file-scope objects (per the tentative-definition rule, C11 6.9.2p2, they behave as if initialized to 0). NOBITS means the section takes no space *in the file*; the loader just zero-fills that many bytes in memory at load time. This program declares none, so it is 0.
+- dec = text + data + bss = 144, the total memory footprint size contributed by this object's loaded segments (excluding read-only string/constant data in .rodata, which `size` does not fold in by default).
+
+This is the numeric reason "put large lookup tables as `static const`" matters for firmware: a `static const` array lands in `.rodata` (flash, read-only, shareable) while a non-const zero-initialized array lands in `.bss` (RAM the loader must zero at startup) and a non-const initialized array lands in `.data` (RAM the loader must copy from flash at startup) -- three different costs for what looks like the same declaration with one keyword changed.
+FOLLOW:
+- Where would `static const char msg[] = "hi";` be counted? => In .rodata, not .data or .bss, since it is both initialized and read-only; `size` does not include .rodata in its text/data/bss triple, so it would not show up in any of the three printed numbers at all.
+- If gvar were `int gvar;` with no initializer instead? => bss would become 4 and data would go back to 0, since an uninitialized file-scope int is a tentative definition that resolves to a zero-initialized .bss entry (C11 6.9.2p2).
+PITFALL: Reading `size`'s dec column as "the binary's disk footprint"; .bss contributes to the runtime memory image but not to file bytes, so a program with a huge zero-initialized static buffer can have a tiny file yet need a large amount of RAM at load.
+VERIFY: C11 6.9.2 paragraph 2
+
+@@ 13.07 | Intermediate | Concept | tags=objectfile,symboltable,nm
+Q: What does a .o file actually contain, and what do nm's single-letter symbol codes mean?
+SHORT: An object file holds machine code and data organized into sections (.text, .data, .bss, .rodata, ...), plus a symbol table (name, section, linkage) and relocation entries for every reference the compiler could not resolve on its own. nm prints one line per symbol table entry; the letter shows its section and linkage: uppercase = external linkage, lowercase = internal (file-local).
+DEEP:
+Common `nm` letters worth memorizing for interview whiteboard use:
+
+| Letter | Meaning |
+|---|---|
+| T / t | defined in .text (code); uppercase external, lowercase static |
+| D / d | defined in .data (initialized global); uppercase external, lowercase static |
+| B / b | defined in .bss (zero/uninitialized global); uppercase external, lowercase static |
+| U | undefined: referenced here, defined elsewhere (the linker must supply it) |
+| R / r | defined in .rodata (read-only constant data) |
+| W / w | weak symbol: a definition the linker may silently replace with a strong one |
+
+A relocation entry is a note to the linker: "at this byte offset in .text, patch in the final address of symbol X once you know it." That is why `objdump -r hello.o` shows entries tying specific instruction bytes back to symbols like `printf`; the compiler emitted a placeholder address, and the linker (or, for a shared library, the loader) fills in the real one.
+
+Concretely, `readelf -s hello.o` for the module 13.01 example lists `main` and `gvar` as `GLOBAL DEFAULT <section>` entries with real byte sizes, and `printf` as `GLOBAL UND` (undefined) -- the same information `nm` summarizes with its letter codes.
+FOLLOW:
+- Why does a static function still appear in nm output? => Its symbol is still needed by the assembler/linker within its own translation unit (for jumps/calls) and for debuggers; it is just marked local (lowercase) so no other translation unit can reference it by name.
+- Does a .o file know its final load address? => No; addresses are typically 0 or placeholders in a relocatable object file (as seen in the `nm` output above), finalized only when the linker (static) or loader (shared library) assigns real addresses.
+PITFALL: Assuming `nm` output on a stripped binary or a fully linked executable looks the same as on a `.o`; a final executable's local symbols and relocation info are often discarded, and `nm`/`strip` behavior differs from the intermediate object file stage.
+
+@@ 13.08 | Intermediate | Trap | tags=tentativedefinition,fcommon
+Q: Two files each write plain `int config_flag;` (no initializer) at file scope via a shared header, with no extern anywhere. Does that link?
+SHORT: Depends on the compiler's -fcommon default. Modern GCC (10+) defaults to -fno-common: it fails with "multiple definition", since each file's uninitialized int is a full definition. With -fcommon (the old Unix default), the linker merges both "common" symbols into one and it links fine. C11 6.9p5 disallows two external definitions once the identifier is used; the merging behavior is a tolerated extension, not standard-guaranteed.
+DEEP:
+Verified on this toolchain (GCC 13, `-std=c11 -Wall -Wextra`), same two files as in 13.05 but *without* an initializer:
+```c
+/* bad_hdr2.h */
+int config_flag;   /* no initializer: a tentative definition (C11 6.9.2) */
+```
+Default flags:
+```
+$ gcc -c x3.c -o x3.o && gcc -c y3.c -o y3.o && gcc x3.o y3.o -o link3
+/usr/bin/ld: y3.o:(.bss+0x0): multiple definition of `config_flag';
+x3.o:(.bss+0x0): first defined here
+```
+Adding `-fcommon` at compile time changes what kind of symbol `nm` reports:
+```
+$ gcc -fcommon -c x3.c -o x4.o
+$ nm x4.o | grep config_flag
+0000000000000004 C config_flag        <- C: common symbol, mergeable
+$ gcc -fcommon x4.o y4.o -o link4 && ./link4 ; echo $?
+0
+```
+With `-fcommon`, an uninitialized file-scope int becomes a *common* symbol (`C` in `nm`), and the linker is explicitly allowed to merge multiple common definitions of the same name into one shared storage location -- this is the classic "K&R common symbol" behavior that predates strict ODR-style enforcement, and it is what C11 6.9.2p2's tentative-definition wording is describing at the level of a single translation unit (and many linkers historically extended across translation units too). GCC changed its *default* to `-fno-common` in version 10 specifically because this merging masks real bugs (accidentally declaring the same global in two unrelated files).
+
+The moral for an interview: never rely on this. Always give exactly one file-scope definition with an initializer, and `extern` declarations everywhere else, as in 13.05's fix.
+FOLLOW:
+- Would an explicit `int config_flag = 0;` in both files show the same -fcommon-dependent behavior? => No; an explicit initializer makes it an external definition immediately (6.9.2p1), not a tentative one, so it is a hard multiple-definition error regardless of -fcommon.
+- Is relying on -fcommon portable across compilers? => No; it is a GCC/linker convenience rooted in traditional Unix toolchains, not something the C standard promises, so code depending on it can fail to link with a different compiler or a newer GCC default.
+PITFALL: Writing what looks like "just a global declaration" (`int x;`) in a shared header and assuming every compiler treats accidental duplication the same way; the actual outcome depends on a compiler flag whose default has changed across toolchain versions.
+VERIFY: C11 6.9.2 paragraph 2; gcc -fcommon/-fno-common default per GCC 10 release notes
+
+@@ 13.09 | Intermediate | Concept | tags=make,incrementalbuild
+Q: What does a Makefile's rule graph actually orchestrate, and how does it decide what to rebuild?
+SHORT: Each rule says "this target depends on these files; run this recipe if the target is missing or older than any dependency." make compares file modification timestamps and only re-runs recipes for out-of-date targets, so touching one .c file recompiles just that file (and re-links), not the whole project.
+DEEP:
+A minimal real Makefile:
+```
+prog: a.o b.o
+	$(CC) $(CFLAGS) a.o b.o -o prog
+a.o: a.c
+	$(CC) $(CFLAGS) -c a.c -o a.o
+b.o: b.c
+	$(CC) $(CFLAGS) -c b.c -o b.o
+```
+First `make` run compiles both files and links:
+```
+gcc ... -c a.c -o a.o
+gcc ... -c b.c -o b.o
+gcc ... a.o b.o -o prog
+```
+Touching only `a.c` and re-running `make` produces exactly:
+```
+gcc ... -c a.c -o a.o
+gcc ... a.o b.o -o prog
+```
+`b.o` is untouched: `make` saw that `b.o` is newer than `b.c`, so `b.c -> b.o`'s rule is already satisfied. It only recompiled `a.o` (because `a.c` is now newer than `a.o`), then re-ran the link rule because `prog`'s dependency `a.o` just changed.
+
+This is the entire mechanism behind "incremental builds": a directed graph of file dependencies plus a timestamp comparison, nothing more magical. Getting the dependency list wrong (a common bug: forgetting that `a.o` also depends on any header `a.c` includes) means `make` will not know to rebuild `a.o` when only a header changes -- the classic "stale build" bug fixed in real projects by compiler-generated `.d` dependency files.
+FOLLOW:
+- Why does the link step re-run even though prog.c itself does not exist? => Because prog's own rule lists a.o and b.o as prerequisites, and a.o's timestamp just changed, making prog older than one of its prerequisites.
+- What is missing from this toy Makefile that a real one needs? => Automatic header dependency tracking (e.g. gcc -MMD generating .d files) so that changing a shared header also triggers recompilation of every .c that includes it.
+PITFALL: Relying only on explicit .c-to-.o rules without header dependency tracking; editing a widely-included header silently leaves stale .o files that make believes are up to date.
+
+@@ 13.10 | Advanced | Concept | tags=staticlinking,dynamiclinking,sharedlibrary
+Q: What actually changes between static linking and dynamic (shared-library) linking, and at what point does each one happen?
+SHORT: Static linking copies the needed library code into the executable at build time; the file is self-contained and its size grows accordingly. Dynamic linking leaves a reference (a needed .so name plus exported symbol names) in the executable and defers loading and resolving that code until the program starts (or first calls into it), via the dynamic loader; multiple running programs can then share one physical copy of the library in memory.
+DEEP:
+Real demonstration: a one-function shared library.
+```c
+/* libmath2.c */
+int triple(int x) { return x * 3; }
+```
+Built with `gcc -fPIC -shared -o libmath2.so libmath2.o`, then a program linked against it with `gcc usemath.o -L. -lmath2 -o dynprog`.
+
+`nm -D libmath2.so` (dynamic symbol table only) shows:
+```
+00000000000010f9 T triple
+```
+`ldd ./dynprog` (with the .so on the library path) shows the dependency the loader must satisfy before `main` runs:
+```
+libmath2.so => ./libmath2.so (0x00007fa140337000)
+```
+Running it prints `21` (triple(7)), confirming the call actually crosses the shared-library boundary correctly. Comparing file sizes for a statically-linked "hello world" versus this dynamically-linked program in this environment came out nearly identical (~16000 bytes) at this tiny scale, because the real weight difference only shows up with a library much bigger than libc's already-shared startup code; the size argument for dynamic linking matters at the scale of, say, linking against a multi-megabyte library used by many processes on one system.
+
+Practically:
+- Build time: static linking resolves every symbol now, and the result runs with no further dependency lookups. Dynamic linking leaves symbol names in the binary for the loader to resolve later.
+- Load/start time: the dynamic loader (`ld.so` on Linux) must find every `.so` listed (`ldd` shows exactly this list), map it into the process, and patch call sites to the resolved addresses (see 13.15 for the PLT/GOT mechanism doing that patching).
+- Update story: replacing a shared library file updates every program that dynamically links it, without rebuilding them (this is also the ABI-break risk in 13.18); a statically linked program needs a full rebuild to pick up a fix.
+- Memory: multiple processes using the same .so can share its code pages in physical memory; statically linked copies cannot.
+FOLLOW:
+- Why is -fPIC needed to build the shared library here? => Position-independent code has no hard-coded absolute addresses, so the same physical code pages can be mapped at a different virtual address in every process that loads the library.
+- Does the C standard mandate any of this? => No; static/dynamic linking, .so files, and the dynamic loader are operating-system and toolchain concepts, not part of ISO C, which only requires that "library components are linked to satisfy external references" (5.1.1.2) without saying how.
+PITFALL: Assuming a dynamically linked program is guaranteed to run unchanged after a library upgrade; a shared library update that silently changes a function's behavior or ABI breaks every program depending on the old contract, see 13.18.
+
+@@ 13.11 | Advanced | Concept | tags=inline,linkage,externinline
+Q: In C11, what is the real difference between static inline, plain inline, and extern inline on a function defined in a shared header, and why does only one of them reliably link?
+SHORT: static inline gives the function internal linkage: every translation unit that includes it gets its own private copy, and there is never a symbol clash, which is why it is the safe default for header-defined helpers. Plain inline (no static, no extern) is an inline definition only: C11 6.7.4p7 says it "does not provide an external definition", so if no translation unit anywhere also provides one, every call becomes an unresolved external reference and the program fails to link.
+DEEP:
+Real test, two translation units including the same header each way.
+
+`static inline` version (`infl.h`: `static inline int sq(int x) { return x * x; }`), included by `p1.c` and `p2.c`:
+```
+$ nm p1.o | grep sq
+0000000000000000 t sq
+$ nm p2.o | grep sq
+0000000000000000 t sq
+$ gcc p1.o p2.o -o pstatic && ./pstatic
+9 16
+```
+Two independent local (`t`, lowercase) copies, no clash, links and runs fine.
+
+Plain `inline` version (`infl2.h`: `inline int sq2(int x) { return x * x; }`), included the same way by `q1.c` and `q2.c`:
+```
+$ nm q1.o | grep sq2
+                 U sq2
+$ nm q2.o | grep sq2
+                 U sq2
+$ gcc q1.o q2.o -o pinline
+/usr/bin/ld: q1.o: in function 'use2':
+q1.c:(.text+0xe): undefined reference to 'sq2'
+/usr/bin/ld: q2.o: in function 'main':
+q2.c:(.text+0x13): undefined reference to 'sq2'
+```
+Both `.o` files show `sq2` as `U` (undefined) -- the compiler treated the plain-`inline` definition as usable only for inlining calls *within* that translation unit's own emitted code path, and (per 6.7.4p7) did not also emit a callable external definition. Since no third translation unit supplies `extern inline int sq2(int x) { ... }` (which is exactly the escape hatch the standard describes for providing the one external definition an inline function needs when it is not always inlined away), every call falls through to an unresolved reference.
+
+The practical rule for header-only helpers: use `static inline`. Reach for plain `inline` (paired with one `extern inline` definition in a single .c file) only when deliberately building the classic "inline in headers, one real definition in one .c file for whichever translation unit needs an address-of or a non-inlined call" pattern, which is easy to get wrong.
+FOLLOW:
+- Why did the static inline version show a lowercase t and still work across two files with the identical function body? => Internal linkage means each translation unit's copy is a separate entity by definition (6.2.2p2); nothing requires them to be merged, so duplicate private copies of a small helper are completely normal and cheap.
+- What extra declaration would make the plain-inline version link? => Adding a definition with the extern specifier (extern inline int sq2(int x) {...}) in exactly one translation unit gives the program the one external definition C11 6.7.4p7 says an inline function needs when it is not defined with extern anywhere.
+PITFALL: Assuming inline by itself behaves like C++'s inline (which does imply a mergeable, always-available external definition); in C11 it does not, and swapping static inline for plain inline in a widely-included header can turn a working build into a wall of "undefined reference" errors.
+VERIFY: C11 6.7.4 paragraph 7
+
+@@ 13.12 | Advanced | Debug | tags=undefinedreference,linkererror
+Q: A build fails with `undefined reference to 'compute_checksum'`. Walk through how you would root-cause it.
+SHORT: The symbol has a declaration (so the compiler accepted the call) but no definition anywhere on the link line. Check in order: is the defining .c file actually compiled and passed to the final link command; is the function accidentally static in the file that defines it; is the name mismatched by a typo or a macro-guarded branch; and, for a library, is it listed on the link line in the right position relative to the objects that need it (13.13).
+DEEP:
+A systematic checklist, cheapest checks first:
+
+1. Confirm the symbol name exactly: `nm your_object.o | grep compute_checksum` on the .o you expect to define it. If it does not appear at all, that file was never compiled with the code you think it has, or was not recompiled after being edited (a stale-build problem, see 13.09's dependency tracking note).
+2. Check for accidental internal linkage: if `nm` shows a lowercase `t compute_checksum` in the defining file instead of uppercase `T`, someone marked it `static`, making it invisible outside that translation unit -- remove `static` or add a proper non-static entry point.
+3. Confirm the defining .o is actually on the final link command line: it is common in growing Makefiles/CMake setups for a new .c file to compile fine (producing a valid .o) but never get added to the list of objects passed to the final `gcc ... -o prog` invocation.
+4. Check link order for libraries: if `compute_checksum` lives in a static library (`.a`), it must appear *after* the object file that calls it on the command line (see 13.13); listing it first means the linker never pulls that member in.
+5. Check for a name mismatch introduced by conditional compilation: a `#ifdef` that compiles a different function name on this platform, or a typo that only shows up as a mismatch between a header declaration and the .c definition (which the compiler cannot catch, since C has no cross-file type checking for this, see 13.03).
+
+Each step is directly checkable with `nm`/`objdump` on the real object files and the actual link command, rather than guessing.
+FOLLOW:
+- Would a missing #include of the function's prototype header cause this exact error? => No, that would usually be a compile-time warning/error (implicit declaration) or, if it compiled anyway, a type mismatch; "undefined reference" specifically means the compiler was satisfied but the linker found no definition.
+- Does the error tell you which translation unit is missing the definition, or just that no one supplied it? => Just the latter; the linker only reports the reference site(s) that needed the symbol and the fact that nothing on the link line defined it, so locating the intended definition is on you.
+PITFALL: Chasing this as if it were a compiler problem (re-checking headers and prototypes) when the actual cause is a build-system issue: the defining .c file was never added to the link command, or a library is in the wrong position.
+
+@@ 13.13 | Advanced | Trap | tags=staticlibrary,linkorder,ar
+Q: You link against two static libraries where liba.a needs a symbol from libb.a, using `gcc main.o -la -lb -o prog`. It works. Why does `gcc -la -lb main.o -o prog` (same libraries, different position) fail with an undefined reference to a function that is clearly inside liba.a?
+SHORT: A traditional Unix linker scans the command line left to right and, on hitting a static library, pulls in only the archive members needed by *undefined references it already has* at that point, then discards the rest of that library from consideration. Objects and libraries providing needed symbols must come after the things that reference those symbols; putting -la -lb before main.o means the linker has no outstanding references yet when it scans the archives, so it pulls nothing from either.
+DEEP:
+Real, reproducible example. `funcb.o` defines `funcb`; `funca.o` calls `funcb` and defines `funca`; `mainprog.o` calls `funca`. Archived as `liba.a` (contains funca.o) and `libb.a` (contains funcb.o).
+```
+$ gcc mainprog.o -L. -la -lb -o prog_ok && ./prog_ok
+11
+$ gcc -L. -la -lb mainprog.o -o prog_bad
+/usr/bin/ld: mainprog.o: in function 'main':
+mainprog.c:(.text+0xe): undefined reference to 'funca'
+```
+In the working command, the linker processes `mainprog.o` first, which creates an outstanding undefined reference to `funca`. It then scans `liba.a`, finds `funca` there, pulls that member in (which in turn creates a new outstanding reference to `funcb`), then scans `libb.a` and resolves that too. Every reference is satisfied by something appearing later on the command line.
+
+In the failing command, `liba.a` and `libb.a` are scanned first, while there are zero outstanding references (nothing has asked for `funca` or `funcb` yet), so the linker takes nothing from either archive and moves on. By the time it reaches `mainprog.o` and discovers it needs `funca`, both archives have already been scanned and, for a traditional one-pass linker, are not revisited.
+
+The general rule: on the link command line, list libraries *after* the objects (and other libraries) that need their symbols, and list a library that itself depends on another library *before* that other library (so `-la -lb` when a needs b, not `-lb -la`). For a true circular dependency between two static libraries, repeating a library (`-la -lb -la`) or using `-Wl,--start-group ... --end-group` forces the linker to rescan.
+FOLLOW:
+- Would this same ordering problem happen with regular .o files instead of .a archives? => No; plain object files (not inside an archive) are always fully included in the link regardless of position, only archive member selection is order-sensitive.
+- Why does a modern linker not just fix this automatically? => Some linkers (e.g. gold, or GNU ld with certain flags) support smarter multi-pass or as-needed resolution, but the traditional single-pass left-to-right behavior is still the portable assumption interviewers expect you to know and reason about.
+PITFALL: "Fixing" a link-order failure by blindly repeating every library on the command line instead of understanding the dependency direction; it works by accident and hides a build script that will break again the next time a new circular or reordered dependency is introduced.
+
+@@ 13.14 | Advanced | Concept | tags=namemangling,extern-c
+Q: Why does linking a C library from C++ require extern "C", when linking two C files never needs anything like it?
+SHORT: C has no overloading, so a C compiler emits a function's own name (implementation-defined leading underscore aside) as its linker symbol. C++ supports overloading, so a C++ compiler "mangles" parameter types into the symbol name; extern "C" tells the C++ compiler to emit the plain, unmangled C-style name instead, so it matches what the C object file or library actually exports.
+DEEP:
+This is purely a toolchain/ABI convention, not something C11 specifies (ISO C has one function namespace per translation unit and no overloading, so it never needed a mangling scheme). It matters for this module because it is the single most common real-world linking failure when C and C++ object files meet: a C++ translation unit calling a C function declared without `extern "C"` looks for a mangled symbol like `_Z6triplei`, while the C object file exports the plain name `triple`, and the link fails with an undefined reference even though the function objectively exists.
+
+This is why C library headers meant to be usable from C++ wrap their declarations:
+```c
+#ifdef __cplusplus
+extern "C" {
+#endif
+int triple(int x);
+#ifdef __cplusplus
+}
+#endif
+```
+No such wrapping is ever needed between two C translation units, because both sides already agree on the same simple, unmangled naming convention by default.
+FOLLOW:
+- Does this affect data symbols (variables) the same way? => Yes; a global variable declared in a C++ translation unit without extern "C" also gets a mangled or namespace-qualified name and will not match a plain C definition.
+- Is name mangling part of the C11 standard? => No; it is entirely a C++ compiler/ABI concept (and differs between C++ compilers on some platforms), while C11 only defines linkage (external/internal/none), not any name-encoding scheme.
+PITFALL: Assuming any two toolchains agree on how a C function name reaches the linker; a leading underscore or symbol-name convention is implementation-defined, and mixing compilers or object formats across platforms can trip on this even in pure C.
+
+@@ 13.15 | Advanced | Cross-layer | tags=plt,got,dynamicloading
+Q: When a dynamically linked program calls a function that lives in a shared library, how does that call actually reach the right address, given that the .so's load address is not known until runtime?
+SHORT: The compiler emits the call through a small stub (the Procedure Linkage Table, PLT) instead of a direct address. The PLT stub jumps through an entry in the Global Offset Table (GOT), a per-process table of addresses that the dynamic loader fills in (often lazily, on first call) once it knows where each shared library actually got mapped. This indirection is what lets the same position-independent .so code (13.10) work at a different address in every process.
+DEEP:
+This is operating-system/ABI machinery sitting on top of what C itself guarantees, so treat it as background rather than a standards citation.
+
+- At compile time (with -fPIC), a call to a function that might live in a shared library is compiled as a call to a PLT stub at a fixed offset within the executable's own code, not a call to the function's real address (which is not known yet).
+- The PLT stub loads an address from a corresponding GOT slot and jumps there. Initially (with lazy binding, the traditional default), that GOT slot points back into the dynamic loader's resolver code.
+- The first time that function is actually called, the resolver looks up the real symbol address in the loaded .so (this is the step `ldd`/`nm -D` are previewing statically: which .so, which exported symbol), writes the real address into the GOT slot, and jumps to it. Every subsequent call through the same PLT stub now jumps straight to the GOT slot's now-correct address, skipping the resolver.
+- This is exactly why 13.10's `nm -D libmath2.so` step (listing exported dynamic symbols) and `ldd`'s dependency list are the two pieces of information the loader needs at this point: which library to map, and which symbol names inside it are valid jump targets.
+
+For firmware/embedded interview purposes, the point worth stating unprompted: this indirection is real runtime overhead (an extra memory load and jump on first call, then one extra load thereafter) compared to a statically linked call, which is one reason latency-critical or very small embedded images often prefer static linking or link-time-resolved calls entirely.
+FOLLOW:
+- Is PLT/GOT part of the C standard? => No; it is an ELF/ABI mechanism used by common Linux and Unix-like loaders, entirely outside what C11 specifies about linking.
+- What does "lazy binding" trade off against? => It defers resolution cost to first-use (faster process startup when many library functions are never called), at the cost of a slightly slower first call to each one and a security surface (GOT-overwrite based exploits) that hardened builds sometimes disable via full RELRO/eager binding.
+PITFALL: Assuming a dynamically linked call has identical performance to a statically linked one; the extra indirection is small but nonzero, and matters when profiling a tight, latency-sensitive loop that happens to cross a shared-library boundary.
+
+@@ 13.16 | Principal | Scenario | tags=odr,headerdesign
+Q: Two translation units each #include the same header, but through different preprocessor conditions the header ends up defining a non-static, non-inline function with two different bodies for the same name. What actually happens when you try to link this, and what should you have done instead?
+SHORT: This is not silently "resolved" by picking one version: both are full external definitions of the same ordinary function name, so the linker reports a plain multiple-definition error, just like 13.05 and 13.08's variable case but for a function symbol. The fix is to never define an ordinary function inside a header: declare it there, and give it exactly one definition, in exactly one .c file, regardless of build configuration.
+DEEP:
+Verified reproduction: a header whose body depends on a macro define.
+```c
+/* oops.h */
+#ifdef VARIANT_B
+int clamp(int x) { return x > 10 ? 10 : x; }
+#else
+int clamp(int x) { return x > 5 ? 5 : x; }
+#endif
+```
+`u1.c` includes it as-is; `u2.c` does `#define VARIANT_B` before including it. Compiling both succeeds independently. Linking:
+```
+/usr/bin/ld: u2.o: in function 'clamp':
+u2.c:(.text+0x0): multiple definition of 'clamp'; u1.o:u1.c:(.text+0x0): first defined here
+```
+This is a reassuring result for an interview to be able to state precisely: an ordinary function symbol is never "common"/mergeable the way an uninitialized variable can be under -fcommon (13.08); the linker always treats two full function bodies with the same external name as a hard error, so this particular class of mistake fails loudly rather than silently picking whichever definition happened to link first. (Contrast this with a truly dangerous version of the same mistake: if the two variants were compiled into *separate shared libraries* loaded by the same process, or one side used `static`/weak-symbol tricks to suppress the clash, the wrong body actually can win silently -- which is why symbol visibility and versioning, 13.17-13.18, matter for real shared-library design.)
+
+What should have been done: never put an executable function body in a header guarded by build-configuration macros. Put the two variants in separate .c files (`clamp_variant_a.c`, `clamp_variant_b.c`) selected at build time by which file the Makefile compiles, or make the branch a runtime `if` inside one always-compiled function, and keep the header to a single declaration.
+FOLLOW:
+- Would marking both variants static have avoided the link error? => Yes, each would become a private internal-linkage copy per translation unit with no cross-file clash, but that reintroduces the real danger: two translation units silently running logically different code under the same function name with no diagnostic at all.
+- Is this scenario covered by a specific standard clause? => Yes, the same one as 13.05's variable case: C11 6.9 paragraph 5 requires exactly one external definition for an identifier that is used, and this is a function identifier violating it.
+PITFALL: Assuming a multiple-definition link failure here is a false alarm because "the header is fine, it is just conditional"; the compiler and linker are correctly reporting the two constructs the header actually can be turned into.
+VERIFY: C11 6.9 paragraph 5
+
+@@ 13.17 | Principal | Concept | tags=abi,visibility,sharedlibrary
+Q: You are designing a shared library that a firmware validation tool will load at runtime. What linking-level choices matter for keeping its ABI stable, and how would you enforce them?
+SHORT: Decide which symbols are the public API and hide everything else (mark internal helpers static, or build with -fvisibility=hidden and export only the intended entry points); version the exported symbol set so old and new builds can be told apart; and never change an exported function's signature or a shared struct's layout without bumping that version, since old callers keep calling by name/offset, not by recompiled knowledge of the new layout.
+DEEP:
+Concretely, the choices a Principal-level design review should call out unprompted:
+
+- Default visibility is wrong for a library: without `-fvisibility=hidden` (or per-symbol `static`), every non-static function and global in the library is a dynamic symbol (visible in `nm -D`, as seen in 13.10), which means internal helper functions become part of the accidental public ABI, and any future rename of one is technically a breaking change for anyone who (mis)used it.
+- Explicit exports: build the small, intended API surface with an explicit export mechanism (a version script listing exported names, or `__attribute__((visibility("default")))` on just those functions) and leave the rest hidden. This directly narrows what 13.15's PLT/GOT resolution machinery, and any external tool inspecting the .so, ever sees.
+- ABI stability across a struct passed by pointer across the library boundary: adding a field in the middle, or changing a field's type, silently breaks every caller compiled against the old header without a rebuild (the classic embedded-firmware "who owns which struct layout" bug); the safe pattern is either an opaque pointer (caller never sees the struct's layout, only calls accessor functions) or appending new fields only at the end plus a version/size field the caller passes in.
+- Symbol versioning: giving exported symbols explicit version tags (the same mechanism glibc uses) lets the library ship a new, incompatible implementation of a function under the old name for old callers, while new callers linking against the new version get the new behavior, without either side needing a rebuild it does not already need.
+
+The failure mode this whole design is defending against is exactly 13.18's scenario: swap in a new .so, and every program that dynamically links it inherits whatever changed, whether or not that program was rebuilt to expect it.
+FOLLOW:
+- Why is an opaque pointer safer than exposing a struct's layout across a shared-library boundary? => Because the caller never bakes the struct's field offsets into its own compiled code; only the library's own functions (compiled together with the struct definition) ever touch its fields directly, so the library is free to change the layout in a new version.
+- What is the one-sentence version of "why hide internal symbols"? => Every exported symbol is a promise you have to keep in every future release; hiding everything except the deliberate API keeps that promise small.
+PITFALL: Treating "it compiles and links against the new .so" as proof the ABI is intact; a mismatched struct layout, an accidentally-renamed internal helper someone else's code was calling, or a changed function signature can all link and then corrupt data or crash at runtime, with no linker diagnostic at all.
+
+@@ 13.18 | Principal | Scenario | tags=abi,debugging,sharedlibrary
+Q: A device previously running fine starts crashing (or silently corrupting data) immediately after only one shared library file on the target was swapped for a "compatible" update, with no other code changed. How do you diagnose this as a linking/ABI problem rather than a fresh logic bug?
+SHORT: Treat it as an ABI-mismatch investigation, not a new-bug hunt: diff the old and new .so's exported symbols (nm -D, readelf --dyn-syms) for anything renamed, resized, or reordered; check whether any struct shared across the boundary changed layout; and check whether the caller was ever rebuilt against a matching header. The caller still calls by name/offset against an assumption baked in at its own build time, and only the library's binary content changed.
+DEEP:
+A concrete diagnostic sequence for this exact situation:
+
+1. Confirm it really is the library swap, not a coincidence: revert to the old .so on a spare unit and confirm the crash disappears; this isolates the variable to exactly one file.
+2. Diff the exported symbol tables: `nm -D old.so > old.syms; nm -D new.so > new.syms; diff old.syms new.syms`. A symbol that disappeared, or changed from a function to something else, or gained/lost a version suffix, is an immediate suspect (this is the same table 13.10 and 13.17 build directly on).
+3. Check for a struct layout change across the boundary: if the library and the caller both compile against a shared header defining a struct passed by value or by pointer, confirm both were built from the *identical* header revision; a field added, removed, reordered, or resized in that struct between the two .so builds is the single most common silent-corruption cause, because the caller's already-compiled code keeps using the old field offsets against the new library's differently-laid-out data.
+4. Check the caller was not, in fact, supposed to be rebuilt: "compatible update" claims are only as good as the versioning discipline in 13.17; if the new .so bumped a symbol version or changed a documented struct, the caller needed a matching rebuild and simply was not given one.
+5. If the symbol tables and struct layout actually match, move on to a normal logic-bug investigation inside the new library's changed code, using the debugging techniques in module 16, rather than continuing to suspect linking.
+
+Stating this sequence unprompted, in this order (fastest and least invasive checks first, matching your own knowledge of what 13.10/13.15/13.17 actually change at the binary level) is what distinguishes a Principal-level answer from "add some printf statements and see."
+FOLLOW:
+- Would rebuilding the calling program have caught this ahead of time? => Only if it was rebuilt against the new library's current header/version at the same time the new .so was deployed; the entire failure mode exists because the caller's binary was not rebuilt when the library's binary changed.
+- Is this fundamentally a linker problem or a process/discipline problem? => Process/discipline; the linker and loader did exactly what they were told (resolve these names dynamically), the missing piece is a versioning and compatibility contract that was not actually honored by the update.
+PITFALL: Spending debugging time inside the caller's unchanged source code, because "nothing else was touched," when the actual defect is a binary-compatibility break introduced entirely by the library update.

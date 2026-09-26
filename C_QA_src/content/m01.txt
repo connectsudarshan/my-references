@@ -1,0 +1,485 @@
+# Module 1: Types, Storage Classes, Scope & Linkage
+
+@@ 1.01 | Basic | Concept | tags=declaration,definition
+Q: What is the difference between a declaration and a definition in C?
+SHORT: A declaration tells the compiler an identifier exists and gives its type; a definition also reserves storage (for an object) or provides a body (for a function). `extern int x;` is a declaration only; `int x;` at file scope is a definition (tentative if uninitialized).
+DEEP:
+Every definition is also a declaration, but not every declaration is a definition.
+
+- `extern int x;` at any scope: declaration only, no storage reserved here.
+- `int x;` at file scope: a definition (tentative per 6.9.2 if there is no initializer elsewhere in the translation unit).
+- `int x = 0;` at file scope: always a definition, never tentative.
+- A function prototype `int f(int);` is a declaration; `int f(int n) { return n; }` is a definition.
+
+```c
+#include <stdio.h>
+
+extern int counter;      /* declaration only: refers to the definition below */
+int counter = 0;         /* the one definition: this reserves storage */
+
+int main(void)
+{
+    extern int counter;  /* redundant re-declaration, same object */
+    counter++;
+    printf("counter = %d\n", counter);
+    return 0;
+}
+```
+Compiled and run with gcc -std=c11 -Wall -Wextra: prints `counter = 1`.
+FOLLOW:
+- Can a header file contain a definition? => Only safely for functions marked `static inline`, or via a tentative definition trick; a plain `int x;` in a header included by multiple .c files causes multiple-definition link errors under C's default semantics on most modern toolchains.
+- Why does `extern int x;` inside `main` work here? => It is just another declaration of the same file-scope object; it does not create a new variable.
+PITFALL: Writing `int x;` in a header and including it in two .c files: each translation unit gets its own tentative definition, and linking both together commonly fails with a duplicate-symbol error.
+VERIFY: 6.9.2
+
+@@ 1.02 | Basic | Concept | tags=types,ranges
+Q: What are C's standard integer types and what does the standard guarantee about their ranges?
+SHORT: char, short, int, long, long long (each signed or unsigned) with non-decreasing rank and non-decreasing minimum width: char >= 8 bits, short/int >= 16 bits, long >= 32 bits, long long >= 64 bits. Exact sizes beyond that are implementation-defined; use stdint.h for guaranteed widths.
+DEEP:
+The standard fixes *minimum* ranges, not exact sizes. `int` is only guaranteed to hold at least -32767 to 32767 (16-bit minimum); on almost every desktop and embedded 32-bit target today it is 32 bits, but a strictly portable firmware codebase should not assume that.
+
+For a guaranteed exact width, use `<stdint.h>`: `int8_t`, `uint16_t`, `int32_t`, `uint64_t`, etc. (7.20.1.1: "designates a signed/unsigned integer type with width N, no padding bits, and a two's complement representation" for the intN_t forms specifically).
+
+```c
+#include <stdio.h>
+#include <stdint.h>
+#include <limits.h>
+
+int main(void)
+{
+    printf("sizeof(int8_t)=%zu sizeof(uint32_t)=%zu sizeof(int64_t)=%zu\n",
+           sizeof(int8_t), sizeof(uint32_t), sizeof(int64_t));
+    printf("INT8_MIN=%d INT8_MAX=%d UINT32_MAX=%u\n",
+           INT8_MIN, INT8_MAX, UINT32_MAX);
+    printf("plain int range: INT_MIN=%d INT_MAX=%d\n", INT_MIN, INT_MAX);
+    return 0;
+}
+```
+Output on this machine: `sizeof(int8_t)=1 sizeof(uint32_t)=4 sizeof(int64_t)=8`, `INT8_MIN=-128 INT8_MAX=127 UINT32_MAX=4294967295`, `INT_MIN=-2147483648 INT_MAX=2147483647`.
+FOLLOW:
+- Is `int8_t` guaranteed to exist on every platform? => No; it only exists if the platform has an exact 8-bit signed type. Use `int_least8_t` or `int_fast8_t` for portability without that guarantee.
+- Why prefer stdint.h types in protocol/register code? => Wire formats and hardware registers have fixed bit widths; `int`/`long` sizes vary by platform and ABI, which silently breaks layout assumptions.
+PITFALL: Assuming `long` is 64 bits; it is 32 bits on Windows LLP64 and on many 32-bit embedded targets, 64 bits on Linux/macOS LP64.
+VERIFY: 7.20.1.1
+
+@@ 1.03 | Basic | Concept | tags=scope,linkage
+Q: What is the difference between scope and linkage?
+SHORT: Scope is about where in the source text an identifier's declaration is visible (block, file, function, or function-prototype scope). Linkage is about whether separate declarations of the same identifier refer to the same object across scopes and translation units (external, internal, or no linkage). They are independent axes.
+DEEP:
+- **Scope** (6.2.1): file scope (outside any block, visible until end of translation unit), block scope (inside `{}`, visible until the block ends), function prototype scope (parameter names in a standalone prototype), function scope (labels only).
+- **Linkage** (6.2.2):
+  - **external linkage**: the same identifier in different translation units denotes the same object/function (the default for file-scope identifiers with no storage-class specifier, and for `extern`).
+  - **internal linkage**: the same identifier denotes the same object only within one translation unit (`static` at file scope).
+  - **no linkage**: each declaration denotes a distinct entity (ordinary block-scope variables without `extern`).
+
+A block-scope variable has block scope and (usually) no linkage: it is a fresh object every time you write it in a different function. A file-scope `static` variable has file scope and internal linkage: one object, visible from anywhere in that file but invisible to other files.
+FOLLOW:
+- Does a block-scope `static int x;` have linkage? => No; it has no linkage (it is a unique entity per declaration site) but static *storage duration*, so it retains its value between calls.
+- Can two functions in different files both have a local variable named `count` with no conflict? => Yes; block-scope locals have no linkage, so there is nothing to collide.
+PITFALL: Confusing "static" the storage-class specifier (which means internal linkage at file scope, but static storage duration at block scope) with a single unified meaning.
+VERIFY: 6.2.1, 6.2.2
+
+@@ 1.04 | Intermediate | Scenario | tags=char,signedness
+Q: Is plain `char` signed or unsigned in C, and why does it matter?
+SHORT: Whether plain `char` is signed or unsigned is implementation-defined (6.2.5p15); on most mainstream platforms including x86/ARM with gcc/clang it is signed. Code that stores small negative values or does bit manipulation in a `char` and assumes one behavior over the other is not portable.
+DEEP:
+`char`, `signed char`, and `unsigned char` are three distinct types for overload/type purposes, even though plain `char` has the same representation as one of the other two (implementation-defined which).
+
+```c
+#include <stdio.h>
+
+int main(void)
+{
+    char c = -1;
+    unsigned char uc = (unsigned char)-1;
+    printf("char c = -1 : c == %d, (c < 0) = %d\n", c, c < 0);
+    printf("unsigned char uc = -1 : uc == %u\n", uc);
+    printf("is plain char signed here? %s\n",
+           ((char)-1 < 0) ? "yes (signed)" : "no (unsigned)");
+    return 0;
+}
+```
+Compiled and run: `char c = -1 : c == -1, (c < 0) = 1`, `unsigned char uc = -1 : uc == 255`, `is plain char signed here? yes (signed)`. This confirms gcc on this x86-64 target treats plain char as signed.
+FOLLOW:
+- Where does the signedness of plain char actually bite? => Reading a byte from a binary file/protocol into a `char` and comparing it against a value > 127, or passing it to a function like `isalpha` without an explicit cast to `unsigned char` first (undefined behavior if the value is negative and not EOF).
+- How do you write portable byte-handling code regardless of char's signedness? => Always store raw bytes as `unsigned char` or `uint8_t`.
+PITFALL: `putchar('\xFF')` or `isupper(c)` with plain (possibly-signed) `char c` holding a byte value > 127 is undefined behavior; cast to `unsigned char` first.
+VERIFY: 6.2.5p15
+
+@@ 1.05 | Intermediate | Concept | tags=static,scope
+Q: What does the `static` keyword mean at file scope versus at block scope?
+SHORT: At file scope, `static` gives an identifier internal linkage (private to that translation unit). At block scope, `static` gives a local variable static storage duration (it keeps its value between calls) without changing its scope or linkage (it still has no linkage, still only visible inside the block).
+DEEP:
+These are two distinctly different effects sharing one keyword:
+
+| Where | Effect of `static` |
+|---|---|
+| File scope function/object | Internal linkage: invisible to other translation units |
+| Block scope object | Static storage duration: lifetime = whole program, initialized once; scope/linkage unchanged |
+
+```c
+#include <stdio.h>
+
+int next_id(void)
+{
+    static int id = 0; /* static storage duration: initialized once, survives calls */
+    return ++id;
+}
+
+int main(void)
+{
+    int a = next_id();
+    int b = next_id();
+    int c = next_id();
+    printf("%d %d %d\n", a, b, c);
+    return 0;
+}
+```
+Compiled and run: prints `1 2 3` (each call increments the same persistent object; a fresh automatic local would print `1 1 1`).
+FOLLOW:
+- Is a static local thread-safe? => No; without external synchronization, two threads calling `next_id()` concurrently can race on `id` (out of scope here, see the C Advanced page's concurrency modules for the memory-model treatment).
+- Why use file-scope static instead of a global? => To hide implementation details of a .c file (a translation-unit-private helper or state variable) the way a header-only "private" keyword would in other languages.
+PITFALL: Forgetting that a static local's *initializer* runs only once ever, not once per call; `static int x = compute();` does not re-run `compute()` on later calls.
+VERIFY: 6.2.2p3, 6.7.1p6
+
+@@ 1.06 | Intermediate | Concept | tags=register
+Q: What does the `register` storage-class specifier actually do, and why can you not take a register variable's address?
+SHORT: `register` is only a hint that the compiler should keep the object in the fastest storage available; the standard makes no guarantee it is honored, and modern optimizers usually ignore it and decide register allocation themselves. The one hard rule (6.7.1p6/footnote 121): you cannot take the address of anything declared `register`, with `&` or via array-to-pointer decay.
+DEEP:
+Because the compiler is allowed to actually place a `register` object in a machine register with no memory address, the standard forbids `&` on it (and forbids indexing/decay operations on a `register` array that would implicitly need its address). This is a **constraint**, not merely folklore: gcc rejects `&x` for a `register` local at compile time.
+
+In practice, on any optimizing compiler built after roughly 1995, `register` changes nothing: the compiler already performs its own register allocation and ignores the hint (it is legal for an implementation to treat every `register` declaration as a plain `auto` declaration, per 6.7.1p6). It survives mainly as a keyword you must recognize in legacy or textbook code, and as a reserved word you cannot use as an identifier.
+FOLLOW:
+- Does `register` guarantee no memory access at all? => No; it is only a suggestion (6.7.1p6: "the extent to which such suggestions are effective is implementation-defined").
+- Is `register` still legal on function parameters? => Yes, and it has the same "cannot take its address" restriction there too.
+PITFALL: Writing `int *p = &reg_var;` where `reg_var` is declared `register` is a compile error ("address of register variable requested"), not a runtime surprise.
+VERIFY: 6.7.1p6, footnote 121
+
+@@ 1.07 | Intermediate | Trap | tags=tentative,linkage
+Q: Can you declare the same file-scope variable more than once without an initializer? What if the linkage disagrees between declarations?
+SHORT: Yes: repeated uninitialized file-scope declarations are all "tentative definitions" (6.9.2) that merge into one object as long as their linkage agrees. If the same identifier ends up with both internal and external linkage in one translation unit, the behavior is undefined (6.2.2p7); gcc typically turns the specific static-after-non-static ordering into a hard compile error instead.
+DEEP:
+```c
+#include <stdio.h>
+
+int i4;          /* tentative definition, external linkage */
+int i4;          /* valid: another tentative definition, same object */
+static int i5;   /* tentative definition, internal linkage */
+static int i5;   /* valid: same object */
+
+int main(void)
+{
+    i4 = 4;
+    i5 = 5;
+    printf("i4=%d i5=%d\n", i4, i5);
+    return 0;
+}
+```
+Compiled and run: prints `i4=4 i5=5`; both pairs of repeated tentative definitions merge cleanly because each pair agrees on linkage.
+
+Now the disagreement case:
+```c
+int x = 1;      /* external linkage */
+static int x;   /* redeclare as internal linkage: linkage disagreement */
+```
+gcc's actual diagnostic for this ordering: `error: static declaration of 'x' follows non-static declaration` -- a hard error, not silent UB, because gcc chooses to reject rather than exploit the undefined behavior. (The reverse order, `static int x; int x;`, is exactly the 6.2.2p4 case where the later `extern`-less declaration inherits internal linkage from the prior one, so it is well-defined and refers to the same static-linkage object.)
+FOLLOW:
+- What does example 1 of 6.9.2 say about `int i2 = 2; ... int i2;`? => The second line is a plain declaration with no storage-class specifier, so by 6.2.2p5 it would default to external linkage while the first `static` gave it internal linkage: 6.2.2 renders this undefined, per the standard's own worked example.
+- Why does gcc turn some of these UB cases into compile errors instead of accepting them? => Diagnosing likely-unintended linkage mismatches at compile time is more useful to programmers than silently picking one interpretation, and the standard permits (but does not require) a diagnostic for constraint violations elsewhere; here gcc goes further as a quality-of-implementation choice.
+PITFALL: Declaring a variable `static` in one header-included declaration and forgetting `static` in another declaration of the same name in the same file; order determines whether you get a clean merge, a compile error, or (per the standard) undefined behavior.
+VERIFY: 6.9.2p2, 6.2.2p4, 6.2.2p7
+
+@@ 1.08 | Intermediate | Numeric | tags=promotion,sizeof
+Q: If `a` and `b` are both `unsigned char`, what type is `a + b`, and what happens when you assign the result back into an `unsigned char`?
+SHORT: Integer promotion converts both operands of `+` to `int` first (since `int` can represent every `unsigned char` value), so `a + b` has type `int` and cannot overflow at 8 bits for any `unsigned char` inputs. Assigning that `int` result back into an `unsigned char` then reduces it modulo 256 (6.3.1.3p2).
+DEEP:
+```c
+#include <stdio.h>
+
+int main(void)
+{
+    unsigned char a = 200, b = 100;
+    int sum = a + b;               /* promoted to int: no overflow possible */
+    printf("sum as int = %d\n", sum);
+
+    unsigned char c = a + b;       /* truncated mod 256 on the way back in */
+    printf("sum truncated into unsigned char = %u\n", c);
+
+    printf("sizeof(a + b) = %zu, sizeof(a) = %zu\n", sizeof(a + b), sizeof(a));
+    return 0;
+}
+```
+Compiled and run: `sum as int = 300`, `sum truncated into unsigned char = 44` (300 mod 256 = 44), `sizeof(a + b) = 4, sizeof(a) = 1`.
+
+The `sizeof` line is the tell: even though `a` and `b` are 1-byte objects, the *expression* `a + b` has type `int` (4 bytes here), because 6.3.1.1p2's integer promotions apply to both operands of `+` before the addition happens.
+FOLLOW:
+- Would this differ for `unsigned short`? => Same idea: promoted to `int` (or `unsigned int` if `int` cannot hold all `unsigned short` values, which is rare and platform-dependent) before the addition.
+- Does this mean 8-bit "wraparound" checksums computed with `unsigned char` variables never see intermediate truncation? => They do see truncation, exactly once, whenever a promoted `int` result is stored back into a narrower type; module 11 covers using this deliberately for bit-twiddling.
+PITFALL: Expecting a firmware "saturating" 8-bit add (clamped at 255) from plain `+`; C's promotion-then-truncate model gives silent wraparound (44, not 255), not saturation.
+VERIFY: 6.3.1.1p2, 6.3.1.3p2
+
+@@ 1.09 | Intermediate | Trap | tags=comparison,promotion
+Q: Why does `(-1 > 0u)` evaluate to true in C?
+SHORT: The usual arithmetic conversions (6.3.1.8) require both operands of a relational operator to have the same type; when one operand is `int` and the other is `unsigned int`, the `int` is converted to `unsigned int`. `-1` converted to `unsigned int` becomes `UINT_MAX` (4294967295 on a 32-bit int), which is greater than 0.
+DEEP:
+```c
+#include <stdio.h>
+
+int main(void)
+{
+    int a = -1;
+    unsigned int b = 0;
+    if (a > b) {
+        printf("a > b is TRUE (a became a huge unsigned value)\n");
+    } else {
+        printf("a > b is FALSE\n");
+    }
+    printf("(unsigned int)a = %u\n", (unsigned int)a);
+    return 0;
+}
+```
+Compiled with `-Wall -Wextra` and run: gcc emits `warning: comparison of integer expressions of different signedness: 'int' and 'unsigned int' [-Wsign-compare]` at the exact line, and the program prints `a > b is TRUE (a became a huge unsigned value)` and `(unsigned int)a = 4294967295`. This is exactly the kind of bug `-Wextra` is meant to surface; the warning is the point of showing this example, not something to silence.
+FOLLOW:
+- Where does this actually bite in real code? => Comparing a `ssize_t`/`int` return value (like a negative error code from `read()`) directly against a `size_t` length without checking for negative first.
+- How do you fix it? => Check the signed value's sign before comparing, or compare after an explicit, deliberate cast, or keep both operands the same signedness in the first place.
+PITFALL: Looping `for (int i = n - 1; i >= 0; i--)` where `n` is `size_t`/`unsigned`: `i >= 0` is fine since `i` is `int`, but `n - 1` when `n == 0` wraps to a huge `size_t` before the subtraction if you are not careful about which type it is computed in.
+VERIFY: 6.3.1.8
+
+@@ 1.10 | Advanced | Concept | tags=linkage,multi-file
+Q: How does `static` at file scope actually isolate an identifier between two translation units? Show it working.
+SHORT: A `static` file-scope identifier has internal linkage: each translation unit that declares `static int x;` gets its own independent object, even with the identical name, and no other file can refer to it via `extern`. Plain (non-static) file-scope identifiers have external linkage, so `extern` in another file really does refer to the same object.
+DEEP:
+Two translation units, linked into one program:
+
+```c
+/* file a.c */
+#include <stdio.h>
+static int hidden = 10;   /* internal linkage: private to this TU */
+int shared = 100;         /* external linkage: visible to other TUs */
+
+void show_a(void)
+{
+    printf("in file a: hidden=%d shared=%d\n", hidden, shared);
+}
+```
+```c
+/* file b.c */
+#include <stdio.h>
+static int hidden = 20;   /* a DIFFERENT object: same name, internal linkage */
+extern int shared;        /* refers to the SAME object defined in a.c */
+void show_a(void);
+
+int main(void)
+{
+    printf("in file b: hidden=%d shared=%d\n", hidden, shared);
+    shared = 200;
+    show_a();
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -o prog a.c b.c` and run: prints `in file b: hidden=20 shared=100` then `in file a: hidden=10 shared=200`. Each file's `hidden` stays independent (10 vs 20); both files' `shared` is the one object (100, then 200 after `b.c` modifies it).
+FOLLOW:
+- Would this link at all if both files declared `int hidden = 10;` (no `static`)? => No; both would have external linkage, and defining the same external identifier with an initializer in two translation units is a duplicate-definition link error.
+- Is this the C mechanism closest to "private" module state? => Yes; file-scope `static` is C's idiomatic way to hide a translation unit's internals from the rest of the program, similar in spirit to an anonymous namespace in C++.
+PITFALL: Relying on `static` file-scope variables for anything that needs to be shared across files; the fix for "I need this in another file too" is to drop `static` and add a matching `extern` declaration in a header, not to duplicate the definition.
+VERIFY: 6.2.2p3, 6.2.2p5
+
+@@ 1.11 | Advanced | Trap | tags=promotion,overflow
+Q: You want an 8-bit "saturating" add (clamp at 255) but wrote `unsigned char c = a + b;`. What actually happens, and how do you fix it?
+SHORT: Integer promotion computes `a + b` as an `int` (no overflow at that width), but assigning the `int` result into `unsigned char c` silently reduces it modulo 256 (6.3.1.3p2), giving wraparound, not saturation. To get real saturation you must check the promoted `int` result explicitly before narrowing.
+DEEP:
+```c
+#include <stdio.h>
+#include <stdint.h>
+
+uint8_t add_wrap(uint8_t a, uint8_t b) { return (uint8_t)(a + b); }
+
+uint8_t add_saturate(uint8_t a, uint8_t b)
+{
+    int sum = (int)a + (int)b;      /* still an int: safe to compare against 255 */
+    return (sum > 255) ? 255 : (uint8_t)sum;
+}
+
+int main(void)
+{
+    printf("wrap:     200 + 100 = %u\n", add_wrap(200, 100));
+    printf("saturate: 200 + 100 = %u\n", add_saturate(200, 100));
+    return 0;
+}
+```
+Compiled and run: `wrap:     200 + 100 = 44`, `saturate: 200 + 100 = 255`. The wraparound path is exactly what plain `+` followed by narrowing gives you for free; saturation always needs an explicit widened comparison, because C has no saturating-arithmetic operator.
+FOLLOW:
+- Does this generalize to signed types? => No directly; signed overflow itself is undefined behavior (module 10), so the "compute in a wider signed/unsigned type, then clamp" pattern must widen enough to avoid ever overflowing during the intermediate computation.
+- Is there a compiler builtin that helps? => gcc/clang expose `__builtin_add_overflow` for detecting overflow without relying on promotion width tricks; useful once you cannot simply widen further.
+PITFALL: Assuming promotion protects you from all overflow; it only protects the *computation* (because `int` is wide enough for one `unsigned char + unsigned char`), not the final narrowing assignment.
+VERIFY: 6.3.1.1p2, 6.3.1.3p2
+
+@@ 1.12 | Advanced | Cross-layer | tags=static,lifetime
+Q: What is the difference in lifetime between an automatic local variable and a static local variable, and what goes wrong if you return a pointer to the wrong one?
+SHORT: An automatic (ordinary) local's lifetime ends when its enclosing block exits; returning its address and then dereferencing that pointer after the function returns is undefined behavior. A static local has static storage duration: its lifetime is the entire program, so a pointer to it stays valid across calls.
+DEEP:
+```c
+#include <stdio.h>
+
+int next_id(void)
+{
+    static int id = 0;
+    return ++id;
+}
+
+int *bad_local_ptr(void)
+{
+    int local = 42;
+    return &local; /* returns address of an object whose lifetime just ended: UB */
+}
+
+int main(void)
+{
+    int a = next_id(), b = next_id(), c = next_id();
+    printf("%d %d %d\n", a, b, c);
+    int *p = bad_local_ptr();
+    (void)p; /* deliberately not dereferenced: doing so would be undefined behavior */
+    printf("ids demonstrate static storage retains value across calls\n");
+    return 0;
+}
+```
+Compiled with `-Wall -Wextra`: gcc flags `bad_local_ptr` with `warning: function returns address of local variable [-Wreturn-local-addr]` -- exactly the bug this question is about, kept as a warning rather than silenced because demonstrating it is the point. Run output: `1 2 3` then the static-retention message; `p` is never dereferenced, so the program itself has no observable UB despite holding a dangling pointer.
+FOLLOW:
+- Is the dangling pointer itself (unused) undefined behavior? => Merely holding an indeterminate/dangling pointer value is not itself UB; *using* it (dereferencing, or in some cases even comparing it) is.
+- What is the fix when you really do need to return per-call data by pointer? => Have the caller pass in storage, allocate on the heap (module 8) and document ownership, or return by value.
+PITFALL: This bug often "works" in unoptimized debug builds because the stack memory has not been reused yet, then fails mysteriously in release builds once the optimizer reuses that stack slot.
+VERIFY: 6.2.4p6
+
+@@ 1.13 | Advanced | Debug | tags=argument-order,unspecified
+Q: A colleague's code assumes `printf`-style logging always evaluates its arguments left to right. Why is that assumption unsafe in C?
+SHORT: The order in which a function's arguments are evaluated relative to each other is unspecified by the standard (6.5.2.2), not guaranteed left-to-right. Two conforming compilers, or even the same compiler at different optimization levels, may legally evaluate `f(g(), h())`'s arguments in either order.
+DEEP:
+```c
+#include <stdio.h>
+
+int n = 0;
+int tag(int v)
+{
+    n++;
+    printf("evaluating argument #%d -> value %d\n", n, v);
+    return v;
+}
+
+int main(void)
+{
+    printf("sum = %d\n", tag(1) + tag(2) + tag(3));
+    return 0;
+}
+```
+Compiled and run on this gcc/x86-64 build: it happened to evaluate `tag(1)`, then `tag(2)`, then `tag(3)`, in that order, giving `sum = 6`. That left-to-right result is what this particular compiler chose today; the standard does not promise it, and other compilers (or the same compiler targeting a different ABI, such as most 32-bit x86 calling conventions which traditionally push arguments right-to-left) commonly choose the opposite order.
+FOLLOW:
+- Is this the same rule as the unsequenced-side-effect UB in module 2? => Related but distinct: evaluating each *argument value* in an unspecified order is well-defined (each argument is fully sequenced internally), whereas `i++ + i++` mixes a side effect and a value use of the same object with no sequencing at all, which is undefined, not just unspecified.
+- How do you write logging code safely then? => Evaluate anything with a side effect into a named local variable on its own statement first, then pass the already-computed values to the logging call.
+PITFALL: Debug logging that calls a counter-incrementing or state-mutating helper function directly inside a multi-argument call can produce different counter values in different builds, and the difference is not a compiler bug.
+VERIFY: 6.5.2.2, Annex J.1 (order of evaluation of the function designator and arguments is listed as unspecified)
+
+@@ 1.14 | Advanced | Concept | tags=static,functions,linkage
+Q: Does `static` mean the same thing for functions as it does for variables?
+SHORT: Yes: `static` on a file-scope function gives it internal linkage, exactly like a `static` file-scope variable, so it is callable only from within its own translation unit. Functions have no separate "storage duration" concept the way objects do, so the analogy is cleaner for functions than the object case.
+DEEP:
+```c
+#include <stdio.h>
+
+static int helper(int x) { return x * 2; } /* internal linkage: private to this file */
+
+int public_api(int x)
+{
+    return helper(x) + 1;
+}
+
+int main(void)
+{
+    printf("public_api(5) = %d\n", public_api(5));
+    return 0;
+}
+```
+Compiled and run: prints `public_api(5) = 11`. If another translation unit wrote `extern int helper(int);` and tried to call it, linking would fail with an undefined-reference error, exactly as it would for a `static` variable: `helper` simply does not exist as a symbol outside this file.
+
+This is the standard C idiom for a module-private helper function: mark every function not part of your header's public API `static`, so the linker (and readers) can immediately tell what is meant to be called from elsewhere.
+FOLLOW:
+- Does marking helper functions `static` help the optimizer too? => Yes; a `static` function that is only called within the file is a much easier candidate for inlining and dead-code elimination, since the compiler can see every call site.
+- Can two files each define their own `static helper` with the same name with no conflict? => Yes, exactly like `static` variables; each is a distinct, internally-linked symbol.
+PITFALL: Forgetting `static` on an internal helper function pollutes the global symbol namespace and can silently collide with an identically-named function in another translation unit at link time, or worse, silently shadow the wrong one depending on link order with weak/strong symbol rules.
+VERIFY: 6.2.2p3, 6.2.2p5
+
+@@ 1.15 | Principal | Cross-layer | tags=register,volatile,forward-reference
+Q: A junior engineer suggests declaring a memory-mapped hardware register pointer as `register volatile uint32_t *p;` to "make register access fast." What is wrong with that reasoning?
+SHORT: `register` and `volatile` operate on different axes: `register` is a (usually-ignored) hint about where the compiler stores the *pointer variable*, while `volatile` controls how accesses through the pointer compile (module 7). Neither makes register access "fast"; `volatile` makes it *correct*, at a real cost, since it forbids caching the value across accesses.
+DEEP:
+This question is really about not conflating two unrelated storage/qualifier concepts that happen to both use the word "register":
+
+- `register` (this module, 6.7.1p6): a storage-class specifier, a hint to the compiler about the *variable* `p` (the pointer), applying to ordinary optimization decisions about where the pointer value lives. Compilers routinely ignore it.
+- `volatile` (module 7): a type qualifier on what `p` points to, forcing every read/write through `p` to actually happen as a real memory access, in program order, with no caching or reordering by the compiler. This is what memory-mapped I/O correctness depends on.
+
+Putting `register` on a `volatile` pointer variable does not change how accesses *through* that pointer are compiled at all; it only hints where the pointer value itself might live, which the optimizer will decide regardless. The mental model to give an interviewer: "`register` is about the compiler's use of CPU registers for a variable; `volatile` is about not eliding or reordering hardware-facing memory operations. They answer completely different questions, and `register` on a hardware-register pointer is a red herring, not an optimization."
+FOLLOW:
+- Does `volatile` provide atomicity or a memory barrier? => No (module 7 covers this in full); it only guarantees each access happens and happens in source order relative to other volatile accesses, nothing about atomicity across threads/interrupts or CPU-level memory ordering.
+- Is there ever a reason to use `register` in 2024-era embedded C? => Rarely; on some small microcontroller toolchains with weaker optimizers it can still matter, but the first thing to check is what your specific compiler's documentation says, not to assume 1990s folklore still applies.
+PITFALL: Treating "register" (the keyword) and "hardware register" (the memory-mapped I/O concept) as related just because they share a word; they are unrelated.
+VERIFY: 6.7.1p6
+
+@@ 1.16 | Principal | Scenario | tags=review,extern,firmware
+Q: Reviewing a firmware driver's headers, you see the same variable declared `extern int status;` in three .c files and defined (without `extern`) once in a fourth. A teammate wants to also mark it `static` in the definition "for encapsulation." Walk through why that specific change breaks the build and what the correct fix looks like.
+SHORT: Adding `static` to the one true definition gives that identifier internal linkage, so it becomes private to its own translation unit; the `extern int status;` declarations in the other three files then refer to a nonexistent external symbol, and the link fails with undefined-reference errors. Real encapsulation here means keeping the state `static` from the start and exposing accessor functions instead of the raw variable.
+DEEP:
+Method for this kind of review:
+
+1. Identify every declaration of the identifier across the codebase (`grep -rn 'status' --include=*.c --include=*.h`) and classify each as declaration-only (`extern`) or definition (initializer or no storage-class specifier at file scope).
+2. Check that exactly one file has the definition, and that its linkage (implicit external, since there is no `static`) matches what every `extern` declaration expects.
+3. If a variable truly should be private to one module, the fix is architectural, not a one-line edit: make it `static` in that one file, delete the `extern` declarations everywhere else, and add getter/setter functions (or an explicit "module API") for anything other files legitimately need.
+4. Re-run the link step immediately after any linkage change; a linkage mismatch across files is almost always caught at link time as an undefined-reference error (not a silent runtime bug), which is the good case -- the bad case (6.2.2p7, same identifier both internal and external linkage within one translation unit) usually only arises from redeclaring a name inconsistently *within a single file*, which is rarer in practice than the cross-file case, but is undefined behavior when it does happen rather than a link error.
+
+A concrete pitfall to name in the review: the teammate's instinct is right (state should not be a raw exported global) but the mechanism is wrong (flipping linkage without removing the callers). Encapsulation in C is a discipline enforced by API design and header hygiene, not by a keyword alone.
+FOLLOW:
+- What is the minimal safe refactor? => Add `int get_status(void)` / `void set_status(int)` next to the now-`static` variable, update the three callers to use the functions, remove the `extern` declarations.
+- Would `const` help express intent here too? => If callers only ever read it, exposing `extern const int status_snapshot;` updated via a setter function is a common middle ground, though it does not stop internal code in the defining file from changing it.
+PITFALL: Changing a variable's linkage without immediately checking every caller; the compiler will not warn you at the point of the linkage change itself, only later at link time (or, worse, not at all if the mismatched declaration was never actually used, per 6.9p3-p5).
+VERIFY: 6.2.2p3, 6.2.2p7, 6.9p3
+
+@@ 1.17 | Principal | Debug | tags=firmware,checksum,promotion
+Q: A one's-complement checksum routine (like the classic IP/UDP header checksum) accumulates 16-bit words directly into a `uint16_t sum` and produces wrong checksums on some packets but not others. Root-cause it.
+SHORT: Accumulating straight into a `uint16_t` means every `sum += words[i]` is computed in promoted `int`, then truncated back to 16 bits immediately, silently discarding any carry out of bit 15 on that iteration. The standard one's-complement algorithm requires accumulating in a wider type and folding the carry back in once, at the end, not per-iteration.
+DEEP:
+```c
+#include <stdio.h>
+#include <stdint.h>
+#include <stddef.h>
+
+/* BUGGY: truncates to 16 bits after every addition, losing carries */
+uint16_t checksum_missing_fold(const uint16_t *words, size_t n)
+{
+    uint16_t sum = 0;
+    for (size_t i = 0; i < n; i++) sum += words[i];
+    return (uint16_t)~sum;
+}
+
+/* CORRECT: accumulate wide, fold carries once at the end */
+uint16_t checksum_correct(const uint16_t *words, size_t n)
+{
+    uint32_t sum = 0;
+    for (size_t i = 0; i < n; i++) sum += words[i];
+    while (sum >> 16) sum = (sum & 0xFFFFu) + (sum >> 16);
+    return (uint16_t)~sum;
+}
+
+int main(void)
+{
+    uint16_t words[] = {0xFFFF, 0x0001}; /* sum overflows 16 bits by exactly 1 */
+    printf("missing_fold = 0x%04X\n", checksum_missing_fold(words, 2));
+    printf("correct      = 0x%04X\n", checksum_correct(words, 2));
+    return 0;
+}
+```
+Compiled and run: `missing_fold = 0xFFFF`, `correct      = 0xFFFE`. These differ precisely because 0xFFFF + 0x0001 = 0x10000, and the buggy version's `uint16_t sum` truncates that to 0x0000 on the spot (integer promotion happens for the addition, but the assignment back into `sum` narrows it right away), whereas the correct version keeps the carry alive in `uint32_t` and folds it back in explicitly.
+
+Root-cause method: (1) reproduce with a minimal input that is known to overflow 16 bits, as above, rather than debugging against real packet captures first; (2) inspect every accumulator's declared width against the arithmetic it needs to support losslessly; (3) fix by widening the accumulator type, not by changing the loop logic.
+FOLLOW:
+- Why does the bug only show up on "some" packets? => Only inputs whose partial sums cross a 16-bit boundary during accumulation trigger a lost carry; small packets or packets whose words happen not to overflow 16 bits checksum correctly by accident.
+- Is `int` (rather than `uint16_t`) as the accumulator type enough of a fix on a platform where `int` is 32 bits? => It would happen to work there, but it is fragile and implicit; explicitly using `uint32_t` documents the requirement and is portable to platforms where `int` is narrower.
+PITFALL: "It passed my test packets" is not evidence of correctness for a carry-dependent algorithm; you must specifically construct an input whose accumulation crosses the narrow type's width boundary.
+VERIFY: 6.3.1.1p2, 6.3.1.3p2

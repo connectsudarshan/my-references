@@ -1,0 +1,440 @@
+# Module 4: Mutexes & Critical Sections
+
+@@ 4.01 | Basic | Concept | tags=mutex,lock,unlock,basics
+Q: What do pthread_mutex_lock, pthread_mutex_unlock and pthread_mutex_destroy actually guarantee?
+SHORT: pthread_mutex_lock() blocks the calling thread until it becomes the mutex's owner, then returns with the mutex locked; pthread_mutex_unlock() releases it, and the scheduling policy picks which blocked thread (if any) acquires it next. It is safe to destroy an unlocked mutex; destroying a locked one is undefined behavior, and only the mutex object itself (never a copy of it) may be used for synchronization.
+DEEP:
+- pthread_mutex_init() sets the mutex to the initialized, unlocked state; passing attr=NULL uses the default attributes.
+- PTHREAD_MUTEX_INITIALIZER is a static-initialization macro for statically allocated mutexes, equivalent to a dynamic pthread_mutex_init() call with attr=NULL, except that no error checks are performed for the static form.
+- "Only mutex itself may be used for performing synchronization. The result of referring to copies of mutex in calls to pthread_mutex_lock(), pthread_mutex_trylock(), pthread_mutex_unlock(), and pthread_mutex_destroy() is undefined" -- passing a struct containing a mutex by value, or memcpy-ing a locked mutex, breaks this.
+- Re-initializing an already-initialized mutex, or destroying one that is currently locked, are both undefined behavior; POSIX's own example shows a mutex destroyed immediately after being unlocked inside a reference-counted object's teardown path.
+```c
+#include <stdio.h>
+#include <pthread.h>
+
+int main(void) {
+    pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&m);
+    printf("critical section: exclusive access here\n");
+    pthread_mutex_unlock(&m);
+    pthread_mutex_destroy(&m);   /* safe: m is unlocked */
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run, this prints `critical section: exclusive access here` and exits 0.
+FOLLOW:
+- Does pthread_mutex_lock() ever return early without the lock, the way a condition wait can? => No, on success it always returns with the mutex locked and owned by the caller; a signal delivered while blocked just resumes the wait after the handler returns, per POSIX.
+- Why does destroying a locked mutex matter if it "seems to work"? => The standard leaves it explicitly undefined, so an implementation is free to corrupt internal state, and even if today's libc tolerates it, a future version or a different platform is not obligated to.
+PITFALL: Passing a pthread_mutex_t by value or copying a live mutex with memcpy and then locking the copy. Only the original object is defined for synchronization; the copy's behavior is undefined.
+VERIFY: POSIX.1-2017, pthread_mutex_lock() and pthread_mutex_init()/pthread_mutex_destroy() DESCRIPTION and RATIONALE sections.
+
+@@ 4.02 | Basic | Concept | tags=critical-section,race,shared-state
+Q: What is a critical section, and why does a shared variable need one at all?
+SHORT: A critical section is the smallest span of code that touches shared, mutable state in a way that must not be interleaved with another thread doing the same; without mutual exclusion around it, two threads' reads and writes can interleave at the machine-instruction level and lose updates. `counter++` looks atomic in C but is really a load, an add, and a store, and another thread can run between any of those.
+DEEP:
+- The C language does not make `counter++` on a plain (non-atomic) int one indivisible operation; the compiler is free to emit separate load/add/store instructions, and the OS scheduler is free to preempt the thread between any of them.
+- A critical section is defined by the data it protects, not by a block of code in isolation: every place that reads or writes the same shared state needs the same mutex around it, or the exclusion is incomplete.
+- See 4.05 for an actual compiled program that reproduces lost updates from an unprotected `counter++` and then fixes it with a mutex.
+- This is squarely the multi-threaded case the C Language page's module on pointers and memory layout does not cover -- a single thread's own memory layout is not the issue here, concurrent access to it is.
+FOLLOW:
+- Is a critical section the same thing as "the code inside lock/unlock"? => Usually, but the boundary should be drawn around exactly the shared-state access, not more: locking too much serializes work that did not need to be serialized (see 4.07).
+- Does making counter `volatile` fix the race? => No; volatile only stops compiler caching/reordering of that variable's own accesses (see the C Advanced page's memory-model module), it does nothing about the read-modify-write not being atomic or about mutual exclusion.
+PITFALL: Assuming a single C statement like `x++` or `x += y` is atomic just because it is one line of source code. It is not, unless x is a suitably used C11 atomic type.
+VERIFY: General C semantics (no single POSIX clause states this; it follows from the absence of any atomicity guarantee on plain int operations).
+
+@@ 4.03 | Basic | Concept | tags=mutex,static-init,dynamic-init
+Q: When would you use PTHREAD_MUTEX_INITIALIZER instead of calling pthread_mutex_init()?
+SHORT: PTHREAD_MUTEX_INITIALIZER is for a statically or globally allocated mutex with default attributes; it avoids a separate init call and any related run-time initialization race, and POSIX defines it as equivalent to pthread_mutex_init(&m, NULL) except that no error checks are performed. Use pthread_mutex_init() explicitly whenever you need non-default attributes (a type other than the default, or PTHREAD_PROCESS_SHARED) or the mutex is heap-allocated and its storage does not exist until run time.
+DEEP:
+- Static initializers exist so that self-initializing modules with private static synchronization state do not need a pthread_once()-guarded init function; POSIX's own RATIONALE walks through exactly this simplification.
+- A heap-allocated or per-connection mutex has no "before main()" moment to be statically initialized in, so it must go through pthread_mutex_init(), typically right after the enclosing struct is allocated.
+- Non-default attributes (PTHREAD_MUTEX_RECURSIVE or PTHREAD_MUTEX_ERRORCHECK type, or PTHREAD_PROCESS_SHARED) can only be requested through an explicit pthread_mutexattr_t passed to pthread_mutex_init(); there is no static-initializer spelling for them in POSIX itself (glibc does provide nonstandard macros like PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP for this).
+FOLLOW:
+- Can you call pthread_mutex_init() on a mutex that was already set up with PTHREAD_MUTEX_INITIALIZER? => No: attempting to initialize an already-initialized mutex is undefined behavior, and the static initializer already counts as initialized.
+- Is PTHREAD_MUTEX_INITIALIZER slower or faster than the dynamic call? => Neither in the steady state; the difference is only that the static form skips the (optional) error checks pthread_mutex_init() may perform, and it needs no explicit call at startup.
+PITFALL: Calling pthread_mutex_init() a second time on a statically-initialized mutex "just to be safe." That is itself undefined behavior, not a safety net.
+VERIFY: POSIX.1-2017, pthread_mutex_init() DESCRIPTION and the "Static Initializers for Mutexes and Condition Variables" RATIONALE subsection.
+
+@@ 4.04 | Intermediate | Concept | tags=mutex-types,normal,recursive,errorcheck
+Q: What is the practical difference between PTHREAD_MUTEX_NORMAL, PTHREAD_MUTEX_RECURSIVE and PTHREAD_MUTEX_ERRORCHECK?
+SHORT: NORMAL (the low-overhead default behavior) does no deadlock detection at all -- relocking it from the same thread simply deadlocks; ERRORCHECK detects a same-thread relock or an unlock by a non-owner and returns an error instead of corrupting state or hanging; RECURSIVE maintains a per-owner lock count so the same thread can relock it any number of times and must unlock it the same number of times before it becomes free to others.
+DEEP:
+- POSIX's own wording: PTHREAD_MUTEX_NORMAL -- "deadlock detection shall not be provided. Attempting to relock the mutex causes deadlock." Unlocking one you do not own, or one already unlocked, is undefined behavior.
+- PTHREAD_MUTEX_ERRORCHECK -- "error checking shall be provided. If a thread attempts to relock a mutex that it has already locked, an error shall be returned." Same for unlocking a mutex you do not own.
+- PTHREAD_MUTEX_RECURSIVE -- lock count starts at 1 on first acquisition, increments on every relock by the owner, decrements on every unlock; only reaches zero (and becomes available to others) when the counts balance.
+- PTHREAD_MUTEX_DEFAULT (what PTHREAD_MUTEX_INITIALIZER gives you) leaves relock and bad-unlock behavior undefined -- on Linux glibc this behaves like NORMAL (deadlocks), but that specific mapping is a Linux/glibc detail, not something POSIX requires.
+| Type | Relock by owner | Unlock by non-owner |
+|---|---|---|
+| NORMAL | deadlocks | undefined behavior |
+| ERRORCHECK | returns EDEADLK | returns EPERM |
+| RECURSIVE | increments count, succeeds | undefined behavior |
+FOLLOW:
+- Which type ships as the default if you use PTHREAD_MUTEX_INITIALIZER or pthread_mutex_init(&m, NULL)? => PTHREAD_MUTEX_DEFAULT, whose relock/bad-unlock behavior POSIX leaves undefined; it is not guaranteed to be identical to NORMAL on every implementation, even though glibc happens to treat them the same.
+- Does ERRORCHECK cost anything at run time compared to NORMAL? => Yes, it has to track the owning thread and lock state to detect the error, so it is intentionally reserved for debugging rather than shipped in a hot path by default.
+PITFALL: Assuming PTHREAD_MUTEX_DEFAULT behaves identically to PTHREAD_MUTEX_NORMAL on every platform because glibc happens to implement it that way. POSIX leaves DEFAULT's relock/bad-unlock behavior undefined, full stop.
+VERIFY: POSIX.1-2017, pthread_mutex_lock() DESCRIPTION (the four type paragraphs).
+
+@@ 4.05 | Intermediate | Debug | tags=race,demo,mutex,lost-update
+Q: Show a real, compiled program that loses updates without a mutex and is exactly correct with one.
+SHORT: Four threads each increment a shared long 200000 times with no lock: the final count is consistently far below the expected 800000, and it varies run to run because the loss depends on scheduling. Wrapping the increment in pthread_mutex_lock()/pthread_mutex_unlock() makes every run land on exactly 800000.
+DEEP:
+```c
+#include <stdio.h>
+#include <pthread.h>
+
+#define NTHREADS 4
+#define NITERS 200000
+
+static long counter = 0;
+static int use_lock = 0;
+static pthread_mutex_t mtx = PTHREAD_MUTEX_INITIALIZER;
+
+static void *worker(void *arg) {
+    (void)arg;
+    for (int i = 0; i < NITERS; i++) {
+        if (use_lock) pthread_mutex_lock(&mtx);
+        counter++;                 /* load, add, store: not atomic */
+        if (use_lock) pthread_mutex_unlock(&mtx);
+    }
+    return NULL;
+}
+
+int main(int argc, char **argv) {
+    use_lock = (argc > 1 && argv[1][0] == '1');
+    pthread_t th[NTHREADS];
+    for (int i = 0; i < NTHREADS; i++) pthread_create(&th[i], NULL, worker, NULL);
+    for (int i = 0; i < NTHREADS; i++) pthread_join(th[i], NULL);
+    printf("use_lock=%d counter=%ld expected=%ld\n", use_lock, counter, (long)NTHREADS * NITERS);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run five times unlocked, the observed counts were 603997, 577615, 624606, 233950 and 585913 -- always short of 800000, never the same number twice. Run locked (argv[1]="1") three times, every run printed exactly `counter=800000 expected=800000`.
+- The unlocked loss happens because two threads can both read the same old value of counter before either writes back its incremented result, so one increment is silently overwritten by the other.
+FOLLOW:
+- Why does the lost count vary between runs instead of being a fixed number? => The exact interleaving of the four threads' load/add/store sequences depends on OS scheduling, which is not deterministic run to run, so a different (nondeterministic) number of increments collide each time.
+- Would making counter `_Atomic long` without any mutex also fix it? => Yes for this specific case (a simple increment), since an atomic increment is a single indivisible read-modify-write; that is module 7's territory, not a substitute for a mutex once the critical section covers more than one variable.
+PITFALL: Running the unlocked version once, seeing it "happen to" print the right number by luck, and concluding the code is race-free. A race is a probability, not a certainty; absence of a failure in one run proves nothing.
+VERIFY: No specific POSIX clause; this follows from pthread_mutex_lock()'s DESCRIPTION guaranteeing exclusive ownership, and from ordinary int/long arithmetic having no atomicity guarantee.
+
+@@ 4.06 | Intermediate | Scenario | tags=critical-section,sizing,granularity
+Q: How do you decide how much code belongs inside the lock?
+SHORT: Include exactly the accesses to shared, mutable state, and nothing that does not need to be serialized against them -- computing inputs, formatting output, or doing I/O should happen outside the lock. POSIX's own RATIONALE for mutexes explicitly expects them to be "locked only for a few instructions"; a lock held across a blocking call (I/O, sleep, another lock acquisition) turns a cheap primitive into a throughput bottleneck and a deadlock risk.
+DEEP:
+- Too small: locking only part of a multi-step update (e.g. protecting a linked list's head pointer write but not the size counter that must move with it) leaves the data structure inconsistent to any thread that observes it mid-update.
+- Too large: locking a whole function (read input, compute, write shared result, log it) when only the shared-result write needs protection turns every caller into a serial bottleneck and can pull unrelated blocking calls (disk I/O, another lock) inside the critical section.
+- "Mutexes are expected to be locked only for a few instructions... the usual case is to lock the mutex, access shared data, and unlock the mutex" -- POSIX's performance rationale for mutexes and condition variables states this directly.
+- A useful rule of thumb: if you can move a statement outside the lock without changing what other threads can observe, move it outside.
+FOLLOW:
+- Does calling a function while holding a lock (e.g. malloc, printf) count against this rule? => Yes if that function can itself block or take a long time; malloc can take an internal lock and occasionally a syscall, so calling it inside your own critical section adds unpredictable latency and lock-ordering risk (see module 8).
+- What is the risk of holding a lock across a blocking syscall specifically? => Every other thread waiting on that mutex now waits for the syscall to complete too, which can be unbounded (e.g. a stalled I/O); for a spinlock this is worse still, since spinning threads burn CPU the whole time (see 4.09).
+PITFALL: Locking "the whole function" out of caution instead of only the shared-state access, then wondering why an otherwise fast operation is contended.
+VERIFY: POSIX.1-2017, pthread_cond_wait() RATIONALE, "Performance of Mutexes and Condition Variables" subsection (states the "locked only for a few instructions" expectation, general to mutex use).
+
+@@ 4.07 | Intermediate | Trap | tags=mutex,self-deadlock,normal-type
+Q: What actually happens if a thread locks a PTHREAD_MUTEX_NORMAL mutex it already holds?
+SHORT: POSIX states plainly that for PTHREAD_MUTEX_NORMAL, "deadlock detection shall not be provided. Attempting to relock the mutex causes deadlock." A compiled test confirms this: the second pthread_mutex_lock() call from the same thread never returns, and the process had to be killed after a timeout, exactly the way any other self-deadlock hangs.
+DEEP:
+```c
+#include <stdio.h>
+#include <pthread.h>
+
+static pthread_mutex_t mtx = PTHREAD_MUTEX_INITIALIZER; /* default type */
+
+int main(void) {
+    printf("locking once\n");
+    pthread_mutex_lock(&mtx);
+    printf("locking again (same thread) - this should hang\n");
+    fflush(stdout);
+    pthread_mutex_lock(&mtx);   /* relock: deadlock */
+    printf("never reached\n");
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run under `timeout 2 ./a.out`, it printed both "locking once" and "locking again..." lines and then hung; the process was killed by the timeout (shell exit code 124), and "never reached" never printed, confirming the second lock call blocked forever rather than erroring out.
+- Because glibc maps PTHREAD_MUTEX_DEFAULT to the same behavior as NORMAL, this happens with the plain PTHREAD_MUTEX_INITIALIZER too, not only with an explicitly-requested NORMAL type.
+FOLLOW:
+- How would you actually confirm this in a real hung process instead of trusting the timeout? => Attach gdb (or use its batch mode: `gdb -p <pid> -batch -ex "thread apply all bt"`) and look for the same thread appearing twice in the backtrace, once at the outer call site and once blocked inside pthread_mutex_lock().
+- What is the fix if the same thread legitimately needs to re-enter a locked region? => Either restructure the code so the inner call does not re-lock (split into a locked wrapper and an unlocked inner function), or use PTHREAD_MUTEX_RECURSIVE deliberately (see 4.11) rather than relying on NORMAL/DEFAULT.
+PITFALL: Assuming a self-relock will be caught with an error return, the way ERRORCHECK behaves. NORMAL and DEFAULT give you a silent, unrecoverable hang instead.
+VERIFY: POSIX.1-2017, pthread_mutex_lock() DESCRIPTION, PTHREAD_MUTEX_NORMAL paragraph; the exact hang-vs-error choice for PTHREAD_MUTEX_DEFAULT is glibc-specific behavior, not POSIX-mandated.
+
+@@ 4.08 | Intermediate | Debug | tags=mutex,errorcheck,edeadlk,eperm
+Q: What does an ERRORCHECK mutex actually return for a same-thread relock and for an unlock by a non-owner?
+SHORT: A compiled test shows the same-thread relock returns EDEADLK ("Resource deadlock avoided") instead of hanging, and an extra unlock after the mutex is already unlocked returns EPERM ("Operation not permitted"). This makes ERRORCHECK the right type to develop and test with when a lock-ordering bug is suspected, even though it is not what you would ship in the hot path.
+DEEP:
+```c
+#define _POSIX_C_SOURCE 200809L
+#include <stdio.h>
+#include <pthread.h>
+#include <string.h>
+
+int main(void) {
+    pthread_mutex_t mtx;
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ERRORCHECK);
+    pthread_mutex_init(&mtx, &attr);
+
+    int rc1 = pthread_mutex_lock(&mtx);
+    int rc2 = pthread_mutex_lock(&mtx);   /* relock by same thread */
+    printf("first lock rc=%d (%s)\n", rc1, strerror(rc1));
+    printf("second lock rc=%d (%s)\n", rc2, strerror(rc2));
+    pthread_mutex_unlock(&mtx);
+    int rc3 = pthread_mutex_unlock(&mtx); /* already unlocked */
+    printf("extra unlock rc=%d (%s)\n", rc3, strerror(rc3));
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -pthread` (note: `_POSIX_C_SOURCE 200809L` is needed before the includes so glibc exposes PTHREAD_MUTEX_ERRORCHECK under -std=c11) and run, it printed: `first lock rc=0 (Success)`, `second lock rc=35 (Resource deadlock avoided)`, `extra unlock rc=1 (Operation not permitted)`.
+- POSIX lists EDEADLK as something pthread_mutex_lock() "may fail" with when "the current thread already owns the mutex," and EPERM as something pthread_mutex_unlock() "may fail" with when "the current thread does not own the mutex" -- both are optional per the standard, but glibc implements them for ERRORCHECK.
+FOLLOW:
+- Is it safe to rely on EDEADLK being returned in production code paths? => No; POSIX marks both errors as "may fail," so a different conforming implementation could hang instead, exactly like NORMAL does; treat ERRORCHECK as a debugging aid, not a guaranteed API contract to branch on.
+- Why does glibc's strerror text call EDEADLK "Resource deadlock avoided" rather than something mentioning mutexes specifically? => EDEADLK is a generic errno value shared with other deadlock-prone APIs (e.g. fcntl locking); its text is generic by design, not mutex-specific.
+PITFALL: Shipping ERRORCHECK mutexes in a performance-sensitive path "just to be safe." The extra state tracking has a real, measurable cost; use it in debug builds or targeted tests, not by default everywhere.
+VERIFY: POSIX.1-2017, pthread_mutex_lock() ERRORS section (EDEADLK, "may fail") and pthread_mutex_unlock() ERRORS section (EPERM, "may fail").
+
+@@ 4.09 | Intermediate | Concept | tags=trylock,ebusy,nonblocking
+Q: What does pthread_mutex_trylock() let you do that pthread_mutex_lock() cannot?
+SHORT: pthread_mutex_trylock() acquires the mutex if it is free and returns 0, but if it is currently locked by any thread (including the caller, unless the type is RECURSIVE) it returns EBUSY immediately instead of blocking -- "in no case shall the pthread_mutex_trylock() function ever block." That makes it useful for doing other work while a lock is contended, or for building deadlock-avoidance schemes based on a strict try-then-backoff protocol.
+DEEP:
+```c
+#define _POSIX_C_SOURCE 200809L
+#include <stdio.h>
+#include <pthread.h>
+#include <time.h>
+
+static pthread_mutex_t mtx = PTHREAD_MUTEX_INITIALIZER;
+
+static void *holder(void *arg) {
+    (void)arg;
+    pthread_mutex_lock(&mtx);
+    sleep(1);
+    pthread_mutex_unlock(&mtx);
+    return NULL;
+}
+
+int main(void) {
+    pthread_t t;
+    pthread_create(&t, NULL, holder, NULL);
+    struct timespec ts = {0, 100000000};
+    nanosleep(&ts, NULL); /* let holder grab the lock first */
+    int rc = pthread_mutex_trylock(&mtx);
+    printf("trylock while held: rc=%d (%s)\n", rc, rc == 0 ? "acquired" : "busy, did not block");
+    if (rc == 0) pthread_mutex_unlock(&mtx);
+    pthread_join(t, NULL);
+    int rc2 = pthread_mutex_trylock(&mtx);
+    printf("trylock after release: rc=%d\n", rc2);
+    if (rc2 == 0) pthread_mutex_unlock(&mtx);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run, it printed `trylock while held: rc=16 (busy, did not block)` (16 is EBUSY) and then `trylock after release: rc=0`, confirming trylock never blocked either time.
+FOLLOW:
+- What does trylock do on a RECURSIVE mutex the caller already owns? => It succeeds immediately and increments the lock count, exactly as a normal relock would, rather than returning EBUSY.
+- Is EBUSY guaranteed the instant the lock becomes free, or could you get EBUSY and then immediately succeed on a retry? => EBUSY only reflects the state at the instant of the call; a retry loop (spin-and-trylock) can absolutely succeed on the very next call once the holder unlocks, which is exactly how a simple backoff scheme is built.
+PITFALL: Spin-calling trylock() in a tight loop with no backoff at all as a substitute for pthread_mutex_lock(). That burns CPU without the benefit of a real spinlock's cache-line-aware wait and adds no fairness guarantee.
+VERIFY: POSIX.1-2017, pthread_mutex_lock() DESCRIPTION (trylock paragraph) and ERRORS (EBUSY).
+
+@@ 4.10 | Advanced | Cross-layer | fig=mutexstate | tags=mutex,contention,scheduler,blocking
+Q: When a thread blocks on a contended mutex, what actually happens underneath pthread_mutex_lock()?
+SHORT: POSIX only promises the call blocks until it becomes owner; it says nothing about the mechanism. On Linux, an uncontended lock/unlock is a fast userspace atomic op with no kernel involvement, and only on contention does the implementation make a futex syscall to sleep, then unlock wakes one waiter -- the fast/slow-path split is why mutexes are cheap uncontended, and why POSIX leaves waking order to "the scheduling policy," not a fixed FIFO.
+DEEP:
+- Fast path (no contention): lock/unlock reduce to an atomic compare-and-swap on the mutex's internal state word, entirely in user space -- no syscall, no context switch.
+- Slow path (contended): the blocking thread transitions from running to blocked; the kernel removes it from the run queue until the mutex becomes available, and the unlocking thread's pthread_mutex_unlock() is what triggers the wake.
+- POSIX's own words: "If there are threads blocked on the mutex object referenced by mutex when pthread_mutex_unlock() is called, resulting in the mutex becoming available, the scheduling policy shall determine which thread shall acquire the mutex" -- it is deliberately not FIFO or priority-fixed by the standard itself, only by whatever scheduling policy is in effect.
+- This Linux mechanism (glibc mutexes are built on the futex() syscall) is a Linux-specific implementation detail, not something POSIX specifies; POSIX's RATIONALE only says mutexes should support "fast, inlined implementations of mutex locking and unlocking" and leaves the blocking mechanism unspecified.
+- This is exactly the picture the fig for this module draws: two threads contending for one mutex, the loser's wait and the winner's eventual wake shown along a timeline.
+FOLLOW:
+- Does this mean an uncontended mutex lock/unlock is "free"? => Not free, but cheap: still an atomic instruction with a memory barrier, just no syscall; the cost jumps by roughly two orders of magnitude the moment contention forces a futex sleep/wake round trip (see 4.13's numbers).
+- Why does POSIX leave the wakeup order unspecified instead of mandating FIFO? => Because different scheduling policies (SCHED_FIFO priority order vs SCHED_OTHER fairness heuristics) have different natural notions of "next," and mandating FIFO would conflict with priority-based scheduling; see module 11.
+PITFALL: Assuming mutex contention is always cheap because "it's just a lock." Once a wait actually blocks, it costs a real context switch in both directions, which dwarfs the uncontended fast path by a wide margin.
+VERIFY: POSIX.1-2017, pthread_mutex_unlock() DESCRIPTION ("the scheduling policy shall determine which thread shall acquire the mutex") and pthread_mutex_lock() RATIONALE; the futex-based mechanism itself is Linux-specific, not POSIX text.
+
+@@ 4.11 | Advanced | Scenario | tags=recursive,legit-use,masking-bugs
+Q: Give a legitimate use of PTHREAD_MUTEX_RECURSIVE, and a compiled demonstration that it actually allows repeated locking.
+SHORT: A recursive mutex is legitimate when a single call chain within one thread must re-enter a lock it already holds -- e.g. a recursive function, or an API whose public entry point locks and then calls an internal helper that is also called (and locks) from other public entry points. A compiled test shows the same thread locking four times in a row and unwinding cleanly, which would self-deadlock (4.07) on a NORMAL mutex.
+DEEP:
+```c
+#define _POSIX_C_SOURCE 200809L
+#include <stdio.h>
+#include <pthread.h>
+
+static pthread_mutex_t mtx;
+
+static void recurse(int depth) {
+    pthread_mutex_lock(&mtx);
+    printf("depth %d: locked (recursive count effectively %d)\n", depth, depth + 1);
+    if (depth < 3) recurse(depth + 1);
+    pthread_mutex_unlock(&mtx);
+}
+
+int main(void) {
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&mtx, &attr);
+    recurse(0);
+    printf("all unwound cleanly\n");
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run, it printed depths 0 through 3 locking successfully, then "all unwound cleanly" -- four nested locks by the same thread, four matching unlocks, no deadlock.
+- The real-world case this models: a `list_lock_and_modify()` public function that locks, then may internally call `list_remove_if_empty()`, itself sometimes called directly by other locked entry points -- without RECURSIVE, that shared helper would need an "already locked" internal variant duplicated everywhere it might be reentered.
+FOLLOW:
+- Why is RECURSIVE often discouraged as a default design choice rather than embraced? => Needing it is frequently a sign the locking boundary was drawn in the wrong place -- a cleaner refactor (separate locked-entry and unlocked-internal functions) usually removes the need for recursion and makes the lock's scope easier to reason about.
+- Does a RECURSIVE mutex change who owns it, or only how many times the owner can relock it? => Only the relock count; ownership is still exclusive to one thread at a time, and other threads still block on the first lock exactly as with any other type.
+PITFALL: Reaching for PTHREAD_MUTEX_RECURSIVE as a quick fix for a self-deadlock you hit during development, without checking whether the real fix is to stop double-locking in the first place.
+VERIFY: POSIX.1-2017, pthread_mutex_lock() DESCRIPTION, PTHREAD_MUTEX_RECURSIVE paragraph.
+
+@@ 4.12 | Advanced | Numeric | tags=spinlock,mutex,contention,overhead
+Q: When is a spinlock actually faster than a mutex, and what happened when this was measured on a 2-core machine?
+SHORT: A spinlock wins only when the expected wait is shorter than a context switch and spinning threads do not outnumber available cores; otherwise spinning burns CPU that could have gone to the lock holder. A compiled timing test on a 2-core sandbox with 4 threads hammering a shared counter showed the mutex consistently faster (about 70-85 ns/op) than the spinlock (about 95-150 ns/op), because with more contending threads than cores, spinners waste cycles instead of yielding.
+DEEP:
+```c
+#define _POSIX_C_SOURCE 200809L
+#include <stdio.h>
+#include <pthread.h>
+#include <time.h>
+
+#define NTHREADS 4
+#define NITERS 500000
+static long counter = 0;
+static pthread_mutex_t mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_spinlock_t spin;
+static int mode = 0; /* 0 = mutex, 1 = spinlock */
+
+static void *worker(void *arg) {
+    (void)arg;
+    for (int i = 0; i < NITERS; i++) {
+        if (mode == 0) { pthread_mutex_lock(&mtx); counter++; pthread_mutex_unlock(&mtx); }
+        else { pthread_spin_lock(&spin); counter++; pthread_spin_unlock(&spin); }
+    }
+    return NULL;
+}
+/* main: times NTHREADS threads running worker() for mode=0 then mode=1, using
+   clock_gettime(CLOCK_MONOTONIC, ...) to bracket each run */
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run three times on a 2-CPU sandbox (`nproc` reported 2), representative output was: `mutex : elapsed=0.1717s (85.8 ns/op)` vs `spin : elapsed=0.1981s (99.1 ns/op)` on the first run, and similar mutex-faster results on the other two runs.
+- This is the oversubscribed case (4 threads, 2 cores): while one thread holds the spinlock, up to 3 others can be actively spinning on 1 remaining core, burning cycles that would otherwise let the scheduler run the actual lock holder sooner; a mutex instead puts waiters to sleep, freeing the core for the holder.
+- Spinning only wins decisively when contending threads <= available cores and the critical section is a handful of instructions -- exactly the profile of very short, per-core-pinned hot loops, not general application code.
+FOLLOW:
+- Would the result flip on an 8-core machine running only 4 threads? => Likely yes for a tiny critical section like a single increment, since every thread could have its own core and never actually needs to sleep while spinning; the numbers here are specific to this oversubscribed 2-core environment, not a universal ratio.
+- Is pthread_spin_lock() part of core POSIX or an optional feature? => It is part of the Spin Locks option (an ADVANCED REALTIME THREADS feature) and "need not be provided on all implementations," unlike the base mutex functions.
+PITFALL: Treating "spinlocks are faster" as a universal rule from a benchmark on one machine. The crossover depends on core count, thread count, and critical-section length; measure on the actual target, do not assume.
+VERIFY: POSIX.1-2017, pthread_spin_init() APPLICATION USAGE (Spin Locks option, not guaranteed on all implementations); the specific ns/op numbers are this run's own measurement, not a spec or vendor figure -- treat them as illustrative, not portable.
+
+@@ 4.13 | Advanced | Trap | tags=mutex,destroy,ub,copies
+Q: What are the two "quiet" ways to invoke undefined behavior with a mutex that will not show up in -Wall -Wextra?
+SHORT: Destroying a mutex while any thread still holds it, and referring to a copy of a mutex object (rather than the original) in any lock/unlock/destroy call, are both undefined behavior with no compiler warning available -- neither is a type error or a syntax issue the compiler can see. POSIX states both explicitly: "Attempting to destroy a locked mutex results in undefined behavior," and "the result of referring to copies of mutex ... is undefined."
+DEEP:
+- Destroying-while-locked commonly happens in a teardown path that races a still-running worker thread; the fix is a documented protocol (drain workers, join them, only then destroy) or a reference count that goes to zero exactly once, unlocked, before destroy -- POSIX's own EXAMPLES section for pthread_mutex_destroy() shows exactly this pattern with a refcounted object.
+- Copying-the-mutex happens innocently: passing a struct containing a pthread_mutex_t by value into a function, returning such a struct, or putting one in a resizable array that gets realloc'd (which memcpy's the old storage to new memory) all create a second, distinct mutex object; locking through the copy while another thread locks through the original provides no mutual exclusion between them at all.
+- Neither mistake produces a compiler diagnostic: the types are correct C, so -Wall -Wextra has nothing to flag; the bug is purely about object identity and lifetime, which only a design/review discipline (never move or copy a live lock; always join before destroy) catches.
+FOLLOW:
+- How would a realloc-based resize accidentally trigger the copy bug? => If a mutex lives inside an element of a dynamically-resized array (`struct entry *arr = realloc(arr, ...)`), the old storage (with its live mutex) is memcpy'd to new memory and the old memory is freed; any thread still holding a pointer to the old element's mutex is now locking freed memory, and any other thread using the new element's copy has no relation to it.
+- Is there a runtime tool that reliably catches either mistake? => ThreadSanitizer can sometimes catch the practical symptom (two threads racing on what looks like "the same" data because the mutex silently stopped providing exclusion), but neither bug has a dedicated, guaranteed detector; module 15 covers sanitizer-based debugging in depth.
+PITFALL: Storing a pthread_mutex_t as a plain struct member in a container type that gets resized with realloc() or copied by value anywhere in the codebase. Locks are not relocatable or copyable; they must be allocated once and referenced by pointer for their entire lifetime.
+VERIFY: POSIX.1-2017, pthread_mutex_destroy() DESCRIPTION ("Attempting to destroy a locked mutex results in undefined behavior") and pthread_mutex_init() DESCRIPTION (the "copies of mutex" sentence).
+
+@@ 4.14 | Advanced | Concept | tags=mutex,critical-section,visibility,memory-model
+Q: Besides mutual exclusion, what does a correctly-used mutex guarantee about memory visibility between threads?
+SHORT: A pthread_mutex_unlock() followed by a pthread_mutex_lock() of the same mutex by another thread establishes a happens-before relationship: everything the unlocking thread wrote before the unlock is guaranteed visible to the locking thread after it acquires the lock. This is why a plain (non-atomic, non-volatile) shared variable is perfectly safe to read and write as long as every access goes through the same mutex -- the mutex itself is the synchronization, not just a mutual-exclusion mechanism.
+DEEP:
+- POSIX does not phrase this in C11 memory-model terms (that vocabulary is a C11, not POSIX, construct), but the practical guarantee mutexes provide is exactly what module 7's acquire/release pairs formalize: unlock is a release, the next lock is an acquire, on the same mutex.
+- This is why the standard bounded-queue idiom (module 5) never needs the shared count or buffer to be `volatile` or `_Atomic` -- every access to that state happens while the mutex is held, so the mutex's own lock/unlock pair does all the ordering and visibility work.
+- Without this guarantee, an otherwise "correctly locked" critical section on a weakly-ordered CPU could still let one thread observe another's writes out of order; mutexes are specified (and implemented) to prevent exactly that, not only to serialize access.
+- Full detail on what "happens-before," acquire, and release actually mean at the C11 level, and how false sharing and reordering interact with atomics specifically, is module 7's scope; this module's point is only that mutexes already give you this for free when used consistently.
+FOLLOW:
+- Does this mean you never need atomics if everything is behind one mutex? => Correct, for state that is only ever touched under that mutex; atomics become relevant when you specifically want to avoid the cost of locking (lock-free code, covered in module 10) or need ordering without exclusion.
+- What breaks this guarantee? => Touching the "protected" variable from anywhere outside the mutex's lock/unlock pair -- even a single unprotected read defeats the guarantee for that access, because there is no unlock-then-lock pair surrounding it.
+PITFALL: Believing a mutex only prevents "at the same time" access, and separately worrying about memory visibility/ordering for the same protected data. A correctly-used mutex already handles both; the visibility question only reopens for accesses made outside the lock.
+VERIFY: No POSIX clause uses C11 happens-before language directly; this is the standard, well-established interpretation of what a correctly-scoped POSIX mutex critical section provides, consistent with pthread_mutex_lock()/unlock() DESCRIPTION and cross-referenced to the C11 memory model in module 7.
+
+@@ 4.15 | Principal | Scenario | tags=lock-granularity,sharding,design
+Q: You have one hot, shared hash table hit by many threads. Walk through the design trade-off between a single global mutex and per-bucket (sharded) locks.
+SHORT: A single global mutex is simplest to reason about and correct by construction, but every access serializes against every other access regardless of which buckets they touch, so contention scales with total traffic, not with actual key overlap. Sharding into N independent mutexes (one per bucket, or one per group of buckets) lets unrelated keys proceed in parallel, at the cost of needing a consistent, deadlock-free rule for any operation that must touch two buckets at once (e.g. a resize).
+DEEP:
+1. **Start with one mutex.** Get correctness first; a single lock around the whole table is trivially correct and easy to review, and premature sharding is a common source of subtle bugs.
+2. **Measure, don't guess, before sharding.** Confirm the mutex is actually the bottleneck (module 15's profiling/instrumentation approach: time spent waiting on the lock versus doing real work) before adding complexity.
+3. **Pick the shard key deliberately.** Hash-bucket-per-lock is common; too few shards does not help, too many wastes memory on padding needed to avoid false sharing between adjacent lock structures (module 7).
+4. **Define the multi-shard rule up front.** Any operation needing two shards at once (a table-wide resize, a move between buckets) must acquire shard locks in one fixed global order (module 8's lock-ordering rule) to avoid a cross-shard deadlock -- e.g. always the numerically lower bucket index first.
+5. **Reassess after resharding.** Sharding trades one easy invariant (one lock, one obvious critical section) for several harder ones (which lock covers which state, and in what order do multi-lock operations acquire them); make sure the team reviewing changes to this table understands the new rule, not just the old single-lock one.
+- A resize is the classic trap: it needs to briefly touch (or replace) every shard, which either needs a distinct "stop the world" global lock layered on top of the per-shard locks, or a redesign (e.g. an atomically-swapped pointer to a whole new table) that avoids taking all shard locks at once.
+FOLLOW:
+- Is there a middle ground between one lock and one-per-bucket? => Yes -- a small fixed number of shards (e.g. 16 or 64, independent of table size) is a common compromise: enough parallelism to relieve contention, few enough locks that a resize's "touch every shard" cost stays bounded and the lock-ordering rule stays simple to state.
+- How would you detect a real deadlock introduced by inconsistent shard-lock ordering, versus normal contention? => A true deadlock hangs indefinitely and a thread backtrace shows each stuck thread waiting on a lock the other stuck thread holds (module 8); ordinary contention instead shows threads slowly making progress, with wait times that go up under load but do not go to infinity.
+PITFALL: Sharding a hot structure without first proving (with real measurement) that the single mutex was actually the bottleneck, and without a written-down, reviewed rule for the order multi-shard operations acquire locks in.
+VERIFY: No single POSIX clause covers sharding design; the lock-ordering requirement for multi-lock operations is the same deadlock-avoidance principle covered normatively (informally, via RATIONALE text) in the pthread_mutex_* pages and formalized in module 8.
+
+@@ 4.16 | Principal | Debug | tags=contention,hang,diagnosis,method
+Q: A service reports "hung" under load on a mutex-protected hot path. How do you tell a true deadlock from severe-but-live contention before paging anyone?
+SHORT: Take two thread backtraces a few seconds apart (`gdb -p <pid> -batch -ex "thread apply all bt"`, or a signal-based dump if gdb attach is not available): if every thread's stack is byte-for-byte the same, stuck waiting on locks in a cycle, it is a real deadlock and nothing will ever change; if the backtraces differ between the two snapshots -- different threads holding the lock, different wait queues -- the system is alive but slow, which is a capacity or lock-granularity problem, not a deadlock.
+DEEP:
+1. **Two snapshots, not one.** A single backtrace cannot distinguish "stuck forever" from "unlucky moment, about to unblock" -- always compare at least two, taken a few seconds apart.
+2. **Look for a wait-for cycle, not just blocked threads.** A deadlock needs thread A blocked on a lock B holds while B is blocked on a lock A holds (module 8's four conditions); many threads simply queued behind one busy lock is contention, not deadlock, even if the queue is long.
+3. **Check whether the lock holder is making progress.** If the same thread holds the contended mutex in both snapshots but its own stack has advanced (different line, different call depth), it is doing slow work under the lock, not stuck; if its stack is identical in both snapshots too, look for what *it* is blocked on.
+4. **Correlate with load, not just presence of contention.** Some contention under peak load is normal and self-resolving; the diagnosis that matters is whether wait time is growing unboundedly (queueing problem, fix with sharding/4.15 or a shorter critical section/4.06) versus flat but nonzero (probably fine).
+5. **Only escalate to "add instrumentation and reproduce" (module 15's ThreadSanitizer/helgrind toolchain) once step 1-4 rule out a live system that is simply overloaded.**
+- The single most common mistake here is treating "many threads waiting on the same mutex" as proof of a deadlock; it is proof of contention, and contention resolves itself once the lock holder finishes, while a true deadlock never does.
+FOLLOW:
+- What if you cannot attach a debugger to the production process? => A `kill -QUIT` (if the process has a handler dumping thread state) or an internal /debug endpoint that dumps each thread's current lock-wait state, taken twice, gives the same two-snapshot comparison without a live debugger attach.
+- Does a livelock (module 8) look different from either case? => Yes -- in a livelock, stack traces keep changing between snapshots (threads are actively running, not blocked), but application-level progress (requests completed) stays at zero; that combination is the tell that distinguishes it from both healthy contention and deadlock.
+PITFALL: Declaring "deadlock" from a single stack dump showing many threads inside pthread_mutex_lock(). That is exactly what heavy, healthy contention also looks like; only a second snapshot proving nothing changed earns the word "deadlock."
+VERIFY: No POSIX clause; this is an operational diagnosis method, cross-referenced to module 8's formal deadlock conditions and module 15's sanitizer-based follow-up.
+
+@@ 4.17 | Advanced | Concept | tags=mutex,protocol,prio-inherit,prio-protect
+Q: What do the PTHREAD_PRIO_NONE, PTHREAD_PRIO_INHERIT and PTHREAD_PRIO_PROTECT mutex protocol attributes control?
+SHORT: These are pthread_mutexattr_t settings for thread priority while a mutex is held: PRIO_NONE (default) does nothing special; PRIO_INHERIT temporarily raises the holder's priority to match the highest-priority waiter, so a low-priority holder cannot stall it indefinitely; PRIO_PROTECT sets a fixed priority ceiling on the mutex, and pthread_mutex_lock() fails with EINVAL if the caller's priority already exceeds that ceiling.
+DEEP:
+- pthread_mutex_lock()'s own ERRORS section names the PRIO_PROTECT case explicitly: EINVAL is returned when "the mutex was created with the protocol attribute having the value PTHREAD_PRIO_PROTECT and the calling thread's priority is higher than the mutex's current priority ceiling."
+- These protocols exist specifically to bound priority inversion (a low-priority thread holding a lock a high-priority thread needs, while an unrelated medium-priority thread preempts the low-priority holder and runs indefinitely) -- the full mechanism and the Mars Pathfinder story that made it famous belong to module 8.
+- Both protocols are part of an optional POSIX real-time feature set, not guaranteed on every implementation; requesting PRIO_INHERIT or PRIO_PROTECT on a platform that lacks the option typically fails at pthread_mutexattr_setprotocol() time, not silently downgrading to PRIO_NONE.
+FOLLOW:
+- Do these protocols matter on a general-purpose SCHED_OTHER system, or only under real-time scheduling? => They matter most under SCHED_FIFO/SCHED_RR, where a fixed priority ordering makes inversion a real, bounded-time hazard; under SCHED_OTHER's fairness heuristics the effect is far less predictable either way.
+- Is choosing a protocol something you do per-mutex or globally? => Per-mutex, via the pthread_mutexattr_t passed to pthread_mutex_init(); different mutexes in the same process can use different protocols depending on which ones are actually on a real-time thread's critical path.
+PITFALL: Assuming PRIO_INHERIT is free. Tracking and adjusting the holder's effective priority on every contended lock/unlock adds real overhead, which is why it is opt-in rather than the default protocol.
+VERIFY: POSIX.1-2017, pthread_mutex_lock() ERRORS (EINVAL, PRIO_PROTECT case); full protocol semantics are defined under pthread_mutexattr_setprotocol(), not among the 60 pages fetched for this page -- flagged as VERIFY: POSIX.1-2017, pthread_mutexattr_setprotocol().
+
+@@ 4.18 | Advanced | Cross-layer | tags=mutex,fork,multithreaded,inheritance
+Q: What happens to a mutex that another thread holds at the moment a multithreaded process calls fork()?
+SHORT: fork() duplicates only the calling thread into the child; the mutex's in-memory state (including "locked") is copied byte-for-byte, but the thread that actually held it in the parent does not exist in the child to ever unlock it. The child inherits a mutex that looks permanently locked, and any child-side call to pthread_mutex_lock() on it blocks forever, with no possibility of the real owner ever calling unlock.
+DEEP:
+- This is a direct consequence of fork()'s single-thread-survives rule, covered in depth on module 2; this module's angle is specifically what that means for a mutex's internal state, which fork() has no way to "fix up" because it does not know your mutex is a mutex, only that it is memory to copy.
+- Real risk zone: a malloc() call that happens to race a fork() -- glibc's internal heap lock is exactly the kind of mutex this bug class hits, which is why malloc-after-fork-in-a-child that itself calls malloc can hang in rare, hard-to-reproduce ways if the parent's allocator lock was held by a different thread at fork time.
+- pthread_atfork() exists precisely to let a library register handlers that release its own locks before fork() and reacquire them after, in both parent and child, so this scenario does not corrupt library-internal mutexes; it does not fix mutexes application code owns, so the same discipline (or a documented "do not call anything beyond exec() or the async-signal-safe list in the child") is the application's own responsibility.
+- The safe pattern for a multithreaded process that must fork(): call fork() only when you can guarantee no other thread holds any mutex the child's post-fork code might touch, and in the child, restrict yourself to async-signal-safe operations until an exec() replaces the image (module 2's guidance, applied here to mutex-specific fallout).
+FOLLOW:
+- Does pthread_mutex_init() in the child fix an inherited "stuck" mutex? => Only if you know for certain no thread in the parent still references it as the original lock; reinitializing a mutex the child intends to keep using as a fresh, unlocked lock is the usual remedy, but only for locks entirely private to the child's own future use.
+- Is this specific to mutexes, or does it also affect condition variables and semaphores? => The same fork()-only-duplicates-the-caller rule applies identically to any lock-like object with hidden internal state (cond vars, semaphores, rwlocks); this module calls it out for mutexes because they are the primitive underneath most of the others.
+PITFALL: Calling fork() from a multithreaded process without auditing which mutexes other threads might be holding at that exact moment. The bug is a hang that only appears under specific, hard-to-reproduce timing, not something a normal test run reliably catches.
+VERIFY: POSIX.1-2017, fork() DESCRIPTION and pthread_atfork() DESCRIPTION (both on module 2's grounding page; referenced here for the mutex-specific consequence only).
+
+@@ 4.19 | Principal | Scenario | tags=firmware,spinlock,mutex,choice
+Q: You are writing a hot polling loop in an SSD firmware validation harness that checks a completion-queue status flag shared with a worker thread. Do you protect it with a spinlock or a mutex?
+SHORT: Neither, if the flag is a simple boolean set by one writer and polled by one reader -- that is what a C11 `atomic_flag` or `atomic_bool` is for (module 7), with no lock needed. If the shared state is more than one flag (a small struct of queue head/tail/depth updated together), a spinlock is defensible only if the section is a few instructions, cores are never oversubscribed for that thread, and it never blocks (no syscall, malloc, or logging) while held; otherwise use a mutex.
+DEEP:
+- The wrong default in validation code is often "spinlock because it's fast" without checking any of the three preconditions: short critical section, cores >= spinning threads, and no blocking calls under the lock; 4.12 showed a spinlock losing to a mutex once the second precondition (cores) was violated, and it loses even harder if the third is violated (a spinning thread starving the CPU a blocked-in-syscall holder needed to make progress).
+- For a truly tiny, single-word state shared between exactly one producer and one consumer thread with no other invariant to protect, prefer `_Atomic` load/store or CAS directly over any lock at all -- it removes the lock-vs-spin question entirely; this is squarely module 7's and module 10's territory, referenced here because "do I even need a lock" should be asked before "which lock."
+- If a real spinlock is chosen, document why (measured contention profile, core pinning guarantee) right next to the pthread_spin_init() call, because the assumptions that justified it (core count, thread count, section length) are exactly the things that silently rot as the harness grows more worker threads over time.
+- Firmware validation code specifically tends to accumulate exactly this kind of rot: a spinlock chosen when the harness had 2 worker threads on an 8-core box, still there unreviewed once it grew to 16 worker threads sharing 8 cores.
+FOLLOW:
+- What is the actual failure mode if the assumptions rot and nobody notices? => Throughput degrades gradually as core oversubscription increases, which often gets misdiagnosed as "the DUT got slower" rather than "our own spinlock stopped being a good idea," precisely because nothing crashes or logs an error.
+- Does this change if the validation harness runs with real-time scheduling (SCHED_FIFO)? => It changes the analysis, not the principle: with real-time priorities, a lower-priority spinner can be starved outright by a higher-priority thread on the same core (no time-sharing), which is a harder failure than the SCHED_OTHER oversubscription case and argues even more strongly for a mutex or an atomic unless core pinning is guaranteed.
+PITFALL: Choosing a spinlock once, based on the thread/core count at the time, and never revisiting that choice as the harness's thread count grows. The performance regression this causes has no compiler warning and no crash to point at it.
+VERIFY: No single POSIX clause; this is a design synthesis of pthread_spin_init()'s APPLICATION USAGE (optional, not universally available) with the measured trade-off already demonstrated in 4.12.
+
+@@ 4.20 | Principal | Trap | tags=code-review,over-locking,checklist
+Q: A pull request wraps an entire handler function -- validate input, look up a shared cache entry, format a log line, write a response -- in one pthread_mutex_lock()/unlock() pair "to be safe." What do you flag in review?
+SHORT: Ask exactly which lines touch shared, mutable state (likely only the cache lookup) and push the lock boundary down to cover only those; everything else (input validation, formatting, the response write) does not need mutual exclusion and should run outside the lock so it cannot serialize unrelated requests or drag a blocking call (logging, I/O) inside the critical section. This is 4.06's sizing principle applied as a concrete review checklist, not a new idea.
+DEEP:
+1. **Identify the actual shared state.** Usually a small fraction of the function; everything else is thread-local (stack variables, the request/response being handled) and needs no lock at all.
+2. **Check for a blocking call inside the lock.** Logging (which may do I/O), formatting large strings, or a nested lookup that itself locks something else are the classic things that sneak into an over-broad critical section and turn a fast lock into a slow one, or a lock-ordering hazard (module 8) if the nested call takes another lock.
+3. **Check whether the "safe" broad lock is hiding a second bug.** Sometimes an overly broad lock is really papering over a missing invariant -- e.g. the cache lookup and a related counter update need to happen together, and the reviewer should confirm the narrowed lock still covers both, not just the lookup.
+4. **Ask for (or run) a quick contention check.** If this handler is on a hot path, request the same before/after timing 4.12's methodology used, comparing requests/sec with the full-function lock versus the narrowed one, so the review has a number, not just an opinion.
+5. **Confirm the narrowed critical section is still complete.** The failure mode of narrowing too aggressively is a fresh race (missing exactly the state that did need protecting); this is why step 1 has to be an honest, complete inventory, not a guess.
+- The underlying principle from POSIX's own performance rationale is direct: mutexes are meant to be "locked only for a few instructions," and a handler-wide lock violates that by construction, not by bad luck.
+FOLLOW:
+- What if the team's stated reason for the broad lock is "we got burned by a race once and now we lock everything"? => That is a signal the original race was never actually root-caused; find and name the specific shared state that raced, protect exactly that, and the broad lock usually turns out to have been masking, not fixing, the real bug.
+- Is there ever a legitimate reason to lock a whole handler function? => Rarely, and only when nearly every line in it does touch state shared with other requests (e.g. a strictly serialized command handler by design); even then, moving pure computation and I/O outside the lock is almost always still possible and worth doing.
+PITFALL: Accepting "it works and passes tests" as sufficient justification for an overly broad lock. Correctness under low load says nothing about the throughput cost under real concurrency, which is exactly what over-broad locking sacrifices.
+VERIFY: POSIX.1-2017, pthread_cond_wait() RATIONALE, "Performance of Mutexes and Condition Variables" (same clause grounding 4.06, applied here as a review checklist rather than a design-time rule).

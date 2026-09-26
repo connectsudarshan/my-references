@@ -1,0 +1,499 @@
+# Module 17: Embedded, Firmware & Secure Coding in C
+
+@@ 17.01 | Basic | Concept | tags=mmio,volatile
+Q: Why must a memory-mapped hardware register be accessed through a volatile-qualified pointer in C?
+SHORT: Without volatile, the compiler is free to cache a register's value in a CPU register, reorder accesses, or eliminate ones it thinks are redundant, since as far as the abstract machine can tell nothing else changes that memory; volatile forces every read and write in the source to actually happen, in order, because the standard says the object may change "in ways unknown to the implementation."
+DEEP:
+```c
+#include <stdio.h>
+#include <stdint.h>
+static uint32_t fake_register = 0;   /* simulates a hardware status register */
+int main(void) {
+    volatile uint32_t *status_reg = &fake_register;
+    fake_register = 0x1;                  /* pretend hardware set "ready" */
+    while ((*status_reg & 0x1u) == 0) {   /* volatile forces a real reload every iteration */
+        /* busy-wait */
+    }
+    printf("device ready, status=0x%x\n", *status_reg);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -O2` and run, it printed `device ready, status=0x1`. Without volatile on `status_reg`, an optimizing compiler is entitled to read the register once, see it is never written to from the compiler's point of view inside the loop, and turn the whole `while` into either an infinite loop (if it decided the condition is always true) or nothing at all -- both wrong, and both technically legal per the standard for a non-volatile object the compiler believes is unchanging (C11 6.7.3p7).
+FOLLOW:
+- Does volatile guarantee the access is atomic? => No; volatile only forces the access to actually happen as written, in program order relative to other volatile accesses -- it says nothing about atomicity or memory ordering visible to another core or thread.
+- Is `volatile uint32_t *p` the same as `uint32_t volatile *p`? => Yes, both qualify the pointed-to type as volatile (the qualifier binds to what precedes it, or to the base type if it is first); `uint32_t *volatile p` instead would make the pointer itself volatile, not what it points to.
+PITFALL: Qualifying the wrong level of a multi-level declaration, e.g. writing `uint32_t *volatile p` when you meant the pointed-to register to be volatile, which silently compiles but protects the wrong thing.
+
+@@ 17.02 | Basic | Concept | tags=isr,constraints
+Q: What must an interrupt service routine (ISR) never do, and why?
+SHORT: An ISR must never block (no mutex waits, no I/O that can stall), must not call malloc/free or most of the standard library (non-reentrant internal state, unbounded time), and must keep its critical section as short as possible, because it runs with interrupts often disabled or nested and any delay or reentrancy bug there stalls or corrupts the whole system.
+DEEP:
+Concrete reasons behind each rule:
+- No blocking calls: an ISR runs "on top of" whatever the CPU was doing; blocking there does not just delay one task, it can delay every other interrupt and the whole scheduler, since many architectures keep interrupts of equal or lower priority masked while the handler runs.
+- No malloc/free (or most libc calls) inside the handler: the general-purpose allocator is not guaranteed reentrant -- if the code the ISR interrupted was itself inside malloc's internal bookkeeping (e.g. updating a free list), calling malloc again from the ISR can corrupt that shared state (see 17.14/17.15 for the concrete signal-handler analogue in the C standard).
+- Keep it short and defer work: the standard firmware pattern is "do the minimum in the ISR (read a register, set a flag or push into a lock-free ring buffer, per module 18's fig=ringbuffer design), then let a later main-loop or scheduled task do the real processing" -- this bounds interrupt latency and keeps the reentrancy surface tiny.
+- Only touch data shared with non-interrupt code through `volatile sig_atomic_t`-style flags or a properly synchronized structure (a single-producer/single-consumer ring buffer is the classic safe pattern), never through an unprotected multi-field struct that could be read half-updated.
+FOLLOW:
+- Can an ISR call printf for quick debugging? => In production code, no -- printf is not guaranteed reentrant and its I/O can block; it is sometimes tolerated temporarily during bring-up debugging on hardware with no other observability, but should never ship.
+- What is "interrupt latency" and why does ISR length matter to it? => The time from the hardware event to the ISR actually starting to handle it; a long-running higher-priority ISR (or one that disables interrupts broadly) delays the start of every other pending interrupt, which is often a hard real-time requirement in firmware.
+PITFALL: Treating "it worked in testing" as proof an ISR is safe; reentrancy and timing bugs in interrupt code are often invisible until a rare overlapping-interrupt timing window occurs in the field.
+
+@@ 17.03 | Basic | Concept | tags=reentrancy,signal-safety
+Q: What does "reentrant" or "signal-handler-safe" (async-signal-safe) mean for a function?
+SHORT: A function is reentrant/async-signal-safe if it can be safely called again while an earlier call to it (on the same thread, e.g. because a signal or interrupt arrived mid-call) has not yet finished, which requires it to touch no shared mutable state without protection that itself cannot be safely re-entered.
+DEEP:
+Why this matters specifically for C on embedded/firmware systems:
+- The C standard itself is explicit about this for signal handlers: per 7.14.1.1p5, if a signal was not raised by `abort`/`raise`, the handler's behavior is undefined if it refers to any static/thread-storage-duration object other than by assigning to a `volatile sig_atomic_t`, or if it calls any standard library function other than `abort`, `_Exit`, `quick_exit`, or `signal` itself.
+- The same reasoning applies to interrupt handlers even outside the standard's own signal-handler wording: `malloc` typically maintains a free list with no lock (on a single-core, single-threaded-looking firmware target, "no lock" is normal since there is usually no preemptive contention to guard against outside interrupts) -- if an ISR calls `malloc` while the interrupted code was itself mid-update of that free list, the second call corrupts shared state that the first call is still relying on.
+- Reentrant-safe operations in this context are small and specific: reading/writing a `volatile sig_atomic_t` (or similarly a single aligned word your target can access atomically), and simple self-contained arithmetic with no shared global side effects.
+- A ring buffer with a single producer (the ISR) and single consumer (the main loop) is reentrant-safe by construction if the head/tail update discipline is followed correctly (module 18 covers this data structure in depth), because each side only ever writes its own index.
+FOLLOW:
+- Is a function reentrant just because it has no static locals? => Not necessarily; it must also avoid calling any non-reentrant function and avoid unprotected access to any object shared with the interrupted context, including through pointers passed in.
+- Does "thread-safe" mean the same thing as "reentrant"? => They overlap but are not identical: thread-safety is about concurrent access from multiple threads (often solved with locks); reentrancy is specifically about a function being safely re-entered on the same thread of control before its first invocation returns, where taking a lock inside a signal/interrupt handler is itself often unsafe or deadlock-prone.
+PITFALL: Assuming a function is safe to call from an ISR just because it "looks stateless," when it actually calls into the standard library's allocator, buffered I/O, or some other function with hidden shared state internally.
+
+@@ 17.04 | Intermediate | Cross-layer | tags=mmio,bitfields,registers
+Q: Why is a C bit-field struct a bad way to describe a hardware register's bit layout, even though it looks natural?
+SHORT: The C standard leaves bit-field allocation order, whether they cross storage-unit boundaries, and their exact storage layout implementation-defined (and unspecified in places), so the same bit-field struct can map to different actual bit positions on different compilers or targets; explicit masks and shifts on a plain volatile integer are the portable way to describe a fixed hardware bit layout.
+DEEP:
+Example of the fragile version versus the portable version for a register where bits [0] = enable, bits [1:3] = mode, bit [4] = error:
+```c
+#include <stdio.h>
+#include <stdint.h>
+
+/* Fragile: relies on this compiler's particular bit-field allocation order
+   and packing, which the standard does not fix (6.7.2.1's bit-field rules
+   leave allocation order and unit-crossing implementation-defined). */
+struct ctrl_bitfield { unsigned enable:1, mode:3, error:1; };
+
+/* Portable: explicit masks/shifts on a plain volatile word, same meaning
+   on every compiler and target. */
+#define CTRL_ENABLE_MASK 0x1u
+#define CTRL_MODE_MASK   0xEu   /* bits 1..3 */
+#define CTRL_MODE_SHIFT  1
+#define CTRL_ERROR_MASK  0x10u
+
+int main(void) {
+    printf("sizeof(struct ctrl_bitfield)=%zu\n", sizeof(struct ctrl_bitfield));
+    volatile uint32_t ctrl = 0;
+    ctrl |= CTRL_ENABLE_MASK;                      /* set enable */
+    ctrl = (ctrl & ~CTRL_MODE_MASK) | (2u << CTRL_MODE_SHIFT); /* set mode=2 */
+    printf("ctrl=0x%x mode=%u\n", ctrl, (ctrl & CTRL_MODE_MASK) >> CTRL_MODE_SHIFT);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -O2` and run, it printed `ctrl=0x5 mode=2`; the exact numeric masks were chosen to match the real register's documented bit positions and will mean the same thing on any C compiler for this target, unlike the bit-field struct's layout.
+FOLLOW:
+- Are bit-fields ever acceptable in firmware code? => Yes, for purely internal, single-compiler, single-build software state where exact memory layout does not need to match an external (hardware or wire) specification; not for anything a datasheet or protocol document fixes the bit positions of.
+- Does using masks and shifts lose readability compared to bit-fields? => Slightly, which is why real firmware code typically wraps them in named macros or small inline helper functions per field, keeping the readability while keeping the layout portable and explicit.
+PITFALL: Porting bit-field-based register code to a new compiler or target without re-verifying the actual bit layout, because "it compiled" gives no guarantee the allocation order matched the datasheet on the new toolchain.
+
+@@ 17.05 | Intermediate | Scenario | tags=signal,sig_atomic_t,isr
+Q: How do you safely communicate "an event happened" from a signal handler (or, by the same pattern, an ISR) to the rest of the program?
+SHORT: Set a single `volatile sig_atomic_t` flag in the handler and do nothing else there; the main code polls that flag and does all the real work outside the handler, which is exactly the one pattern the C standard guarantees is well-defined for a signal handler triggered other than by raise/abort (7.14.1.1p5).
+DEEP:
+```c
+#include <signal.h>
+#include <stdio.h>
+
+static volatile sig_atomic_t stop_flag = 0;
+
+void on_sigterm(int signum) {
+    (void)signum;
+    stop_flag = 1;   /* only thing this handler does: set a flag */
+}
+
+int main(void) {
+    signal(SIGTERM, on_sigterm);
+    raise(SIGTERM);              /* simulate receiving the signal right away */
+    if (stop_flag) {
+        printf("stop_flag observed set after signal\n");
+    }
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -g` and run, it printed `stop_flag observed set after signal`, confirming the main code correctly saw the flag change after the (simulated) signal.
+- `sig_atomic_t` is guaranteed by the standard to be a type whose objects can be accessed as atomic entities even in the presence of asynchronous interrupts (7.14p2), which is exactly the property needed here; it is not a general-purpose atomic integer type for arithmetic under contention, just for this set/read flag pattern.
+- The same exact pattern (a `volatile` flag, set only by the interrupting context, read and cleared only by the interrupted context) is the correct minimal building block for an ISR-to-main-loop signal in firmware, with the ISR-safety caveats from 17.02/17.03 applying identically.
+FOLLOW:
+- Can the flag carry more than a boolean, e.g. an event-type code? => Yes as long as it stays a single `sig_atomic_t`-width value written in one access; do not build a multi-field struct and expect the handler to update it "atomically" without extra synchronization.
+- Why not just use `int stop_flag` instead of `volatile sig_atomic_t`? => Without volatile the compiler can cache stop_flag's value across the loop and never notice the handler changed it; the standard specifically singles out `sig_atomic_t` as the type whose accesses from within a signal handler are well-defined at all, so both qualifier and type matter.
+PITFALL: Doing real work (calling library functions, allocating, complex logic) inside the handler itself instead of just setting the flag; see 17.14/17.15 for exactly why that class of mistake is unsafe.
+
+@@ 17.06 | Intermediate | Scenario | tags=packed-struct,wire-format
+Q: How do you safely parse a fixed binary protocol header into a struct without relying on the compiler's natural struct layout?
+SHORT: Decode each field explicitly, byte by byte, from a raw buffer using shifts and masks in the documented wire byte order, rather than casting the buffer to a struct pointer and dereferencing it; only use a `#pragma pack`'d struct as the destination you fill in, never as something you cast the wire bytes directly onto.
+DEEP:
+```c
+#include <stdio.h>
+#include <stdint.h>
+
+#pragma pack(push, 1)
+typedef struct {
+    uint8_t  opcode;
+    uint16_t length;   /* big-endian on the wire */
+    uint32_t crc;      /* big-endian on the wire */
+} pkt_hdr_t;
+#pragma pack(pop)
+
+static uint16_t be16(const uint8_t *p) { return (uint16_t)((p[0] << 8) | p[1]); }
+static uint32_t be32(const uint8_t *p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+}
+
+int main(void) {
+    uint8_t wire[] = { 0x05, 0x00, 0x10, 0xDE, 0xAD, 0xBE, 0xEF };
+    printf("sizeof(pkt_hdr_t) packed = %zu\n", sizeof(pkt_hdr_t));
+
+    pkt_hdr_t h;
+    h.opcode = wire[0];
+    h.length = be16(&wire[1]);
+    h.crc    = be32(&wire[3]);
+    printf("opcode=0x%02x length=0x%04x crc=0x%08x\n", h.opcode, h.length, h.crc);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -g` and run, it printed `sizeof(pkt_hdr_t) packed = 7` and `opcode=0x05 length=0x0010 crc=0xdeadbeef`, matching the wire bytes exactly. `#pragma pack(push,1)` removes the compiler's usual padding (module 6 covers padding/alignment rules in depth) so the struct's own in-memory size matches the wire size, but the struct is still filled in field by field here, not by casting the raw buffer to `pkt_hdr_t *`; see 17.07 for exactly what goes wrong with that shortcut.
+FOLLOW:
+- Why not just memcpy the whole wire buffer into the packed struct at once? => memcpy would still leave each multi-byte field in the wire's byte order, which only matches the host's native order by accident; the fields would need per-field byte-swapping after the copy regardless, so decoding field-by-field is no more work and is clearer.
+- Is #pragma pack part of the C standard? => No, it and `__attribute__((packed))` are compiler extensions (widely supported by gcc/clang/MSVC in their own forms); the standard leaves structure padding implementation-defined and provides no portable way to remove it.
+PITFALL: Forgetting `#pragma pack(pop)` (or the attribute equivalent) after the wire-format struct definitions, which leaves every later struct in the file unexpectedly packed too.
+
+@@ 17.07 | Intermediate | Trap | tags=endianness,type-punning
+Q: What goes wrong when you cast a raw network/wire buffer directly to a struct pointer and read a multi-byte field?
+SHORT: The field's bytes get reinterpreted in the host's native byte order instead of the wire's documented order, so on a little-endian host a big-endian 16-bit wire value like 0x0010 is read back as 0x1000; the fix is decoding explicitly with shifts, never trusting the host's struct layout to match the wire's byte order.
+DEEP:
+```c
+#include <stdio.h>
+#include <stdint.h>
+
+#pragma pack(push, 1)
+typedef struct { uint8_t opcode; uint16_t length; } pkt_hdr_t;
+#pragma pack(pop)
+
+int main(void) {
+    uint8_t wire[] = { 0x05, 0x00, 0x10 };   /* opcode=0x05, length=0x0010 (big-endian) */
+
+    pkt_hdr_t *bad = (pkt_hdr_t *)wire;      /* BUGGY: direct cast */
+    printf("buggy direct-cast length = 0x%04x (wrong: wire said 0x0010)\n", bad->length);
+
+    uint16_t good_length = (uint16_t)((wire[1] << 8) | wire[2]);  /* CORRECT */
+    printf("correct decoded length   = 0x%04x\n", good_length);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -g` and run on this (little-endian x86-64) host, it printed:
+```
+buggy direct-cast length = 0x1000 (wrong: wire said 0x0010)
+correct decoded length   = 0x0010
+```
+The struct-cast read the two length bytes (0x00, 0x10) in the host's little-endian order, producing 0x1000 instead of the wire's intended 0x0010 -- silently wrong, not a crash, which is what makes this bug class dangerous in the field: it can pass every test run on a little-endian development machine and only misbehave against a real big-endian peer or a specific value pattern.
+FOLLOW:
+- Would this bug also exist on a big-endian host? => No, on an actual big-endian host the direct cast would happen to read the correct value, which is exactly why the bug is easy to miss during development on one architecture and only appears when porting to or interoperating with the other endianness.
+- Is casting a buffer to a struct pointer also a strict-aliasing concern, separate from endianness? => Yes; besides the endianness bug, reading through a pointer of a different effective type than how the memory was written is a distinct undefined-behavior risk covered in module 10, so the struct-cast approach has two independent problems, not just one.
+PITFALL: Testing wire-format parsing code only on one host architecture and concluding it is correct, when the byte-order bug is invisible precisely on a same-endianness host/wire pairing.
+
+@@ 17.08 | Advanced | Cross-layer | fig=mmio | tags=volatile,compiler-reordering
+Q: Concretely, what does the compiler actually do differently to a memory-mapped register write with and without volatile?
+SHORT: Compiling the identical write-three-times loop with and without volatile and comparing disassembly shows the non-volatile version collapsing three stores into one (the compiler proves the first two are "dead" since nothing it can see reads them), while the volatile version emits three separate store instructions plus a real reload, exactly the compiler behavior 6.7.3p7 exists to prevent for objects that "may be modified in ways unknown to the implementation."
+DEEP:
+```c
+/* non-volatile version */
+#include <stdint.h>
+static uint32_t reg = 0;
+int main(void) {
+    uint32_t *p = &reg;
+    for (int i = 0; i < 3; i++) { *p = 1; }
+    return (int)*p;
+}
+```
+```c
+/* volatile version, otherwise identical */
+#include <stdint.h>
+static uint32_t reg = 0;
+int main(void) {
+    volatile uint32_t *p = &reg;
+    for (int i = 0; i < 3; i++) { *p = 1; }
+    return (int)*p;
+}
+```
+Both compiled with `gcc -std=c11 -Wall -Wextra -O2`. Disassembling with `objdump -d`, the non-volatile `main` contained exactly one store instruction:
+```
+movl   $0x1,0x2fc6(%rip)        # reg
+mov    $0x1,%eax
+ret
+```
+while the volatile `main` contained three separate stores plus a final load:
+```
+movl   $0x1,0x2fc6(%rip)        # reg
+movl   $0x1,0x2fbc(%rip)        # reg
+movl   $0x1,0x2fb2(%rip)        # reg
+mov    0x2fac(%rip),%eax        # reg  (real reload for the return value)
+ret
+```
+This is the figure's point made concrete: the compiler treated the non-volatile writes as redundant (only the last one is observable, so the first two are eliminated, and the final read is answered from the constant it just proved was stored, no reload needed) while every volatile write and the final volatile read actually happened as separate instructions in program order, because the standard requires the abstract machine's sequence of accesses to a volatile object to be preserved, not just its final value.
+FOLLOW:
+- Would -O0 show the same difference between the two versions? => Mostly not; at -O0 gcc generally does not perform this kind of dead-store elimination anyway, so both versions tend to emit similar code, which is exactly why relying on an unoptimized build to "prove" non-volatile register access is fine is misleading.
+- Does this same reasoning apply to reads, not just writes? => Yes symmetrically: a non-volatile read inside a polling loop can be hoisted out of the loop entirely (read once, then loop forever or not at all on that stale value) since the compiler sees nothing in the loop body that could change it; volatile forces a fresh read every iteration, which is exactly the polling pattern in 17.01.
+PITFALL: Testing volatile-sensitive code only at -O0, where the compiler often has not yet applied the optimizations (dead-store/load elimination, hoisting, reordering) that a volatile qualifier exists to prevent, then being surprised when a release (-O2) build breaks.
+
+@@ 17.09 | Advanced | Debug | tags=buffer-overflow,strcpy
+Q: A firmware log function using strcpy on attacker- or peer-controlled input overflows its stack buffer. Show the vulnerable code, how it fails, and a real fix.
+SHORT: strcpy has no destination-size awareness, so any input at or past the buffer's size overflows the stack; the fix is bounding the copy to the destination's size and always null-terminating, for example with snprintf's guaranteed truncation-and-terminate behavior.
+DEEP:
+Vulnerable:
+```c
+#include <string.h>
+#include <stdio.h>
+void copy_in(const char *user_input) {
+    char buf[16];
+    strcpy(buf, user_input);   /* no bound check: overflow if input >= 16 bytes */
+    printf("buf=%s\n", buf);
+}
+int main(void) {
+    copy_in("short");
+    copy_in("this string is far longer than 16 bytes");
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -g -fsanitize=address` and run, ASan aborted on the second call:
+```
+==1493==ERROR: AddressSanitizer: stack-buffer-overflow ... WRITE of size 40
+    #1 in copy_in t.c:5
+    #2 in main t.c:10
+Address ... is located in stack of thread T0 at offset 48 in frame
+    #0 in copy_in t.c:3
+  This frame has 1 object(s): [32, 48) 'buf' <== overflows this variable
+```
+Fixed:
+```c
+#include <string.h>
+#include <stdio.h>
+void copy_in(const char *user_input) {
+    char buf[16];
+    /* snprintf always null-terminates and never writes past sizeof(buf) */
+    int n = snprintf(buf, sizeof(buf), "%s", user_input);
+    if (n < 0) return;
+    printf("buf=%s\n", buf);
+}
+int main(void) {
+    copy_in("short");
+    copy_in("this string is far longer than 16 bytes");
+    return 0;
+}
+```
+Compiled the same way and run, it produced no ASan report and printed `buf=short` then `buf=this string is` (the second string silently, safely truncated to fit).
+FOLLOW:
+- Would strncpy(buf, user_input, sizeof(buf)) have been an equally good fix? => Almost, with one classic trap: strncpy does not guarantee null-termination when the source is exactly sizeof(buf) or longer, so buf could be left without a terminator; you would still need to force `buf[sizeof(buf)-1] = '\0'` afterward, which snprintf already handles for you.
+- Is a stack canary (compiler stack-protector) a substitute for this fix? => No, a canary can turn some overflows into a detected abort instead of silent corruption, but it does not prevent the overflow itself or guarantee detection for every overflow pattern; bounding the copy is the actual fix, the canary is defense in depth.
+PITFALL: Switching to a "safer-looking" function name (like strncpy) without checking its exact truncation/termination contract, and ending up with a different but still real bug (a non-terminated buffer read later as if it were a C string).
+
+@@ 17.10 | Advanced | Debug | tags=format-string,printf
+Q: Why is printf(user_string) a security bug, and what real fix removes it?
+SHORT: If user_string itself contains conversion specifiers like %s or %n, printf interprets them and pulls arguments off the stack that were never actually passed, reading (or, with %n, writing to) whatever garbage address it finds there; the fix is always passing a fixed format string and the user data as its argument, e.g. printf("%s", user_string), so user data is never treated as format syntax.
+DEEP:
+Vulnerable:
+```c
+#include <stdio.h>
+void log_msg(const char *user_string) {
+    printf(user_string);   /* attacker-controlled format string */
+}
+int main(void) {
+    log_msg("hello\n");          /* looks fine */
+    log_msg("%s%s%s%s\n");       /* reads unrelated stack values as pointers: undefined */
+    return 0;
+}
+```
+gcc's own `-Wall -Wextra` already flags this at compile time (`-Wformat-security`: "format not a string literal and no format arguments"), and compiling and running it anyway (to see the real failure mode) printed:
+```
+hello
+hello
+(null)(null)<garbage bytes>
+```
+The first call was harmless because the literal happened to contain no `%` conversions; the second, with no arguments actually passed for its four `%s` specifiers, made printf read whatever values happened to be in the argument-passing registers/stack slots and dereference them as `char *`, which is undefined behavior and, with attacker-chosen format strings (especially `%n`, which writes to a pointer argument), a known real-world exploitation technique for information disclosure or memory corruption.
+Fixed:
+```c
+#include <stdio.h>
+void log_msg(const char *user_string) {
+    printf("%s", user_string);   /* user string is always DATA, never the format */
+}
+int main(void) {
+    log_msg("hello\n");
+    log_msg("%s%s%s%s\n");   /* now printed literally, harmless */
+    return 0;
+}
+```
+Compiled and run, this version printed `hello` then the literal text `%s%s%s%s`, correctly treating the attacker-supplied string as data with no special meaning.
+FOLLOW:
+- Does this same bug class apply to other formatted functions? => Yes, any of printf's family (fprintf, snprintf, syslog and similar logging APIs) has the identical risk whenever the format-string argument is not a fixed literal.
+- Would -Wformat-security have caught this without ever running the program? => Yes, it is a static warning gcc/clang emit at compile time whenever a non-literal is passed as a format string with no corresponding variadic arguments; treating that warning as an error (-Werror=format-security) in a firmware build is a reasonable hardening policy.
+PITFALL: Assuming a format-string bug is harmless because "we control what strings normally flow through this code path"; the entire risk is inputs the code was not designed to expect, which is exactly what security review targets.
+
+@@ 17.11 | Advanced | Numeric | tags=integer-overflow,malloc
+Q: A firmware routine computes malloc(count * size) for an attacker-influenced count. Work out how this overflows and show the fix.
+SHORT: On this 64-bit platform, size_t wraps modulo 2^64; choosing count = (SIZE_MAX / 4) + 10 and size = 4 makes count * size wrap to a small number (36 bytes here) instead of the astronomically large true product, so malloc happily "succeeds" with far too little memory for the code's later writes; the fix checks count > SIZE_MAX / size before multiplying.
+DEEP:
+```c
+#include <stdio.h>
+#include <stdlib.h>
+
+void *alloc_records_vuln(size_t count, size_t size) {
+    return malloc(count * size);   /* count*size can overflow size_t and wrap */
+}
+void *alloc_records_fixed(size_t count, size_t size) {
+    if (size != 0 && count > (size_t)-1 / size) return NULL;  /* would overflow */
+    return malloc(count * size);
+}
+
+int main(void) {
+    size_t huge_count = ((size_t)-1) / 4 + 10;
+    size_t rec_size = 4;
+    printf("count=%zu size=%zu product(wrapped)=%zu\n",
+           huge_count, rec_size, huge_count * rec_size);
+    void *p1 = alloc_records_vuln(huge_count, rec_size);
+    printf("vuln malloc returned %s\n", p1 ? "non-NULL" : "NULL");
+    free(p1);
+    void *p2 = alloc_records_fixed(huge_count, rec_size);
+    printf("fixed alloc returned %s\n", p2 ? "non-NULL" : "NULL");
+    free(p2);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -g` and run, it printed:
+```
+count=4611686018427387913 size=4 product(wrapped)=36
+vuln malloc returned non-NULL
+fixed alloc returned NULL
+```
+The math: `(size_t)-1` is `SIZE_MAX` (2^64 - 1 on this platform, an unsigned type so this cast is well-defined per 6.3.1.3p2, not UB); dividing by 4 and adding 10 deliberately produces a count where `count * 4` exceeds 2^64 and wraps to 36 (mod 2^64) instead of the true, enormous product. `malloc(36)` then succeeds and returns a real but far-too-small allocation; any code that trusted `count` records now fit and wrote that many 4-byte records would overflow that 36-byte block on record number 10 -- a heap overflow whose root cause is the earlier integer overflow, several lines before the actual out-of-bounds write. The fixed version rejects the request before multiplying by checking `count > SIZE_MAX / size` (rearranged from `count * size > SIZE_MAX` to avoid overflowing while checking for overflow).
+FOLLOW:
+- Why is (size_t)-1 well-defined here instead of undefined like signed overflow? => size_t is an unsigned type, and unsigned arithmetic (including converting a negative value like -1 to an unsigned type) is defined by the standard to wrap modulo 2^N (6.3.1.3p2), unlike signed overflow which is undefined behavior.
+- Is calloc a safer alternative to malloc(count*size) for this exact pattern? => The C11 text itself only says calloc(nmemb, size) allocates space for nmemb objects of size size and zero-fills it (7.22.3.2p2), with no explicit overflow-checking guarantee; in practice, quality implementations (glibc among them) do reject an overflowing nmemb*size internally, which is why calloc is still the preferred call here, but that check is a quality-of-implementation property to verify for your target, not a portable C11 guarantee.
+VERIFY: Whether the specific libc on your target's calloc actually rejects an overflowing nmemb*size; the C11 standard text itself does not mandate this.
+PITFALL: Checking `count * size == 0` as an overflow test; a wrapped product can land on any value, including a plausible-looking nonzero one (36 here), not just zero, so that check misses the overflow entirely.
+
+@@ 17.12 | Advanced | Scenario | tags=length-prefixed,bounds-check
+Q: How do you safely parse a length-prefixed packet (a 2-byte length followed by that many payload bytes) out of a fixed-size receive buffer?
+SHORT: Read the length field first, then before touching any payload byte verify the claimed length does not exceed both the receive buffer's actual remaining bytes and the destination buffer's capacity; reject (do not truncate-and-continue) any packet that fails either check, since a claimed length is untrusted input, not a fact.
+DEEP:
+```c
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+
+#define RX_BUF_CAP 64
+
+/* Returns 0 on success, -1 on a malformed/oversized packet (rejected, not truncated). */
+int parse_packet(const uint8_t *rx, size_t rx_len, uint8_t *out, size_t out_cap, size_t *out_len) {
+    if (rx_len < 2) return -1;                         /* not even a full length field */
+    uint16_t claimed_len = (uint16_t)((rx[0] << 8) | rx[1]);
+    size_t available = rx_len - 2;
+    if (claimed_len > available) return -1;            /* claims more than we actually received */
+    if (claimed_len > out_cap) return -1;               /* would not fit destination either */
+    memcpy(out, rx + 2, claimed_len);
+    *out_len = claimed_len;
+    return 0;
+}
+
+int main(void) {
+    uint8_t good_pkt[] = { 0x00, 0x03, 'a', 'b', 'c' };
+    uint8_t bad_pkt[]  = { 0xFF, 0xFF, 'a', 'b', 'c' };  /* claims 65535 bytes, only 3 present */
+    uint8_t out[RX_BUF_CAP];
+    size_t out_len;
+
+    printf("good packet: %s\n", parse_packet(good_pkt, sizeof(good_pkt), out, sizeof(out), &out_len) == 0 ? "accepted" : "rejected");
+    printf("bad packet:  %s\n", parse_packet(bad_pkt, sizeof(bad_pkt), out, sizeof(out), &out_len) == 0 ? "accepted" : "rejected");
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -g` and run, it printed `good packet: accepted` and `bad packet:  rejected`, confirming the oversized-length packet was rejected before any `memcpy` touched memory based on its untrusted claim.
+FOLLOW:
+- Why reject instead of clamping claimed_len down to available and continuing? => A packet whose claimed length does not match what was actually received is malformed by definition; silently reinterpreting it as a shorter, different packet can misparse the remaining bytes (which the sender intended as something else) rather than safely handling an error.
+- Does this pattern change for a length field that could itself be adversarially huge (e.g. a 32-bit length)? => The same two checks still apply, just done in a wide-enough integer type to avoid a length-field-arithmetic overflow of its own, similar in spirit to 17.11's count*size overflow.
+PITFALL: Validating claimed_len against the destination buffer's capacity but forgetting to also validate it against how many bytes were actually received, which lets a short, truncated receive still "successfully" copy uninitialized or stale bytes from beyond what arrived.
+
+@@ 17.13 | Principal | Concept | tags=secure-parsing,checklist
+Q: You are reviewing a firmware update image parser before it ships. What is a concrete checklist for the input-validation issues an interviewer expects you to raise unprompted?
+SHORT: Validate every length/count/offset field against both the buffer actually available and the destination capacity before use (17.12), check every size computation for overflow before allocating or indexing (17.11), never format untrusted data as a printf format string (17.10), never copy untrusted data with an unbounded function (17.09), and verify a cryptographic signature/hash over the whole image before trusting any of its parsed contents, not just checking a version field.
+DEEP:
+A Principal-level review checklist, in the order an attacker-controlled update image should be examined:
+1. Authenticity first: is the image's signature (or at minimum a strong hash against a trusted, separately-delivered value) verified before any field inside it is parsed and acted on? Parsing untrusted structure before authentication means a malformed-but-unsigned image can already exploit a parser bug even if it would later fail signature checks.
+2. Every length and count field: is it bounds-checked against both the actual received/mapped image size and the destination buffer before being used to index, copy, or allocate (17.12's pattern)? Flag any place a length field is trusted without that check.
+3. Every size computation feeding an allocation or index (count * element_size, offset + length, and similar): checked for overflow before use, in a wide-enough type (17.11's pattern), not just "looks reasonable" by inspection.
+4. Every fixed-size destination buffer receiving variable-length data: copied into with a bounded function (snprintf, memcpy with a checked length, never strcpy/strcat/sprintf/gets) per 17.09.
+5. Any place a field from the image is passed as, or concatenated into, a format string, a shell command, or similar interpreted syntax: rejected in favor of treating it purely as data (17.10's pattern, generalized).
+6. Version/compatibility fields: parsed defensively (reject unknown/out-of-range versions explicitly) rather than assuming a version number itself is trustworthy just because it parses as a plausible integer.
+7. Failure paths: does every rejection path actually stop processing (return/abort parsing) rather than logging a warning and continuing with partially-parsed or default-filled state? A validated-but-then-ignored check is equivalent to no check.
+A Principal answer states this as a checklist proactively, not just as a reaction to a hypothetical found bug, because "what would you look for" is the actual question being asked, not "can you fix this one bug."
+FOLLOW:
+- Why does authenticity (signature check) come before structural validation in this order? => Because parsing itself is where memory-safety bugs live; an attacker does not need a valid signature to trigger a parser bug from a malformed field, so structural parsing of anything not yet authenticated should be treated as parsing hostile input regardless of what the fields claim.
+- Is this checklist specific to firmware update images, or does it generalize? => It generalizes to any parser consuming external/untrusted binary or text input (network protocols, file formats, IPC messages); firmware update images are simply a case where the consequence of a missed check (a compromised, hard-to-recover device) is unusually severe.
+PITFALL: Reviewing only the "happy path" fields (the ones the normal build tool produces) and never constructing a deliberately malformed image to exercise every rejection path during review or testing.
+
+@@ 17.14 | Principal | Trap | tags=signal,reentrancy,malloc
+Q: What specifically goes wrong if a signal handler calls printf or malloc, and why can it appear to "just work" in casual testing?
+SHORT: printf and malloc maintain internal shared state (stdio buffers, the heap's free-list/bookkeeping) that is not guaranteed reentrant; if the signal interrupts the main program while it is itself inside that same internal state, the handler's call can corrupt it, but this only manifests when the interrupt happens to land inside that narrow window, which is why it can pass every test that never interrupts at exactly the wrong instruction.
+DEEP:
+```c
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+/* BAD: calls malloc() and printf(), neither on the C standard's short list of
+   functions a signal handler may call (7.14.1.1p5: only abort, _Exit,
+   quick_exit, and signal itself, for a signal not raised via raise/abort). */
+static void bad_handler(int signum) {
+    (void)signum;
+    int *leak = malloc(sizeof(int));
+    if (leak) { *leak = 1; printf("handled\n"); }
+}
+static volatile sig_atomic_t got_signal = 0;
+static void good_handler(int signum) { (void)signum; got_signal = 1; }
+
+int main(void) {
+    signal(SIGUSR1, bad_handler);
+    raise(SIGUSR1);           /* demonstrates it "runs", not that it is safe */
+    signal(SIGUSR1, good_handler);
+    got_signal = 0;
+    raise(SIGUSR1);
+    printf("got_signal=%d\n", got_signal);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -g` and run, this printed `handled` then `got_signal=1` -- the bad_handler call "worked" in this run, because `raise` here happens synchronously with nothing else mid-call in malloc/stdio's internal state at that exact moment; per the standard this is still undefined behavior, since raise/abort-triggered signals are the one exception where the handler's actions are more permissive (7.14.1.1p4-5), but a real asynchronous interrupt landing while the interrupted code is itself inside malloc's free-list update or stdio's buffer-flush logic would re-enter that same non-reentrant code and can corrupt it -- a bug that depends on timing that a synchronous test using raise() at a controlled point does not reproduce.
+- This is precisely why "it worked when I tested it" is not evidence of safety here: the standard's undefined-behavior classification is about what is permitted to happen across all possible timings and implementations, not about what one specific test run's timing happened to trigger.
+- The good_handler pattern (a bare volatile sig_atomic_t assignment) has none of this risk because it touches no shared library-internal state at all.
+FOLLOW:
+- Does this same risk apply identically to a hardware ISR calling malloc, not just a POSIX signal handler? => Yes, the mechanism is the same (re-entering non-reentrant shared state from an asynchronously-interrupting context); the C standard's specific wording is about signal handlers, but the underlying reentrancy hazard is identical for interrupt handlers in embedded firmware.
+- Would running this under ThreadSanitizer or a similar tool reliably catch the bug? => Not reliably; these tools are strongest at races between truly concurrent threads, while this hazard is about a single thread of control being asynchronously re-entered, which needs the interrupt to land at exactly the vulnerable instruction to manifest, something a sanitizer cannot force without specialized interrupt-fuzzing tooling.
+PITFALL: Concluding a signal/ISR handler is safe because a debug build with printf logging inside it "worked fine" during development; the exact conditions that trigger the corruption are timing-dependent and can be arbitrarily rare.
+
+@@ 17.15 | Principal | Cross-layer | tags=isr-review,root-cause
+Q: You are handed an ISR that calls printf for logging and occasionally the system hangs or corrupts unrelated data. Walk through diagnosing and fixing it at Principal depth.
+SHORT: Recognize the pattern immediately (printf inside an ISR touches non-reentrant stdio/allocator state, 17.14), confirm by checking whether the hang/corruption correlates with logging-heavy code paths and with the ISR firing during those windows, then fix by replacing the logging call with a lock-free write into a ring buffer that a normal-context task later drains and actually prints from.
+DEEP:
+A concrete diagnosis-to-fix walkthrough:
+1. Pattern-match first: any ISR calling a stdio function or the allocator is an immediate suspect regardless of symptoms, per 17.02/17.03/17.14; state this as the leading hypothesis before even reproducing, since it is a structural defect, not something that needs a crash dump to justify raising.
+2. Look for the timing signature that confirms it: does the hang/corruption correlate with periods of heavier logging (more printf calls in flight, meaning more time spent inside stdio's internal buffer/lock state) and with higher interrupt rates (more chances for the ISR to fire mid-printf)? Both correlating together strongly supports the reentrancy hypothesis over an unrelated bug.
+3. If reproducible in a lab setup, confirm directly: a debug build that logs (from normal, non-ISR context only, to avoid the very bug being tested) the program counter or a marker showing "main context was inside printf/malloc when the ISR fired" at the moment of failure is strong direct evidence.
+4. Fix architecturally, not by patching the symptom: remove the printf call from the ISR entirely. Replace it with the minimal safe operation from 17.02/17.03 -- push the log message (or just a compact event code/timestamp) into a single-producer/single-consumer ring buffer (module 18 covers the real data structure) using only plain index arithmetic, no library calls. A separate, normal-context task or the main loop then pops from that ring buffer and does the actual printf/formatting/I/O outside any interrupt context.
+5. Explicitly state the trade-off this fix accepts: log messages are now delayed until the consumer next runs (not printed instantly at the moment of the event), and if the ring buffer fills faster than it drains, messages are dropped (a real, size-able capacity/throughput trade-off, not just a code fix); a Principal-level answer names this trade-off unprompted rather than presenting the fix as a free improvement.
+6. Verify the fix actually removed the hazard, not just the symptom: confirm no remaining code path in or reachable from the ISR calls a non-reentrant library function, not only that printf specifically is gone (the same class of bug could reappear via a different call, e.g. malloc for a "temporary" formatting buffer).
+FOLLOW:
+- Why might the original bug present as a full system hang rather than a crash? => Corrupting stdio's or the allocator's internal lock/state can leave a data structure in a state where a later, unrelated call spins forever (e.g. on a corrupted linked free-list) rather than faulting immediately, which looks like a hang with no obvious faulting instruction to backtrace to.
+- Is disabling interrupts around the printf call in the ISR itself an acceptable fix instead? => No; that does not address calling non-reentrant code from within an ISR (the hazard is re-entering the allocator/stdio state that the main-context code was left inside, not other interrupts arriving), and it also extends interrupt latency for every other interrupt source, trading one problem for another.
+PITFALL: Fixing this by simply removing the log calls (losing observability) instead of restoring safe observability via a ring-buffer-plus-deferred-consumer design, treating "make the symptom stop" as equivalent to "make the system correct and still debuggable."
+
+@@ 17.16 | Principal | Concept | tags=hardening,firmware-update
+Q: Design-level: how would you harden a firmware update image validator against the buffer- and integer-overflow classes of attack covered in this module, and what would you state as the residual risk?
+SHORT: Layer defenses: authenticate the whole image before parsing any field (17.13), validate every length/count against both source and destination bounds (17.12), check every size computation for overflow before allocating or indexing (17.11), use only bounded copy/format functions throughout (17.09/17.10), and state plainly that this reduces but never eliminates risk from an unknown parser bug.
+DEEP:
+A design answer structured the way a Principal review expects, stated unprompted rather than only in response to a specific found bug:
+- Defense in depth, ordered by what an attacker needs to defeat first: (1) a valid signature over the entire image, checked before any byte of the image's structure is parsed for meaning; (2) structural validation of every field that controls a length, count, offset, or size computation, rejecting rather than clamping on any inconsistency; (3) bounded, checked primitives (snprintf/memcpy-with-checked-length, overflow-checked size arithmetic) used exclusively throughout the parser, with no direct calls to strcpy/sprintf/gets or unchecked multiplication feeding an allocation.
+- Fail-closed as a stated design principle: any validation failure aborts the update and leaves the existing, already-verified firmware running (never partially applies an unvalidated image), which turns a parser bug from "attacker gets code execution or bricks the device" into, at worst, "a malformed update is correctly rejected."
+- State the residual risk plainly: signature verification protects against a *tampered* image, not against a bug in the *validator itself* being triggered by a maliciously crafted but validly-signed image (e.g. if the signing pipeline itself accepts attacker-supplied firmware, or if the parser bug is in code that runs before or regardless of signature status, such as a bootloader's initial header sniff). The concrete mitigation for that residual risk is minimizing what runs before authentication (ideally: read a fixed-size, fixed-format header, verify the signature, and only then parse anything variable-length or attacker-influenced) and testing the validator itself with fuzzing against deliberately malformed images, treating it as untrusted-input-facing code held to the same standard as a network-facing parser.
+- This is the answer shape a Principal interview is testing for: naming the layered checks, explaining the order they must apply in and why, and being explicit about what is not fully solved rather than presenting hardening as making the system attack-proof.
+FOLLOW:
+- Why does the order (signature before structural parsing) matter for the residual-risk argument specifically? => Because minimizing pre-authentication parsing surface is the actual mitigation for "a bug in the validator" risk; the less code that runs on attacker-controlled bytes before authentication, the smaller that residual attack surface actually is, not just in principle.
+- Would code review alone (no fuzzing) be sufficient assurance for this validator before shipping? => No; this module's own examples (17.07's endian bug, 17.11's overflow) show defects that are easy to miss by inspection and are exactly the class that fuzzing/dynamic testing against malformed inputs reliably surfaces, so both practices are expected together, not as substitutes for each other.
+PITFALL: Treating "we verify a signature" as sufficient justification to relax structural validation elsewhere in the parser; the signature protects the image's authenticity, not the correctness of the code that later parses its contents.

@@ -1,0 +1,90 @@
+[
+ {
+  "id": 1,
+  "title": "Processes vs Threads & Process Memory Layout",
+  "scope": "What a process and a thread each own (address space, file descriptors, signal handlers are process-wide; stack, registers, thread-local storage are per-thread), the address-space layout (text, initialized/uninitialized data, heap, stack, and where thread stacks live relative to the main stack), and why threads make some bugs process-invisible.",
+  "figs": "procmem: one process's address space with a shared heap/data segment and multiple thread stacks"
+ },
+ {
+  "id": 2,
+  "title": "Process Control: fork, exec, wait, signals",
+  "scope": "fork()'s copy-on-write duplication and what is and is not inherited, the exec family replacing the image, wait/waitpid and orphan/zombie processes, signal delivery and default dispositions, signal handlers and async-signal-safe functions (POSIX's actual list), and why fork() in a multithreaded process is dangerous.",
+  "figs": "forkmodel: parent/child address spaces after fork with copy-on-write pages, and a process tree waiting on a child"
+ },
+ {
+  "id": 3,
+  "title": "POSIX Threads: Creation, Joining & Attributes",
+  "scope": "pthread_create's signature and start routine contract, pthread_join vs pthread_detach and the resource-leak risk of neither, pthread_attr_t (stack size, guard size, detach state, scheduling policy), passing and returning data safely through the void* argument, and thread-local storage with __thread / _Thread_local."
+ },
+ {
+  "id": 4,
+  "title": "Mutexes & Critical Sections",
+  "scope": "pthread_mutex_init/lock/unlock/destroy semantics, mutex types (PTHREAD_MUTEX_NORMAL/RECURSIVE/ERRORCHECK) and when each matters, spinlocks vs mutexes and when spinning is actually faster, critical section sizing, and a real compiled example that reproduces a race with the lock removed and fixes it with the lock added.",
+  "figs": "mutexstate: two threads contending for one mutex, with the blocked thread's wait and wake shown on a timeline"
+ },
+ {
+  "id": 5,
+  "title": "Condition Variables & Signaling",
+  "scope": "pthread_cond_wait/signal/broadcast and why a condition variable is always used with a mutex and a predicate loop (never a bare wait), lost wakeups and spurious wakeups and how the predicate loop prevents both, signal vs broadcast, and building a bounded blocking queue from a mutex plus two condition variables (not-empty, not-full).",
+  "figs": "condvarflow: producer signaling a waiting consumer through a mutex-protected condition variable, with the predicate check on wake"
+ },
+ {
+  "id": 6,
+  "title": "Semaphores, Read-Write Locks & Barriers",
+  "scope": "POSIX unnamed and named semaphores (sem_init/sem_post/sem_wait) as counting resource guards versus a mutex's binary ownership, pthread_rwlock for read-heavy workloads and the writer-starvation risk, and pthread_barrier_wait for phased parallel work, each with a compiled example.",
+  "figs": "rwlock: multiple concurrent readers versus one exclusive writer on the same rwlock, and a writer waiting for readers to drain"
+ },
+ {
+  "id": 7,
+  "title": "Memory Model, Atomics & Ordering",
+  "scope": "The C11 abstract memory model, stdatomic.h types and operations, the memory_order variants (relaxed, acquire, release, acq_rel, seq_cst) and what each actually orders, compiler reordering versus CPU reordering versus cache-coherence effects, false sharing across cache lines, and why volatile is neither atomic nor a memory barrier (ties back to the C page's qualifier module).",
+  "figs": "memorder: a store-then-flag-set on one thread and a flag-check-then-load on another, showing what an acquire/release pair actually prevents"
+ },
+ {
+  "id": 8,
+  "title": "Deadlock, Livelock, Starvation & Priority Inversion",
+  "scope": "The four necessary deadlock conditions and which one lock ordering breaks, try-lock and timeout-based avoidance, livelock (two threads politely deadlocking by both backing off in lockstep), starvation under an unfair scheduler or lock, and priority inversion with the priority-inheritance-mutex fix (the Mars Pathfinder story is fair game to mention, briefly).",
+  "figs": "deadlock: two threads each holding one lock and waiting on the other's, as a wait-for cycle"
+ },
+ {
+  "id": 9,
+  "title": "Classic Concurrency Problems",
+  "scope": "Producer-consumer with a bounded buffer, the readers-writers problem with both the naive and starvation-avoiding solutions, and dining philosophers with the resource-ordering fix that avoids the deadlock, each as real compiled pthreads code with the bug reproduced before the fix.",
+  "figs": "diningphil: five philosophers and five forks as a circular resource graph, with the asymmetric fix that breaks the cycle"
+ },
+ {
+  "id": 10,
+  "title": "Thread-Safety Patterns & Lock-Free Basics",
+  "scope": "Reentrant vs thread-safe (a function can be one without the other), thread-local storage as a lock-free technique, double-checked locking done correctly with C11 atomics (and why the naive version is broken), compare-and-swap and a simple lock-free counter, and where an application engineer should stop and reach for a library instead of hand-rolling lock-free structures."
+ },
+ {
+  "id": 11,
+  "title": "OS Scheduling & Real-Time Concurrency",
+  "scope": "Preemptive multitasking basics, Linux scheduling policies (SCHED_OTHER, SCHED_FIFO, SCHED_RR) and nice/priority, context-switch cost and why it matters for high-IOPS validation code, and what changes when a task has a real deadline (priority assignment, avoiding page faults and unbounded locks in the hot path).",
+  "figs": "scheduling: several threads' run/ready/blocked states over time under a preemptive scheduler"
+ },
+ {
+  "id": 12,
+  "title": "Inter-Process Communication",
+  "scope": "Anonymous and named pipes, POSIX message queues (mq_open/mq_send/mq_receive), shared memory (shm_open/mmap) with an explicit synchronization primitive since shared memory itself provides none, and signals as a lightweight control-plane mechanism, contrasted with the in-process primitives from modules 4 to 6.",
+  "figs": "ipcmodel: two processes exchanging data via a pipe, a message queue, and shared memory, with what synchronization each needs"
+ },
+ {
+  "id": 13,
+  "title": "Virtual Memory & mmap",
+  "scope": "Paging, the page table's role, and what a page fault actually does; mmap for file-backed and anonymous memory, MAP_SHARED vs MAP_PRIVATE, msync, and memory-mapped I/O in firmware/embedded validation code (mapping a register file via /dev/mem-style access) as the concrete tie to module 1's address-space picture.",
+  "figs": "vmpaging: a virtual address translating through a page table to a physical frame, with a fault on an unmapped page"
+ },
+ {
+  "id": 14,
+  "title": "Interrupts, ISRs & Embedded Concurrency",
+  "scope": "Interrupt context versus normal thread/task context, why an ISR must never block (no mutex, no malloc, no blocking syscall), disabling interrupts versus taking a lock as two different concurrency tools, top-half/bottom-half (or hardirq/softirq, tasklet) style splits for deferring work, and reentrancy when the same ISR can interrupt itself or another ISR.",
+  "figs": "isrflow: normal task execution interrupted by an ISR, with the top half doing minimal work and handing off to a deferred bottom half"
+ },
+ {
+  "id": 15,
+  "title": "Debugging Concurrency & Principal-Level Design",
+  "scope": "Finding real races with ThreadSanitizer and helgrind, the difference between a Heisenbug that vanishes under a debugger and one that needs stress plus sanitizers, and Principal-level design-and-code questions: a fixed-size thread pool with a work queue, a strategy for a system with many locks that provably avoids deadlock, and a bounded blocking queue built and reasoned about from first principles (ties back to module 5).",
+  "figs": "threadpool: a shared work queue with several worker threads pulling tasks under one mutex and one condition variable"
+ }
+]

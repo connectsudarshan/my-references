@@ -1,0 +1,102 @@
+[
+ {
+  "id": 1,
+  "title": "Types, Storage Classes, Scope & Linkage",
+  "scope": "Exact-width and standard int types, char signedness, integer promotion and the usual arithmetic conversions, auto/static/extern/register, block scope vs file scope, internal vs external linkage, tentative definitions, and declaration vs definition (the classic 'extern int x;' vs 'int x;' confusion)."
+ },
+ {
+  "id": 2,
+  "title": "Operators, Expressions & Sequence Points",
+  "scope": "Precedence/associativity tables worth memorizing, integer promotion in mixed expressions, short-circuit && / ||, the comma operator, sequence points and what changed in C11's unsequenced-side-effects wording, i=i++ and similar undefined-behavior classics, and ternary pitfalls."
+ },
+ {
+  "id": 3,
+  "title": "Control Flow & Program Structure",
+  "scope": "if/else dangling-else, switch fall-through and duff's-device-style tricks, for/while/do-while and loop invariants, goto for cleanup patterns (still legitimate in C), recursion, tail calls and stack growth, and how control flow lowers to jumps/branches."
+ },
+ {
+  "id": 4,
+  "title": "Pointers Deep Dive",
+  "scope": "Pointer declaration syntax reading rules, pointer arithmetic and its unit (sizeof the pointed-to type), pointer-to-pointer and multi-level indirection, array-to-pointer decay, pointer to an array vs array of pointers, const placement (const T* vs T* const), void* and generic containers, NULL vs dangling vs wild pointers, and pointer comparison rules.",
+  "figs": "ptrmodel: pointer, address and dereference relationship, plus array decay vs pointer-to-array"
+ },
+ {
+  "id": 5,
+  "title": "Arrays, Strings & Memory Layout",
+  "scope": "Array indexing as pointer arithmetic, multi-dimensional array row-major layout and stride math, string literals (read-only, may be shared), null termination and off-by-one bugs, sizeof vs strlen, and writing real, compiled implementations of strlen/strcpy/strcat/strcmp to show true understanding.",
+  "figs": "strlayout: where a string literal and a char array actually live, and why modifying a literal is undefined"
+ },
+ {
+  "id": 6,
+  "title": "Structures, Unions & Bit-Fields",
+  "scope": "Member alignment and padding rules, structure layout with worked byte-offset examples, unions and type punning (and why it is UB except through a byte type), bit-fields (implementation-defined ordering, portability limits), flexible array members (C99), and __attribute__((packed)) / #pragma pack for wire-format structs.",
+  "figs": "structpad: a worked struct layout showing padding bytes and total size"
+ },
+ {
+  "id": 7,
+  "title": "Type Qualifiers: const, volatile, restrict",
+  "scope": "What const actually promises (and does not promise, e.g. a const pointer to non-const data), volatile's real contract (every access is observable, no reordering across it) and why it does not imply atomicity or a memory barrier, restrict's aliasing promise to the optimizer, volatile for memory-mapped registers and signal-handler-shared globals, and the difference from atomics (forward reference to the Advanced page)."
+ },
+ {
+  "id": 8,
+  "title": "Dynamic Memory Management",
+  "scope": "malloc/calloc/realloc/free contracts, alignment guarantees, what realloc does on shrink/grow/failure, heap layout intuition (allocator metadata, free lists), memory leaks, double-free, use-after-free, buffer overflow into adjacent allocations, and writing a minimal fixed-block custom allocator.",
+  "figs": "memmap: a process's address space (text, data, BSS, heap growing up, stack growing down) with where malloc and locals live"
+ },
+ {
+  "id": 9,
+  "title": "The Preprocessor & Macros",
+  "scope": "Object-like vs function-like macros, macro expansion order and rescanning, # (stringize) and ## (token paste), variadic macros (__VA_ARGS__), the parenthesize-everything and do{...}while(0) rules, multiple-evaluation bugs (MAX(x++,y)), include guards vs #pragma once, and X-macros for generated tables."
+ },
+ {
+  "id": 10,
+  "title": "Undefined Behavior & Standard Compliance",
+  "scope": "The standard's three-way split (undefined, unspecified, implementation-defined behavior) with real clause references, strict aliasing and why it breaks naive type punning, signed integer overflow being UB while unsigned wraps defined, out-of-bounds pointer arithmetic, and why -fsanitize=undefined catches things -Wall does not."
+ },
+ {
+  "id": 11,
+  "title": "Bit Manipulation & Numeric Representation",
+  "scope": "Two's complement representation and why it makes subtraction free, endianness (byte order) with a runtime check, IEEE-754 float basics relevant to interviews, and the classic bit-twiddling questions with compiled code: set/clear/toggle/test a bit, count set bits (Brian Kernighan's trick), check power of two, swap two variables without a temporary, and reverse bits in a byte.",
+  "figs": "bitops: bit positions and a worked AND/OR/XOR/shift example; endian: the same 32-bit value's byte layout on little- vs big-endian"
+ },
+ {
+  "id": 12,
+  "title": "Function Pointers & C-Style Polymorphism",
+  "scope": "Declaring, assigning and calling through a function pointer, arrays of function pointers as dispatch tables, callback patterns (qsort's comparator, signal handlers), and emulating an interface/vtable in C with a struct of function pointers plus a void* context, the technique behind most C 'object systems'.",
+  "figs": "vtable: a struct-of-function-pointers dispatch table calling into two different implementations"
+ },
+ {
+  "id": 13,
+  "title": "Compilation, Linking & the Build Pipeline",
+  "scope": "The four phases (preprocess, compile to assembly, assemble to object code, link), translation units and one-definition-rule-style issues in C, symbol resolution and the linker's view of a .o file (symbol table, relocations), static vs dynamic linking and what a shared library changes at load time, and what a Makefile's rules actually orchestrate.",
+  "figs": "buildpipeline: source through preprocessor, compiler, assembler and linker to an executable, with what each stage produces"
+ },
+ {
+  "id": 14,
+  "title": "Standard Library Internals",
+  "scope": "stdio buffering modes (fully buffered, line buffered, unbuffered) and when a flush actually happens, the string.h and ctype.h families and their common misuses, qsort/bsearch with a real comparator, and writing minimal versions of common functions (a simple printf subset, memcpy, atoi/itoa) to prove understanding rather than memorized names."
+ },
+ {
+  "id": 15,
+  "title": "Core Data Structures & Algorithms in C",
+  "scope": "A singly and doubly linked list, a stack and queue (array- and list-backed), a binary search tree, and a simple hash table with chaining, all as real compiled C code, plus the classic coding-round questions built on them: reverse a linked list (iterative and recursive), detect a cycle (Floyd's algorithm), find the middle node, and merge two sorted lists.",
+  "figs": "linkedlist: node/next pointer structure and an in-place reversal step by step"
+ },
+ {
+  "id": 16,
+  "title": "Debugging, Tooling & Sanitizers",
+  "scope": "A practical gdb session (breakpoints, backtrace, print, watch), Valgrind for leaks and invalid access, AddressSanitizer and UndefinedBehaviorSanitizer output and how to read it, static analysis (cppcheck/clang-tidy class tools), and working backward from a crash address or corrupted value to the real bug."
+ },
+ {
+  "id": 17,
+  "title": "Embedded, Firmware & Secure Coding in C",
+  "scope": "Memory-mapped I/O through volatile pointers, ISR-safe code (what an interrupt handler must never do), reentrancy and signal-handler safety, packed structs for parsing wire/protocol data safely, and the security side: stack buffer overflows, format-string vulnerabilities (printf(user_string) is a bug), and integer-overflow-driven vulnerabilities, each with a real vulnerable snippet and its fix.",
+  "figs": "mmio: a volatile-qualified hardware register access versus a plain memory access the compiler could reorder or elide"
+ },
+ {
+  "id": 18,
+  "title": "Principal-Level Systems Design in C",
+  "scope": "Design-and-code questions at Principal depth: a fixed-block memory pool allocator (O(1) alloc/free, no fragmentation across blocks), a single-producer/single-consumer ring buffer sized as a power of two, and a small generic event/callback dispatch system, each with real, compiled code and a discussion of the trade-offs an interviewer expects you to state unprompted.",
+  "figs": "ringbuffer: a power-of-two ring buffer with head/tail indices and the wrap-around case"
+ }
+]

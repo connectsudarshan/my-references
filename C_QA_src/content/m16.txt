@@ -1,0 +1,377 @@
+# Module 16: Debugging, Tooling & Sanitizers
+
+@@ 16.01 | Basic | Concept | tags=gdb,workflow
+Q: What is the basic gdb workflow for finding a bug (breakpoints, backtrace, print, watch)?
+SHORT: Compile with -g, run under gdb, set breakpoints with `break`, step with `next`/`step`, inspect state with `print`, and on a crash run `backtrace` to see the call chain that led there.
+DEEP:
+The core loop for almost any gdb session:
+- `gcc -g -O0 -o prog prog.c` so gdb has line numbers and locals are not optimized away.
+- `gdb ./prog`, then `break function_name` or `break file.c:42` to stop before the suspect code runs.
+- `run` (with args if needed) starts the program; execution stops at the breakpoint.
+- `next` steps over a line (does not enter called functions), `step` steps into them.
+- `print expr` shows a variable or expression's current value; `print *ptr` dereferences.
+- `watch expr` breaks whenever that expression's value changes, useful when you know what is being corrupted but not where.
+- On a crash (no breakpoint needed), just `run` and let it fault, then `backtrace` (or `bt`) prints the stack of calls that led to the fault, innermost frame first.
+- `frame N` moves your current inspection point to stack frame N so `print` and `list` operate in that frame's context.
+
+FOLLOW:
+- Does gdb need source code to work? => No, it can disassemble and show registers on a stripped binary, but without -g and source it cannot show line numbers or variable names.
+- What is the difference between next and step? => next steps over a function call as one line; step follows the call into the function's own source if debug info is available.
+PITFALL: Debugging an optimized (-O2) build makes gdb's variable and line info unreliable because the compiler reorders and eliminates code; always reproduce with -O0 -g first.
+
+@@ 16.02 | Basic | Concept | tags=gdb,compilation
+Q: Why does gdb need the -g compiler flag, and what does it actually add to the binary?
+SHORT: -g embeds debug info (DWARF on Linux): a mapping from machine instructions back to source lines, plus symbol names, types and stack-frame layout, so gdb can show source, variable names and backtraces instead of raw addresses.
+DEEP:
+Without -g, a binary still runs identically, but gdb only has the symbol table (function and global names) to work with, not per-line or per-variable information.
+- `-g` adds a separate debug-info section (DWARF, on Linux/ELF) alongside the actual machine code; it does not change what the CPU executes.
+- This is why -g does not slow the program down: it is metadata the debugger reads, not extra instructions.
+- Optimization (-O1 and above) is still compatible with -g, but variables can be optimized into registers, merged, or eliminated, so gdb may report "optimized out" for a value that logically exists conceptually but not as a distinct memory location anymore.
+- Stripping a binary (`strip`) removes this debug info (and often the symbol table too) for a smaller release binary; that is why release crash dumps are often re-analyzed against a separately kept unstripped copy.
+FOLLOW:
+- Can you add -g and still ship an optimized binary? => Yes, -O2 -g is common; just expect gdb's view of locals to be less exact than an -O0 -g build.
+- Does -g affect binary size? => Yes, it adds a debug-info section, sometimes larger than the code itself, which is why release packages often strip it.
+PITFALL: Debugging a stripped release binary with no matching debug-info build available leaves you reading raw addresses and registers only.
+
+@@ 16.03 | Basic | Concept | tags=valgrind,asan
+Q: What is Valgrind used for, and how is it different from AddressSanitizer?
+SHORT: Valgrind is a runtime instrumentation tool (Memcheck being its default tool) that finds memory leaks, invalid reads/writes and use of uninitialized memory by emulating the program in software; it needs no recompilation but runs much slower than AddressSanitizer, which is compiled in and much faster.
+DEEP:
+Both catch the same broad class of bugs (out-of-bounds access, use-after-free, leaks) but with very different mechanisms and costs.
+- Valgrind (Memcheck) runs your unmodified binary inside a CPU emulator, tracking every byte's "defined" and "addressable" state; typical slowdown is 10-50x, but you do not need to recompile or add flags.
+- AddressSanitizer (ASan) is a compiler instrumentation (`-fsanitize=address`): the compiler inserts checks and redzones around allocations at compile time; slowdown is usually only 2x, but you must recompile.
+- Valgrind tends to be better at "uninitialized value used" detection; ASan tends to be faster and catches stack and global buffer overflows that plain Memcheck configurations sometimes miss without extra tools.
+- Both are commonly run together in CI: cheap ASan runs on every build, Valgrind on selected slower nightly runs.
+FOLLOW:
+- Do you need -g for Valgrind to show source lines? => Yes, same as gdb; without debug info Valgrind reports addresses instead of file:line locations.
+- Can Valgrind and ASan be used on the same binary at once? => No, running an ASan-instrumented binary under Valgrind's emulator is unsupported and typically fails or gives meaningless results.
+PITFALL: Assuming a clean Valgrind run proves a program is memory-safe; it only proves no bug was triggered on the exact inputs and code paths exercised during that run.
+
+@@ 16.04 | Intermediate | Debug | tags=gdb,segfault,backtrace
+Q: Given a segfault, how do you use gdb to find exactly which call and which pointer caused it?
+SHORT: Run the crashing program under gdb (or open its core file); when it faults, `backtrace` shows the call chain, and `print` on the frame's arguments (for example a null pointer) confirms the bad value that caused the fault.
+DEEP:
+Example with a bug three calls deep:
+```c
+#include <stdio.h>
+void level3(int *p) { *p = 42; }
+void level2(int *p) { level3(p); }
+void level1(void) { int *bad = NULL; level2(bad); }
+int main(void) { printf("starting\n"); level1(); return 0; }
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -g -O0` and run as `gdb -batch -ex run -ex backtrace -ex "print p" ./prog`, gdb produced:
+```
+Program received signal SIGSEGV, Segmentation fault.
+0x0000555555555159 in level3 (p=0x0) at t.c:2
+2       void level3(int *p) { *p = 42; }
+#0  0x0000555555555159 in level3 (p=0x0) at t.c:2
+#1  0x000055555555517e in level2 (p=0x0) at t.c:3
+#2  0x00005555555551a1 in level1 () at t.c:4
+#3  0x00005555555551c0 in main () at t.c:5
+$1 = (int *) 0x0
+```
+Frame #0 is where the fault happened (`*p = 42` in level3); `print p` confirms `p` is 0x0 (NULL). Frame #2 shows the actual root cause: level1 passed a NULL `bad` into level2. The fix is at the source of the bad value, not necessarily at the frame where the crash was reported.
+FOLLOW:
+- Why look past frame 0 instead of just fixing level3? => Frame 0 only shows where the invalid access happened; the root cause (level1 constructing a NULL) is further up the stack, and fixing only level3 (e.g. adding a NULL check) would hide the real defect.
+- How do you get a backtrace from a core file instead of a live run? => `gdb ./prog core` (or `gdb -c core ./prog`), then `bt`, works the same way against a saved crash dump.
+PITFALL: Reading only the innermost frame and patching there treats a symptom; always walk the backtrace to where the bad value was actually created.
+
+@@ 16.05 | Intermediate | Debug | tags=valgrind,heap-overflow
+Q: How do you read a Valgrind "Invalid write" report to find an off-by-one heap overflow?
+SHORT: Valgrind names the exact instruction and line that wrote out of bounds, and states how many bytes past which allocation's end the write landed, e.g. "0 bytes after a block of size 20"; that number tells you precisely how far past the buffer the loop went.
+DEEP:
+```c
+#include <stdlib.h>
+int main(void) {
+    int *arr = malloc(5 * sizeof(int));
+    for (int i = 0; i <= 5; i++)   /* off-by-one: writes arr[5], out of bounds */
+        arr[i] = i;
+    free(arr);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -g -O0` (no warning from gcc itself) and run under `valgrind -q`, the output was:
+```
+==1314== Invalid write of size 4
+==1314==    at 0x1091A3: main (t.c:5)
+==1314==  Address 0x4a7d054 is 0 bytes after a block of size 20 alloc'd
+==1314==    at 0x4846828: malloc (in vgpreload_memcheck-amd64-linux.so)
+==1314==    by 0x10917E: main (t.c:3)
+```
+Reading it: the write is "size 4" (one int), at main line 5 (the loop body), and lands "0 bytes after a block of size 20" allocated at line 3. 20 bytes / 4 bytes per int = 5 ints, so the block holds valid indices 0..4; the write at offset 20 is exactly `arr[5]`, confirming the loop's `i <= 5` should be `i < 5`.
+FOLLOW:
+- Why did gcc -Wall -Wextra not flag this at compile time? => Static warnings cannot generally prove a runtime loop bound against a runtime-sized allocation; this needs dynamic checking (Valgrind or ASan), not compile-time analysis.
+- What does "Address ... is N bytes after a block of size S" tell you in general? => It converts the raw faulting address into a distance from a known allocation's boundary, which combined with the element size lets you compute the exact bad index.
+PITFALL: Assuming the reported line number is always the bug; here it correctly is, but with inlining or macro-heavy code the reported line can be the outer call site, not the true faulting expression.
+
+@@ 16.06 | Intermediate | Debug | tags=valgrind,leak
+Q: How do you read a Valgrind leak-check report to find where a leaked allocation came from?
+SHORT: `--leak-check=full` prints each leaked block's size and the exact allocation call stack (down to the malloc site), so "definitely lost" plus that stack tells you precisely which allocation was never freed.
+DEEP:
+```c
+#include <stdlib.h>
+void make_leak(void) {
+    int *p = malloc(100 * sizeof(int));
+    p[0] = 1; /* p goes out of scope here without free: leaked */
+}
+int main(void) { make_leak(); return 0; }
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -g -O0` and run as `valgrind -q --leak-check=full ./prog`:
+```
+==1325== 400 bytes in 1 blocks are definitely lost in loss record 1 of 1
+==1325==    at 0x4846828: malloc (in vgpreload_memcheck-amd64-linux.so)
+==1325==    by 0x10915E: make_leak (t.c:3)
+==1325==    by 0x10917C: main (t.c:7)
+```
+"definitely lost" means Valgrind found no remaining pointer to that block anywhere in reachable memory at exit; the stack under it is the allocation site (`make_leak`, line 3, called from `main`, line 7), which is exactly where the missing `free(p)` belongs.
+FOLLOW:
+- What does "still reachable" mean instead of "definitely lost"? => A pointer to the block still exists somewhere (e.g. a global), so it was technically never freed but was not truly orphaned; often intentional for allocations meant to live until process exit.
+- Does Valgrind show where memory should have been freed? => No, only where it was allocated; you infer the missing free's location from the code path and the object's intended lifetime.
+PITFALL: Ignoring "still reachable" leaks in a long-running (not short-lived) process; they can still be a real, growing leak if the reachable pointer is never actually used to free the memory.
+
+@@ 16.07 | Intermediate | Concept | tags=asan,heap-overflow
+Q: What does an AddressSanitizer heap-buffer-overflow report tell you, and how do you compile for it?
+SHORT: Add -fsanitize=address (with -g) to compilation; ASan wraps every heap allocation in "redzones" it can detect touching, and on violation prints the faulting access, its exact source line, and the allocation's own line and size.
+DEEP:
+```c
+#include <stdlib.h>
+int main(void) {
+    char *buf = malloc(10);
+    buf[10] = 'x';   /* one past the end */
+    free(buf);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -g -fsanitize=address` and run directly (no separate tool invocation needed, the check is built into the binary):
+```
+==1335==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x50200000001a
+WRITE of size 1 at 0x50200000001a thread T0
+    #0 0x... in main /tmp/t.c:4
+0x50200000001a is located 0 bytes after 10-byte region [0x502000000010,0x50200000001a)
+allocated by thread T0 here:
+    #0 0x... in malloc
+    #1 0x... in main /tmp/t.c:3
+SUMMARY: AddressSanitizer: heap-buffer-overflow /tmp/t.c:4 in main
+```
+This is more precise than Valgrind's "N bytes after a block" phrasing but gives the same essential facts: WRITE (not READ), size 1 byte, at line 4, into a 10-byte region allocated at line 3, one byte past its end (`buf[10]` on a 10-byte buffer, valid indices 0..9).
+FOLLOW:
+- Why is ASan faster than Valgrind for the same class of bug? => ASan's checks are compiled directly into the binary (redzone bounds checks around real allocations) instead of emulating every instruction in software.
+- Does ASan catch stack and global buffer overflows too, not just heap? => Yes, with the same -fsanitize=address flag it instruments stack and global arrays as well, each reported with its own overflow message naming the object.
+PITFALL: Forgetting -g means ASan still catches the bug but reports only a binary address instead of a source file and line.
+
+@@ 16.08 | Intermediate | Concept | tags=ubsan,signed-overflow
+Q: What does UndefinedBehaviorSanitizer catch that AddressSanitizer and -Wall do not?
+SHORT: UBSan (-fsanitize=undefined) instruments arithmetic and type operations to catch undefined behavior with no memory-safety symptom, like signed integer overflow, division by zero, or invalid shifts, none of which corrupt memory and so are invisible to ASan or Valgrind.
+DEEP:
+```c
+#include <stdio.h>
+int main(void) {
+    int a = 2147483647;   /* INT_MAX */
+    int b = a + 1;         /* signed overflow: UB */
+    printf("%d\n", b);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -fsanitize=undefined -g` (no warning from -Wall/-Wextra) and run:
+```
+t.c:4:9: runtime error: signed integer overflow: 2147483647 + 1 cannot be represented in type 'int'
+-2147483648
+```
+The program still ran to completion and printed a value (wrapping to INT_MIN on this toolchain), because UBSan by default reports and continues rather than aborting; but per the C standard, signed overflow is undefined behavior (6.5p5's general clause plus the integer-overflow footnote), so a different compiler, optimization level, or platform is free to produce a different result, trap, or optimize the surrounding code unexpectedly.
+FOLLOW:
+- Why does -Wall -Wextra not catch this at compile time? => The overflow depends on the runtime value of `a`, which the compiler cannot always prove at compile time; -Wall is a static check, UBSan is a runtime instrumentation.
+- Can UBSan be told to abort instead of just printing and continuing? => Yes, `-fsanitize=undefined -fno-sanitize-recover=all` (or `-fsanitize-trap=undefined`) turns each detected violation into an abort/trap.
+PITFALL: Treating a "clean" run under -Wall -Wextra as proof there is no undefined behavior; UB with no immediate memory-safety symptom needs UBSan specifically.
+
+@@ 16.09 | Intermediate | Numeric | tags=valgrind,offset-math
+Q: A Valgrind report says "Address ... is 0 bytes after a block of size 20 alloc'd" for a write of size 4; which array index actually overflowed?
+SHORT: 20 bytes / 4 bytes per element = 5 elements, valid indices 0..4; a write landing 0 bytes after that block is at byte offset 20, which is index 20 / 4 = 5, i.e. exactly one past the last valid index.
+DEEP:
+This is the arithmetic behind reading module 16's Valgrind example (16.05) without re-running the tool:
+1. Block size in bytes: 20.
+2. Element size from the write report: "size 4" (an int on this platform).
+3. Number of valid elements: 20 / 4 = 5, so valid indices are 0, 1, 2, 3, 4.
+4. The faulting write is reported as "0 bytes after" the block, i.e. at byte offset 20 (the first byte past the end).
+5. Index of that offset: 20 / 4 = index 5.
+6. Index 5 is exactly one past the last valid index (4), confirming a classic off-by-one (`i <= 5` instead of `i < 5` when the array has 5 elements).
+This same offset-to-index conversion works for any element size: divide the "bytes after" (or "bytes before", for underflows) figure and the block size by the element size to get exact indices without needing to reproduce the run.
+FOLLOW:
+- What if the write size and the array's element size differ? => Then the access is not a clean array-index overflow at all; recompute using the block's element type, not the write's reported size, and suspect a type-punning or pointer-arithmetic bug instead.
+- Does the same offset math work for stack-buffer-overflow reports from ASan? => Yes, ASan's "region [start, end)" plus the faulting address gives the same offset, which divided by element size gives the index.
+PITFALL: Dividing the wrong quantity (the write size instead of the block size) by the element size; always convert the block/offset numbers, treating the write size only as the element size hint.
+
+@@ 16.10 | Advanced | Debug | tags=asan,use-after-free
+Q: How does AddressSanitizer report a use-after-free, and why does gcc's own -Wall sometimes also catch the simplest cases?
+SHORT: ASan poisons freed memory's shadow bytes so any later access aborts with "heap-use-after-free", naming both the access site and the original free's location; modern gcc's -Wuse-after-free (part of -Wall in recent versions) can also catch the most obvious same-function cases purely by static analysis.
+DEEP:
+```c
+#include <stdlib.h>
+int main(void) {
+    int *p = malloc(sizeof(int));
+    *p = 5;
+    free(p);
+    *p = 10;   /* use after free */
+    return 0;
+}
+```
+Compiling with plain `gcc -std=c11 -Wall -Wextra -g` already produced a static warning here:
+```
+t.c: In function 'main':
+t.c:6:8: warning: pointer 'p' used after 'free' [-Wuse-after-free]
+    6 |     *p = 10;
+      |     ~~~^~~~
+t.c:5:5: note: call to 'free' here
+```
+Compiling instead with `-fsanitize=address` and running gave the dynamic confirmation:
+```
+==1356==ERROR: AddressSanitizer: heap-use-after-free on address 0x502000000010
+WRITE of size 4 at 0x502000000010 thread T0
+    #0 0x... in main /tmp/t.c:6
+0x502000000010 is located 0 bytes inside of 4-byte region [...]
+freed by thread T0 here:
+    #0 0x... in free
+    #1 0x... in main /tmp/t.c:5
+```
+The static warning only fires when the compiler can trivially see both the `free` and the later dereference in the same function with no intervening reassignment; once the pointer crosses a function boundary, is stored in a struct, or the free happens conditionally, only the dynamic ASan check reliably catches it.
+FOLLOW:
+- Does -Wuse-after-free replace the need for ASan? => No, it only catches simple, locally visible cases; ASan catches the general case at runtime regardless of how the pointer traveled.
+- Why does ASan say "0 bytes inside of 4-byte region" rather than "after"? => Because the access is within the original allocation's bounds, just after it was freed; this is a use-after-free, not a bounds overflow.
+PITFALL: Relying on `-Wall` alone for use-after-free safety in any code where the free and the reuse are not both visible in one small function.
+
+@@ 16.11 | Advanced | Cross-layer | tags=asan,ubsan,gdb
+Q: Can AddressSanitizer, UndefinedBehaviorSanitizer and gdb watchpoints be combined, and when would you want all three?
+SHORT: Yes: -fsanitize=address,undefined links into one binary, and running that binary under gdb still works normally, with ASan/UBSan aborting on the exact faulting access while gdb's watch or the sanitizer's own abort gives you a backtrace at the moment of the real bug rather than wherever memory corruption later happens to crash.
+DEEP:
+A practical order of escalation for a hard-to-reproduce corruption bug:
+- First combine both sanitizers in one build: `gcc -std=c11 -Wall -Wextra -g -fsanitize=address,undefined -o prog prog.c`. Both instrument independently and their reports do not conflict.
+- Run the binary normally; on either kind of violation the process aborts immediately at the real faulting instruction, with a stack trace, instead of continuing and crashing later somewhere unrelated (the classic "corruption crashes far from its cause" problem).
+- If you need to inspect live state instead of just reading the abort message, run the same binary under gdb (`gdb ./prog`, then `run`): the sanitizer's internal abort behaves like any other signal gdb can catch, and `backtrace` at that point shows the exact call chain.
+- A `watch` on a specific variable is still useful alongside sanitizers when you know which value is being corrupted but the sanitizers themselves are not triggering (for example, a logic bug that writes a wrong-but-in-bounds value); the sanitizers cannot catch a bug that never touches invalid memory or invokes undefined behavior.
+- Threaded code (data races, memory ordering across threads) needs ThreadSanitizer (-fsanitize=thread) instead, and is out of scope here; see the C Advanced page's concurrency modules for that.
+FOLLOW:
+- Can ASan and UBSan be combined with -O2 for a closer-to-release repro? => Yes, both work at any optimization level, though line-accurate reporting is best at -O0 -g.
+- Is there a performance reason to run them separately in CI? => Sometimes; combined they are still only roughly as slow as ASan alone, so most projects run them together unless a specific job needs to isolate one signal.
+PITFALL: Expecting sanitizers to catch a purely logical bug (wrong but in-bounds, well-defined computation); they only catch memory-safety and undefined-behavior classes, not incorrect-but-legal results.
+
+@@ 16.12 | Advanced | Concept | tags=clang-tidy,static-analysis
+Q: What can a static analyzer like clang-tidy catch that neither compiler warnings nor a single test run will, and what are its limits?
+SHORT: clang-tidy's clang-analyzer checks perform path-sensitive analysis across a function's possible execution paths (not just the one your tests happened to exercise), so it can flag a leak or null-dereference that only occurs on a code path you never actually ran, at the cost of false positives and no guarantee of completeness.
+DEEP:
+```c
+#include <stdio.h>
+#include <stdlib.h>
+void bad(void) {
+    int *p = malloc(sizeof(int));
+    *p = 5;
+    printf("%d\n", *p);
+    /* missing free(p): leak */
+}
+int main(void) { bad(); return 0; }
+```
+This compiles clean with `gcc -std=c11 -Wall -Wextra -g` (no warning; gcc's static analysis does not track allocation lifetime this deeply by default) and runs fine, so a single execution proves nothing about the leak. Running `clang-tidy t.c -checks='-*,clang-analyzer-*' -- -std=c11` reported:
+```
+t.c:6:5: warning: Potential leak of memory pointed to by 'p' [clang-analyzer-unix.Malloc]
+    Calling 'bad'
+    Memory is allocated
+    Potential leak of memory pointed to by 'p'
+```
+The analyzer symbolically walks the function's logic (allocate, then every path from there) rather than executing it, which is why it finds the missing `free` without any test input triggering it.
+- Static analyzers trade recall for false positives: expect to suppress or tune some warnings that are not real bugs in your context.
+- They complement, not replace, ASan/UBSan/Valgrind: static tools find issues without running the program at all; dynamic tools confirm what actually happens on the paths you do execute.
+FOLLOW:
+- Is clang-tidy specific to code compiled with clang? => No, it can analyze C/C++ source compiled with any compiler's flags passed after `--`; it does its own parsing, it does not need to link or run the resulting binary.
+- What is cppcheck's role relative to clang-tidy? => A similar class of static analyzer with a different (often faster, sometimes less deep) rule set; many teams run both since they catch different subsets of issues.
+PITFALL: Treating a clean static-analysis run as proof of correctness; both false negatives (missed real bugs) and false positives (flagged non-bugs) are expected and normal.
+
+@@ 16.13 | Advanced | Scenario | tags=double-free,methodology
+Q: You have a crash reported as "double free or corruption" from glibc. What is a systematic method to find the second, incorrect free call?
+SHORT: Reproduce under AddressSanitizer, which reports both the second (invalid) free's location and the first free's location in one message; without ASan, add temporary logging or gdb breakpoints on every free of the suspect pointer to find the pair, since glibc's own message only names where the check fired, not the earlier valid free.
+DEEP:
+A concrete method, cheapest step first:
+1. Recompile with `-fsanitize=address -g` if at all possible; ASan's "attempting double-free" report gives two full stack traces directly: where the invalid second free happened, and where the original (valid) free that made the pointer already-freed happened. This alone usually finds the bug in minutes.
+2. If ASan cannot be used (e.g. only reproduces in a environment you cannot recompile for), run under Valgrind's Memcheck, which reports the same two-stack information for double frees.
+3. If neither tool is available at all, fall back to gdb: `break free` (or a conditional breakpoint `break free if $rdi == <suspect address>` once you know the address), then continue and note every stack at which that specific pointer value is freed; the second hit is the bug.
+4. Once you have both call sites, look for the actual root cause pattern: a pointer stored in two owners (e.g. copied into a cache and also owned by its original container), an early-return path that frees then falls through to a shared cleanup `goto` that frees again, or a realloc-failure path that frees a pointer the caller also frees.
+5. The fix is almost always ownership clarification, not a patch at the crash site: decide which one piece of code owns the free, and set the other's copy to NULL after use (or reference-count, or restructure so only one path reaches the free).
+FOLLOW:
+- Why is ASan's message more useful than glibc's default abort message here? => glibc's message only fires the moment the corruption is detected (the second free), with no memory of the first, valid free; ASan instruments allocation state itself and remembers both events.
+- Is setting a pointer to NULL after freeing it a real fix or just a safety net? => Freeing NULL is a defined no-op in C, so it prevents that specific double-free from crashing again, but it does not fix an ownership design that allows two code paths to both believe they own the pointer.
+PITFALL: "Fixing" a double-free by wrapping the second free call in a NULL check without understanding why two code paths both reached a free on the same pointer; the underlying ownership bug usually resurfaces elsewhere.
+
+@@ 16.14 | Advanced | Trap | tags=wall,sanitizers
+Q: A program compiles cleanly with -Wall -Wextra and passes its tests. Is it safe to assume it has no serious memory bugs?
+SHORT: No; -Wall/-Wextra are static, best-effort warnings that miss most out-of-bounds heap accesses (they cannot generally reason about runtime-sized allocations or loop bounds), and passing tests only proves correctness on the exact inputs exercised, not on all inputs.
+DEEP:
+```c
+#include <stdlib.h>
+int main(void) {
+    char *buf = malloc(10);
+    buf[10] = 'x';   /* one past the end */
+    free(buf);
+    return 0;
+}
+```
+Compiling this exact file with `gcc -std=c11 -Wall -Wextra -g -O0` produces zero warnings and it links and "runs" (the process usually exits 0, since one stray byte write often does not corrupt anything the program later reads back) -- yet it is a real, undefined-behavior heap overflow, confirmed only when the same source is recompiled with `-fsanitize=address` and run, which reports a heap-buffer-overflow at that exact line (see 16.07).
+- -Wall/-Wextra reason about the source text and types; they do not track allocation sizes through arbitrary control flow, so a runtime-computed index against a runtime-sized `malloc` is invisible to them in general.
+- Passing tests establish nothing about inputs, sizes, or timings the tests did not exercise; a buffer overflow that writes past the end into unused heap padding can be silently harmless today and corrupt something critical tomorrow after an allocator or struct layout change.
+- The only way to get real assurance is to actually run the code (ideally with realistic and edge-case inputs) under ASan/UBSan and/or Valgrind as part of the normal test cycle, not as an occasional manual check.
+FOLLOW:
+- Would -Wanalyzer (gcc's static analyzer) have caught this? => Not reliably for a runtime-determined index like this one; static analyzers are stronger on some bug shapes (nullability, leaks on clear paths) than on data-dependent bounds violations.
+- Is it enough to run ASan once locally before merging? => Better than nothing, but the strongest practice is running the full test suite under ASan/UBSan in CI on every change, since a bug only manifests on the inputs actually exercised.
+PITFALL: Treating "compiles with no warnings" as a safety signal for memory correctness; it is a signal about code style and some classes of definite errors, not about runtime memory safety.
+
+@@ 16.15 | Principal | Concept | tags=methodology,core-dump
+Q: A field device sends back a core dump from a crash you cannot reproduce locally. What is your method for turning that core file into a root cause?
+SHORT: Confirm the core matches a known build (same binary/symbols, same libc), load it in gdb with that exact binary (`gdb ./prog core`), get the backtrace and the values of every pointer/index involved in the faulting frame, then work backward through the call chain to where the bad value was actually produced, treating the fault frame as a symptom location, not the bug's location.
+DEEP:
+A concrete method for this Principal-level scenario:
+1. Establish provenance first: which exact build produced this core (git commit / build ID), and does the binary you have locally (with debug symbols) match it exactly? A mismatched binary makes every subsequent step meaningless (wrong line numbers, wrong optimized-away variables, or gdb refusing to load frames sensibly).
+2. Load it: `gdb ./matching_binary core.1234`, then `bt full` for a backtrace with every frame's locals, not just arguments.
+3. Identify the faulting frame's bad value (a NULL pointer, an out-of-range index, a corrupted length field) and its type/expected invariant.
+4. Walk outward: for each caller frame, ask "was this value already bad when it was passed in, or did this frame corrupt a previously-good value?" Repeat until you find the frame where a good value first became bad; that is the actual defect location, often several frames away from the crash.
+5. If the corruption looks like it crosses an unrelated boundary (e.g. the bad value lives in a different struct than the one being manipulated at the fault site), suspect a buffer overflow or dangling pointer earlier in execution, not a logic error at the fault site; a core dump alone cannot show you the history of writes, only the final state, so this may require adding targeted logging/assertions and reproducing again with those in place, or shipping an ASan-instrumented build to the field temporarily if crash frequency allows it.
+6. Once a hypothesis exists, write a minimal reproduction locally (even a synthetic one that fakes the suspected bad input) and confirm it reproduces the same crash signature before calling it root-caused.
+A method statement an interviewer wants to hear: never declare root cause from the fault frame alone; always trace the value's origin, and be explicit about what the core dump can and cannot tell you (final state, not history).
+FOLLOW:
+- What if the field binary was stripped and no debug-symbol build survives for that exact version? => This is why keeping a build-artifact archive (binary plus matching debug info, indexed by build ID) is part of a serious release process; without it, only the raw addresses and the stripped symbol table remain, severely limiting analysis.
+- Is a core dump enough to prove root cause on its own? => Rarely by itself; it proves the state at the moment of the fault, and a plausible causal chain still needs to be confirmed by reproduction or by ruling out alternative explanations for that same final state.
+PITFALL: Fixing the symptom at the fault frame (e.g. adding a NULL check right where the crash happened) without finding where the bad value actually originated, which leaves the real defect free to resurface with a different symptom later.
+
+@@ 16.16 | Principal | Scenario | tags=heap-corruption,release-build
+Q: Users report intermittent crashes only in the optimized release build (no sanitizers, no debug symbols); ASan is not available there. How do you root-cause suspected heap corruption under that constraint?
+SHORT: Reproduce the same source under ASan/UBSan in a debug-equivalent build first to catch the common cases cheaply; if the bug truly only manifests under release-build optimization and timing, add targeted canaries/guard bytes or a lightweight custom allocator wrapper that records allocation metadata, and narrow with bisection (which recent change, which code path) rather than blind staring at the crash address.
+DEEP:
+A layered method for this constraint (no ASan in production, bug does not reproduce off it):
+1. First assume it is an ordinary bug that a debug/sanitized build should also show, and spend real effort trying to reproduce it under `-fsanitize=address,undefined -g -O0` with the same inputs, timing patterns, and data sizes as production, including running for as long as needed; many "release-only" bugs are actually "not-yet-triggered-with-these-inputs" bugs, not truly optimization-dependent ones.
+2. If it still does not reproduce even with equivalent inputs, suspect either: (a) a data race or memory-ordering issue exposed only by release-build timing (point to the C Advanced page's concurrency modules for that analysis), or (b) undefined behavior whose observable effect depends on the specific optimizations the release flags enable (e.g. a strict-aliasing violation that -O0 happens to not miscompile but -O2 does).
+3. For (b), bisect the compiler flags: build the same source at increasing optimization levels (-O0, -O1, -O2) and see exactly where the symptom appears; that narrows the search to the specific optimization pass's assumptions the code is violating, which is often traceable to one of the classic UB categories (aliasing, signed overflow, uninitialized reads).
+4. If flags alone do not narrow it, instrument minimally and cheaply for production: wrap malloc/free with a thin layer that stores a magic-number guard byte and the allocation's size/call-site right before/after the block (a hand-built, lightweight ASan-like check), and check the guard on every free; this catches the same overflow/corruption class with far less overhead than full ASan, at the cost of writing and validating that wrapper yourself.
+5. State the trade-off explicitly to stakeholders: full ASan in production is the most reliable tool but usually too slow/heavy to ship; guard-byte instrumentation is a deliberate, lighter approximation with known blind spots (it only catches corruption that touches the guard bytes, not all corruption); and compiler-flag bisection narrows the search space without needing new instrumentation at all.
+FOLLOW:
+- Why not just ship a debug build to production to get ASan there too? => Debug/ASan builds are typically 2-10x slower and use more memory (redzones), which can itself change timing enough to hide a timing-dependent bug, and may be unacceptable for production load; a canary/percentage rollout of an ASan build is a common middle ground instead of blanket deployment.
+- Is compiler-flag bisection a reliable way to find every optimization-dependent bug? => It reliably narrows which optimization level exposes the symptom, but the underlying defect is still undefined behavior in the source; the fix is correcting that UB, not permanently pinning a lower optimization level.
+PITFALL: Concluding the compiler itself has a bug from an optimization-level-dependent crash; the overwhelming majority of such cases are undefined behavior in the source that a higher optimization level is newly free to miscompile, not an actual compiler defect.
+
+@@ 16.17 | Principal | Concept | tags=ci-policy,methodology
+Q: What debugging and static-analysis tooling policy would you mandate for a firmware team's CI pipeline, and what does each layer catch that the others do not?
+SHORT: Run -Wall -Wextra -Werror on every compile, run the full test suite under -fsanitize=address,undefined on every change, run a static analyzer (clang-tidy/cppcheck) on every change to catch bugs on paths tests do not exercise, and reserve full Valgrind runs for a slower nightly job; state which bug classes each layer misses so gaps are a known trade-off, not a surprise.
+DEEP:
+A single small function can show why no one layer is sufficient alone:
+```c
+#include <stdio.h>
+#include <stdlib.h>
+void risky(int n) {
+    int *arr = malloc((size_t)n * sizeof(int));
+    for (int i = 0; i <= n; i++) arr[i] = i;  /* off-by-one overflow */
+    /* no free(arr): leak too */
+}
+int main(void) { risky(4); printf("done\n"); return 0; }
+```
+- Compiled with `gcc -std=c11 -Wall -Wextra -g` alone: zero warnings, and running it printed `done` with no visible symptom -- this layer alone would ship the bug.
+- Compiled with `-fsanitize=address` added and run: immediately aborted with `AddressSanitizer: heap-buffer-overflow ... WRITE of size 4 ... in risky t.c:8`, catching the overflow the instant this exact code path ran, but only because `main` happened to call `risky` at all in this build; a real codebase's test suite must actually exercise a function for ASan to see it.
+- Run through `clang-tidy -checks='-*,clang-analyzer-*'` (module 16.12's tool): flags the leak via path-sensitive analysis without needing `risky` to be called by anything, catching the leak class ASan's dynamic instrumentation would only report as "still reachable/leaked" if the process happened to exit while still allocated and leak-checking was enabled.
+A concrete policy statement for a review: (1) `-Wall -Wextra -Werror` blocking on every commit, zero cost beyond compile time, catches the definite-error subset; (2) the full test suite additionally run under `-fsanitize=address,undefined` on every commit or PR, roughly 2x slower, catches memory-safety/UB on any exercised path; (3) a static analyzer pass on every commit, catches some unexercised-path bugs at the cost of tuning false positives; (4) a nightly (not per-commit, due to its 10-50x slowdown) full Valgrind run across a broader input/fuzz corpus than the fast per-commit test suite typically covers, as a deeper backstop.
+FOLLOW:
+- Why not just run Valgrind on every commit instead of ASan, since Valgrind needs no recompilation? => Its 10-50x slowdown makes per-commit CI feedback too slow for routine development; ASan's roughly 2x cost is the better fit for the fast, every-commit feedback loop, with Valgrind reserved for a slower, less frequent deeper pass.
+- Does this policy guarantee no memory bugs reach production? => No; it only guarantees no bug within a class these specific tools detect, on a code path these specific tests exercise, reaches production undetected -- a completely untested path or a bug class outside all four layers (e.g. a purely logical error with no memory-safety or UB signature) can still ship.
+PITFALL: Treating any single layer (most commonly, "it compiles clean with -Wall") as sufficient sign-off for a change, when each layer in this policy is deliberately catching a different, non-overlapping class of bug.

@@ -1,0 +1,397 @@
+# Module 8: Deadlock, Livelock, Starvation & Priority Inversion
+
+@@ 8.01 | Basic | Concept | tags=coffman-conditions,deadlock,necessary
+Q: What are the four necessary conditions for a deadlock, and why does breaking any single one prevent it?
+SHORT: Mutual exclusion (a resource is held by one thread at a time), hold-and-wait (a thread holds one resource while blocked waiting for another), no preemption (a resource cannot be forcibly taken from its holder), and circular wait (a cycle of threads each waiting on the next). All four must hold at once for deadlock, so breaking any single one, by design, makes deadlock structurally impossible for that resource set.
+DEEP:
+- These are the Coffman conditions (Coffman, Elphick, Shoshani, 1971), general operating-systems theory rather than a POSIX or C11 clause -- they apply to any resource (locks, file handles, database rows), not only pthread mutexes.
+- Mutual exclusion is usually not the condition to attack for a lock-based design, since the whole point of a mutex is exclusive access; the practical levers are hold-and-wait (acquire everything up front, or release before waiting) and circular wait (a global lock ordering, 8.05).
+- No-preemption is rarely broken for mutexes directly (a mutex has no "force this thread to give it up" operation in POSIX), but a timeout-based or trylock-based acquisition (8.07) achieves a similar effect: a thread voluntarily gives back what it already holds rather than waiting forever.
+- Circular wait is the condition module 8's own two-mutex deadlock (8.04) is built to exhibit directly: thread 1 holds A waiting for B, thread 2 holds B waiting for A -- a two-node cycle in the "waits-for" graph.
+FOLLOW:
+- Is deadlock possible with only one shared lock? => No -- circular wait needs at least two resources and two threads each holding one while waiting for the other; a single mutex can only ever have threads queued waiting for the same one thing, never a cycle.
+- Does more careful code eliminate deadlock risk, or does it need a structural fix? => Careful code reduces the *chance* of hitting the timing window, but as long as all four conditions remain structurally possible, deadlock remains possible; only removing one condition (usually hold-and-wait or circular wait) eliminates the risk outright.
+PITFALL: Treating deadlock as a probabilistic bug that "mostly doesn't happen in practice" rather than a structural possibility. A deadlock that has not yet occurred in testing can still occur in production the first time the exact interleaving lines up, especially under new load patterns.
+VERIFY: General operating-systems theory (the four Coffman conditions), not itself POSIX or C11 text.
+
+@@ 8.02 | Basic | Concept | tags=deadlock-vs-livelock-vs-starvation,definitions
+Q: What is the actual difference between deadlock, livelock, and starvation?
+SHORT: Deadlock is threads permanently blocked, doing nothing, waiting on each other in a cycle -- no CPU used, no progress, ever. Livelock is threads actively running, repeatedly changing state, but making no forward progress because their actions keep undoing each other's (8.08's two threads backing off in lockstep, forever). Starvation is a thread that could progress but is repeatedly passed over by an unfair scheduler or lock while others proceed.
+DEEP:
+- Deadlock's signature (confirmed directly in 8.04/8.13) is threads sitting in "S" (interruptible sleep) state inside a futex wait, with a gdb backtrace showing each one blocked in `pthread_mutex_lock()` on a different mutex -- essentially zero CPU used, permanently.
+- Livelock's textbook signature is the opposite: threads that never block, spinning through retry logic that keeps failing, which classically shows as sustained high CPU with no progress -- though 8.14 found this specific study guide's own deterministic livelock reproduction (built on a blocking barrier to force reliable lockstep) does not show that high-CPU signature itself, an important nuance in what "the CPU signature" actually depends on.
+- Starvation does not require any cycle or lockstep pattern at all -- a single thread can be starved simply because whatever scheduling or lock-acquisition policy is in effect keeps favoring other threads, the same shape module 6's naive readers-writers problem showed for a writer against a stream of readers (module 9 rebuilds this exact scenario with hand-rolled mutexes).
+- All three are correctness/liveness failures, distinct from a safety failure (a race producing a wrong value); a deadlocked, livelocked, or starved thread never corrupts data, it simply never finishes.
+FOLLOW:
+- Can a livelock eventually resolve itself, unlike a deadlock? => Yes in principle, if timing noise (scheduling jitter, unequal delays) breaks the symmetric pattern; 8.08's jittered-backoff fix demonstrates exactly this, resolving in milliseconds every run versus the fixed-delay version's 100% failure-to-progress rate.
+- Is starvation always a bug? => Not always -- some designs deliberately accept bounded starvation risk for a simpler implementation (module 6's default rwlock kind), but unbounded starvation of a thread that must eventually run (a shutdown handler, a health check) is a real liveness bug that needs a specific fix (a fairness mechanism or a different primitive).
+PITFALL: Diagnosing any "process seems stuck" report as a deadlock by default. The fix (and the diagnostic method, 8.20) differs for each of the three, so confirming which one first saves real debugging time.
+VERIFY: General concurrency theory; deadlock/livelock/starvation terminology is standard but not itself defined by a POSIX or C11 clause.
+
+@@ 8.03 | Basic | Concept | tags=priority-inversion,plain-terms
+Q: In plain terms, what is priority inversion?
+SHORT: A high-priority thread ends up waiting, indirectly, on a lower-priority thread it is not even contending with: it blocks on a lock held by a low-priority thread, and that thread cannot finish and release the lock because a third, medium-priority thread (needing no lock at all) keeps the CPU busy and preempts it. The result: the highest-priority thread in the system waits on the lowest, priority ordering effectively inverted.
+DEEP:
+- This is specifically a real-time-scheduling hazard: it requires a scheduler that actually enforces strict priority (SCHED_FIFO/SCHED_RR, module 11), since without strict priority enforcement there is no "should always run first" guarantee to invert in the first place.
+- The Mars Pathfinder incident (1997) is the famous real-world case: a low-priority meteorological data-gathering task held a mutex a high-priority bus-management task needed, and an unrelated medium-priority communications task kept preempting the low-priority holder, causing periodic system resets on Mars until a priority-inheritance fix was uploaded remotely.
+- The fix families are priority inheritance (temporarily boost the lock holder's priority to match the highest-priority waiter, 8.11) and priority ceiling / priority protection (pre-declare a ceiling priority for the lock itself, 8.12) -- both are POSIX-standard mutex protocol attributes, not Linux-specific extensions.
+- This module owns the full explanation and Mars Pathfinder story; the OS Scheduling module's own priority-inversion question (module 11) covers only the SCHED_FIFO/SCHED_RR-specific angle and explicitly refers back here for the general mechanism.
+FOLLOW:
+- Does priority inversion require exactly three threads to occur? => The classic illustration uses three (high, low, medium) to show the medium thread as the actual root cause, but the core inversion (high waits on low) can already be called priority inversion with just two threads and a lock; the third thread is what turns a brief, bounded wait into an unbounded one.
+- Is priority inversion a bug in the mutex, the scheduler, or the application design? => None of the three individually -- the mutex, scheduler, and each thread's priority are all behaving exactly as specified; the inversion is an emergent interaction the application design has to account for explicitly, which is exactly why a mutex protocol attribute (not a scheduler change) is the standard fix.
+PITFALL: Assuming priority inversion cannot happen without a "bug" somewhere. Every component can be functioning exactly per its specification and the inversion still occurs; it is a property of the interaction, not a defect in any one piece.
+VERIFY: General real-time-systems concurrency theory and the well-documented Mars Pathfinder incident; POSIX's own protocol-attribute mechanism for the fix is cited directly in 8.11/8.12.
+
+@@ 8.04 | Intermediate | Debug | fig=deadlock | tags=ab-ba,two-mutex,compiled,hang
+Q: Reproduce a real AB-BA deadlock with a compiled program: two threads that lock two mutexes in opposite order.
+SHORT: Thread 1 locks A, sleeps 200ms, then locks B; thread 2 locks B, sleeps 200ms, then locks A. Compiled and run under `timeout 3`, the process printed both threads' first lock and their attempt to acquire the second, then hung: `t1: locking B` and `t2: locking A` were the last two lines, and the shell reported exit code 124 (killed by timeout) -- a real, reproduced circular-wait deadlock, not a hypothetical one.
+DEEP:
+```c
+static pthread_mutex_t A = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t B = PTHREAD_MUTEX_INITIALIZER;
+
+static void *thread1(void *arg) {
+    pthread_mutex_lock(&A);
+    sleep_ms(200);             /* gives thread2 time to lock B first */
+    pthread_mutex_lock(&B);    /* blocks forever: thread2 holds B, wants A */
+    pthread_mutex_unlock(&B); pthread_mutex_unlock(&A);
+    return NULL;
+}
+static void *thread2(void *arg) {
+    pthread_mutex_lock(&B);
+    sleep_ms(200);
+    pthread_mutex_lock(&A);    /* blocks forever: thread1 holds A, wants B */
+    pthread_mutex_unlock(&A); pthread_mutex_unlock(&B);
+    return NULL;
+}
+/* main: create both threads, join both */
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run under `timeout 3 ./deadlock_ab_ba`, the output was: `t1: locking A` / `t1: locked A, sleeping 200ms, then locking B` / `t2: locking B` / `t2: locked B, sleeping 200ms, then locking A` / `t1: locking B` / `t2: locking A` -- then nothing further; the shell reported exit code 124, confirming the process was killed after hanging with both threads permanently blocked.
+- This is exactly the four Coffman conditions (8.01) all present at once: mutual exclusion (each mutex), hold-and-wait (each thread holds one while waiting for the other), no preemption (neither mutex can be forcibly taken), circular wait (thread1 waits on thread2's resource and vice versa) -- and this is the wait-for cycle this module's diagram illustrates.
+- The 200ms sleep is there purely to make the race deterministic for this demonstration (guaranteeing both threads have their first lock before either tries the second); the underlying hazard exists with or without it, at whatever probability the real scheduling happens to produce.
+FOLLOW:
+- Would this deadlock every single run without the 200ms sleep? => Not necessarily -- without forcing the interleaving, thread1 might occasionally acquire both locks before thread2 starts, or vice versa; the sleep is what makes this demo reliably reproduce the bug rather than leaving it to chance timing, exactly the same technique 8.08's livelock and module 6's rwlock demos use.
+- How would this be confirmed in a real (non-instrumented) production hang? => Attach gdb to the running process and print backtraces for every thread (8.13 does exactly this on this same binary), looking for multiple threads each parked inside `pthread_mutex_lock()` on a different mutex.
+PITFALL: Assuming a deadlock that does not reproduce in a quick manual test does not exist. This exact bug needed a deliberate 200ms window to reproduce reliably in a demo; a production system under different load and scheduling might hit the same circular-wait window rarely, but not never.
+VERIFY: POSIX.1-2017, pthread_mutex_lock() DESCRIPTION (blocks until available; no built-in multi-lock deadlock detection). Compiled and run: deadlock_ab_ba.c (exit 124, hung as described).
+
+@@ 8.05 | Intermediate | Concept | tags=lock-ordering,circular-wait,prevention
+Q: Why does a consistent global lock-acquisition order prevent deadlock, and which Coffman condition does it actually break?
+SHORT: A global order (e.g. "always lock the lower-address mutex first") breaks circular wait specifically: if every thread needing both A and B acquires them in the same order, no thread can ever hold the "second" while waiting for the "first," exactly the structure a wait-for cycle needs. Mutual exclusion, hold-and-wait, and no-preemption stay completely intact -- lock ordering is a circular-wait-only fix, not general-purpose.
+DEEP:
+- The proof sketch: label locks with a fixed total order; every thread acquires locks only in increasing order; then any two threads contending for the same pair of locks are both trying to acquire the lower-ordered one first, so whichever gets it first will never be blocked waiting on the second lock from a thread that is itself waiting on the first -- no cycle can form.
+- This is the exact fix 8.06 applies to 8.04's deadlocking program: both threads changed to acquire A before B (instead of thread2 acquiring B before A), with no other change to the logic, and the deadlock stopped reproducing across 100 consecutive runs.
+- A global order does not need to be based on address; a stable, application-defined ranking (e.g. "always lock the account with the lower account ID first" in a funds-transfer function) works identically, as long as every code path that touches more than one lock in this set agrees on the same order.
+- This fix does nothing about hold-and-wait itself (a thread can still hold lock A while waiting for lock B); it only guarantees that waiting can never form a cycle, which is sufficient, not because hold-and-wait stopped being true, but because circular wait -- the condition that actually requires a cycle -- is now structurally impossible.
+FOLLOW:
+- What happens if a third-party library's internal locking cannot be reordered to match your own scheme? => This is a real, hard case -- if your code must call into a library while holding one of your locks, and that library takes its own lock in an order you do not control, the two lock sets can still deadlock; the usual mitigation is to never call into unknown code while holding your own lock, releasing first wherever possible.
+- Does lock ordering scale to many locks acquired dynamically (not known at compile time)? => Yes, provided every lock has a comparable, stable identity (an address or an assigned ID) known at the point of acquisition -- 8.16 designs exactly this for an arbitrary, dynamically-determined set of resources.
+PITFALL: Establishing a lock order for the "obvious" contended pairs in a codebase but missing a rarely-exercised code path that acquires the same two locks in the opposite order. A single violation anywhere in the program reintroduces the exact cycle the ordering discipline was meant to eliminate.
+VERIFY: General operating-systems deadlock-prevention theory (Coffman conditions, 8.01); not itself POSIX or C11 text.
+
+@@ 8.06 | Intermediate | Debug | tags=lock-ordering,fixed,compiled,no-hang
+Q: Apply the lock-ordering fix to 8.04's deadlocking program and confirm, by actually running it, that the deadlock is gone.
+SHORT: Changing only thread2's acquisition order (locking A before B, matching thread1, instead of B before A) and running 100 fresh thread-pair rounds completed every single one with no hang: `100/100 runs completed, no hang, consistent A-then-B ordering broke the circular wait`.
+DEEP:
+```c
+/* both threads now acquire in the same order: A before B */
+static void *thread1(void *arg) {
+    pthread_mutex_lock(&A);
+    sleep_ms(20);
+    pthread_mutex_lock(&B);
+    pthread_mutex_unlock(&B); pthread_mutex_unlock(&A);
+    return NULL;
+}
+static void *thread2(void *arg) {
+    pthread_mutex_lock(&A);   /* was B first; now matches thread1's order */
+    sleep_ms(20);
+    pthread_mutex_lock(&B);
+    pthread_mutex_unlock(&B); pthread_mutex_unlock(&A);
+    return NULL;
+}
+/* main: for (100 rounds) { create both threads, join both } */
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run under `timeout 20`, it completed in about 4.1 seconds real time and printed `100/100 runs completed, no hang, consistent A-then-B ordering broke the circular wait` -- with A now always acquired before B by both threads, thread2 simply blocks on A (behind thread1) instead of ever being positioned to hold B while thread1 holds A.
+- This is the identical program to 8.04 with a one-line change (which mutex thread2 locks first); nothing about the sleep timing, the mutex type, or the thread count changed -- isolating lock ordering as the entire fix.
+- With this ordering, contention is still possible (thread2 can block waiting for A while thread1 holds it), but that is ordinary lock contention, not deadlock -- thread2 simply waits its turn and both eventually complete, which is exactly what 100/100 completed runs confirms.
+FOLLOW:
+- Does this fix require both threads' source code to be visible and editable? => In this demo, yes -- both call sites were under the same author's control; 8.05's FOLLOW covers the harder case where one of the two lock acquisitions is buried inside a third-party library whose order you cannot change.
+- Would increasing the thread count (more than 2 threads touching A and B) still be safe under this same ordering rule? => Yes, as long as every thread that touches both A and B acquires A first -- the proof in 8.05 does not depend on exactly two threads; any number of threads following the same total order cannot form a cycle.
+PITFALL: Fixing the ordering for the two specific threads observed in a bug report without auditing every other code path that touches the same two locks. A single remaining call site with the reversed order reintroduces the exact deadlock this fix just eliminated.
+VERIFY: POSIX.1-2017, pthread_mutex_lock() DESCRIPTION (ordinary blocking contention behavior once circular wait is removed). Compiled and run: deadlock_fixed.c (100/100 runs, no hang).
+
+@@ 8.07 | Intermediate | Scenario | tags=trylock,backoff,deadlock-avoidance,compiled
+Q: Instead of imposing a global lock order, use pthread_mutex_trylock() with backoff to avoid deadlock between two threads that still acquire locks in opposite order.
+SHORT: Thread 1 locks A then trylocks B; thread 2 locks B then trylocks A -- opposite order, same hazard as 8.04, but each releases its first lock and retries (with a brief delay) whenever the trylock fails instead of blocking forever. Across 30 rounds with a deliberate 2ms hold to force real contention, this logged 37 total trylock backoffs and completed all 30 rounds with no hang.
+DEEP:
+```c
+static void *thread1(void *arg) {
+    for (;;) {
+        pthread_mutex_lock(&A);
+        sleep_ms(2);                              /* force real overlap with thread2 */
+        if (pthread_mutex_trylock(&B) == 0) {
+            pthread_mutex_unlock(&B); pthread_mutex_unlock(&A);
+            return NULL;
+        }
+        pthread_mutex_unlock(&A);                  /* give up A, don't hold-and-wait */
+        atomic_fetch_add(&backoffs, 1);
+        sleep_ms(1);
+    }
+}
+/* thread2 mirrors this with B locked first, trylock(A) second */
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run under `timeout 30`, it printed `30/30 runs completed with opposite lock order, 37 trylock backoffs total, no hang` -- confirming both that the retry mechanism actually engaged (37 real backoffs, not zero) and that no round ever hung despite the truly opposite acquisition order.
+- The critical difference from 8.04's deadlocking version: on a failed second-lock attempt, this code releases the first lock before retrying, breaking hold-and-wait for the retry window instead of leaving the thread parked holding one resource while blocked on the other.
+- `pthread_mutex_trylock()` is documented to "fail if: EBUSY The mutex could not be acquired because it was already locked" and return immediately rather than blocking -- this is the exact primitive that makes voluntarily giving up and retrying possible at all; a plain `pthread_mutex_lock()` on the second lock offers no such escape hatch.
+- The 1ms backoff delay before retrying is deliberately naive here (module 8.08 shows why a fixed, identical delay on both sides is itself a hazard -- livelock); this specific trylock demo happened not to livelock in 30 rounds, but that outcome is not guaranteed by the trylock mechanism alone.
+FOLLOW:
+- Does this approach need a global lock order at all? => No -- that is the entire point: trylock-based backoff tolerates an arbitrary, even inconsistent, acquisition order across threads, at the cost of needing retry logic (and the livelock risk 8.08 covers) that a consistent order avoids entirely.
+- Is trylock-based avoidance strictly better than lock ordering? => Not automatically -- lock ordering is simpler to reason about and has zero livelock risk once established; trylock-based avoidance is the right tool specifically when a consistent order cannot be established (e.g. locks acquired dynamically in an order determined by external, unpredictable input).
+PITFALL: Adding a trylock-and-retry loop without releasing the first lock on failure. Retrying while still holding the first lock reintroduces hold-and-wait and can deadlock exactly like a blocking pthread_mutex_lock() would, just with extra, pointless retry attempts on the way to hanging.
+VERIFY: POSIX.1-2017, pthread_mutex_trylock() DESCRIPTION and ERRORS (EBUSY, immediate-return-on-contention semantics). Compiled and run: trylock_avoid.c (30/30 runs, 37 backoffs, no hang).
+
+@@ 8.08 | Intermediate | Trap | tags=livelock,lockstep,backoff,jitter,compiled
+Q: Reproduce a real livelock -- two threads that keep retrying in perfect lockstep and never make progress -- then fix it with randomized backoff.
+SHORT: Two threads, forced via a barrier to attempt their opposite-order trylock at the same instant every round with an identical fixed 3ms backoff delay, gave up after 100 tries each with zero progress, every single run (3/3 runs tested). Switching only the backoff delay to a small random jitter (1-8ms) resolved the exact same contention on the very first attempt, every time (5/5 runs tested) -- confirming the fixed, synchronized delay itself was the entire cause.
+DEEP:
+```c
+/* both threads: id 0 wants A-then-B, id 1 wants B-then-A (same shape as 8.07) */
+pthread_barrier_wait(&start_barrier);           /* both begin the "race" at the same instant */
+while (!done && tries < MAX_TRIES) {
+    pthread_mutex_lock(first);
+    sleep_ms(2.0);                               /* force real overlap, same technique as 8.07 */
+    int rc = pthread_mutex_trylock(second);
+    if (!use_jitter)
+        pthread_barrier_wait(&attempt_barrier);   /* lockstep mode: force symmetric failure every round */
+    if (rc == 0) { /* success path */ }
+    pthread_mutex_unlock(first);
+    tries++;
+    sleep_ms(use_jitter ? (1.0 + rand_r(&seed) % 8) : 3.0);
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run: lockstep mode printed `worker 0: gave up, made zero progress after 100 tries` and the same for worker 1, on all 3 runs tested (elapsed about 0.53s each, done=0); jittered mode printed `worker N: acquired both locks after 0 tries` on all 5 runs tested, resolving in about 6-8 milliseconds.
+- The `attempt_barrier` in lockstep mode is what makes this reproducible on demand: without something forcing both threads' retry timing back into alignment every round, ordinary scheduling noise (thread creation jitter, unequal cache effects) is enough to desync two threads even with an identical nominal delay, which an early, unforced version of this same test confirmed by resolving immediately instead of livelocking.
+- This is the real mechanism behind the folklore "two people politely stepping aside for each other in a hallway, repeatedly, in sync" livelock story: a shared, deterministic retry rule applied by both parties at the same moment keeps recreating the identical conflict, and only breaking the symmetry (randomizing one side's timing) lets one of them win.
+- 8.07's trylock-and-backoff avoidance code is exactly the shape that can livelock this way if its backoff delay is fixed and both threads' timing happens to stay aligned; 8.07's own 1ms fixed delay did not livelock in that specific test, but nothing in trylock-based avoidance alone rules it out.
+FOLLOW:
+- Is jitter alone always a complete fix? => It converts a deterministic, permanent failure mode into an overwhelmingly-likely-to-resolve-quickly one; a residual, exponentially small chance of repeated unlucky alignment remains in principle, the same way randomized exponential backoff in networking reduces collision probability without making it mathematically zero.
+- Would adding a fixed, unequal delay (thread 0 waits 3ms, thread 1 waits 5ms) work as well as jitter? => Yes in principle for exactly two threads, since any consistent asymmetry breaks the lockstep just as effectively as randomness -- jitter is preferred in general because it scales to more than two contending parties without needing a hand-assigned unique delay per thread.
+PITFALL: Adding retry logic with a backoff delay and treating "it has a delay, so it won't spin forever" as equivalent to "it cannot livelock." A fixed, identical delay on all contending parties is exactly the shape that can keep them in permanent lockstep; the delay must be randomized or otherwise made asymmetric to actually break that risk.
+VERIFY: General concurrency theory (livelock, randomized backoff); not itself POSIX or C11 text. Compiled and run: livelock.c (3/3 lockstep runs gave up, 5/5 jittered runs resolved immediately).
+
+@@ 8.09 | Intermediate | Concept | tags=starvation,fairness,unlock-scheduling
+Q: What does POSIX actually guarantee about which waiting thread gets a mutex next when it is unlocked, and why does that leave the door open to starvation?
+SHORT: "If there are threads blocked on the mutex object... when pthread_mutex_unlock() is called... the scheduling policy shall determine which thread shall acquire the mutex" -- POSIX defers to "the scheduling policy," not arrival order, with no first-in-first-out promise at all. Under an ordinary scheduling policy this leaves real room for one thread to keep winning the race to reacquire a just-unlocked mutex while another waits indefinitely.
+DEEP:
+- This is the same absence of a fairness guarantee module 6 found for `pthread_rwlock_t` (6.10, 6.17) and this study guide's own naive readers-writers reproduction (module 9) demonstrates concretely for a hand-rolled mutex-based scheme: nothing in the primitive itself promises fairness, only that some thread among those blocked will get it.
+- In practice, a mutex implementation is free to hand the lock to whichever thread the scheduler happens to run next, which under SCHED_OTHER (module 11) is influenced by things like which thread's cache state or recent CPU time makes it more likely to be scheduled promptly -- not by how long it has been waiting.
+- Starvation risk from this specific gap is usually low in practice for short, evenly-distributed critical sections, but becomes a real, observable problem exactly under the same pattern module 9's naive readers-writers shows: one side arriving continuously and rapidly can keep "winning" the race against a less frequent, longer-waiting contender.
+- The practical mitigations are the same family covered elsewhere in this page: a ticket-lock-style explicit fairness scheme built on top of a mutex and condition variable (module 9's principal-level fair readers-writers design), or accepting the platform's default and only addressing it if actually measured to be a problem (module 6's own diagnostic-before-fixing discipline).
+FOLLOW:
+- Does PTHREAD_MUTEX_RECURSIVE or PTHREAD_MUTEX_ERRORCHECK change this fairness behavior? => No -- the mutex type attribute (module 4) governs relock/unlock error-checking behavior, entirely separate from which waiter is chosen when the mutex becomes free; none of the three standard types adds a fairness guarantee.
+- Is there a POSIX mutex attribute specifically for fairness, the way PRIO_INHERIT exists for priority inversion? => Not among the standard mutexattr protocol values; fairness is left as an implementation detail, which is why an application that needs a specific fairness guarantee typically builds one explicitly rather than relying on any pthread_mutex_t default.
+PITFALL: Assuming pthread_mutex_t is first-in-first-out because that "seems like the obvious fair behavior." POSIX explicitly declines to promise this, and relying on an observed FIFO-like behavior on one platform is not portable.
+VERIFY: POSIX.1-2017, pthread_mutex_unlock() DESCRIPTION ("the scheduling policy shall determine which thread shall acquire the mutex").
+
+@@ 8.10 | Advanced | Cross-layer | tags=priority-inversion,mechanism,mars-pathfinder
+Q: Walk through the priority-inversion mechanism in full, cross-layer detail, including how the Mars Pathfinder incident actually unfolded.
+SHORT: Three SCHED_FIFO threads: low-priority L holds a mutex a high-priority H needs; H blocks in pthread_mutex_lock(), correctly waiting for L. But L cannot finish and unlock, because a third, medium-priority M thread needing no lock at all keeps preempting L on the CPU every time the scheduler gets a choice, since M outranks L. H, the highest-priority thread, ends up effectively blocked on M, the lowest -- an unbounded wait unrelated to H's own priority.
+DEEP:
+1. **The setup.** L acquires a mutex and begins work that needs the CPU to finish; H (needing the same mutex) is created or becomes runnable and blocks in `pthread_mutex_lock()`, correctly waiting -- so far this is ordinary, bounded lock contention.
+2. **The trigger.** M, a thread with priority between L and H that needs no lock at all, becomes runnable. Under strict SCHED_FIFO priority scheduling, M preempts L (M outranks L) every time the scheduler has to choose, and keeps running for as long as it has work to do.
+3. **The inversion.** L, still holding the mutex H needs, makes zero further progress while M runs, since strict priority scheduling never lets L run while a higher-priority M is runnable. H is therefore blocked not for the bounded time L's own critical section takes, but for however long M happens to keep the CPU -- unrelated to the lock, unrelated to H's own priority.
+4. **Mars Pathfinder (1997).** A low-priority meteorological data-gathering task held a mutex the high-priority bus-management task needed; an unrelated medium-priority communications task repeatedly preempted the low-priority holder, and the bus-management task's watchdog timer -- expecting to run promptly -- triggered full system resets. Engineers on Earth diagnosed the pattern from telemetry and uploaded a fix enabling priority inheritance on the contested mutex, resolving it remotely without physical access to the hardware.
+5. **The fix families.** Priority inheritance (8.11) temporarily boosts L's effective priority to H's for as long as H is waiting, so M (priority between L and H) can no longer preempt L; priority ceiling / protection (8.12) instead pre-declares a ceiling priority for the mutex itself, achieving a related but distinct bound.
+- This module's compiled reproduction (8.11) built exactly this three-thread scenario for real, with real SCHED_FIFO priorities and a real CPU-bound M thread, and measured the actual wait -- not a hypothetical -- confirming the mechanism end to end on this sandbox.
+FOLLOW:
+- Could this happen with only two threads (no M)? => Not in the unbounded form -- with only L and H, H's wait is bounded by L's own critical-section length (ordinary contention); the unbounded, "borrowed from an unrelated thread" character of true priority inversion specifically requires a third party like M to be the one actually consuming the CPU L needs.
+- Is this specific to SCHED_FIFO/SCHED_RR, or can it happen under SCHED_OTHER too? => The mechanism technically can occur under any scheduler, but it matters far less under SCHED_OTHER, which makes no strict priority-ordering promise to begin with (module 11.12); priority inversion is a real-time-scheduling concern specifically because SCHED_FIFO/SCHED_RR promise an ordering this bug silently breaks.
+PITFALL: Diagnosing "my high-priority thread is randomly slow" as a scheduler bug rather than checking whether it is blocked on a lock also held by a lower-priority thread that is itself being preempted by an unrelated thread. Priority inversion, not the scheduler, is the far more common real cause once strict priorities are in play.
+VERIFY: General real-time-systems theory and the well-documented Mars Pathfinder incident (public NASA/JPL post-incident accounts); the general mechanism is not itself POSIX or C11 text.
+
+@@ 8.11 | Advanced | Debug | tags=priority-inheritance,prio-inherit,sched-fifo,compiled,real-timing
+Q: Reproduce real priority inversion with actual SCHED_FIFO threads and a real timed measurement, then fix it with a PTHREAD_PRIO_INHERIT mutex and measure the difference.
+SHORT: With a plain mutex, a high-priority (90) thread waited 3.741s and 3.772s (two runs) for a low-priority (10) holder, because a medium-priority (50) unrelated CPU-bound thread kept preempting the holder the whole time. With the mutex created via `pthread_mutexattr_setprotocol(&attr, PTHREAD_PRIO_INHERIT)`, the same thread waited only 1.100s and 0.697s -- bounded by the holder's own work, not the unrelated medium-priority thread.
+DEEP:
+```c
+pthread_mutexattr_t attr;
+pthread_mutexattr_init(&attr);
+pthread_mutexattr_setprotocol(&attr, PTHREAD_PRIO_INHERIT);   /* the entire fix */
+pthread_mutex_init(&mtx, &attr);
+/* L: SCHED_FIFO prio 10, locks mtx, then ~1.5s of real CPU-bound "critical section" work
+   M: SCHED_FIFO prio 50, ~2.5s of unrelated CPU-bound work, no lock involved
+   H: SCHED_FIFO prio 90, calls pthread_mutex_lock(&mtx) and times the wait
+   all three pinned to CPU 0 so strict priority alone decides who runs */
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run: without PRIO_INHERIT, the trace showed `L: acquired mutex at t=0.000s` / `H: calling pthread_mutex_lock() at t=0.450s` / `M: starting unrelated CPU-bound work at t=0.480s` / `L: finished critical section at t=4.191s` / `H: acquired mutex at t=4.191s, waited 3.741s` -- L made zero progress the entire time M ran. With PRIO_INHERIT: `H: calling pthread_mutex_lock() at t=0.452s` / `M: starting... at t=0.481s` / `L: finished critical section at t=1.552s` / `H: acquired mutex at t=1.552s, waited 1.100s` -- L's priority was boosted above M's the instant H blocked, so M could not preempt L at all, and L finished in almost exactly its own unimpeded work time.
+- The difference (about 3.7s versus about 1s-1.1s, consistent across two runs each) is the entire priority-inversion mechanism made visible as a real, measured number, not just a description: without the protocol, H's wait tracked M's runtime plus L's own work; with it, H's wait tracked only L's own work.
+- `pthread_mutexattr_setprotocol()` and `PTHREAD_PRIO_INHERIT` are not among this study guide's 60 fetched POSIX man pages (only the resulting EINVAL error condition on pthread_mutex_lock()/trylock() for the related PRIO_PROTECT case appears there, 8.12) -- their behavior here is confirmed by this compiled, measured test, cross-referenced against well-known POSIX mutexattr protocol semantics.
+FOLLOW:
+- Why pin all three threads to one CPU? => To force strict priority to be the only thing deciding who runs -- with 2 real cores available and no pinning, M and L could simply run simultaneously on separate cores, hiding the entire inversion; pinning is what makes the mechanism reliably reproducible on this sandbox's hardware.
+- Does PRIO_INHERIT eliminate H's wait entirely? => No -- it bounds H's wait to L's own critical-section length (ordinary contention), which is the correct, expected outcome; PRIO_INHERIT removes the *unbounded* part of the wait (the dependency on M's unrelated runtime), not lock contention itself.
+PITFALL: Believing PRIO_INHERIT is a Linux-only extension. It is a standard POSIX mutexattr protocol value (`PTHREAD_PRIO_INHERIT`), portable across POSIX-conformant real-time implementations, unlike some of the scheduling extensions module 11 flags explicitly as Linux-specific (e.g. `PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP`).
+VERIFY: POSIX.1-2017 mutexattr protocol values (PTHREAD_PRIO_INHERIT) are standard but not among the 60 fetched pages -- cross-reference against pthread_mutex_lock()'s own EINVAL/PRIO_PROTECT text (8.12), which is fetched and directly confirms the protocol attribute mechanism exists. Compiled and run: prio_inv.c (two runs each mode, numbers above).
+
+@@ 8.12 | Advanced | Debug | tags=prio-protect,priority-ceiling,einval,compiled
+Q: Set up a mutex with the PTHREAD_PRIO_PROTECT protocol and a priority ceiling, and confirm POSIX's documented EINVAL behavior actually triggers when a thread above the ceiling tries to lock it.
+SHORT: "EINVAL: The mutex was created with the protocol attribute having the value PTHREAD_PRIO_PROTECT and the calling thread's priority is higher than the mutex's current priority ceiling" -- a compiled test confirmed this exactly: a mutex with ceiling 50 locked cleanly (rc=0) from a SCHED_FIFO thread at priority 20, then failed with rc=22 (EINVAL) from the same thread after raising its own priority to 80, above the ceiling.
+DEEP:
+```c
+pthread_mutexattr_t attr;
+pthread_mutexattr_init(&attr);
+pthread_mutexattr_setprotocol(&attr, PTHREAD_PRIO_PROTECT);
+pthread_mutexattr_setprioceiling(&attr, 50);
+pthread_mutex_t m;
+pthread_mutex_init(&m, &attr);
+/* caller at SCHED_FIFO prio 20 (<= ceiling 50): */
+pthread_mutex_lock(&m);      /* rc=0 */
+pthread_mutex_unlock(&m);
+/* caller raises itself to SCHED_FIFO prio 80 (> ceiling 50): */
+pthread_mutex_lock(&m);      /* rc=22 (EINVAL), exactly as documented */
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run, the output was: `setprotocol(PRIO_PROTECT) rc=0` / `setprioceiling(50) rc=0` / `mutex_init with PRIO_PROTECT attr rc=0` / `lock at caller prio 20 (<= ceiling 50): rc=0` / `lock at caller prio 80 (> ceiling 50): rc=22 (EINVAL=22)` -- the documented ERRORS text confirmed as real, observed behavior on this glibc, not just cited spec prose.
+- Priority ceiling works differently from priority inheritance (8.11): instead of dynamically boosting whoever currently holds the lock, the mutex itself is pre-assigned a ceiling priority (here, 50), and any thread whose own priority exceeds that ceiling is refused the lock outright with EINVAL rather than being allowed to acquire it and potentially still suffer inversion from something the ceiling did not anticipate.
+- This means priority ceiling requires the ceiling to be chosen correctly up front (at least as high as the highest-priority thread that will ever need this mutex) -- an EINVAL here in production usually means the ceiling was set too low for a legitimate caller, a configuration bug, not a runtime race.
+- Unlike PRIO_INHERIT's dynamic, no-configuration-needed boost, PRIO_PROTECT trades that simplicity for a compile/design-time requirement: every mutex's ceiling must be known and correctly set relative to every thread that might ever lock it.
+FOLLOW:
+- Which protocol is generally preferred in practice? => PRIO_INHERIT is more commonly used because it requires no upfront ceiling configuration and adapts automatically to whichever threads are actually contending; PRIO_PROTECT can offer a tighter worst-case bound when the ceiling is set correctly, at the cost of that upfront configuration burden and the risk demonstrated here (a legitimate high-priority caller being refused if the ceiling was set too low).
+- Does a SCHED_OTHER (non-real-time) thread trigger this same EINVAL path? => The ceiling comparison depends on having a real-time scheduling priority to compare in the first place; a caller thread that was not first put under SCHED_FIFO/SCHED_RR was observed in early testing to fail the lock attempt for a different reason entirely (no comparable priority), underscoring that PRIO_PROTECT is meaningfully real-time-scheduling-specific in a way plain mutexes are not.
+PITFALL: Setting a mutex's priority ceiling without auditing every thread priority that will ever call pthread_mutex_lock() on it. A legitimate high-priority caller added later can be refused the lock outright with EINVAL if nobody re-checks the ceiling against the new caller's priority.
+VERIFY: POSIX.1-2017, pthread_mutex_lock() ERRORS (EINVAL for PRIO_PROTECT above ceiling, directly fetched and quoted above); pthread_mutexattr_setprotocol()/setprioceiling() themselves are not among the 60 fetched pages. Compiled and run: prio_protect_api.c (rc values above, exactly as documented).
+
+@@ 8.13 | Advanced | Debug | tags=gdb,backtrace,diagnosis,production-hang
+Q: A production process appears hung. Walk through actually using gdb to confirm whether it is a deadlock, and what the backtrace evidence looks like.
+SHORT: Attaching gdb to 8.04's hung process with `gdb -batch -p <pid> -ex "thread apply all bt"` showed exactly the signature to look for: thread 3 (`thread1`) parked in `___pthread_mutex_lock` on mutex B, thread 2 (`thread2`) parked the same way on mutex A, main blocked in `pthread_join`. Two threads each inside `pthread_mutex_lock()` on a different mutex, nothing running, confirms circular-wait deadlock concretely, not a guess from symptoms.
+DEEP:
+```
+Thread 3 (LWP 13878) "deadlock_ab_ba":
+#2  lll_mutex_lock_optimized (mutex=0x... <B>) at ./nptl/pthread_mutex_lock.c:48
+#3  ___pthread_mutex_lock (mutex=0x... <B>) at ./nptl/pthread_mutex_lock.c:93
+#4  thread1 ()
+
+Thread 2 (LWP 13879) "deadlock_ab_ba":
+#2  lll_mutex_lock_optimized (mutex=0x... <A>) at ./nptl/pthread_mutex_lock.c:48
+#3  ___pthread_mutex_lock (mutex=0x... <A>) at ./nptl/pthread_mutex_lock.c:93
+#4  thread2 ()
+
+Thread 1 (LWP 13876) "deadlock_ab_ba" (main):
+#3  __pthread_clockjoin_ex (...) at ./nptl/pthread_join_common.c:102
+#4  main ()
+```
+This is a real, captured gdb transcript against the actual running (hung) 8.04 binary, not a reconstructed example -- `thread apply all bt` dumped every thread's C-level call stack in one command, immediately showing thread1 waiting on B (which thread2 holds) and thread2 waiting on A (which thread1 holds), the exact circular-wait pattern 8.01/8.04 describe.
+1. **Attach without killing.** `gdb -batch -p <pid> -ex "thread apply all bt"` attaches, dumps every thread's backtrace, and detaches, without needing to stop the process manually first or risk losing the exact hung state by restarting it.
+2. **Look for multiple threads inside the same lock function.** Several threads each sitting in `pthread_mutex_lock()` (or the internal `lll_mutex_lock_optimized`/futex-wait frames beneath it) is the signature; note *which* mutex address each one is blocked on (visible in the `mutex=0x...` argument).
+3. **Cross-reference the blocked-on addresses against who holds what.** If thread A is blocked on mutex X and thread B is blocked on mutex Y, check the source (or add logging) to confirm thread B currently holds X and thread A currently holds Y -- that confirmation is the actual proof of a cycle, not just "multiple threads are blocked somewhere."
+4. **Confirm CPU usage independently.** `ps -L -o pid,lwp,stat,pcpu -p <pid>` showing every thread in "S" state at essentially 0% CPU corroborates the gdb evidence: nothing is running, everything is parked waiting.
+5. **Distinguish this from a livelock or unrelated hang using the same tools** (8.20 covers the full decision procedure using both gdb and CPU-usage evidence together).
+FOLLOW:
+- Does this method work on a production binary built with optimizations, without debug symbols? => Less cleanly -- frame names and arguments can be missing or misleading without debug info; shipping a debug build (or at least frame pointers and symbols) for production diagnosis, even if optimized, is what keeps this technique usable when it matters most.
+- Is there a way to get this information without attaching a live debugger, e.g. after the fact? => A core dump taken at the moment of the hang (or triggered manually, e.g. via `gcore <pid>`) can be loaded into gdb afterward with the same `thread apply all bt` technique, useful when attaching live is not possible (a customer's production system, for example).
+PITFALL: Concluding "it's a deadlock" from a hang report alone, without actually capturing thread backtraces. A livelock (8.14) or an unrelated hang (blocked I/O, an infinite loop with no lock involved at all) can look identical from the outside ("the process stopped responding") but need a completely different fix.
+VERIFY: General gdb usage (not POSIX or C11 text). Backtrace captured live against this study guide's own deadlock_ab_ba.c process (PIDs and addresses specific to that one captured run).
+
+@@ 8.14 | Advanced | Trap | tags=livelock,cpu-signature,ps,nuance
+Q: Does a livelock always show up as sustained high CPU usage, the way deadlock shows up as near-zero CPU? Check this against a real measurement, not just the textbook expectation.
+SHORT: Not necessarily -- it depends entirely on whether the retry loop actually spins without blocking. This study guide's own deterministic livelock (8.08), built on `pthread_barrier_wait()` to force reliable lockstep, measured only about 0.005-0.078s of real CPU time across a full 5-second hung run: since the barrier itself blocks in the kernel rather than spinning, these threads spend nearly all their time asleep, not burning CPU, despite zero real progress.
+DEEP:
+- The textbook "livelock = high CPU, deadlock = zero CPU" heuristic assumes the retry loop itself never blocks -- a hand-rolled spin-and-immediately-retry loop with no kernel wait call anywhere in it. The moment any blocking primitive (a barrier, a condition variable, even a sleep) is part of the retry cycle, the CPU-usage signature can look far closer to a deadlock's, even though the process is livelocked, not deadlocked, by every other definition (8.02).
+- Measured directly: `time timeout 5 ./livelock_hot` (a variant built with a barrier-forced retry and no artificial sleep, only `sched_yield()` between attempts) still showed only `user=0.005s sys=0.000s` over a 5.003s wall-clock run -- confirming that even removing an explicit sleep does not produce high CPU usage once a blocking barrier is part of the same retry cycle, since the barrier wait itself is where most of the wall-clock time is actually spent.
+- This is a real, load-bearing nuance for 8.20's diagnostic method: CPU usage alone (via `ps`/`top`) is a useful first signal, but is not a reliable way to distinguish every livelock from every deadlock -- the reliable distinguishing evidence is still a gdb backtrace showing threads cycling through different code locations across repeated attaches (livelock) versus parked in the exact same blocked call every time (deadlock, 8.13).
+- A livelock built purely from a tight compute loop with no blocking call at all (no barrier, no sleep, no yield) would be expected to show the classic high-CPU signature; this study guide did not isolate that specific pure-spin variant with a clean measurement, so treat the classic "livelock = 100% CPU" expectation as correct for that specific shape, and this module's own measured counterexample as the caveat for any retry loop that uses a blocking synchronization primitive internally.
+FOLLOW:
+- So how do you tell a blocking-barrier-based livelock apart from a real deadlock using ps alone? => You often cannot reliably, which is exactly why 8.20's method leads with gdb backtraces (do the blocked frames change across repeated attaches, seconds apart) rather than CPU usage as the primary signal.
+- Does this mean CPU-usage monitoring is useless for livelock detection? => No -- it remains a strong, fast first signal for the classic tight-spin livelock shape, and a real, sustained high CPU reading on a "hung" process is still excellent evidence against a simple deadlock; it is specifically the *absence* of high CPU that this module shows is not, by itself, evidence against livelock.
+PITFALL: Ruling out livelock because a "hung" process shows near-zero CPU usage. As measured directly here, a livelock built around a blocking synchronization primitive in its retry cycle can look exactly like a deadlock by CPU usage alone; repeated gdb backtraces are the more reliable test.
+VERIFY: This module's own compiled measurements (livelock.c, livelock_hot.c) on this specific sandbox; the general "spin-based livelock shows high CPU" expectation is standard concurrency folklore, not independently re-verified here for a pure-spin (no blocking call) variant.
+
+@@ 8.15 | Advanced | Numeric | tags=priority-inheritance,overhead,hedge
+Q: Roughly, how much more does locking a PTHREAD_PRIO_INHERIT mutex cost than an ordinary one, in the uncontended case?
+SHORT: A reasoned hedge, not an independently benchmarked figure: an ordinary uncontended mutex lock/unlock measured about 70-85 ns/op on this same 2-core sandbox (module 4.12); a priority-inheritance mutex additionally checks and potentially adjusts the caller's effective priority against any waiters on every lock/unlock, real non-zero bookkeeping -- expect a modest constant overhead on the base 70-85 ns, not a multiplier, since the check is small and bounded.
+DEEP:
+- This module's own 8.11/8.12 tests measured PRIO_INHERIT's and PRIO_PROTECT's *correctness* effect (a 3.7s wait cut to about 1s, and a documented EINVAL path) directly and precisely; neither test isolated or timed the uncontended per-call locking overhead itself, which is why this figure is a reasoned estimate from the base mutex cost plus the known extra bookkeeping requirement, not a fresh measurement.
+- The extra bookkeeping specifically: on lock, the implementation must record enough information to later know whose priority to restore on unlock, and on a contended lock, walk the (typically short) list of waiters to determine the new effective priority to apply -- bounded, cheap work for the small number of waiters realistic mutex contention produces, but not free.
+- This is directly analogous to the ERRORCHECK mutex type's documented extra cost over NORMAL (module 4.04's FOLLOW: "it has to track the owning thread and lock state to detect the error, so it is intentionally reserved for debugging... default") -- both PRIO_INHERIT and ERRORCHECK trade a small, real per-call cost for a correctness or safety property the plain default does not provide.
+- The right way to pin this down for a specific target is exactly module 4.12's own before/after timing methodology, applied to a PRIO_INHERIT mutex against a plain one under the same uncontended lock/unlock loop -- this study guide did not run that specific timing comparison, so treat the "modest constant overhead" claim as a reasoned expectation to verify, not a cited number.
+FOLLOW:
+- Is this overhead ever a reason to avoid PRIO_INHERIT on a real-time-priority code path? => Only if that path is also extremely lock-heavy and latency-critical at a sub-microsecond scale; for the overwhelming majority of code where priority inversion is even a risk (locks held for real work, not held in a tight per-nanosecond loop), the correctness benefit (bounding an otherwise-unbounded wait, 8.11) vastly outweighs a modest, uncontended per-call cost.
+- Would PRIO_PROTECT's overhead differ from PRIO_INHERIT's? => Plausibly lower on lock (a ceiling comparison is simpler than inheritance bookkeeping across arbitrary waiters), but this was not measured directly here either -- the same VERIFY-and-measure discipline applies before relying on any specific number for either protocol.
+PITFALL: Assuming a real-time correctness mechanism like PRIO_INHERIT is "too expensive" for production use based on intuition alone, without measuring the actual uncontended overhead on the target platform the way module 4.12 measured mutex-vs-spinlock. The correctness risk it addresses (an unbounded wait, 8.11) is usually the much larger, harder-to-quantify cost.
+VERIFY: No POSIX or C11 clause states a performance figure for PRIO_INHERIT; this is a reasoned hedge built on module 4.12's own measured 70-85 ns/op base mutex figure plus general bookkeeping-cost reasoning, not independently benchmarked in this study guide.
+
+@@ 8.16 | Principal | Scenario | tags=design,global-lock-order,deadlock-free,dynamic
+Q: Design a deadlock-free locking scheme for a system where threads acquire an arbitrary, dynamically-determined subset of N resources at a time, not knowable in advance.
+SHORT: Assign every lock a stable, comparable identity independent of acquisition order (a fixed numeric ID at creation, or simply the lock's own memory address), and require every code path -- without exception -- to sort its needed locks by that identity and acquire them in increasing order before doing any work, releasing in reverse. This structurally eliminates circular wait (8.05) regardless of how many locks are needed or in what order the caller first decided it needed them.
+DEEP:
+1. **Pick a stable identity, decided once, at design time.** A lock's own address (`&mutex`) is simplest and needs no extra bookkeeping, provided locks are never moved or reallocated at a different address while in use; an explicit assigned ID is the alternative when locks can be relocated or when address-based ordering would be nondeterministic across runs in a way that complicates debugging.
+2. **Collect the full set of needed locks before acquiring any.** The calling code must determine (or be handed) the complete list of locks a given operation needs up front -- acquiring "the first lock I need, then figuring out the second," without knowing the second in advance, cannot be reliably sorted against a global order.
+3. **Sort by the chosen identity, then acquire in that order, unconditionally.** A small wrapper function (`lock_all(mutex_t **locks, int n)`) that sorts the array by address and then locks each one in that fixed sequence keeps the ordering discipline in one place instead of relying on every call site to remember it correctly.
+4. **Release in reverse order (not required for correctness, but conventional).** Reverse-order release is not what prevents deadlock (acquisition order is what matters), but it keeps the acquire/release pattern symmetric and easier to reason about in code review.
+5. **Enforce the discipline structurally, not just by convention.** A debug-only wrapper that asserts a thread never acquires a lock with a lower identity than one it already holds (tracked in thread-local storage) catches an ordering violation immediately in testing, rather than leaving it to a rare production timing window to expose (8.04's own deadlock needed a deliberately engineered timing window to reproduce reliably even as a known bug).
+- This generalizes 8.05/8.06's two-mutex fix to the actual hard case: an arbitrary and dynamically-determined resource set is exactly what a single "always lock A before B" comment cannot cover once there are more than a small, fixed handful of locks in the system.
+FOLLOW:
+- What if two locks legitimately have the same address-derived priority (impossible for addresses, but relevant for hash-based IDs)? => Use a stable secondary tiebreaker (insertion order, or simply disallow ID collisions by construction) so the total order is fully total; a partial order with ties reopens the circular-wait possibility the whole scheme exists to close.
+- Does this scheme handle a thread that needs to acquire an additional lock *after* already starting work under the first set? => Only if the additional lock's identity is guaranteed higher than every lock already held -- acquiring a lower-identity lock after already holding a higher one violates the global order and must instead release everything and re-acquire the full set in order, which is exactly the added complexity this design should be judged against before adopting it.
+PITFALL: Enforcing the sorted-acquisition discipline in most of the codebase but leaving one code path (often an error-handling or cleanup path added later) that acquires locks directly without going through the shared `lock_all()`-style helper. A single such path reintroduces exactly the circular-wait risk the entire design exists to eliminate.
+VERIFY: General deadlock-prevention design (Coffman conditions, 8.01/8.05); no single POSIX or C11 clause specifies this pattern.
+
+@@ 8.17 | Principal | Debug | tags=review,checklist,lock-ordering-audit
+Q: You are reviewing a PR that adds a new code path acquiring two existing locks (already used elsewhere in the codebase) together for the first time. What do you specifically check before approving?
+SHORT: Find every other place in the codebase that already acquires both of these same two locks, and confirm this new path uses the identical order -- not just "a sensible order," the *same* order as every existing call site, since even one path anywhere with the reversed order reintroduces circular wait (8.05). If no existing call site acquires both together yet, this PR sets the order for the first time, so it should record that decision where future callers can find it.
+DEEP:
+1. **Search, don't assume.** Grep (or equivalent) for every call site that locks either of these two mutexes, then check each one that touches both for its acquisition order -- a mental review of "does this look right" is not a substitute for actually finding every existing precedent.
+2. **Check transitively through called functions, not just the immediate function body.** A function that looks like it only locks A directly might call into another function that locks B while A is still held -- the effective order includes every lock acquired anywhere in the call chain while another is held, not just locks taken in the same stack frame.
+3. **If this is the first time these two locks are used together, establish and document the order now.** A comment at each lock's declaration ("always acquired before/after lock X, see docs/locking.md") and a single canonical reference documenting every established pairwise order gives the next PR's author something concrete to check against instead of re-deriving the answer from scratch.
+4. **Consider whether this pair should go through a shared acquisition helper instead of ad hoc locking.** If this is the third or fourth distinct call site independently acquiring the same two locks, that is a signal to introduce a `lock_both()`-style helper (8.16) that enforces the order in one place rather than trusting every call site to remember it.
+5. **Ask specifically about error and early-return paths within the new code**, not just the success path -- an early return that leaves the second lock unlocked while still holding the first (or unlocks in the wrong order) can reintroduce a bug in this one path even when the overall ordering discipline is otherwise sound.
+- This is the same discipline module 6.20 already applied to a semaphore-and-rwlock PR, now specifically focused on the multi-mutex ordering question this module's earlier questions build up to (8.05, 8.06, 8.16).
+FOLLOW:
+- What if the two locks are acquired in different orders in two different subsystems that never actually call into each other? => If they truly can never be held simultaneously by any thread crossing between the two subsystems, there is no real circular-wait risk yet -- but this is a fragile invariant to rely on long-term; flag it explicitly in review as a documented constraint ("subsystem X and Y must never call into each other while holding either lock") rather than leaving it as an accidental, undocumented fact.
+- Is a runtime lock-order-violation detector (a debug-build assertion tracking each thread's currently-held locks) worth the engineering cost for this? => Worth it once a codebase has enough distinct locks and call sites that manual review can no longer realistically catch every ordering violation (8.16's FOLLOW covers the mechanism); for a small, well-understood lock set, disciplined code review plus documentation is often sufficient.
+PITFALL: Approving a PR because the new code path's own two-lock order "looks reasonable in isolation," without actually checking it against every existing call site that already acquires the same pair. Reasonable-looking and consistent-with-existing-code are not the same thing, and only the second one actually prevents deadlock.
+VERIFY: General deadlock-prevention review discipline (8.05, 8.16); no single POSIX or C11 clause covers this practice.
+
+@@ 8.18 | Principal | Scenario | tags=production-fix,priority-inversion,instrument-verify
+Q: A production real-time validation harness reports a high-priority I/O-completion thread occasionally taking seconds to respond, correlated with an unrelated background compression job running at medium priority. Diagnose and fix it end to end.
+SHORT: This is the exact three-thread priority-inversion shape (8.10): confirm it by instrumenting wait times against the background job's activity (the same technique 8.11 used: timestamp when the high-priority thread starts waiting and when it acquires, and log what the medium-priority job was doing), rather than trusting the "seems related" anecdote. If confirmed, apply PTHREAD_PRIO_INHERIT to that specific mutex, then re-measure to confirm the fix bounded the wait.
+DEEP:
+1. **Instrument before changing anything.** Add the same measurement 8.11's compiled test used directly: a timestamp when the high-priority thread enters `pthread_mutex_lock()` and another when it returns, logged alongside what the suspected medium-priority job was doing at the same moment (a simple "job started/finished" timestamp is enough to correlate).
+2. **Confirm the shape matches priority inversion specifically, not general contention.** Distinguish "the high-priority thread's wait is bounded and matches the low-priority holder's own critical-section length" (healthy, ordinary contention) from "the wait grows in proportion to how long the unrelated medium-priority job runs" (real priority inversion) -- the same distinguishing question 8.11's own before/after measurement (3.7s versus about 1s) answers directly for this exact shape.
+3. **Identify the actual mutex and its current holder's priority.** Confirm, via the same lock-identification technique module 8.13's gdb backtrace method provides, which specific mutex the high-priority thread blocks on and what priority the thread currently holding it runs at -- applying PRIO_INHERIT to the wrong mutex (one not actually on the critical path) fixes nothing.
+4. **Apply PTHREAD_PRIO_INHERIT to that specific mutex.** `pthread_mutexattr_setprotocol(&attr, PTHREAD_PRIO_INHERIT)` passed to that mutex's `pthread_mutex_init()` -- a targeted, minimal change to the one contended resource, not a blanket change to every mutex in the system.
+5. **Re-measure with the identical instrumentation from step 1.** Confirm the high-priority thread's wait-time distribution is now bounded by the low-priority holder's own work, independent of the background job's runtime, the same before/after comparison 8.11 already demonstrated works for exactly this fix.
+- The specific numbers 8.11 measured (about 3.7s of wait cut to about 1.0-1.1s, twice) are this study guide's own reproduction of exactly this failure mode and fix, at the scale of a deliberately-slowed demo; a real production system's actual wait times and improvement will differ, but the instrument-confirm-fix-reconfirm method transfers directly.
+FOLLOW:
+- What if applying PRIO_INHERIT to the identified mutex does not fully fix the reported latency? => Either the wrong mutex was identified (repeat step 3 more carefully, checking for other locks in the same call chain), or the high-priority thread is also blocked on something priority inheritance cannot help with (a non-mutex resource, an I/O wait, module 12's IPC-level blocking) -- re-run the same instrumentation to see exactly where the remaining wait time is actually going.
+- Should PRIO_INHERIT be applied to every mutex in the system preemptively, to avoid ever needing this investigation again? => Not without weighing 8.15's real (if modest) per-lock overhead against the benefit -- applying it broadly to mutexes real-time-priority threads never actually contend on adds cost with no corresponding benefit; targeted application to confirmed, contended mutexes on the real-time path is the more defensible default.
+PITFALL: Applying PTHREAD_PRIO_INHERIT anywhere in the vicinity of the reported symptom without first confirming, via instrumentation, which specific mutex and which specific holder are actually involved. A fix applied to the wrong lock can appear to do nothing, wasting an investigation cycle on a plausible-looking but unconfirmed guess.
+VERIFY: POSIX.1-2017 mutexattr protocol mechanism (8.11, 8.12); the investigation method is a design synthesis of this module's own compiled measurements, not a single cited clause.
+
+@@ 8.19 | Principal | Trap | tags=trylock-backoff,livelock-risk,synthesis
+Q: A team adopts trylock-and-backoff (8.07) everywhere instead of a global lock order, specifically to avoid the discipline of auditing every call site's acquisition order (8.16/8.17). What new risk does this trade introduce, and how do you catch it in review?
+SHORT: Trylock-and-backoff trades deadlock risk for livelock risk (8.08): every trylock retry loop with a fixed, non-randomized backoff delay is a candidate for the exact lockstep failure 8.08 demonstrated (100/100 runs made zero progress with a fixed delay, versus 5/5 resolving immediately with jitter). A reviewer who checks only "does this avoid deadlock" (yes) and not "can this livelock" has caught half of what this design needs.
+DEEP:
+- The team's motivation is legitimate: trylock-and-backoff truly does not need the global-ordering discipline 8.16/8.17 require, and structurally cannot deadlock in the classical sense (8.07 confirmed this directly, 30/30 runs completed under an intentionally opposite lock order). The gap is that "cannot deadlock" was never the whole safety requirement -- liveness (making actual progress) is a separate property trylock-and-backoff does not get for free.
+- The specific review question this demands: does every trylock-retry loop's backoff delay have some source of variation (randomized jitter, a per-thread-unique fixed offset, or exponential growth with randomization) rather than an identical fixed delay on every contending thread? 8.08's own measured contrast (permanent lockstep failure versus immediate resolution) is the concrete evidence this specific check is not academic.
+- A subtler version of the same risk: even jittered backoff (8.08's fix) only makes livelock overwhelmingly unlikely, not impossible in principle (8.08's own FOLLOW notes the residual probability is not literally zero) -- for a safety-critical path, consider adding a bounded retry count with an explicit escalation (log a warning, fall back to blocking lock() with a documented reason, or alert) rather than retrying forever even with jitter.
+- This ties directly back to 8.02's definitional distinction: a codebase that eliminated deadlock risk by adopting trylock-and-backoff everywhere has not eliminated liveness risk in general, it has traded one specific liveness failure mode (deadlock) for a different one (livelock) that is less likely per-attempt but not structurally impossible the way a correct global lock order makes deadlock impossible.
+FOLLOW:
+- Is there a way to get trylock-and-backoff's flexibility (no global order needed) with deadlock's structural impossibility, the way lock ordering provides? => Not directly from trylock-and-backoff alone; a hybrid approach (attempt a global order where practical, fall back to trylock-and-backoff with jitter only for the specific cases where ordering truly cannot be established) captures more of each approach's strength than committing fully to either.
+- Should every trylock-retry loop in a codebase be required to use jittered backoff, with no exceptions? => As a strong default, yes -- the cost of adding jitter (a few lines, negligible performance impact) is far lower than the cost of an intermittent, hard-to-reproduce livelock in production; an exception would need a specific, reviewed argument for why lockstep is provably impossible in that particular case.
+PITFALL: Reviewing a trylock-and-backoff PR only for deadlock safety ("it uses trylock, so it can't deadlock, approved") without checking the backoff delay for the specific lockstep risk 8.08 demonstrated is real and measured, not theoretical.
+VERIFY: This module's own compiled contrast (livelock.c, 8.08) as the concrete evidence; the general trade-off (deadlock-free schemes are not automatically livelock-free) is standard concurrency-design reasoning, not itself POSIX or C11 text.
+
+@@ 8.20 | Principal | Cross-layer | tags=diagnosis,method,tooling,end-to-end
+Q: A production process is reported "hung" or "occasionally very slow." Lay out the actual end-to-end method for determining which of deadlock, livelock, starvation, priority inversion, or an unrelated hang it is, and which tool confirms each.
+SHORT: Start with `ps -L -o pid,lwp,stat,pcpu` (near-zero CPU across threads hints deadlock or blocking I/O; sustained high CPU hints a spin-based livelock), but treat it as a hint, not proof (8.14 found a real livelock reading near-zero too). Follow with `gdb -batch -p <pid> -ex "thread apply all bt"` taken twice, seconds apart: identical blocked frames both times is deadlock (8.13); frames that differ is livelock (8.08); one thread alone stuck is starvation (8.09) or inversion (8.10).
+DEEP:
+1. **CPU-usage first pass (`ps -L`/`top`), as a hint only.** Near-zero CPU across every thread of the hung process is consistent with deadlock, a blocking I/O wait, or (as 8.14 showed directly, measured) certain livelock shapes built on a blocking retry primitive -- it narrows the search but does not by itself distinguish these three.
+2. **Two gdb backtrace snapshots, seconds apart, is the actual discriminator.** Identical backtraces (same threads, same blocked call, same lock addresses) both times: deadlock (8.13's exact evidence). Backtraces that differ between snapshots -- the same threads present, but at different points in a retry loop, or blocked on different mutexes each time -- is livelock: no thread is permanently stuck at one instruction, but nothing is converging either.
+3. **If only one thread is failing to progress while others complete normally, it is starvation or priority inversion, not deadlock/livelock.** Check whether the stuck thread is blocked on a lock at all (if yes, and other threads are racing it for the same lock repeatedly, 8.09's fairness gap); check the stuck thread's and the lock-holder's relative scheduling priorities specifically (if the holder is lower-priority and something medium-priority is running, 8.10's inversion pattern, confirmed the way 8.11/8.18 measured it).
+4. **If no thread is blocked on any pthread synchronization primitive at all**, the hang is not this module's territory -- check for a blocking I/O call (module 2/12), an infinite loop with no lock involved, or a wait on an external resource (a network call, a database) instead.
+5. **Confirm the diagnosis with a targeted fix, then re-verify with the same tooling.** A lock-ordering fix should be re-confirmed with the same repeated-attempts test 8.06 used (many rounds, checking for zero hangs); a priority-inversion fix should be re-confirmed with the same before/after wait-time instrumentation 8.11/8.18 used; guessing at a fix without this confirmation loop risks "fixing" a symptom that was not the actual root cause.
+- Every piece of evidence in this method was demonstrated directly and compiled in this module: the CPU-usage nuance (8.14), the gdb backtrace technique (8.13), the fairness gap (8.09), and the priority-inversion measurement (8.11) are not separate claims, they are the same tools and results this module already produced, assembled into one decision procedure.
+FOLLOW:
+- Does this method require attaching a debugger to a live production process, which some environments restrict? => When live attach is not permitted, a core dump captured at the moment of the hang (8.13's FOLLOW) preserves the same backtrace evidence for offline analysis; the CPU-usage first pass can also often be captured from monitoring infrastructure already in place, without needing to attach anything at the time of the incident.
+- What if the two gdb snapshots show partially-overlapping evidence (some threads identical, some different)? => Treat the process as potentially exhibiting more than one issue simultaneously (e.g. two threads truly deadlocked while a third, unrelated thread is separately livelocked in its own retry loop) -- diagnose and fix each subset of threads independently rather than assuming one single root cause must explain every thread's state.
+PITFALL: Stopping the investigation at the first plausible-looking piece of evidence (e.g. "CPU usage is low, so it's a deadlock") without taking the second gdb snapshot needed to actually distinguish deadlock from the specific livelock shape 8.14 showed can look identical by CPU usage alone.
+VERIFY: This module's own compiled diagnostics (8.09, 8.11, 8.13, 8.14) assembled into one procedure; general gdb/ps usage is not itself POSIX or C11 text.

@@ -1,0 +1,725 @@
+# Module 3: POSIX Threads: Creation, Joining & Attributes
+
+@@ 3.01 | Basic | Concept | tags=pthread_create,start-routine,signature
+Q: What is pthread_create()'s exact signature, and what is the contract for the start routine it calls?
+SHORT: `int pthread_create(pthread_t *restrict thread, const pthread_attr_t *restrict attr, void *(*start_routine)(void*), void *restrict arg);` creates a new thread running `start_routine(arg)`, storing its ID in `*thread`. If `start_routine` returns instead of calling pthread_exit(), POSIX treats that exactly as if it had called pthread_exit() with the returned value as the thread's exit status (pthread_create.3p).
+DEEP:
+- `attr` may be NULL for default attributes (module 3's remaining questions cover what those defaults are and how to change them); the SAME attributes object can be reused across multiple pthread_create() calls to create a "class" of similarly-configured threads.
+- The start routine takes exactly one `void *` argument and returns exactly one `void *` -- this is the ONLY channel for passing data in and getting a result out; 3.04-3.06 cover the real bugs this shape invites.
+- pthread_create() returns 0 on success or a nonzero error number (NOT via errno) on failure -- EAGAIN (resource/thread-count limits, 3.14) or EINVAL (bad attr).
+FOLLOW:
+- Does the new thread start running immediately, or only after the creating thread continues? => Unspecified relative ordering; POSIX guarantees the thread exists and will run, but not that it starts before pthread_create() returns to the caller.
+- Why does pthread_create() return an error code directly instead of setting errno? => This is a deliberate POSIX threads convention (unlike most other POSIX calls); it avoids relying on a shared/thread-specific errno mechanism for a function whose whole purpose is to be safely callable from any thread.
+PITFALL: Checking `errno` after a failed pthread_create() call instead of its actual return value. pthread_create() does not set errno on failure; the error number is the function's own return value.
+VERIFY: POSIX.1-2017, pthread_create() (pthread_create.3p): signature and the implicit-pthread_exit()-on-return contract are quoted directly from the DESCRIPTION.
+
+@@ 3.02 | Basic | Concept | tags=join,detach,resource-cleanup
+Q: What's the difference between pthread_join() and pthread_detach(), and when should you use each?
+SHORT: pthread_join() blocks the caller until the target thread terminates and retrieves its exit status; pthread_detach() marks a thread so its resources are reclaimed automatically on termination, with no way to retrieve its status or know when it finished. Use join when you need the result or need to know the thread is done before proceeding; use detach for a fire-and-forget thread whose completion nothing else waits on.
+DEEP:
+```c
+#include <stdio.h>
+#include <pthread.h>
+#include <unistd.h>
+
+void *worker(void *arg) {
+    long id = (long)arg;
+    printf("worker %ld: running\n", id);
+    return (void *)(id * 10);
+}
+
+int main(void) {
+    pthread_t t1, t2;
+    pthread_create(&t1, NULL, worker, (void *)1);
+    pthread_create(&t2, NULL, worker, (void *)2);
+
+    void *ret1;
+    pthread_join(t1, &ret1);
+    printf("joined t1, return value=%ld\n", (long)ret1);
+
+    pthread_detach(t2);
+    printf("detached t2 -- its resources are reclaimed automatically on exit, no join needed or possible\n");
+    sleep(1);
+    return 0;
+}
+```
+Compiled and run, this printed both workers running, `joined t1, return value=10` (the value t1's start routine returned, retrieved through pthread_join()'s value_ptr argument), and the detach message for t2, whose resources are reclaimed by the implementation with no further action and no retrievable status.
+FOLLOW:
+- Can you detach a thread AFTER already joining it? => No; once pthread_join() succeeds the thread and its ID are gone; pthread_detach() on an already-terminated-and-joined thread ID has nothing valid to act on.
+- What if two threads both try to pthread_join() the same target? => POSIX says the results of multiple SIMULTANEOUS joins on the same target are undefined; at most one join should "own" waiting for a given thread.
+PITFALL: Creating a thread with neither a plan to join it nor to detach it. Per POSIX's own RATIONALE, "the pthread_join() or pthread_detach() function should eventually be called for every thread... so that storage associated with the thread may be reclaimed" -- an orphaned joinable thread's resources are not released until something joins or detaches it, even after it finishes running.
+VERIFY: POSIX.1-2017, pthread_join() (pthread_join.3p) and pthread_detach() (pthread_detach.3p) RATIONALE sections, quoted directly.
+
+@@ 3.03 | Basic | Concept | tags=joinable,leak,default-state
+Q: If you never join or detach a joinable thread, what actually leaks, and for how long?
+SHORT: The thread's own kernel/library-level resources -- its exit status slot, its stack allocation (module 1's per-thread stack), and its thread ID slot -- stay reserved and unreclaimed for as long as the process runs, even though the thread itself finished executing long ago; a program that creates many such "abandoned" joinable threads over time can exhaust {PTHREAD_THREADS_MAX} or its stack-memory budget, exactly the failure mode 1.16 and 3.14 test for directly.
+DEEP:
+- The default detach state for a new thread (no attr, or attr with detachstate unset) is PTHREAD_CREATE_JOINABLE (3.07); it takes an explicit pthread_join() or pthread_detach() call to release that thread's resources, EVEN IF the thread's start routine has already returned and the thread is no longer running any code.
+- This is a different failure mode from 3.02's "did you retrieve the result" question: an abandoned joinable thread is a plain RESOURCE LEAK, observable the same way 1.16's demo observes thread-count/stack pressure, not a logic bug about lost data.
+- The fix is always one of: join it eventually (even if you discard the return value with `pthread_join(t, NULL)`), detach it immediately after creation (3.08) if you never intend to join, or use PTHREAD_CREATE_DETACHED in the attr object up front (3.07/3.08) so there is no window where forgetting matters.
+FOLLOW:
+- Does the leaked thread still consume CPU or otherwise run code? => No; it has already returned/exited, it is simply sitting as unreclaimed bookkeeping (an ended-but-unjoined thread's resources), not an active thread doing work.
+- Would a tool like valgrind or a thread sanitizer normally catch this leak the way it catches a malloc() leak? => Not always directly as a "leak" in the malloc()-leak sense; it is more reliably caught by the SAME technique 1.16 and 3.14 use -- monitor pthread_create()'s return code failing with EAGAIN once enough abandoned threads accumulate, or watch the process's live thread/stack-memory count grow over time.
+PITFALL: Assuming a thread that has already returned from its start routine has "cleaned itself up." Per POSIX, its resources are held until an explicit join or detach, regardless of how long ago it actually finished running.
+
+@@ 3.04 | Intermediate | Debug | tags=void-star,loop-variable,race
+Q: Several threads are created in a loop, each passed `&i` where `i` is the loop counter. What goes wrong, and what's the fix?
+SHORT: All the threads receive a pointer to the SAME shared `i`, which main keeps incrementing (and which may have finished the loop entirely) while the threads read it whenever the scheduler happens to run them -- a genuine data race, producing duplicated, skipped, or "impossible" observed values. The fix: pass the value itself (cast through the void* argument, or a per-thread heap/array-allocated copy) rather than the address of a variable the creating thread keeps mutating.
+DEEP:
+```c
+#include <stdio.h>
+#include <pthread.h>
+
+#define N 5
+
+void *worker_broken(void *arg) {
+    int val = *(int *)arg; /* races with main's loop incrementing i */
+    printf("broken: saw i=%d\n", val);
+    return NULL;
+}
+
+void *worker_fixed(void *arg) {
+    long val = (long)arg;
+    printf("fixed:  saw i=%ld\n", val);
+    return NULL;
+}
+
+int main(void) {
+    pthread_t t[N];
+    printf("-- broken: passing &i, every thread reads the SAME shared loop variable --\n");
+    int i;
+    for (i = 0; i < N; i++) {
+        pthread_create(&t[i], NULL, worker_broken, &i);
+    }
+    for (int k = 0; k < N; k++) pthread_join(t[k], NULL);
+
+    printf("-- fixed: passing the value itself through void*, no shared variable --\n");
+    for (long j = 0; j < N; j++) {
+        pthread_create(&t[j], NULL, worker_fixed, (void *)j);
+    }
+    for (int k = 0; k < N; k++) pthread_join(t[k], NULL);
+    return 0;
+}
+```
+Compiled and run, the broken section printed `2, 2, 3, 5, 5` for the five threads (not the intended `0, 1, 2, 3, 4`) -- some values were seen twice, 0 and 1 were never seen, and 5 (one past the loop's actual range) was seen twice, all consistent with threads reading `i` at unpredictable, overlapping points in main's loop. The fixed section printed a permutation of exactly `0, 1, 2, 3, 4`, each exactly once, because each thread received its OWN value with no shared variable to race on.
+FOLLOW:
+- Why does casting an int to void* and back work here, given void* and int may differ in size? => Casting through `long` (as done here) is safe on any platform where `long` can hold a pointer-sized value (true for the common LP64 Linux/macOS data model); casting a plain `int` directly to `void*` and back is common in practice but technically relies on the same assumption, so `long`/`intptr_t` is the safer choice for portable code.
+- Is passing `&ctx[i]` for a per-index array element (module 3.12) different from this bug? => Yes, critically: each element of an array indexed by the LOOP variable is itself a distinct, non-racing object (as long as no other thread mutates ctx[i] concurrently); the bug here is specifically about pointing every thread at the SAME single shared variable, not about using pointers into per-thread data at all.
+PITFALL: "Fixing" this by adding a sleep() after each pthread_create() call so the thread "has time to read i first." That masks the race under low contention without removing it; the correct fix removes the shared mutable variable from the equation entirely.
+
+@@ 3.05 | Intermediate | Concept | tags=return-value,heap,ownership
+Q: How do you correctly return a nontrivial result from a thread's start routine, and who is responsible for freeing it?
+SHORT: Allocate the result on the HEAP inside the thread (never return the address of a stack local, 3.06) and return that pointer from the start routine; pthread_join()'s value_ptr argument hands that same pointer back to the joiner, who now owns it and is responsible for eventually free()ing it.
+DEEP:
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <pthread.h>
+
+typedef struct { int code; char msg[32]; } result_t;
+
+void *worker(void *arg) {
+    (void)arg;
+    result_t *r = malloc(sizeof(*r));
+    r->code = 42;
+    snprintf(r->msg, sizeof(r->msg), "done");
+    return r; /* ownership transfers to whoever joins */
+}
+
+int main(void) {
+    pthread_t t;
+    pthread_create(&t, NULL, worker, NULL);
+    void *ret;
+    pthread_join(t, &ret);
+    result_t *r = ret;
+    printf("joiner: code=%d msg=%s\n", r->code, r->msg);
+    free(r); /* joiner's responsibility */
+    return 0;
+}
+```
+Compiled and run, this printed `joiner: code=42 msg=done` -- the heap object survived the thread's termination (unlike a stack local would, 3.06) and was correctly freed by the joiner after use.
+FOLLOW:
+- What if the thread is detached (3.02) instead of joined -- who frees a heap result then? => There is no joiner to hand it to, so the thread itself must free anything it allocated for its "result" before exiting, or the design should not allocate a return value at all for a detached thread.
+- Is there a way to avoid the malloc()/free() pair entirely? => Yes, if the caller pre-allocates a result struct (on ITS OWN stack or heap) and passes a pointer to it IN via the void* argument (3.12's pattern); the thread writes into that caller-owned struct instead of allocating its own, and the caller reads it after pthread_join() confirms the thread is done -- no cross-thread free() needed at all.
+PITFALL: Returning a `malloc()`'d pointer from a thread that gets detached rather than joined. Nothing will ever call pthread_join() to retrieve (and free) it, so it leaks for the life of the process.
+
+@@ 3.06 | Intermediate | Trap | tags=dangling-pointer,stack-local,ub
+Q: What actually happens if a thread returns the address of its OWN stack-local variable through pthread_exit()/return?
+SHORT: Undefined behavior -- the storage for that local variable belongs to the thread's stack, which is invalidated (and, in practice, may be immediately reused or unmapped) the moment the thread terminates, so the joiner's value_ptr is a dangling pointer. It might print old-looking data, might print zeroed/garbage data, or might fault outright when dereferenced; none of those outcomes is something the standard promises, and this run happened to produce a NULL-looking pointer followed by a crash.
+DEEP:
+```c
+#include <stdio.h>
+#include <pthread.h>
+
+void *broken(void *arg) {
+    (void)arg;
+    int local = 12345;
+    return &local; /* undefined behavior: local's storage is gone once the thread exits */
+}
+
+int main(void) {
+    pthread_t t;
+    pthread_create(&t, NULL, broken, NULL);
+    void *ret;
+    pthread_join(t, &ret);
+    printf("joiner received pointer %p (dereferencing it is undefined behavior)\n", ret);
+    fflush(stdout);
+    int *p = ret;
+    printf("dereferenced anyway to show what this run actually produced: %d\n", *p);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -pthread`, the compiler itself flagged the bug at compile time: `warning: function returns address of local variable [-Wreturn-local-addr]`. Run anyway, it printed `joiner received pointer (nil)` -- the pointer value observed by the joiner was NULL, not `local`'s original address, apparently already overwritten by the thread-teardown machinery reusing that stack memory -- and then crashed with a segmentation fault on the following dereference (exit code 139), confirming this is actually unsafe memory, not merely "risky-looking but fine."
+FOLLOW:
+- Why didn't it just print `12345` or obvious garbage instead of exactly NULL? => Undefined behavior means the standard makes no promise about WHICH of these outcomes occurs; here, the C library's own thread-exit bookkeeping happened to write a NULL-like value into that same stack location before the joiner read it -- a different libc, platform, or optimization level could show 12345, other garbage, or crash immediately instead.
+- Does the -Wreturn-local-addr warning always fire for this bug? => It is a good, real signal here, but it is a heuristic (best-effort static analysis), not a guarantee; more indirect versions of the same bug (returning a pointer stored inside a struct that itself is stack-allocated, for instance) can easily slip past it.
+PITFALL: Treating a compiler warning like -Wreturn-local-addr as optional noise on legacy code, rather than as exactly the class of bug this question demonstrates being caught before it ever reaches a joiner.
+VERIFY: The specific observed value (NULL, then a crash) is this run's behavior on this compiler/libc/platform, not a portable guarantee; C11 gives no defined semantics at all for accessing an object outside its lifetime (6.2.4), which is the underlying rule that makes any outcome here equally "correct" from the standard's point of view.
+
+@@ 3.07 | Intermediate | Concept | tags=pthread_attr_t,detachstate,stacksize
+Q: What can you configure via pthread_attr_t before creating a thread, and how does setting detachstate up front compare to calling pthread_detach() afterward?
+SHORT: A pthread_attr_t (initialized with pthread_attr_init()) can set the detach state (PTHREAD_CREATE_JOINABLE, the default, or PTHREAD_CREATE_DETACHED), stack size and guard size, scheduling policy/inheritance, and contention scope, all applied at creation by pthread_create(); PTHREAD_CREATE_DETACHED in the attr object has the same effect as creating a joinable thread and immediately calling pthread_detach() on it -- both make the thread unjoinable, reclaimed automatically on exit.
+DEEP:
+```c
+#include <stdio.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <errno.h>
+
+void *worker(void *arg) { (void)arg; return NULL; }
+
+int main(void) {
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+
+    pthread_t t1;
+    pthread_create(&t1, &attr, worker, NULL);
+    int rc = pthread_join(t1, NULL); /* not joinable: expect EINVAL */
+    printf("join a PTHREAD_CREATE_DETACHED thread: rc=%d (%s)\n",
+           rc, rc == EINVAL ? "EINVAL, as expected" : "unexpected");
+
+    pthread_t t2;
+    pthread_create(&t2, NULL, worker, NULL); /* joinable by default */
+    pthread_detach(t2); /* same effect, applied dynamically instead of via attr */
+    rc = pthread_join(t2, NULL);
+    printf("join after pthread_detach(): rc=%d (%s)\n",
+           rc, rc == EINVAL ? "EINVAL, as expected" : "unexpected");
+
+    pthread_attr_destroy(&attr);
+    sleep(1);
+    return 0;
+}
+```
+Compiled and run, both attempts printed `rc=22 (EINVAL, as expected)` -- attr-configured PTHREAD_CREATE_DETACHED and a runtime pthread_detach() call produced identical, unjoinable results, exactly as the concept predicts.
+FOLLOW:
+- Is there a race between "detach dynamically right after create" and the thread already finishing? => No; pthread_detach() operates on the thread ID/handle regardless of whether the target has already terminated, as long as it has not already been joined -- there is no unsafe window here, unlike the classic "check-then-act" races elsewhere.
+- Does modifying attr after pthread_create() affect an already-created thread? => No; pthread_attr_init.3p is explicit that a thread's attributes are fixed at creation time from whatever the attr object held AT THAT MOMENT -- later changes to the same attr object (even reused for a NEXT pthread_create() call) do not retroactively affect threads already created.
+PITFALL: Assuming an attr object is consumed or invalidated by pthread_create(). It is not; the same initialized attr object can be reused for many pthread_create() calls, which is precisely the "class of threads" usage POSIX's RATIONALE describes attributes objects as being designed for.
+VERIFY: POSIX.1-2017, pthread_attr_init()/pthread_attr_destroy() (pthread_attr_init.3p): the reusability of one attr object across multiple pthread_create() calls is quoted from the DESCRIPTION; the specific attribute setter/getter function names (pthread_attr_setdetachstate() etc.) are standard POSIX API but were not each individually re-fetched from a dedicated man page for this build -- treat any specific setter's exact constant values as a VERIFY item if precision matters.
+
+@@ 3.08 | Intermediate | Numeric | tags=stacksize,default,memory-budget
+Q: What is the default per-thread stack size on a typical 64-bit Linux system, and why does that number matter when planning a harness with many threads?
+SHORT: Querying pthread_attr_getstacksize() on a default-initialized attr object reports 8388608 bytes (8.00 MB) on this system -- a common default on 64-bit Linux/glibc. Multiply that by the number of concurrently LIVE threads a design runs to get a rough virtual-memory budget (1.16's concern); most I/O-bound worker threads need nowhere near 8 MB, so a smaller explicit stacksize lets a given memory budget support more threads.
+DEEP:
+```c
+#include <stdio.h>
+#include <pthread.h>
+
+int main(void) {
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    size_t stacksize;
+    pthread_attr_getstacksize(&attr, &stacksize);
+    printf("default pthread stack size on this system: %zu bytes (%.2f MB)\n",
+           stacksize, stacksize / (1024.0 * 1024.0));
+    pthread_attr_destroy(&attr);
+    return 0;
+}
+```
+Compiled and run, this printed `default pthread stack size on this system: 8388608 bytes (8.00 MB)`.
+- This number is queried empirically here, not hardcoded from memory, precisely because it is NOT a POSIX-mandated constant; POSIX only requires that a default exists and be queryable/settable, leaving the actual value implementation-defined.
+- Since 1.04/1.16 already show that unused stack pages are not physically committed until touched, the REAL cost of an oversized default stacksize at scale is virtual address-space pressure and, on some platforms/configurations, RLIMIT_AS or overcommit accounting (3.14's demo triggers exactly this by capping RLIMIT_AS deliberately), not necessarily real RAM usage.
+FOLLOW:
+- Does lowering stacksize risk the guard-page overflow bug from 3.11? => Yes, that is exactly the tradeoff: a smaller stack fits more threads in a given memory budget but leaves less headroom before deep recursion or large local arrays hit the guard page; size it to the worker's ACTUAL measured stack usage plus margin, not by guesswork.
+- Is 8 MB the same on every Linux system? => No; it commonly tracks the system's `ulimit -s` (stack size resource limit) default for the main thread, which is configurable per system/distribution, so this exact figure should be treated as this-machine's value, not a portable constant.
+PITFALL: Hardcoding "8 MB" as THE default thread stack size in code or documentation instead of querying it (as shown here) or deliberately setting an explicit value. The real default varies by platform and system configuration.
+VERIFY: This is an empirically queried value from pthread_attr_getstacksize() on THIS system, not a POSIX-specified constant; POSIX.1-2017 pthread_attr_init.3p only requires that a default stack size attribute exists and is queryable/settable via the getter/setter functions, without mandating any specific value.
+
+@@ 3.09 | Advanced | Debug | tags=edeadlk,self-join,detection
+Q: If a thread calls pthread_join() on itself (pthread_self()), does that hang, and how would you detect it without waiting for a hang to happen?
+SHORT: POSIX allows (though does not require) EDEADLK detection here: "the value of thread specifies the calling thread" is explicitly listed as a case where pthread_join() MAY fail with EDEADLK rather than actually blocking forever -- checking the RETURN CODE, as shown below, is exactly how you confirm an implementation detects this case rather than hanging.
+DEEP:
+```c
+#include <stdio.h>
+#include <pthread.h>
+#include <string.h>
+
+void *worker(void *arg) {
+    (void)arg;
+    pthread_t self = pthread_self();
+    int rc = pthread_join(self, NULL);
+    printf("worker: pthread_join(pthread_self()) returned %d (%s)\n", rc, strerror(rc));
+    return NULL;
+}
+
+int main(void) {
+    pthread_t t;
+    pthread_create(&t, NULL, worker, NULL);
+    pthread_join(t, NULL);
+    return 0;
+}
+```
+Compiled and run, this printed `worker: pthread_join(pthread_self()) returned 35 (Resource deadlock avoided)` -- errno value 35 is EDEADLK on this system, meaning this implementation DOES detect the obvious self-join case up front and fails fast rather than hanging.
+- Note the "may fail" wording (3.10's VERIFY): POSIX does not REQUIRE EDEADLK detection for self-joins, only permits it; portable code should never rely on getting this diagnostic and should instead avoid self-joins by construction (a thread simply has no legitimate reason to join itself).
+FOLLOW:
+- Would this same EDEADLK detection catch a two-thread mutual-join cycle (A joins B, B joins A)? => Not necessarily; POSIX's EDEADLK wording for pthread_join() specifically calls out "a deadlock was detected OR the value of thread specifies the calling thread" -- some implementations detect only the trivial self-join case reliably, and a genuine A-joins-B-while-B-joins-A cycle is a real, and generally harder to portably detect, deadlock (module 8's territory).
+- Is this the same EDEADLK a mutex can return? => Same error CONSTANT, but a different scenario: pthread_mutex_lock() on an ERRORCHECK mutex can also return EDEADLK for a thread re-locking a mutex it already holds (module 4), a logically similar "obviously can't proceed" self-referential case.
+PITFALL: Writing code that relies on pthread_join() detecting and reporting EVERY possible deadlock scenario involving joins. POSIX only permits (does not require) detection, and only explicitly calls out the trivial self-join case; treat EDEADLK here as a best-effort diagnostic, not a guaranteed deadlock detector.
+VERIFY: POSIX.1-2017, pthread_join() (pthread_join.3p) ERRORS: "The pthread_join() function MAY fail if: EDEADLK A deadlock was detected or the value of thread specifies the calling thread" -- the word "may" (not "shall") is the standard's own wording, confirming this is implementation-optional, not guaranteed.
+
+@@ 3.10 | Advanced | Scenario | tags=guardsize,stack-overflow,crash-vs-corruption
+Q: What does the guardsize attribute actually protect against, and what does hitting it look like versus a stack overflow with no guard page at all?
+SHORT: guardsize reserves an unmapped (or no-access) region immediately past the low end of a thread's stack; deep recursion or oversized locals that overrun the stack hit that region and fault immediately (a clean, diagnosable SIGSEGV) instead of silently writing into whatever memory happens to sit past the stack (module 1.11's corruption-adjacency scenario). It trades a small amount of reserved address space for turning an otherwise-silent corruption bug into an immediate, unambiguous crash.
+DEEP:
+```c
+#include <stdio.h>
+#include <pthread.h>
+#include <string.h>
+
+void *recurse(void *arg) {
+    char buf[1024 * 64];
+    memset(buf, 1, sizeof(buf));
+    long depth = (long)arg;
+    if (depth < 100000) return recurse((void *)(depth + 1));
+    return NULL;
+}
+
+int main(void) {
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 256 * 1024); /* deliberately small */
+    size_t guard;
+    pthread_attr_getguardsize(&attr, &guard);
+    printf("stack=256KB guardsize=%zu bytes -- expect a guard-page SIGSEGV, not silent corruption\n", guard);
+    fflush(stdout);
+    pthread_t t;
+    pthread_create(&t, &attr, recurse, (void *)0);
+    pthread_join(t, NULL);
+    pthread_attr_destroy(&attr);
+    printf("joined normally (unexpected if the guard page was hit)\n");
+    return 0;
+}
+```
+Compiled and run, this printed `stack=256KB guardsize=4096 bytes -- expect a guard-page SIGSEGV, not silent corruption`, then the process terminated with a segmentation fault (exit code 139) -- the "joined normally" line never printed, confirming the guard page did its job: a 256 KB stack recursing with 64 KB frames overflows almost immediately, and the overflow faulted cleanly rather than corrupting whatever mapping happened to sit past the stack.
+FOLLOW:
+- Does a larger guardsize make a stack overflow "safer" in any other sense? => No; it only affects how RELIABLY the overflow is caught before it can write past the guard region into another mapping (a single huge stack-frame write could in principle still jump past a too-small guard page); it does not make overflowing the stack itself acceptable or recoverable.
+- Can you set guardsize to 0? => Yes, via pthread_attr_setguardsize(), which removes this protection entirely, reverting to 1.11's "silent corruption of an adjacent mapping" risk instead of a clean fault -- there is essentially no good reason to do this for a stack whose size headroom is not already proven safe.
+PITFALL: Treating a guard-page SIGSEGV as evidence that "threads with guard pages are fragile." The crash IS the guard page working as designed; the actual bug is undersizing the stack (or writing more per frame than budgeted) for what the thread's code path actually needs, not the presence of the guard page itself.
+VERIFY: The default guardsize value (commonly one page, 4096 bytes on this platform, as observed) is implementation-defined; POSIX.1-2017's pthread_attr_init.3p RATIONALE discusses stack size as inherently machine-dependent but does not itself specify a numeric guardsize default.
+
+@@ 3.11 | Advanced | Concept | tags=context-array,per-thread-data,pattern
+Q: What is the safe pattern for giving each of N worker threads its OWN distinct piece of data, avoiding both the 3.04 shared-variable bug and any need for locking?
+SHORT: Allocate an array of N per-thread context structs BEFORE the creation loop (on the stack of the creating function, or on the heap), and pass `&ctx[i]` to each thread -- since each array element is a distinct object nothing else touches until that thread's own join, there is no shared mutable state and no synchronization is needed at all.
+DEEP:
+```c
+#include <stdio.h>
+#include <pthread.h>
+
+#define N 5
+
+typedef struct { int id; int square; } ctx_t;
+
+void *worker(void *arg) {
+    ctx_t *c = arg;
+    c->square = c->id * c->id;
+    return NULL;
+}
+
+int main(void) {
+    pthread_t t[N];
+    ctx_t ctx[N];
+    for (int i = 0; i < N; i++) {
+        ctx[i].id = i;
+        pthread_create(&t[i], NULL, worker, &ctx[i]); /* each thread gets its own struct */
+    }
+    for (int i = 0; i < N; i++) pthread_join(t[i], NULL);
+    for (int i = 0; i < N; i++) printf("id=%d square=%d\n", ctx[i].id, ctx[i].square);
+    return 0;
+}
+```
+Compiled and run, this printed `id=0 square=0` through `id=4 square=16` in order -- each thread wrote only to its own array element, and reading the results after ALL threads are joined is safe precisely because pthread_join() establishes that the thread's writes are visible to whoever joined it (no separate synchronization needed for this specific read-after-join pattern).
+- Contrast with 3.04's bug: there, every thread pointed at the SAME single `int`; here, every thread points at a DIFFERENT element of an array set up before any thread starts -- the array itself is not mutated by main after the creation loop starts, only read by main after every thread has been joined.
+FOLLOW:
+- Would this pattern still be safe if main READ ctx[i] values before joining the corresponding thread? => No; reading ctx[i].square before thread i has been joined (or otherwise synchronized) is a genuine race, since the write and the read have no ordering guarantee relative to each other without a join, mutex, or atomic in between.
+- Does the ctx array need to be heap-allocated if N is only known at runtime? => Yes if N is not a compile-time constant (use malloc() for the array), but the same "one distinct struct per thread, set up before creation, read only after join" principle applies either way.
+PITFALL: Passing `&ctx[i]` correctly, but then having every thread ALSO write into some OTHER shared variable (a running total, say) without synchronization "just for logging." The per-thread-struct pattern only protects the per-thread data; any additional shared target still needs a mutex/atomic (modules 4/7).
+
+@@ 3.12 | Advanced | Trap | tags=double-join,unspecified,tid-reuse
+Q: What actually happens if pthread_join() is called twice, sequentially, on the same already-terminated thread?
+SHORT: POSIX only defines the SIMULTANEOUS-multiple-join case as undefined; a second, sequential join after the first one already succeeded is not something the standard promises a specific result for either, since the thread ID may already be invalid or reused by the time the second call happens -- on this system, the second call returned ESRCH ("no such process/thread"), but portable code should never rely on any particular outcome here.
+DEEP:
+```c
+#include <stdio.h>
+#include <pthread.h>
+#include <string.h>
+
+void *worker(void *arg) { (void)arg; return NULL; }
+
+int main(void) {
+    pthread_t t;
+    pthread_create(&t, NULL, worker, NULL);
+    int rc1 = pthread_join(t, NULL);
+    int rc2 = pthread_join(t, NULL); /* the first join already consumed this thread ID */
+    printf("first join rc=%d (%s)\n", rc1, strerror(rc1));
+    printf("second join rc=%d (%s)\n", rc2, strerror(rc2));
+    return 0;
+}
+```
+Compiled and run, this printed `first join rc=0 (Success)` and `second join rc=3 (No such process)` -- once the first pthread_join() completed, the thread ID `t` no longer referred to a valid, joinable thread, and the second call failed with ESRCH rather than hanging or silently succeeding again.
+FOLLOW:
+- Could the second call instead hang, crash, or return success on a different platform? => Yes, in principle; since POSIX does not define this case, a different implementation could legitimately behave differently -- treat this observed ESRCH as this platform's behavior, not a portable contract to code against.
+- Is this related to 3.09's EDEADLK self-join case? => Different mechanism, similar lesson: both are cases where calling pthread_join() outside its well-defined use (once, on a still-valid joinable thread, by exactly one caller) produces implementation-specific, not standard-guaranteed, results.
+PITFALL: Writing code with a "just in case" redundant second pthread_join() call on the same thread as defensive programming. It relies on unspecified behavior; the correct defensive pattern is ensuring, by construction, that each joinable thread is joined exactly once (e.g., track join state explicitly if the call site is reachable more than once).
+VERIFY: POSIX.1-2017, pthread_join() (pthread_join.3p): "the results of multiple simultaneous calls to pthread_join() specifying the same target thread are undefined" covers the CONCURRENT case explicitly; the SEQUENTIAL double-join result shown here (ESRCH) is this implementation's behavior for a related but not identically-worded scenario, flagged here rather than presented as normative.
+
+@@ 3.13 | Advanced | Cross-layer | tags=eagain,rlimit,thread-limit
+Q: What does pthread_create() failing with EAGAIN actually look like in practice, and how do you reliably trigger and observe it rather than just reading about it?
+SHORT: EAGAIN means "the system lacked the necessary resources... or the system-imposed limit on the total number of threads... would be exceeded" (pthread_create.3p); capping the process's own virtual address space (RLIMIT_AS) to a small value makes this observable on demand, since each new thread's fixed-size stack mapping consumes part of that budget until it runs out.
+DEEP:
+```c
+#include <stdio.h>
+#include <pthread.h>
+#include <sys/resource.h>
+#include <string.h>
+#include <unistd.h>
+
+void *noop(void *arg) { (void)arg; sleep(2); return NULL; }
+
+int main(void) {
+    struct rlimit rl;
+    rl.rlim_cur = rl.rlim_max = 200 * 1024 * 1024; /* 200 MB address space */
+    if (setrlimit(RLIMIT_AS, &rl) != 0) { perror("setrlimit"); return 1; }
+
+    int created = 0, rc = 0;
+    pthread_t th[100];
+    for (int i = 0; i < 100; i++) {
+        rc = pthread_create(&th[i], NULL, noop, NULL); /* default 8 MB stack each */
+        if (rc != 0) break;
+        created++;
+    }
+    printf("created=%d threads before failure (200MB budget / ~8MB default stack)\n", created);
+    printf("pthread_create finally returned rc=%d (%s)\n", rc, strerror(rc));
+    for (int i = 0; i < created; i++) pthread_join(th[i], NULL);
+    return 0;
+}
+```
+Compiled and run, this printed `created=24 threads before failure (200MB budget / ~8MB default stack)` and `pthread_create finally returned rc=11 (Resource temporarily unavailable)` -- errno 11 is EAGAIN, and 24 threads * 8 MB is close to the 200 MB budget, matching the expected arithmetic almost exactly.
+- Note that a plain RLIMIT_NPROC cap did NOT reproduce this on this system when running as root (a separate, unsuccessful attempt created all 200 requested threads despite a tiny RLIMIT_NPROC), because RLIMIT_NPROC is bypassed for a process with CAP_SYS_RESOURCE (a Linux-specific privilege interaction); RLIMIT_AS, by contrast, is enforced by the memory-mapping subsystem regardless of privilege, which is why it was used here to get a reliable, reproducible EAGAIN.
+FOLLOW:
+- Would lowering each thread's stacksize attribute let more threads fit in the same RLIMIT_AS budget? => Yes directly; halving the per-thread stack size roughly doubles how many threads fit before hitting the same address-space ceiling, which is exactly 1.16/3.08's stacksize-tuning tradeoff made concrete with a real failure.
+- Is EAGAIN here about a hard system limit, or specifically about THIS process's rlimit? => In this demo, specifically this process's RLIMIT_AS, set deliberately; in production, the same EAGAIN can also come from a genuine system-wide limit ({PTHREAD_THREADS_MAX}, kernel thread-count ceilings) with no rlimit involved at all -- the fix differs (raise this process's own limit versus address a real system/design ceiling), so distinguishing the two in a real incident matters.
+PITFALL: Running an EAGAIN-triggering test as an unprivileged user and generalizing "RLIMIT_NPROC causes this" without checking whether the SAME test as root (or with CAP_SYS_RESOURCE) behaves differently, as it did here.
+VERIFY: POSIX.1-2017, pthread_create() (pthread_create.3p) ERRORS: "EAGAIN the system lacked the necessary resources to create another thread, or the system-imposed limit on the total number of threads in a process {PTHREAD_THREADS_MAX} would be exceeded" is quoted directly; the RLIMIT_AS-versus-RLIMIT_NPROC-and-root behavior described here is this Linux environment's observed behavior, not POSIX-specified.
+
+@@ 3.14 | Advanced | Concept | tags=tls,thread-local,__thread,_Thread_local
+Q: What's the actual difference between __thread and _Thread_local, and do they behave the same way in practice?
+SHORT: __thread is a GNU/pre-C11 compiler extension for thread-local storage; _Thread_local is the C11 standard keyword for the same concept (C11 6.7.1, storage-class specifiers). On GCC/Clang, they are interchangeable in ordinary use (the same underlying TLS mechanism), so existing __thread-based code and new _Thread_local code can even be mixed in the same translation unit with identical per-thread behavior.
+DEEP:
+```c
+#include <stdio.h>
+#include <pthread.h>
+
+__thread int a = 1;
+_Thread_local int b = 2;
+
+void *worker(void *arg) {
+    (void)arg;
+    a++;
+    b++;
+    printf("thread: a=%d b=%d (both start fresh per thread)\n", a, b);
+    return NULL;
+}
+
+int main(void) {
+    a = 100;
+    b = 200;
+    pthread_t t;
+    pthread_create(&t, NULL, worker, NULL);
+    pthread_join(t, NULL);
+    printf("main: a=%d b=%d (unaffected by the thread's own copies)\n", a, b);
+    return 0;
+}
+```
+Compiled and run, this printed `thread: a=2 b=3 (both start fresh per thread)` and `main: a=100 b=200 (unaffected by the thread's own copies)` -- the new thread's copies of BOTH variables started from their static initializers (1 and 2), completely independent of what main had already set its own copies to (100 and 200), with __thread and _Thread_local behaving identically.
+- Module 1's TLS question (1.17) already showed the address-space-level picture (a per-thread block, not the shared data segment); this question's addition is specifically the language-level distinction between the GNU extension spelling and the C11 standard keyword, which matters for portability (a strictly conforming C11 compiler without GNU extensions needs `_Thread_local`, not `__thread`).
+FOLLOW:
+- Is there any C11 code that requires the standard library's <threads.h> `thread_local` macro instead of the raw keyword? => <threads.h> (an OPTIONAL C11 feature many implementations, including glibc, do not fully provide) defines `thread_local` as a convenience macro for `_Thread_local`; code targeting POSIX threads directly (as this whole page does) typically uses `_Thread_local` or `__thread` directly rather than depending on that optional header.
+- Does POSIX itself define __thread or _Thread_local? => No; both are LANGUAGE-level features (a GNU extension and a C11 keyword respectively), not POSIX APIs -- POSIX's own thread-local mechanism is the older pthread_key_create()/pthread_getspecific()/pthread_setspecific() API, which predates both and is still relevant for cleanup-on-thread-exit via destructor functions (pthread_key_create.3p).
+PITFALL: Assuming _Thread_local is "the modern, portable one" and __thread is "legacy and should be replaced" without checking whether the target compiler even supports C11's _Thread_local; both remain in wide practical use, and the choice is mostly about which language mode a given codebase targets.
+VERIFY: C11 6.7.1 lists `_Thread_local` among the storage-class specifiers; the claim that GCC/Clang treat `__thread` and `_Thread_local` as behaviorally interchangeable is this toolchain's documented behavior, not a C11 requirement that other conforming implementations must match for a GNU-specific extension.
+
+@@ 3.15 | Principal | Scenario | tags=thread-pool,create-join,design
+Q: Sketch the minimal create-many/join-many skeleton for a fixed pool of worker threads, and say where this stops being enough for a real thread pool.
+SHORT: Create N threads up front, each processing one pre-assigned unit of work (3.11's per-thread-context pattern), then join all N before reading results -- this "fixed pool, fixed assignment" skeleton suits a known, bounded batch of parallel work, but is NOT yet a real thread pool: a production pool needs a shared work QUEUE workers pull from repeatedly (so N threads handle more than N tasks) plus a mutex-plus-condition-variable handoff, module 5's and 15's job.
+DEEP:
+```c
+#include <stdio.h>
+#include <pthread.h>
+
+#define NWORKERS 4
+
+typedef struct { int id; int result; } task_t;
+
+void *worker(void *arg) {
+    task_t *t = arg;
+    t->result = t->id * t->id;
+    return NULL;
+}
+
+int main(void) {
+    pthread_t pool[NWORKERS];
+    task_t tasks[NWORKERS];
+    printf("starting a fixed pool of %d worker threads\n", NWORKERS);
+    for (int i = 0; i < NWORKERS; i++) {
+        tasks[i].id = i;
+        pthread_create(&pool[i], NULL, worker, &tasks[i]);
+    }
+    printf("joining all workers before shutdown\n");
+    for (int i = 0; i < NWORKERS; i++) pthread_join(pool[i], NULL);
+    for (int i = 0; i < NWORKERS; i++) printf("task %d -> %d\n", tasks[i].id, tasks[i].result);
+    printf("pool shut down cleanly, all threads joined\n");
+    return 0;
+}
+```
+Compiled and run, this printed the startup and shutdown messages plus `task 0 -> 0` through `task 3 -> 9`, confirming clean creation, independent execution, and orderly joining of all four workers before results are read.
+- Where this stops being enough: if the number of TASKS exceeds the number of WORKER THREADS, this skeleton has no mechanism for a worker to pick up a second task after finishing its first -- that requires a shared queue the workers loop on, protected by a mutex, with a condition variable so idle workers block efficiently instead of busy-polling (module 5's bounded-queue content, applied at Principal level in module 15's fuller thread-pool design).
+- What THIS module's slice of the design gets right on its own: correct creation with per-thread-distinct data (3.11), a clean join-based shutdown (3.02/3.03), and no attribute misconfiguration (3.07/3.08) -- exactly the create/join/attributes fundamentals this module covers, before any locking primitive enters the picture.
+FOLLOW:
+- Why not just create a new thread per task instead of a fixed pool at all? => That is fine for a small, bounded number of tasks (as here), but does not scale: 1.05/1.16/3.13 all show real costs and real failure modes (EAGAIN, stack-memory pressure) from creating unboundedly many threads, which is exactly the problem a real bounded pool with a work queue avoids.
+- What's the minimal change to let this skeleton handle MORE tasks than workers? => Give each worker a loop that repeatedly claims the next unclaimed task index (via an atomic counter or, more robustly, a mutex-protected index) instead of processing exactly one fixed task, still without a full queue -- a reasonable intermediate step before module 15's complete design.
+PITFALL: Calling this fixed create-N/join-N skeleton "a thread pool" in a design review without qualifying that it handles exactly N units of pre-assigned work with no ability to absorb more work than worker threads created; a reviewer expecting a real bounded work-queue pool will assume more capability than this skeleton actually provides.
+
+@@ 3.16 | Advanced | Concept | tags=schedpolicy,inheritsched,attr
+Q: pthread_attr_setschedpolicy() and pthread_attr_setschedparam() look like they configure a new thread's scheduling policy and priority. What is the gotcha that can make those settings silently do nothing?
+SHORT: A pthread_attr_t's inheritsched attribute defaults to PTHREAD_INHERIT_SCHED, which means pthread_create() ignores the attr's own schedpolicy/schedparam settings and gives the new thread the CREATING thread's scheduling policy and priority instead; those attr settings only take effect once pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED) is also called.
+DEEP:
+```c
+#include <stdio.h>
+#include <pthread.h>
+#include <string.h>
+
+static const char *polname(int p) {
+    if (p == SCHED_FIFO) return "SCHED_FIFO";
+    if (p == SCHED_RR) return "SCHED_RR";
+    if (p == SCHED_OTHER) return "SCHED_OTHER";
+    return "?";
+}
+
+static void *worker(void *arg) {
+    const char *label = arg;
+    int policy;
+    struct sched_param sp;
+    pthread_getschedparam(pthread_self(), &policy, &sp);
+    printf("%s: actual policy=%s priority=%d\n", label, polname(policy), sp.sched_priority);
+    return NULL;
+}
+
+int main(void) {
+    pthread_attr_t attr1, attr2;
+    struct sched_param sp;
+    sp.sched_priority = 50;
+
+    /* attr1: set SCHED_FIFO + priority, but leave inheritsched at its default */
+    pthread_attr_init(&attr1);
+    pthread_attr_setschedpolicy(&attr1, SCHED_FIFO);
+    pthread_attr_setschedparam(&attr1, &sp);
+    int inh;
+    pthread_attr_getinheritsched(&attr1, &inh);
+    printf("attr1 default inheritsched=%s\n", inh == PTHREAD_EXPLICIT_SCHED ? "PTHREAD_EXPLICIT_SCHED" : "PTHREAD_INHERIT_SCHED");
+
+    /* attr2: same policy/priority, but force PTHREAD_EXPLICIT_SCHED */
+    pthread_attr_init(&attr2);
+    pthread_attr_setinheritsched(&attr2, PTHREAD_EXPLICIT_SCHED);
+    pthread_attr_setschedpolicy(&attr2, SCHED_FIFO);
+    pthread_attr_setschedparam(&attr2, &sp);
+
+    pthread_t t1, t2;
+    pthread_create(&t1, &attr1, worker, "attr1 (default inheritsched)");
+    pthread_create(&t2, &attr2, worker, "attr2 (PTHREAD_EXPLICIT_SCHED)");
+    pthread_join(t1, NULL);
+    pthread_join(t2, NULL);
+    pthread_attr_destroy(&attr1);
+    pthread_attr_destroy(&attr2);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run, this printed `attr1 default inheritsched=PTHREAD_INHERIT_SCHED`, then `attr1 (default inheritsched): actual policy=SCHED_OTHER priority=0` -- the SCHED_FIFO/priority-50 settings in attr1 were silently discarded -- and `attr2 (PTHREAD_EXPLICIT_SCHED): actual policy=SCHED_FIFO priority=50` -- the identical settings took effect once PTHREAD_EXPLICIT_SCHED was also set.
+- The default is INHERIT_SCHED specifically so that a thread created with a plain, unconfigured attr (or NULL) predictably inherits the creator's scheduling context rather than some implementation-chosen default; the cost of that sensible default is that setting schedpolicy/schedparam in an attr object without ALSO setting PTHREAD_EXPLICIT_SCHED is a silent no-op, not an error.
+- Neither pthread_attr_setschedpolicy() nor pthread_attr_setschedparam() themselves fail or warn when inheritsched is left at PTHREAD_INHERIT_SCHED; the values are simply stored in the attr object and then ignored by pthread_create(), which is exactly what makes this bug easy to miss in code review.
+FOLLOW:
+- Would querying pthread_attr_getschedpolicy() on attr1 after setting it show SCHED_FIFO? => Yes; the attr object faithfully stores whatever was set, which is precisely why this bug is invisible from inspecting the attr alone -- only pthread_getschedparam() on the actual created thread (as this demo does) reveals what really took effect.
+- Does this same inheritsched default apply to pthread_setschedparam() called on an already-running thread? => No, that is a different, unrelated call: it directly changes a specific existing thread's scheduling policy/parameters immediately and always takes effect (subject to the same permission rules as 3.17), with no inheritsched concept involved at all.
+PITFALL: Setting SCHED_FIFO and a priority in a pthread_attr_t and assuming pthread_create() used them, without also setting PTHREAD_EXPLICIT_SCHED. The default PTHREAD_INHERIT_SCHED makes those settings silently irrelevant.
+VERIFY: The default inheritsched value (PTHREAD_INHERIT_SCHED) and the requirement to set PTHREAD_EXPLICIT_SCHED for attr-based scheduling to take effect are standard POSIX pthread attribute semantics; the specific setter/getter pages (pthread_attr_setinheritsched.3p etc.) are not among the 60 fetched pages for this study guide, so treat exact wording as a VERIFY item against POSIX.1-2017 if precision matters.
+
+@@ 3.17 | Principal | Debug | tags=eperm,realtime-scheduling,privilege
+Q: You set PTHREAD_EXPLICIT_SCHED, SCHED_FIFO, and a real-time priority in a pthread_attr_t (correctly, per 3.16), then pthread_create() fails. What is the likely cause, and how do you confirm it?
+SHORT: pthread_create() with a real-time policy (SCHED_FIFO/SCHED_RR) in an EXPLICIT_SCHED attr commonly fails with EPERM, because POSIX requires "appropriate permission to set the required scheduling parameters or scheduling policy" (pthread_create.3p) and an ordinary user lacks it; check the RETURN CODE (not errno, 3.01) and confirm by rerunning as root or with CAP_SYS_NICE, where it succeeds.
+DEEP:
+```c
+#include <stdio.h>
+#include <pthread.h>
+#include <string.h>
+
+static void *noop(void *arg) { (void)arg; return NULL; }
+
+int main(void) {
+    pthread_attr_t attr;
+    struct sched_param sp;
+    sp.sched_priority = 50;
+    pthread_attr_init(&attr);
+    pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
+    pthread_attr_setschedpolicy(&attr, SCHED_FIFO);
+    pthread_attr_setschedparam(&attr, &sp);
+
+    pthread_t t;
+    int rc = pthread_create(&t, &attr, noop, NULL);
+    printf("pthread_create with SCHED_FIFO prio 50: rc=%d (%s)\n", rc, rc ? strerror(rc) : "success");
+    if (rc == 0) pthread_join(t, NULL);
+    pthread_attr_destroy(&attr);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -pthread`, run as root it printed `pthread_create with SCHED_FIFO prio 50: rc=0 (success)`; the identical binary run as an unprivileged user (`su ubuntu -c ./a.out` on this system) printed `pthread_create with SCHED_FIFO prio 50: rc=1 (Operation not permitted)` -- same attr, same binary, different privilege, different outcome.
+- "EPERM: The caller does not have appropriate permission to set the required scheduling parameters or scheduling policy" is quoted directly from pthread_create.3p's ERRORS section -- this is a documented POSIX failure mode, not a platform quirk.
+- On Linux specifically, the actual gate is the CAP_SYS_NICE capability, which root has by default; a non-root process can be granted just that one capability (`setcap cap_sys_nice+ep ./binary`, or run under a wrapper that grants it) without needing full root, which is the usual production fix for a harness that must not run as root.
+- Note this is a DIFFERENT EAGAIN/EPERM distinction than 3.13's RLIMIT_AS-driven EAGAIN: that question was about resource exhaustion regardless of privilege; this one is about a privilege check that has nothing to do with how much memory or how many threads exist.
+FOLLOW:
+- Would raising RLIMIT_RTPRIO for the unprivileged user avoid needing CAP_SYS_NICE? => On Linux, yes for a bounded real-time priority (a nonzero RLIMIT_RTPRIO lets an unprivileged process use real-time scheduling up to that priority ceiling without CAP_SYS_NICE), which is a Linux-specific rlimit mechanism, not something these fetched POSIX pages describe.
+- Is EINVAL possible instead of EPERM for the same attr? => Yes, but for a different reason: EINVAL means the attr object itself (or the priority value) is invalid for the given policy (e.g. a priority outside SCHED_FIFO's valid range), which is a configuration bug to fix in the attr, not a privilege problem to work around.
+PITFALL: Interpreting a failed pthread_create() with a real-time attr as a generic bug and retrying, without checking the actual return code. EPERM here means "ask for the right privilege or drop the real-time requirement," not "retry" or "add more attr settings."
+VERIFY: POSIX.1-2017, pthread_create() (pthread_create.3p) ERRORS: "EPERM the caller does not have appropriate permission to set the required scheduling parameters or scheduling policy" is quoted directly; the specific CAP_SYS_NICE/RLIMIT_RTPRIO mechanism is Linux-specific (sched_setscheduler.3p's own PROLOG notes the Linux implementation may differ from bare POSIX here).
+
+@@ 3.18 | Principal | Scenario | tags=contention-scope,pthread-scope,linux-limitation
+Q: What is contention scope (PTHREAD_SCOPE_SYSTEM vs PTHREAD_SCOPE_PROCESS), and what happens when you actually try to set PTHREAD_SCOPE_PROCESS on Linux?
+SHORT: PTHREAD_SCOPE_SYSTEM means the thread competes for the CPU against every thread on the system; PTHREAD_SCOPE_PROCESS means it competes only against other threads of its own process, with the process itself scheduled as one unit against the rest of the system. On Linux/NPTL only PTHREAD_SCOPE_SYSTEM is actually implemented; pthread_attr_setscope(&attr, PTHREAD_SCOPE_PROCESS) itself fails with ENOTSUP, leaving the attr's scope unchanged.
+DEEP:
+```c
+#include <stdio.h>
+#include <pthread.h>
+#include <string.h>
+
+static void *noop(void *arg) { (void)arg; return NULL; }
+
+int main(void) {
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+
+    int scope;
+    pthread_attr_getscope(&attr, &scope);
+    printf("default contention scope=%s\n", scope == PTHREAD_SCOPE_SYSTEM ? "PTHREAD_SCOPE_SYSTEM" : "PTHREAD_SCOPE_PROCESS");
+
+    int rc_set = pthread_attr_setscope(&attr, PTHREAD_SCOPE_PROCESS);
+    printf("pthread_attr_setscope(PTHREAD_SCOPE_PROCESS) rc=%d (%s)\n", rc_set, rc_set ? strerror(rc_set) : "success");
+
+    pthread_attr_getscope(&attr, &scope);
+    printf("scope after attempted set=%s\n", scope == PTHREAD_SCOPE_SYSTEM ? "PTHREAD_SCOPE_SYSTEM" : "PTHREAD_SCOPE_PROCESS");
+
+    pthread_t t;
+    int rc_create = pthread_create(&t, &attr, noop, NULL);
+    printf("pthread_create with that attr: rc=%d (%s)\n", rc_create, rc_create ? strerror(rc_create) : "success");
+    if (rc_create == 0) pthread_join(t, NULL);
+    pthread_attr_destroy(&attr);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run, this printed `default contention scope=PTHREAD_SCOPE_SYSTEM`, then `pthread_attr_setscope(PTHREAD_SCOPE_PROCESS) rc=95 (Operation not supported)` -- errno 95 is ENOTSUP -- then `scope after attempted set=PTHREAD_SCOPE_SYSTEM` (unchanged, since the set call failed) and finally `pthread_create with that attr: rc=0 (success)`, since the attr was left holding its still-valid default scope.
+- PTHREAD_SCOPE_PROCESS would imply a many-to-few model (many user-level threads multiplexed onto fewer kernel-scheduled entities); Linux's NPTL threading implementation is 1:1 (every pthread is a distinct kernel-schedulable entity, module 1.12's clone()-based picture), which has no notion of a "process-scope" pool to multiplex onto, so the attribute is accepted by the API's existence but rejected by this specific setter.
+- This is a different failure shape than 3.17's EPERM: EPERM says "you are not allowed to do this here"; ENOTSUP says "this implementation does not do this at all," regardless of privilege -- running the identical program as root does not change the ENOTSUP outcome.
+FOLLOW:
+- Does every POSIX-conformant system reject PTHREAD_SCOPE_PROCESS? => No; POSIX defines both values and requires an implementation to support at least one of them, but does not require both -- a different, non-Linux POSIX implementation could legitimately support PTHREAD_SCOPE_PROCESS instead of or in addition to PTHREAD_SCOPE_SYSTEM.
+- Since pthread_create() still succeeded with rc=0, would a caller who does not check pthread_attr_setscope()'s own return code even notice the requested scope was rejected? => No, and that is exactly the risk: if the caller only checks pthread_create()'s return value, a scope request that was silently rejected earlier looks identical to one that was silently honored, which is why 3.20's review checklist calls out checking EVERY attr setter's return code, not just pthread_create()'s.
+PITFALL: Assuming pthread_attr_setscope() succeeded just because a later pthread_create() using the same attr object also succeeded. pthread_create() succeeds here because the attr's scope value was left at its prior (default) setting after the failed setscope() call, not because PTHREAD_SCOPE_PROCESS was honored.
+VERIFY: The PTHREAD_SCOPE_SYSTEM/PTHREAD_SCOPE_PROCESS concept is described in POSIX's contention-scope language (seen in sched_setscheduler.3p's DESCRIPTION); the pthread_attr_setscope()/pthread_attr_getscope() function pages themselves are not among the 60 fetched pages, and the specific Linux/NPTL ENOTSUP behavior for PTHREAD_SCOPE_PROCESS is this platform's documented glibc behavior, not a POSIX requirement, confirmed here on glibc 2.39.
+
+@@ 3.19 | Principal | Scenario | tags=design,realtime-priority,harness
+Q: A validation harness wants one completion-poller thread to preempt regular worker threads whenever it has data ready, using pthread_attr_t to configure this before creation. Design this end to end: what do you configure, what could go wrong, and how do you verify it actually worked?
+SHORT: Set PTHREAD_EXPLICIT_SCHED, SCHED_FIFO, and a priority above the workers' in the poller's attr (3.16's gotcha, applied correctly); expect pthread_create() to be able to fail with EPERM in an unprivileged environment (3.17), so check its return code and fall back to default attrs rather than aborting; verify after creation with pthread_getschedparam() on the live thread, since that is the only way to confirm what actually took effect rather than what was requested.
+DEEP:
+```c
+#include <stdio.h>
+#include <pthread.h>
+#include <string.h>
+
+static const char *polname(int p) {
+    if (p == SCHED_FIFO) return "SCHED_FIFO";
+    if (p == SCHED_RR) return "SCHED_RR";
+    if (p == SCHED_OTHER) return "SCHED_OTHER";
+    return "?";
+}
+
+static void *report(void *arg) {
+    const char *label = arg;
+    int policy;
+    struct sched_param sp;
+    pthread_getschedparam(pthread_self(), &policy, &sp);
+    printf("%-16s: actual policy=%-11s priority=%d\n", label, polname(policy), sp.sched_priority);
+    return NULL;
+}
+
+static pthread_t make_thread(const char *label, int use_rt, int prio) {
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    if (use_rt) {
+        struct sched_param sp = { .sched_priority = prio };
+        pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED); /* the 3.16 gotcha, applied correctly */
+        pthread_attr_setschedpolicy(&attr, SCHED_FIFO);
+        pthread_attr_setschedparam(&attr, &sp);
+    }
+    pthread_t t;
+    int rc = pthread_create(&t, &attr, report, (void *)label);
+    if (rc != 0) {
+        fprintf(stderr, "%s: pthread_create failed: %s (falling back to default attrs)\n", label, strerror(rc));
+        pthread_create(&t, NULL, report, (void *)label);
+    }
+    pthread_attr_destroy(&attr);
+    return t;
+}
+
+int main(void) {
+    pthread_t poller = make_thread("completion-poller", 1, 80);
+    pthread_t w1 = make_thread("worker-1", 0, 0);
+    pthread_t w2 = make_thread("worker-2", 0, 0);
+    pthread_join(poller, NULL);
+    pthread_join(w1, NULL);
+    pthread_join(w2, NULL);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run as root, this printed `completion-poller: actual policy=SCHED_FIFO  priority=80`, `worker-1: actual policy=SCHED_OTHER priority=0`, `worker-2: actual policy=SCHED_OTHER priority=0` -- exactly the intended split. Run as the unprivileged `ubuntu` user, it printed `completion-poller: pthread_create failed: Operation not permitted (falling back to default attrs)` followed by `completion-poller: actual policy=SCHED_OTHER priority=0` and the two workers unchanged -- the fallback path ran cleanly instead of the program aborting or the caller mistakenly believing the real-time priority was granted.
+1. **Configure correctly.** PTHREAD_EXPLICIT_SCHED + SCHED_FIFO + a priority strictly above the workers' (here 80 versus the workers' default 0/SCHED_OTHER, which are not comparable priorities in the same policy, but SCHED_FIFO/SCHED_RR threads always preempt SCHED_OTHER ones regardless of the SCHED_OTHER "priority" number).
+2. **Expect and handle the privilege failure.** Check pthread_create()'s return code specifically for EPERM (3.17) and have an explicit, tested fallback (plain attrs) rather than letting the harness crash or silently misreport its own scheduling in a CI environment that is not root.
+3. **Verify, do not assume.** Call pthread_getschedparam() on the actually-created thread (not just trust the attr object, 3.16/3.18) and log the real policy/priority as part of harness startup diagnostics, so a silent privilege downgrade in production is visible in logs rather than discovered only when a completion deadline is missed.
+4. **Document the privilege requirement.** Whatever deployment runs this harness needs either root or CAP_SYS_NICE (3.17) for the real-time path to actually engage; this is an operational/deployment fact, not just a code detail, and belongs in the harness's runbook.
+FOLLOW:
+- Why prefer a graceful fallback over failing the whole harness startup on EPERM? => A harness that still functions correctly (just without the preemption guarantee) is usually more useful than one that refuses to start at all in a CI sandbox or a locked-down container; the verified-logged actual policy (step 3) is what lets a reviewer or an on-call engineer tell the two situations apart.
+- Would raising the WORKER threads' niceness instead of raising the poller's real-time priority achieve something similar? => Not the same guarantee -- SCHED_OTHER nice values only bias a best-effort, still-preemptible scheduler among SCHED_OTHER threads; only an actual real-time policy (SCHED_FIFO/SCHED_RR) gives the poller priority-based preemption over SCHED_OTHER threads regardless of niceness (module 11 covers scheduling policy in more depth).
+PITFALL: Configuring the real-time attr correctly (3.16) and testing it only as root (or only in a privileged CI runner), then shipping a harness that silently runs at SCHED_OTHER in a less-privileged production environment with no logged indication that the intended preemption guarantee never actually engaged.
+VERIFY: This design composes 3.16's inheritsched requirement, 3.17's EPERM/pthread_create.3p citation, and pthread_getschedparam()'s DESCRIPTION (querying a live thread's actual scheduling attributes) -- no single POSIX clause covers the end-to-end design itself.
+
+@@ 3.20 | Principal | Debug | tags=review,checklist,attr-audit
+Q: You are reviewing a PR that creates threads with custom pthread_attr_t settings (stack size, detach state, and scheduling policy) for a validation harness. What do you check before approving?
+SHORT: Check every pthread_attr_t setter's return code, not just pthread_create()'s (some setters silently no-op, others error, on an unsupported value); confirm any scheduling-policy attr also sets PTHREAD_EXPLICIT_SCHED (3.16); confirm a tested EPERM fallback exists for real-time scheduling (3.17) rather than assuming CI and production share the same privileges; and confirm the applied policy/priority is verified post-creation (3.19), not just the attr's requested values.
+DEEP:
+1. **Every setter's return code, not just pthread_create()'s.** 3.18 showed pthread_attr_setscope() can fail with ENOTSUP while a later pthread_create() using the same attr still succeeds silently on the attr's prior (unchanged) value -- a PR that only checks pthread_create()'s rc can look clean while quietly not doing what it claims.
+2. **Scheduling-policy attrs paired with PTHREAD_EXPLICIT_SCHED.** Any code setting schedpolicy/schedparam without also setting inheritsched to PTHREAD_EXPLICIT_SCHED (3.16) is a silent no-op; grep for pthread_attr_setschedpolicy() calls specifically and confirm the accompanying pthread_attr_setinheritsched() call sits right next to each one.
+3. **A real, tested EPERM/privilege fallback.** Real-time scheduling attrs can fail with EPERM in exactly the environments (sandboxed CI, a locked-down container, a customer site with a hardened deployment policy) where the bug would be easiest to miss in testing and most consequential in production (3.17, 3.19) -- ask whether the fallback path has ever actually been exercised in CI, not just written.
+4. **Stack size and guard size sanity.** A custom stacksize (3.08/3.10) should be justified by measured need, not a round number picked defensively; confirm guardsize was not set to 0 without a stated reason (3.10's PITFALL).
+5. **Post-creation verification for anything attr-configured.** For scheduling attrs specifically, confirm the PR's own tests call pthread_getschedparam() (or an equivalent check) on the created thread rather than only checking that pthread_create() returned 0, exactly 3.19's verification step.
+- A design that reads correctly in the attr-configuration code but was never checked against what the running thread actually got is precisely the class of bug this module's own 3.16/3.18 demonstrate compile and run without any error at all.
+FOLLOW:
+- What if the PR author says "it works on my machine" as root? => That is exactly the gap step 3 exists to catch -- ask for the same test run as the least-privileged user/container the harness will actually deploy under, since 3.17's EPERM is precisely a such-privilege-dependent failure that a root-only test run cannot reveal.
+- Is a stress test sufficient to catch a silently-ignored scheduling attr (3.16's bug)? => No, not reliably -- the program runs to completion either way, just with different (and unverified, unless explicitly checked) actual scheduling behavior; only an explicit pthread_getschedparam() assertion in the test itself catches this, the same lesson 6.20 draws for silent rwlock/semaphore misuse.
+PITFALL: Approving attr-configuration code because it compiles, runs, and pthread_create() returns 0, without checking that every individual attr setting actually took effect on the live thread and that failure paths (EPERM, ENOTSUP) are handled rather than merely unencountered in the reviewer's own environment.
+VERIFY: No single POSIX clause; this composes the specific citations already given in 3.16 (pthread_attr_init.3p-adjacent inheritsched semantics), 3.17 (pthread_create.3p EPERM), and 3.18 (contention-scope description in sched_setscheduler.3p) into a review checklist.

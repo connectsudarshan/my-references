@@ -1,0 +1,390 @@
+# Module 13: Virtual Memory & mmap
+
+@@ 13.01 | Basic | Concept | tags=virtualmemory,pagetable,mmu
+Q: What does virtual memory actually buy a process, and what translates a virtual address to a physical one?
+SHORT: Virtual memory gives each process its own private address space, isolated from every other process, backed by physical RAM that the OS can move, share, or page out without the process knowing. The CPU's memory management unit (MMU) translates each virtual address to a physical one by walking the page table the OS maintains for that process, usually helped by a translation cache (the TLB).
+DEEP:
+- Without virtual memory, every process would compete for the same flat physical address space; a bug in one process could corrupt another's memory directly.
+- The page table maps virtual pages (a fixed-size chunk, commonly 4 KiB on x86-64) to physical frames; an entry can also be absent, meaning that virtual page currently has no physical backing.
+- The translation lookaside buffer (TLB) caches recent virtual-to-physical translations so the MMU does not walk the full page table on every access; a TLB miss forces a walk, which is why frequent context switches or huge working sets that thrash the TLB cost real time.
+- This module builds on the address-space picture from the C Language page (module 1 of this page, `Processes vs Threads & Process Memory Layout`) -- that module shows text/data/heap/stack; this module shows what actually backs those regions in physical memory and how it is mapped.
+FOLLOW:
+- Is the page table itself in physical or virtual memory? => Physical memory; the CPU register (e.g. CR3 on x86-64) holds the physical address of the top-level page table, since the MMU cannot use virtual addresses to find the table that resolves virtual addresses.
+- Does every process get the same page size? => Usually the same base page size (4 KiB is standard on x86-64 and most ARM configs), though huge pages (2 MiB, 1 GiB) can back specific mappings; see 13.20.
+PITFALL: Assuming a process's contiguous virtual address range must also be contiguous in physical RAM. It almost never is; contiguity is a virtual-address illusion the page table maintains.
+VERIFY: TLB size and page-table walk cost are CPU-model-specific; treat any cycle count as an order-of-magnitude approximation (see 13.12).
+
+@@ 13.02 | Basic | Concept | tags=pagefault,minor,major
+Q: What is a page fault, and what is the difference between a minor and a major fault?
+SHORT: A page fault is a CPU exception raised when a memory access cannot be translated by the current page table -- the page is unmapped, not yet backed by physical memory, or protection forbids the access. A minor fault is resolved without disk I/O (e.g. the OS just needs to allocate/zero a physical frame or fix up a mapping); a major fault requires reading the page in from disk (a file-backed mapping or swap), which is orders of magnitude slower.
+DEEP:
+- Faults are not necessarily errors: lazily allocating memory (letting `malloc`'d or `mmap`'d anonymous pages fault in only when first touched) is intentional and normal.
+- A fault the OS cannot legitimately resolve (a true out-of-bounds access, a write to a read-only page, a reference past the end of a mapped object) results in the process being signaled: SIGSEGV for an invalid virtual address, or SIGBUS in specific mmap cases (13.13, 13.14).
+- Sequence on a resolvable fault: CPU raises the exception, the kernel's fault handler runs, it consults the VMA (virtual memory area) covering that address to decide what should be there, allocates or reads in a physical frame, updates the page table entry, and returns to re-execute the faulting instruction.
+- fig=vmpaging is used on 13.10, which walks this whole sequence end to end.
+FOLLOW:
+- Can a page fault happen inside kernel code, not just user code? => Yes; the kernel also uses paged memory for much of its own state, though certain critical paths run with faults disabled.
+- Why do people call the very first access to a freshly mmap'd anonymous region "free" in terms of allocation but "not free" in terms of time? => The virtual mapping is set up instantly, but the first touch of each page costs a minor fault to actually back it with a zeroed physical frame.
+PITFALL: Treating "page fault" as synonymous with "crash." Most page faults in a healthy process are minor and invisible; only unresolvable ones become a delivered signal.
+
+@@ 13.03 | Basic | Concept | tags=mmap,syscall,readwrite
+Q: What does mmap() do in one sentence, and how is using it different from read()/write()?
+SHORT: mmap() maps a file, shared memory object, or anonymous region directly into the calling process's address space so ordinary memory loads and stores access it, instead of going through read()/write() calls that copy data through a kernel buffer into a separate user buffer. POSIX describes it exactly this way: mmap() "shall establish a mapping between the address space of the process ... and a memory object" (mmap.3p DESCRIPTION).
+DEEP:
+- With read()/write(), each call copies bytes between the kernel's page cache and a buffer you allocated; with mmap(), your pointer IS (a view onto) the page cache, so there is no extra copy for the mapped bytes themselves.
+- The classic APPLICATION USAGE example from mmap.3p: `fildes = open(...); address = mmap(0, len, PROT_READ, MAP_PRIVATE, fildes, some_offset); /* use data at address */` replaces `lseek` + `read` into a buffer.
+- mmap() requires the file descriptor to have been opened with read permission regardless of `prot`, and with write permission if `PROT_WRITE` is requested for a `MAP_SHARED` mapping (mmap.3p DESCRIPTION).
+- The mapping survives fork() (mmap.3p: "The mapping type is retained across fork()"); see 13.11.
+FOLLOW:
+- Does mmap() itself read the file's contents into memory immediately? => No; typically only the page table entries are set up, and the actual file data faults in lazily on first access (a major fault) unless the OS chooses to prefetch.
+- Can you mmap() a device file to talk to hardware registers? => Yes, that is exactly the memory-mapped I/O idiom used in 13.15, though a plain regular file stands in there for a real device node.
+PITFALL: Forgetting that `off` and (for MAP_FIXED) `addr` must be a multiple of the system page size (mmap.3p ERRORS, EINVAL); an arbitrary byte offset into the file is not directly usable as `off`.
+
+@@ 13.04 | Intermediate | Concept | tags=mapshared,mapprivate,mmap
+Q: What is the actual difference between MAP_SHARED and MAP_PRIVATE, per POSIX?
+SHORT: Per mmap.3p: "If MAP_SHARED is specified, write references shall change the underlying object. If MAP_PRIVATE is specified, modifications to the mapped data by the calling process shall be visible only to the calling process and shall not change the underlying object." MAP_SHARED writes propagate to the file (and to any other mapper); MAP_PRIVATE writes are copy-on-write and stay local to your process.
+DEEP:
+- Either flag can be specified, never both (mmap.3p: "Either MAP_SHARED or MAP_PRIVATE can be specified, but not both").
+- With MAP_PRIVATE, POSIX explicitly leaves one thing unspecified: "It is unspecified whether modifications to the underlying object done after the MAP_PRIVATE mapping is established are visible through the MAP_PRIVATE mapping" -- do not depend on a MAP_PRIVATE view staying in sync with a file another process is actively writing.
+- MAP_SHARED is how two unrelated processes (or a process and its child after fork) can communicate through a file-backed or shm_open()-backed mapping; but the mapping itself provides zero synchronization -- you still need a mutex in shared memory, a semaphore, or file locking to coordinate concurrent access (see module 12 for the IPC framing of this).
+- 13.08 shows both flags side by side against the same file, and what actually lands on disk.
+FOLLOW:
+- Does MAP_PRIVATE make a full copy of the file up front? => No; it is copy-on-write at the page level -- pages are shared read-only with the underlying object until the process writes to one, at which point that single page is copied.
+- If a MAP_PRIVATE-mapped page is never written, does it use extra physical memory? => No, it can stay backed by the same physical frame as the file's page-cache copy until a write forces the copy.
+PITFALL: Expecting a MAP_PRIVATE write to eventually reach the file if you just wait or call msync(). It never does; msync() on a MAP_PRIVATE mapping is explicitly unspecified/no-op for propagating data (msync.3p DESCRIPTION).
+
+@@ 13.05 | Intermediate | Concept | tags=anonymous,mapanonymous,malloc
+Q: What is an anonymous mmap, and why does malloc() use it internally for large allocations?
+SHORT: An anonymous mapping (MAP_ANONYMOUS, fildes conventionally -1, offset 0) is backed by fresh, zero-filled physical memory, not a file -- a way to get process-private memory from the OS with no backing file. malloc() often uses mmap(MAP_ANONYMOUS) for large requests instead of extending the heap with brk(), since a large mmap'd region can be independently unmapped the instant it is freed.
+DEEP:
+- MAP_ANONYMOUS itself is a common extension, not in the core POSIX.1 mmap.3p text used here; it is universal in practice on Linux and other POSIX systems, but treat its exact flag name and required fildes/offset conventions as platform documentation, not POSIX-guaranteed (VERIFY).
+- Heap memory obtained via brk()/sbrk() is one contiguous, growable region: freeing memory in the middle of it cannot shrink the heap (nothing after it can move), so it is returned to the allocator's free list, not to the OS.
+- A large mmap'd allocation is its own independent VMA: munmap() on it immediately returns the physical pages to the OS, which matters for a long-running validation harness that allocates and frees large buffers repeatedly and must not let RSS creep up.
+- Anonymous MAP_SHARED (as opposed to MAP_PRIVATE) is also how unrelated or forked processes share memory without a backing file at all; 13.11's fork test uses exactly this.
+FOLLOW:
+- If MAP_ANONYMOUS memory is zero-filled, is that guaranteed by POSIX for a plain mmap() with a real file descriptor too? => For a file-backed mapping, mmap.3p only guarantees zero-fill for the partial page at the end of the object, not the whole mapping; anonymous memory's all-zero guarantee is a property of that extension, not of file-backed mmap() itself.
+- Does every malloc() call for a small object end up going through mmap()? => No, small and medium allocations are normally served from the existing heap/arena to avoid mmap()'s per-call overhead and page-alignment waste.
+PITFALL: Assuming you can rely on a specific malloc()-to-mmap() size threshold across allocators; it is an implementation detail that differs by C library and can change between versions (VERIFY against your actual libc if it matters for a benchmark).
+
+@@ 13.06 | Intermediate | Scenario | tags=mmap,msync,fileio
+Q: How do you actually map a file, modify it through the mapping, and make sure the write is durable?
+SHORT: Open the file, mmap() it PROT_READ|PROT_WRITE with MAP_SHARED, write through the returned pointer, then call msync() with MS_SYNC to force those write operations to complete "as defined for synchronized I/O data integrity completion" (msync.3p) before you rely on another reader seeing the durable result.
+DEEP:
+- msync() requires `addr` to be a multiple of the page size (msync.3p DESCRIPTION), same page-alignment rule as mmap()/mprotect(); it operates on whole pages covering the given range.
+- MS_ASYNC returns as soon as the writes are queued; MS_SYNC blocks until they are actually completed -- msync.3p is explicit that "Either MS_ASYNC or MS_SYNC is specified, but not both."
+- Normal system activity (the kernel's own writeback) can also flush mmap'd pages to disk on its own schedule; msync.3p's APPLICATION USAGE notes plainly that "there are no guarantees that msync() is the only control over when pages are or are not written to disk" -- msync() gives you a floor guarantee, not exclusive control.
+```c
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+int main(void) {
+    int fd = open("/tmp/m13_file.dat", O_RDWR | O_CREAT | O_TRUNC, 0644);
+    ftruncate(fd, 4096);
+    char *map = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    strcpy(map, "hello from mmap");
+    msync(map, 4096, MS_SYNC);
+    printf("wrote via mmap: %s\n", map);
+
+    char buf[32] = {0};
+    lseek(fd, 0, SEEK_SET);
+    read(fd, buf, sizeof(buf) - 1);   /* independent read() sees the same bytes */
+    printf("read() back: %s\n", buf);
+    munmap(map, 4096);
+    close(fd);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run, this printed `wrote via mmap: hello from mmap` and `read() back: hello from mmap` -- confirming the MAP_SHARED write reached the underlying file.
+FOLLOW:
+- Why bother with msync(MS_SYNC) if a later read() in the same process already sees the write? => Because that later read() only proves the page cache is consistent with itself; msync(MS_SYNC) is what you need before, say, telling another machine or process "the data is safely on stable storage."
+- What happens if you msync() a range you never actually mmap'd? => ENOMEM: msync.3p ERRORS lists this exactly ("the addresses ... specify one or more pages that are not mapped").
+PITFALL: Calling msync() without MS_SYNC or MS_ASYNC set at all. msync.3p requires one of them; passing an invalid combination fails with EINVAL.
+
+@@ 13.07 | Intermediate | Concept | tags=mprotect,pageprotection
+Q: What does mprotect() let you do, and what must addr satisfy?
+SHORT: mprotect() changes the read/write/execute protection on an existing mapping's whole pages covering the given range, using the same PROT_READ/PROT_WRITE/PROT_EXEC/PROT_NONE flags as mmap(). Per mprotect.3p, "The implementation shall require that addr be a multiple of the page size as returned by sysconf()" -- an unaligned addr fails with EINVAL.
+DEEP:
+- mprotect.3p is explicit that its behavior "is unspecified if the mapping was not established by a call to mmap()" -- you cannot rely on it to protect arbitrary heap or stack memory that did not come from mmap(), even though many implementations happen to let you try.
+- Requesting PROT_WRITE on a MAP_PRIVATE mapping can fail with EAGAIN or ENOMEM if the system cannot reserve resources to lock the now-writable private page (mprotect.3p ERRORS) -- a resource limit, not a logic error.
+- A common defensive pattern: allocate a buffer, fill it, then mprotect() it PROT_READ to catch any later unintended write as an immediate SIGSEGV instead of silent corruption -- useful for hardening a validation harness's "golden" reference buffers.
+- Ties to memory-mapped I/O (13.15): a real device register mapping is often set up by the driver/kernel with specific caching attributes that mprotect() from userspace does not control; mprotect() only changes access protection, not caching behavior.
+FOLLOW:
+- Can mprotect() widen permissions beyond what mmap() originally granted (e.g. add PROT_EXEC to a mapping that was never opened for it)? => It can attempt to, but it is still bounded by the underlying object's open-mode permissions (e.g. mmap.3p's requirement that PROT_WRITE needs the fd opened for write, unless MAP_PRIVATE); the exact interaction is implementation-defined enough to verify for a given platform (VERIFY).
+- If mprotect() fails partway through a large range, what state is the memory left in? => mprotect.3p warns "the protections on some of the pages in the range ... may have been changed" when it fails for reasons other than EINVAL -- treat a failure as leaving a partially-changed, not rolled-back, range.
+PITFALL: Passing a non-page-aligned addr and being surprised by EINVAL; always round down to the page boundary (from sysconf(_SC_PAGESIZE)) before calling mprotect().
+
+@@ 13.08 | Intermediate | Scenario | tags=mapshared,mapprivate,fileio
+Q: Given the same file mapped twice, once MAP_SHARED and once MAP_PRIVATE, what actually ends up on disk after both mappings write?
+SHORT: The MAP_SHARED write changes the underlying file; the MAP_PRIVATE write only changes that mapping's private, copy-on-write copy and never reaches the file, exactly as mmap.3p specifies for each flag.
+DEEP:
+- This is the cleanest way to see 13.04's rule land in actual bytes on disk rather than just in the specification text.
+```c
+#include <stdio.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+int main(void) {
+    int fd = open("/tmp/m13_file2.dat", O_RDWR | O_CREAT | O_TRUNC, 0644);
+    ftruncate(fd, 4096);
+    write(fd, "AAAA", 4);
+
+    char *shared = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    char *priv   = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+
+    priv[0] = 'P';       /* MAP_PRIVATE write: process-local only */
+    shared[0] = 'S';     /* MAP_SHARED write: goes to the underlying file */
+    msync(shared, 4096, MS_SYNC);
+
+    char onfile[8] = {0};
+    lseek(fd, 0, SEEK_SET);
+    read(fd, onfile, 4);
+    printf("shared[0]=%c priv[0]=%c file-on-disk=%.4s\n", shared[0], priv[0], onfile);
+    munmap(shared, 4096); munmap(priv, 4096); close(fd);
+    return 0;
+}
+```
+Compiled and run, this printed `shared[0]=S priv[0]=P file-on-disk=SAAA` -- the file on disk shows the MAP_SHARED write ('S') and never sees the MAP_PRIVATE write ('P'), confirming both semantics in one process.
+FOLLOW:
+- Does the MAP_PRIVATE mapping see the MAP_SHARED write that landed on disk? => Not necessarily and not reliably; POSIX leaves this unspecified (13.04), so do not build logic on it either way.
+- Would a second process opening the same file after this program exits see 'S' or 'A' at byte 0? => 'S', since the MAP_SHARED write, once msync(MS_SYNC)'d, is durable on the underlying file that any later open() will read.
+PITFALL: Testing MAP_SHARED vs MAP_PRIVATE by inspecting only the in-memory pointer in one process. You must check the actual file contents (or a separate process/fd) to see the real difference; both pointers will show your own process's own write regardless of the flag.
+
+@@ 13.09 | Intermediate | Concept | tags=munmap,sigsegv
+Q: What happens to the address range after munmap(), and what does touching it afterward do?
+SHORT: munmap() removes the mapping for the covered whole pages; per munmap.3p, "Further references to these pages shall result in the generation of a SIGSEGV signal to the process." If a removed mapping was MAP_PRIVATE, any unsaved modifications in that range are simply discarded, not written anywhere.
+DEEP:
+- munmap.3p requires addr to be a multiple of the page size and len to be nonzero (EINVAL otherwise); it does not require the exact same len as the original mmap() -- it removes mappings for "those entire pages containing any part of the address space ... starting at addr and continuing for len bytes," so a partial unmap of a larger mapping is legal.
+- "If there are no mappings in the specified address range, then munmap() has no effect" (munmap.3p) -- calling munmap() twice on the same range is not an error the second time, it is simply a no-op.
+- munmap() also drops any mlock() held on that range (munmap.3p RATIONALE) as a side effect, even though you never called an unlock function directly.
+- This is the mechanism behind 13.14's SIGBUS demo's cousin bug: touching memory after munmap() (a use-after-unmap) is a plain SIGSEGV, distinct from SIGBUS, which is specifically for referencing whole pages beyond a mapped object's backing (13.13).
+FOLLOW:
+- If two mappings of the same file overlap in address range (which cannot normally happen unless you used MAP_FIXED), does munmap() on one affect the other? => munmap() acts on the calling process's address-space mapping, not the underlying object; a second, independent mapping elsewhere in the same or another process is unaffected.
+- Does munmap() close the file descriptor used to create the mapping? => No; mmap() and munmap() do not touch the fd's open/closed state at all, and mmap.3p notes the mapping itself "adds an extra reference to the file" that outlives closing that fd.
+PITFALL: Confusing "unmapped page" (SIGSEGV on touch, per munmap.3p) with "mapped page past the object's end" (SIGBUS on touch, per mmap.3p). They are different, specific failure signals for different situations, not interchangeable terms for "bad memory access."
+
+@@ 13.10 | Advanced | Cross-layer | fig=vmpaging | tags=pagefault,mmu,tlb,kernel
+Q: Walk through exactly what happens, at the hardware and OS level, when a program touches a virtual address whose page is not currently mapped.
+SHORT: The MMU tries to translate the address, misses in the TLB, walks the page table, finds no valid entry (or a permission mismatch), and raises a page-fault exception into the kernel; the kernel's fault handler consults the VMA covering that address, decides the access is legitimate (e.g. a lazily-allocated anonymous page or a not-yet-read-in file page), allocates/reads in a physical frame, installs the page table entry, and returns to re-execute the faulting instruction, now successfully.
+DEEP:
+1. CPU issues a load/store to virtual address V.
+2. MMU checks the TLB for a cached V-to-physical translation; on a miss, it walks the multi-level page table in physical memory (the walk itself can also fault, at each level, if an intermediate table is missing).
+3. No valid, permission-matching page table entry is found -> the CPU raises a page-fault exception, saving the faulting address and access type.
+4. The kernel's fault handler runs in the interrupted process's context; it looks up the VMA (virtual memory area) that should cover V to decide "is this address supposed to be valid for this process, and for what kind of access."
+5. If legitimate: allocate a physical frame (zero it for anonymous memory, or schedule a disk read for file-backed memory -- this read is what makes it a major fault), install the new page table entry, and invalidate/refresh the relevant TLB entry.
+6. The kernel returns to user mode at the exact faulting instruction, which now succeeds because the translation exists.
+7. If illegitimate (V is not covered by any VMA, or the access type violates the VMA's permissions), the kernel instead delivers SIGSEGV (or SIGBUS for the specific whole-page-beyond-object case in mmap.3p) to the process.
+- This is the mechanism underlying every mmap() page: the mapping call itself usually only sets up the VMA and page-table bookkeeping; the first real access is what drives steps 1-6.
+FOLLOW:
+- Where in this sequence does an mmap()'d but never-touched page's memory actually get allocated? => Not at mmap() time; it happens at step 5, the first time some instruction actually reads or writes that page, which is why mmap() itself is cheap even for a huge mapping.
+- Is the page-table walk in step 2 done by software or hardware? => On x86-64 and most current designs it is done by dedicated MMU hardware; some architectures instead trap to a software handler for the walk itself, which is a real but platform-specific difference (VERIFY for a given CPU).
+PITFALL: Assuming a page fault always means something is wrong. The overwhelming majority, in a healthy process, are the deliberate mechanism behind lazy allocation and demand paging, not errors.
+VERIFY: The exact fault-handling sequence and terminology (VMA, TLB) are OS/kernel-internal, not POSIX-specified; POSIX defines mmap()'s user-visible contract, not how a conforming kernel must implement paging.
+
+@@ 13.11 | Advanced | Scenario | tags=fork,mapshared,mapprivate,copyonwrite
+Q: After fork(), does a child's write through a MAP_SHARED mapping reach the parent? Does a write through MAP_PRIVATE?
+SHORT: Yes for MAP_SHARED: mmap.3p states "the mapping type is retained across fork()", and a MAP_SHARED region is truly shared physical memory, so the parent sees the child's write. No for MAP_PRIVATE: fork() itself already gives each process its own copy-on-write view of all memory including MAP_PRIVATE mappings, so the child's write only affects the child's own copy.
+DEEP:
+- This combines two copy-on-write mechanisms that are easy to conflate: fork()'s general COW duplication of the whole address space (module 2), and MAP_PRIVATE's own COW-on-write-to-the-mapped-object behavior (13.04) -- after fork(), a MAP_PRIVATE page is COW with respect to both the parent/child split and the underlying file.
+```c
+#include <stdio.h>
+#include <sys/mman.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+int main(void) {
+    int *shared = mmap(NULL, sizeof(int), PROT_READ | PROT_WRITE,
+                        MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    int *priv   = mmap(NULL, sizeof(int), PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    *shared = 1; *priv = 1;
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        *shared = 99;   /* child's write, MAP_SHARED */
+        *priv = 99;     /* child's write, MAP_PRIVATE (COW, child-local) */
+        _exit(0);
+    }
+    waitpid(pid, NULL, 0);
+    printf("parent sees after child exits: shared=%d priv=%d\n", *shared, *priv);
+    return 0;
+}
+```
+Compiled and run, this printed `parent sees after child exits: shared=99 priv=1` -- the parent observed the child's MAP_SHARED write but not its MAP_PRIVATE write, exactly as the two flags' semantics predict.
+FOLLOW:
+- Why does the example use MAP_ANONYMOUS instead of a real file? => To isolate the fork/COW behavior from any file-backing details; the same result holds for a file-backed mapping, since mmap.3p's "mapping type is retained across fork()" applies regardless of what backs the mapping.
+- Is a MAP_SHARED anonymous mapping usable for IPC between two unrelated (non-fork-related) processes? => Not directly, since MAP_ANONYMOUS has no name another process can open; for that, use shm_open() plus MAP_SHARED, covered in module 12.
+PITFALL: Assuming fork() itself breaks a MAP_SHARED mapping into two independent copies the way it does with ordinary heap memory. It does not; MAP_SHARED memory stays one shared thing across the fork, by design.
+
+@@ 13.12 | Advanced | Numeric | tags=pagefault,contextswitch,approximate
+Q: Roughly how expensive is a minor page fault compared to a major page fault and to a plain function call, in order of magnitude?
+SHORT: As rough, approximate reference points on typical modern hardware: a plain function call is sub-nanosecond to a few nanoseconds; a minor page fault (no disk I/O, just kernel bookkeeping and a TLB update) is on the order of hundreds of nanoseconds to a few microseconds; a major page fault that reads from an SSD is on the order of tens to low hundreds of microseconds; from a spinning disk it can be several milliseconds. Treat all of these as order-of-magnitude approximations, not guarantees.
+DEEP:
+- The gap between "minor fault" and "major fault" is the entire point of demand paging being cheap for anonymous/lazy allocation but expensive the moment real I/O is involved -- this is why touching a huge freshly-mmap'd buffer for the first time (all minor faults, no I/O) is fast, while mmap()-ing and then reading a huge file you have never touched (all major faults) is bounded by storage latency.
+- For an SSD firmware validation context specifically: a major fault against your own device under test could be dominated by the device's actual read latency (which you are probably also measuring for other reasons), not by OS overhead -- do not conflate "slow page fault" with "slow storage device" without checking which one you are actually bottlenecked on.
+- These numbers move with CPU generation, kernel version, NUMA locality, and whether the page needs zeroing; use them only to sanity-check "is this the right ballpark," never as a spec-level guarantee for a design decision.
+FOLLOW:
+- Why would you ever care about minor-fault cost in a validation harness? => A tight loop that repeatedly touches freshly-allocated memory (e.g. per-iteration buffer allocation without reuse) can accumulate enough minor-fault overhead to visibly skew latency measurements you intended to attribute entirely to the device.
+- Is mlock()-ing a buffer a way to avoid this? => It prevents that specific memory from ever being paged out (so no future major fault on it), but does not avoid the one-time cost of the initial faults that bring it in.
+PITFALL: Quoting any of these numbers as an exact, portable constant in an interview or a report. State them as approximate and hedge explicitly, as done here.
+VERIFY: All figures are commonly cited approximate orders of magnitude from general OS-performance literature, not from a specific measured benchmark in this session; treat as VERIFY for any real decision.
+
+@@ 13.13 | Advanced | Concept | tags=sigbus,mmap,eof
+Q: Under what specific mmap() circumstance does POSIX say a SIGBUS is generated, and how is that different from SIGSEGV?
+SHORT: mmap.3p states: "References within the address range starting at pa and continuing for len bytes to whole pages following the end of an object shall result in delivery of a SIGBUS signal." That is specifically about mapping more pages than the underlying object actually has -- referencing those extra whole pages is SIGBUS, distinct from SIGSEGV, which covers referencing memory that was never validly mapped at all (e.g. after munmap(), per 13.09).
+DEEP:
+- A subtler related case: mmap.3p also allows "An implementation may generate SIGBUS signals when a reference would cause an error in the mapped object, such as out-of-space condition" -- e.g. writing to a MAP_SHARED page when the backing filesystem is actually full.
+- Within the last page of the object, mmap.3p separately guarantees the partial tail is zero-filled and that the kernel "shall never write out any modified portions of the last page of an object which are beyond its end" -- so bytes past the true EOF but still inside that last page are readable and writable, just never persisted past EOF; only whole pages fully beyond the object trigger SIGBUS.
+- This distinction matters for a validation tool that mmap()'s a growing log file: if the mapping was sized larger than the file's current length by more than a page, touching those extra whole pages is a real SIGBUS risk until the file is grown (e.g. via ftruncate()) to actually cover them.
+FOLLOW:
+- If you mmap() exactly len bytes equal to the file's current size, can you still get SIGBUS from a normal access within that range? => No, not from the "beyond the object" case; you would need the file to shrink out from under you (its size changing after the mapping was established has unspecified effects per mmap.3p) or a storage error to trigger the "out-of-space" case.
+- Can SIGBUS be caught and handled instead of terminating the process? => Yes, with sigaction() and a handler, exactly as shown in 13.14, though you must not simply return from a handler for a fault caused by a bad memory reference -- longjmp() out of it, as done there.
+PITFALL: Assuming any out-of-bounds mmap() access always produces the same signal. Which signal you get depends precisely on whether the address is unmapped (SIGSEGV) or is a whole page beyond a mapped object's real backing (SIGBUS) -- two different POSIX-specified outcomes for two different situations.
+
+@@ 13.14 | Advanced | Debug | tags=sigbus,mmap,eof
+Q: How do you actually observe a SIGBUS in practice by mapping more pages than a file has?
+SHORT: Create a small file (say 100 bytes), mmap() two whole pages of it, and touch a byte in the second page -- the first page is legitimately backed (with a zero-filled tail per mmap.3p), but the second page is entirely beyond the object, so touching it delivers SIGBUS exactly as mmap.3p specifies.
+DEEP:
+- Catching SIGBUS with sigaction() and jumping out with sigsetjmp()/siglongjmp() lets the program observe and report the fault instead of dying, which is how the following was actually confirmed to happen rather than just asserted.
+```c
+#include <stdio.h>
+#include <signal.h>
+#include <setjmp.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+static sigjmp_buf jb;
+static void on_sigbus(int sig) { (void)sig; siglongjmp(jb, 1); }
+
+int main(void) {
+    int fd = open("/tmp/m13_small.dat", O_RDWR | O_CREAT | O_TRUNC, 0644);
+    ftruncate(fd, 100);               /* file is only 100 bytes */
+    long pg = sysconf(_SC_PAGESIZE);
+    size_t maplen = (size_t)pg * 2;   /* map two pages; file backs only the first */
+    char *map = mmap(NULL, maplen, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+
+    struct sigaction sa = {0};
+    sa.sa_handler = on_sigbus;
+    sigaction(SIGBUS, &sa, NULL);
+
+    printf("map[0]=%d (within file's first page, zero-filled tail)\n", map[0]);
+    if (sigsetjmp(jb, 1) == 0) {
+        char v = map[pg];   /* start of 2nd mapped page: past the file's last page */
+        printf("unexpectedly read map[pg]=%d\n", v);
+    } else {
+        printf("caught SIGBUS: whole pages beyond the object's last page fault with SIGBUS\n");
+    }
+    munmap(map, maplen); close(fd);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run, this printed `map[0]=0 (within file's first page, zero-filled tail)` followed by `touching map[pg] ...` and `caught SIGBUS: whole pages beyond the object's last page fault with SIGBUS` -- confirming the exact POSIX-specified behavior.
+FOLLOW:
+- Why did the first access, map[0], not fault at all despite the file having no real data there? => Byte 0 is inside the file's first page, which mmap.3p guarantees is zero-filled for the partial tail beyond the file's 100 real bytes; only whole pages entirely beyond the object trigger SIGBUS.
+- Is siglongjmp() out of a signal handler always safe? => It is a well-established pattern for recovering from a synchronous fault like this in the same thread, but it does not restore arbitrary program state; anything the interrupted code was in the middle of (locks held, partially written data) is left exactly where it was, so use it only when you truly intend to abandon that in-flight work.
+PITFALL: Writing this test with only one page mapped and expecting SIGBUS on the very next byte past the mapping's own length; that address is not part of the mapping at all and its behavior (may or may not fault, may hit unrelated mapped memory) is not the SIGBUS case being tested here -- you must map extra whole pages beyond the object to see this specific signal.
+
+@@ 13.15 | Advanced | Cross-layer | tags=mmio,firmware,volatile
+Q: How does mmap()-based memory-mapped I/O work for talking to a device's register file, and why must the pointer be volatile?
+SHORT: A device driver exposes its register file through a device node (or /dev/mem-style access) that you mmap() with PROT_READ|PROT_WRITE and MAP_SHARED; the returned pointer then lets loads/stores become real reads/writes to hardware registers. The pointer must be volatile because the C page's module 7 rule applies directly: without it, the compiler could cache a "redundant" read or elide a "useless" write, dropping a real hardware side effect.
+DEEP:
+- This is the same volatile contract covered in the C Language page (module 7, type qualifiers) -- see that page for what volatile does and does not guarantee; this module adds the mmap()-specific mechanics of how you get a pointer to the register file in the first place.
+- A real device's register mapping is normally set up by the kernel driver with specific caching attributes (typically uncached or write-combining) that a plain mmap() of a regular file, as used for illustration here, does not replicate -- doing this against real hardware in production firmware requires the kernel/driver side to configure that caching policy; userspace mmap() alone is not sufficient (VERIFY against your platform's actual MMIO path).
+- Multi-register access ordering (e.g. write control, then read status) can matter on real hardware in ways a plain volatile struct does not fully capture -- real MMIO code often also needs a memory barrier to stop the CPU or compiler from reordering across register accesses that a device expects in a strict sequence; volatile alone only forces the accesses to happen, not necessarily in a hardware-meaningful order relative to non-volatile memory (this is the same limit volatile has in module 7).
+```c
+#include <stdio.h>
+#include <stdint.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+struct regfile { uint32_t status; uint32_t control; uint32_t doorbell; };
+
+int main(void) {
+    int fd = open("/tmp/m13_regs.dat", O_RDWR | O_CREAT | O_TRUNC, 0644);
+    ftruncate(fd, sizeof(struct regfile));
+    volatile struct regfile *regs = mmap(NULL, sizeof(struct regfile),
+                                          PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    regs->control = 0x1;      /* enable bit */
+    regs->doorbell = 42;      /* ring doorbell with a queue index */
+    printf("wrote control=0x%x doorbell=%u\n", regs->control, regs->doorbell);
+    munmap((void *)regs, sizeof(struct regfile));
+    close(fd);
+    return 0;
+}
+```
+Compiled and run, this printed `wrote control=0x1 doorbell=42`, confirming the writes through the volatile-qualified mapped pointer took effect and read back correctly; a real register file would additionally have status bits driven by the hardware itself rather than just echoing what was written.
+FOLLOW:
+- Why MAP_SHARED here instead of MAP_PRIVATE? => A register write must reach the real underlying object (the device, or here the stand-in file) immediately; MAP_PRIVATE's copy-on-write semantics would make the "write" invisible to anything else, which is the opposite of what a register poke needs.
+- Does this example use real hardware? => No; a regular file stands in for a device node purely to keep the example runnable and safe. The mmap()/volatile mechanics shown are the same idiom used against a real /dev/mem-style mapping (VERIFY the exact device-node and permission requirements for your actual platform).
+PITFALL: Treating a plain (non-volatile) pointer returned by mmap() as automatically safe for register access just because the memory came from mmap(). mmap() controls where the memory lives; volatile controls whether the compiler is allowed to optimize away your accesses to it -- you need both for real MMIO.
+
+@@ 13.16 | Advanced | Trap | tags=mmio,caching,volatile
+Q: Why isn't "just mmap() the device file and add volatile" actually sufficient for correct memory-mapped I/O on real hardware?
+SHORT: volatile only stops the compiler from eliding or reordering accesses in the generated code; it says nothing about CPU-level caching, write buffering, or memory-ordering between the CPU and the device, all of which real MMIO correctness depends on. On real hardware, the driver/kernel side must also mark the mapping's caching attribute correctly (typically uncached), and the code may still need explicit memory barriers around accesses that must happen in a specific order relative to the device.
+DEEP:
+- This is a direct extension of the module 7 lesson (volatile is a compiler-only contract, not a hardware barrier) into the specific case that makes the gap most costly: a cached register read can return a stale value from the CPU cache instead of the device's current state, and volatile does nothing to prevent that if the mapping's caching attribute is wrong.
+- On the kernel side, this caching attribute is typically configured through the specific mapping API used for device memory (distinct from an ordinary mmap() of a regular file), and is highly platform- and architecture-specific; do not assume a userspace mmap() of an arbitrary file reproduces this correctly (VERIFY against your platform's real MMIO documentation before writing production register-poke code).
+- A second, separate gap: even with correct caching, a sequence like "write control register, then read status register" may need a compiler/CPU memory barrier between the two if the architecture's memory model allows the accesses to be reordered relative to each other; volatile forces each access to happen but, per the C11 model, says nothing about ordering relative to non-volatile memory, and on some architectures not even a strict guarantee relative to other volatile accesses beyond program order at the compiler level.
+FOLLOW:
+- Is this why real driver code uses functions like readl()/writel() (Linux kernel idiom) instead of a bare volatile pointer dereference? => Yes in spirit -- those wrapper functions are where the kernel encodes the correct barriers and access width for a given architecture; treat the exact primitives as platform/kernel-version documentation, not something this POSIX-grounded page defines (VERIFY).
+- Does this mean the mmap()+volatile pattern shown in 13.15 is wrong? => Not wrong as a teaching example of the mmap() mechanics and the volatile requirement; it is incomplete as production register-access code, which is exactly the gap this question calls out.
+PITFALL: Shipping a bare `volatile struct regfile *` register-access pattern straight from a tutorial into real firmware code without verifying the kernel-side mapping's caching attributes and any needed barriers for your specific architecture and device.
+
+@@ 13.17 | Principal | Scenario | tags=validation,mmap,tracing
+Q: You are designing a high-throughput SSD firmware validation harness that logs every command's timing to a large trace file, and you want near-zero-copy writes. How would you use mmap() and msync() here, and what tradeoff would you flag to the team?
+SHORT: mmap() the trace file MAP_SHARED with room pre-grown via ftruncate(), write entries directly through the mapped pointer (no read()/write() copy per entry), and call msync(MS_ASYNC) periodically to nudge writeback without stalling the hot path, reserving msync(MS_SYNC) for a final flush before declaring the trace durable. Tradeoff to flag: mmap() defers disk-write cost to the kernel's own writeback schedule, which can spike latency mid-run unless writeback is tuned or spread out.
+DEEP:
+- Growing the file: writing past the current end of an mmap'd region is not how you extend a file; you must ftruncate() (or otherwise pre-size) the file first, then mmap() over the new size, or re-mmap() after growing it, since mmap.3p explicitly leaves the effect of "some other operation" changing the mapped file's size while mapped as unspecified for the already-mapped region.
+- MS_SYNC per trace entry would serialize your fast path on storage latency, defeating the entire purpose; MS_ASYNC "shall return immediately once all the write operations are initiated or queued" (msync.3p) so it is the right tool for "keep writeback moving" without blocking the logger.
+- What to instrument: page-fault rate on the trace region (a spike means you are outrunning pre-allocation or hitting unexpected major faults), actual dirty-page writeback rate versus your MS_ASYNC cadence, and the wall-clock cost of the final MS_SYNC flush at run end (that one you do want to measure and budget for).
+- Pitfall to flag explicitly to the team: msync.3p's own APPLICATION USAGE warns "there are no guarantees that msync() is the only control over when pages are or are not written to disk" -- the kernel can flush dirty mmap'd pages on its own schedule regardless of your calls, so a validation run's I/O pattern on the underlying device can include writeback traffic you did not directly request, which matters if you are also trying to measure the device's read/write behavior in the same window.
+FOLLOW:
+- Would O_DIRECT + write() instead of mmap() avoid this writeback-timing uncertainty? => It trades one uncertainty for another: O_DIRECT gives you explicit control over when I/O happens but loses the page-cache sharing and zero-copy read benefits mmap() gives readers of the same trace file concurrently (e.g. a live-tailing monitor process).
+- How would you size the pre-grown trace file if the run length is not known exactly in advance? => Overestimate generously (disk space is cheap relative to a failed run) and ftruncate() down to the actual used size at the end, since shrinking a file mmap() is mapping is safe as long as you are not still touching the truncated-away pages.
+PITFALL: Calling msync(MS_SYNC) inside the per-entry hot path "to be safe." It converts a zero-copy design into a synchronous-I/O design and defeats the reason mmap() was chosen in the first place.
+
+@@ 13.18 | Principal | Debug | tags=mapprivate,ipc,diagnosis
+Q: An engineer reports that a child process's writes to an mmap'd config region "disappear" -- the parent never sees them, even though both processes clearly touch the same address. How do you diagnose and fix this?
+SHORT: The most likely cause is the mapping was created MAP_PRIVATE, so each process's writes are copy-on-write and private by design; check with pmap or /proc/<pid>/maps for the mapping's flags, confirm the flag is MAP_PRIVATE, and fix by switching to MAP_SHARED (backed by a real file or shm_open()) if the intent was genuine cross-process sharing.
+DEEP:
+1. Confirm the symptom is really cross-process, not a synchronization bug: have the parent read the value only after the child has fully exited and been wait()'d on, to rule out a benign read-before-write race.
+2. Inspect the mapping: on Linux, `cat /proc/<pid>/maps` for both processes shows the flags column; a `p` (private) versus `s` (shared) there is the smoking gun. `pmap -x <pid>` gives a friendlier view of the same information.
+3. Check the mmap() call site for the actual flags argument passed; MAP_PRIVATE is an easy default to reach for since many tutorials use it for read-only mappings, and it silently "works" for read-only or same-process use until someone expects a write to be visible elsewhere.
+4. If genuine sharing across fork() was intended, the fix per 13.11 is MAP_SHARED (anonymous, if the two processes are related by fork(), or shm_open()-backed if not) -- and note that MAP_SHARED alone still provides zero synchronization, so if the config region has multiple fields being updated, a mutex or semaphore in that same shared region is still needed (module 6, module 12) to avoid the child and parent tearing a multi-field update.
+5. Confirm the fix: rerun the same reproduction and additionally verify with strace that the write actually reaches the file (an write()-equivalent page flush) or, more directly, have a third process independently open() and read() the backing file/shm object to confirm the value without relying on either original process's own view.
+FOLLOW:
+- Could the same symptom also happen with MAP_SHARED if the config file was opened without write permission on that fd? => Yes -- mmap.3p requires the fd to be open for write for a MAP_SHARED, PROT_WRITE mapping; check the open() flags too, not just the mmap() flags, before concluding it must be a MAP_PRIVATE issue.
+- Is there a way to make this class of bug fail loudly instead of silently? => A defensive assertion right after mmap() that re-opens the backing file (or checks the mapping's flags via /proc) and aborts if it does not match the intended sharing mode catches this at startup instead of during a confusing multi-process debugging session later.
+PITFALL: Fixing this by having the child write the value to a pipe or write() it back to the parent instead of understanding why the mapping did not share it. That papers over the actual misunderstanding and leaves the mmap() call sitting there as a trap for the next person who touches this code.
+
+@@ 13.19 | Principal | Cross-layer | tags=pagecache,mmap,odirect
+Q: Why do writes through an mmap(MAP_SHARED) mapping show up to a read() on the same file from another process immediately, without any explicit flush, and how is that different from O_DIRECT?
+SHORT: Because MAP_SHARED pages are the same physical page-cache pages the kernel uses for buffered read()/write() on that file, so a write through either view is instantly visible through the other (durability to disk is separate, handled by msync() or writeback, per 13.06). O_DIRECT bypasses the page cache entirely, trading that coherence for direct transfers, so mixing O_DIRECT and mmap() on the same file needs the application's own consistency handling.
+DEEP:
+- This is the mechanism behind mmap.3p's own APPLICATION USAGE warning: "The application must ensure correct synchronization when using mmap() in conjunction with any other file access method, such as read() and write(), standard input/output, and shmat()" -- synchronization of concurrent access is still on you, even though the underlying cache coherence between mmap() and read()/write() is automatic.
+- Visibility (another reader sees your write immediately) and durability (the write has actually reached physical storage) are two different guarantees; MAP_SHARED gives you the first for free through shared page-cache pages, but you still need msync(MS_SYNC) or an equivalent for the second, exactly as in 13.06.
+- O_DIRECT is a Linux-specific (and generally platform-specific) extension, not part of the POSIX.1 mmap.3p/msync.3p text grounding this module; treat its exact alignment and synchronization requirements as platform documentation (VERIFY), but its high-level tradeoff against the page cache is the relevant contrast here.
+FOLLOW:
+- If a validation harness needs to measure a device's true read/write latency without page-cache effects, why might it prefer O_DIRECT over mmap()? => Because mmap() through the page cache can serve a read from cache instead of the device, or absorb a write into a dirty page that is flushed later, both of which hide the device's actual per-operation latency behind the OS -- O_DIRECT (or O_DIRECT-backed mmap() where supported) is chosen specifically to remove that layer from the measurement.
+- Does MAP_PRIVATE share the same page-cache coherence with read()/write() on the file? => Only until the first write to a given page, per 13.04; before that, MAP_PRIVATE pages are the same cached pages (read-only, shared with everyone), but a write breaks that sharing for that one page via copy-on-write.
+PITFALL: Assuming "mmap() is always faster than read()/write()" without checking whether your workload actually benefits from page-cache sharing (repeated access to the same hot pages) versus needing to bypass it entirely (a device-latency benchmark, where O_DIRECT is the right tool instead).
+
+@@ 13.20 | Principal | Concept | tags=hugepages,tlb,performance
+Q: Why might a validation harness that mmap()'s a very large buffer want to use huge pages, and what does that actually change?
+SHORT: A huge page (commonly 2 MiB or 1 GiB, versus a standard 4 KiB base page) covers far more address space per TLB entry, so a large mapping backed by huge pages needs far fewer page-table entries and TLB entries, reducing TLB-miss overhead for workloads that scan or randomly access a large mapped region. It does not change mmap()'s POSIX-level contract (MAP_SHARED/MAP_PRIVATE semantics, msync() behavior) at all -- it is purely a page-size/performance mechanism layered underneath.
+DEEP:
+- The tradeoff: huge pages reduce TLB pressure but increase internal fragmentation risk (allocating a 2 MiB page for data that only needs a fraction of it wastes real memory) and can increase the latency of the initial fault that brings the huge page in, since more memory must be allocated/zeroed at once.
+- Transparent huge pages (a kernel feature that opportunistically backs regular anonymous mappings with huge pages without an explicit request) versus explicit huge-page allocation (a dedicated hugetlbfs-style mechanism requiring pre-reserved huge pages) are two distinct mechanisms with different guarantees and configuration; treat both the exact API and whether either is even enabled on a given system as platform/kernel-version specific (VERIFY).
+- For an SSD validation harness specifically, a plausible use case is a large mmap'd ring buffer or trace region (13.17) that is scanned or randomly indexed heavily enough that TLB-miss overhead becomes measurable; whether that is actually the harness's bottleneck should be confirmed by profiling (e.g. hardware performance counters for TLB misses) before reaching for huge pages, since they add real operational complexity (reservation, alignment, sometimes root privileges) for a benefit that may not matter if the bottleneck is actually elsewhere (the device, a lock, a memcpy).
+FOLLOW:
+- Does using huge pages change how MAP_SHARED versus MAP_PRIVATE behave? => No; page size is orthogonal to the sharing semantics in 13.04 -- both flags mean the same thing regardless of the underlying page size.
+- Is huge-page support something POSIX defines? => No, this is entirely outside the POSIX.1 text grounding this module; it is a kernel/platform performance feature layered on top of the standard mmap() interface (VERIFY the exact flags and setup for your target platform).
+PITFALL: Reaching for huge pages as a first-guess performance fix without profiling. If the actual bottleneck is device latency, a lock, or an unrelated hot loop, changing the page size backing a mapping will not move the number that matters.
+</content>

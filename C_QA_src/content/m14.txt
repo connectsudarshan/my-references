@@ -1,0 +1,512 @@
+# Module 14: Standard Library Internals
+
+@@ 14.01 | Basic | Concept | tags=stdio,buffering
+Q: What are the three stdio buffering modes, and when does each one actually flush to the destination?
+SHORT: Unbuffered: each character is intended to appear as soon as possible. Line buffered: a block is transmitted when a newline is written (or when input is needed on that or an unbuffered stream). Fully buffered: a block is transmitted only when the buffer fills. C11 7.21.3p7 says stdin/stdout are fully buffered unless the stream can be determined not to refer to an interactive device; stderr starts out not fully buffered.
+DEEP:
+C11 7.21.3p3-7 defines these modes and who gets which by default. In practice: a terminal-attached stdout is usually line buffered by the C library, a stdout redirected to a file or pipe becomes fully buffered, and stderr is unbuffered (or at least never fully buffered) so diagnostics show up immediately even if the process crashes right after.
+
+Real, reproducible demonstration of why this matters: same program, same four calls, run with stdout and stderr merged into one file (`./buf2 > merged.txt 2>&1`):
+```c
+printf("stdout-1\n");
+fprintf(stderr, "stderr-1\n");
+printf("stdout-2\n");
+fprintf(stderr, "stderr-2\n");
+```
+Output, because stdout is fully buffered (not a tty) and only flushes at program exit, while stderr writes immediately:
+```
+stderr-1
+stderr-2
+stdout-1
+stdout-2
+```
+Forcing stdout unbuffered with `setvbuf(stdout, NULL, _IONBF, 0);` before the same four calls produces the order the source suggests:
+```
+stdout-1
+stderr-1
+stdout-2
+stderr-2
+```
+Nothing about the program's logic changed; only the buffering mode did. `setvbuf`'s three mode macros are exactly `_IOFBF` (fully buffered), `_IOLBF` (line buffered), `_IONBF` (unbuffered), per 7.21.5.6.
+FOLLOW:
+- Does fflush(stdout) fix the reordering without changing the buffering mode? => Yes; inserting fflush(stdout) after each printf forces that block out immediately regardless of mode, at the cost of losing the performance benefit of buffering.
+- Why is stderr special-cased? => So that diagnostic and error output remains useful even if the process aborts right after printing it, before a full buffer would otherwise have been flushed.
+PITFALL: Debugging with interleaved printf/fprintf(stderr, ...) calls and trusting their on-screen order when output has been redirected to a file or pipe; the order you see on a terminal can be completely different once buffering mode changes.
+VERIFY: C11 7.21.3 paragraphs 3 and 7; 7.21.5.6
+
+@@ 14.02 | Basic | Concept | tags=ctype,ub
+Q: Why do ctype.h functions like isalpha take an int instead of a char, and what breaks if you pass a plain (possibly negative) char directly?
+SHORT: C11 7.4p1 requires the argument's value to be representable as an unsigned char or equal EOF; passing any other value is undefined behavior. On a platform where plain char is signed, a byte with the high bit set (e.g. 0xE9) becomes a negative int when passed as char, which is a value outside that allowed range unless explicitly cast to unsigned char first.
+DEEP:
+Real demonstration:
+```c
+char c = (char)0xE9;                 /* signed char: value is -23 on this platform */
+printf("c as int = %d\n", c);        /* -23 */
+isalpha(c);                          /* UB per 7.4p1: -23 is not representable as
+                                         unsigned char and is not EOF */
+isalpha((unsigned char)c);           /* correct: promotes 0xE9 = 233, a valid unsigned char */
+```
+On this toolchain (glibc), both calls happened to return 0 with no crash, because glibc's ctype lookup table is deliberately built with extra entries covering the negative-index range as a long-standing compatibility accommodation. That is an implementation choice, not a standard guarantee: 7.4p1 leaves the behavior undefined for the un-cast call, and a different C library, a hardened build, or a different negative value is free to read out-of-bounds memory or misclassify the character.
+The fix is always the same one-line cast: wrap the argument in `(unsigned char)` before passing it to any ctype.h function, every time the source value could be a plain (possibly signed) char.
+FOLLOW:
+- Why does EOF (typically -1) get a special exemption in the rule? => Because these functions are commonly fed the direct return value of getchar()/fgetc(), which is an int already carrying either a valid unsigned char value or EOF, so the standard explicitly allows EOF through without requiring a cast.
+- Is this the same underlying mistake as the ctype/plain-char issue seen anywhere else on this page? => Yes, in spirit it is the same class of bug as any signed/unsigned mismatch at a library boundary; the specific fix here is always casting to unsigned char before the call.
+PITFALL: Writing isalpha(*p) on a plain char * without a cast; it works by accident on most bytes and breaks specifically on high-bit-set bytes on signed-char platforms, which is exactly the kind of bug that only shows up with certain input data.
+VERIFY: C11 7.4 paragraph 1
+
+@@ 14.03 | Basic | Concept | tags=memcpy,memmove
+Q: What is the actual difference between memcpy and memmove's contracts, and why does it matter for overlapping buffers?
+SHORT: memcpy (7.24.2.1) copies n bytes from src to dst and is undefined behavior if the two objects overlap. memmove (7.24.2.2) copies as if src were first copied into a temporary buffer, so it is explicitly defined and correct for overlapping regions. Use memmove whenever the source and destination might overlap, such as shifting elements within one array.
+DEEP:
+Real test shifting a 20-byte buffer left by 2 (a classic in-place array-shift pattern):
+```c
+char a[20] = "0123456789ABCDEFGHI";
+char b[20] = "0123456789ABCDEFGHI";
+memmove(a, a + 2, 10);   /* defined: overlap is explicitly handled */
+memcpy(b, b + 2, 10);    /* UB per 7.24.2.1: src and dst overlap */
+```
+On this toolchain both produced the identical, correct-looking result `23456789ABABCDEFGHI`, because this glibc's memcpy implementation happened to copy in a direction that tolerates this particular overlap and size. That is exactly the danger the standard is warning about: it is undefined, not "always visibly wrong". A different libc version, a different size, a vectorized/SIMD memcpy that copies in chunks, or a more aggressive compiler optimization pass are all free to produce silently corrupted data for the same overlapping memcpy call, and the bug would only show up on some platforms or after a toolchain upgrade.
+The rule for firmware code doing any kind of in-place buffer shift, ring-buffer wraparound copy, or struct-field shuffling: if there is any chance the two ranges overlap, use memmove, never memcpy, regardless of what today's specific compiler happens to get away with.
+FOLLOW:
+- Does memmove cost more than memcpy? => It can, since a general memmove implementation may need to check overlap direction and possibly copy through a scratch area or copy backwards, though many libc implementations optimize the common cases well.
+- Is strcpy safe on overlapping strings? => No, the standard's string functions generally share this same undefined-on-overlap restriction unless a function's own description says otherwise, exactly as memcpy's does.
+PITFALL: "It worked when I tested it" is not evidence that an overlapping memcpy is safe; the standard's undefined behavior classification means correctness is not guaranteed across compiler versions, optimization levels, or platforms even when today's specific test passes.
+VERIFY: C11 7.24.2.1 paragraph 2; 7.24.2.2 paragraph 2
+
+@@ 14.04 | Intermediate | Concept | tags=qsort,bsearch,contract
+Q: What exactly do qsort and bsearch require from the comparator function, and what do they leave unspecified?
+SHORT: The comparator returns negative, zero, or positive for "less than, equal to, greater than" between its two const void * arguments (cast to the real element type first), consistently across all pairs. C11 7.22.5.2p4 leaves the relative order of elements that compare equal unspecified after qsort, and 7.22.5.1p4 leaves which matching element bsearch returns unspecified when duplicates exist.
+DEEP:
+Both functions (`stdlib.h`) take `void *base, size_t nmemb, size_t size, int (*compar)(const void *, const void *)`. Neither knows anything about the actual element type; all type safety is the caller's responsibility inside the comparator.
+
+`bsearch` additionally requires the array to already be sorted according to that same comparator (7.22.5.1p3): "the array shall consist of: all the elements that compare less than, ... equal to, ... greater than the key object, in that order," which is a precondition, not something bsearch checks.
+
+Duplicate-key demonstration, real run:
+```c
+int arr[] = { 1, 3, 5, 5, 5, 7, 9 };
+int key = 5;
+int *hit = bsearch(&key, arr, 7, sizeof(int), cmp_int);
+/* found 5 at index 3 */
+```
+Index 3 (the middle of the three 5s here) is simply what this particular implementation's binary-search midpoint math landed on; 7.22.5.1p4 explicitly says which one is unspecified, so code must never depend on getting "the first" or "the last" matching element from bsearch.
+FOLLOW:
+- What happens if the comparator is inconsistent (a < b and b < a both report true for the same pair)? => The standard's precondition is violated, so qsort's/bsearch's result is unspecified in a much stronger sense: the array may not end up sorted at all, and bsearch may miss an element that is actually present.
+- Can qsort's element size differ from sizeof of the actual element type? => It must not; passing a mismatched size silently corrupts memory since qsort moves size bytes per swap regardless of what type those bytes actually hold.
+PITFALL: Assuming qsort is a stable sort; two elements that compare equal can end up in either relative order, which breaks code that relies on "first-inserted wins" tie-breaking without an explicit tie-break field in the comparator.
+VERIFY: C11 7.22.5.1 paragraph 4; 7.22.5.2 paragraph 4
+
+@@ 14.05 | Intermediate | Debug | tags=qsort,comparator,overflow
+Q: A qsort comparator written as `return *(const int*)a - *(const int*)b;` sorts most arrays correctly but produces obviously wrong order on some inputs. What is the bug, and how do you fix it?
+SHORT: Subtracting two ints for the comparator can itself signed-overflow (undefined behavior) when the two values are far enough apart, e.g. one near INT_MAX and one near INT_MIN; the wrapped/UB result can have the wrong sign, making qsort misplace elements. Fix: compare with `(x > y) - (x < y)`, which never overflows.
+DEEP:
+Real, reproducible failure:
+```c
+int bad_cmp(const void *a, const void *b) {
+    return *(const int *)a - *(const int *)b;      /* BUG */
+}
+int good_cmp(const void *a, const void *b) {
+    int x = *(const int *)a, y = *(const int *)b;
+    return (x > y) - (x < y);                       /* correct */
+}
+int arr1[] = { 2000000000, -2000000000, 0 };
+int arr2[] = { 2000000000, -2000000000, 0 };
+qsort(arr1, 3, sizeof(int), bad_cmp);
+qsort(arr2, 3, sizeof(int), good_cmp);
+```
+Actual output on this toolchain:
+```
+bad_cmp  result: 2000000000 -2000000000 0     <- unsorted!
+good_cmp result: -2000000000 0 2000000000     <- correctly ascending
+```
+`2000000000 - (-2000000000)` is `4000000000`, which does not fit in a 32-bit signed int (max is `2147483647`); the subtraction is signed overflow, which C11 leaves undefined (module 10's territory), and in practice wraps to a negative number here, so the comparator reports "2000000000 is less than -2000000000", corrupting the sort.
+`(x > y) - (x < y)` only ever produces `1`, `0`, or `-1` from two boolean comparisons, so it is correct for the full range of int with no overflow risk, and is the idiomatic, safe comparator body for any qsort/bsearch on a numeric type.
+FOLLOW:
+- Would casting to a wider type before subtracting also fix it? => Yes, e.g. `(long)x - (long)y` avoids the overflow for any int values since long is guaranteed wide enough, but the branchless (x > y) - (x < y) form works for any comparable type without needing to reason about a wider type's range.
+- Does -Wall/-Wextra catch this bug? => No; it compiles cleanly with both flags, since signed overflow in a subtraction is not something GCC's warnings flag by default (module 10 and 16 cover -fsanitize=undefined, which does catch it at runtime).
+PITFALL: Writing a - b as a shortcut for a three-way comparator on any signed integer type; it is a common idiom that is only safe when the value range is known to be small enough that the subtraction cannot overflow.
+VERIFY: C11 7.22.5.2 (qsort); overflow behavior per module 10 / 6.5 paragraph 5 (signed integer overflow is undefined)
+
+@@ 14.06 | Intermediate | Concept | tags=strncpy,pitfall
+Q: What does strncpy(dst, src, n) actually guarantee about null-termination, and how does that differ from what most people assume?
+SHORT: If src (including its terminator) is shorter than n, strncpy copies it and then pads the rest of dst with zero bytes up to n, so dst is null-terminated. If src's length is n or more, strncpy copies exactly n bytes and writes no terminator at all, leaving dst potentially not null-terminated. Most misuse assumes strncpy always produces a proper C string.
+DEEP:
+Real demonstration, both cases:
+```c
+char dst[8];
+memset(dst, 'X', sizeof dst);
+strncpy(dst, "hi", sizeof dst);      /* src shorter than n */
+/* dst bytes: 68 69 00 00 00 00 00 00  -> "hi" then zero padding, safely terminated */
+
+char dst2[4];
+strncpy(dst2, "abcdef", sizeof dst2);  /* src longer than n */
+/* dst2 bytes: 'a' 'b' 'c' 'd' -- no NUL byte anywhere in dst2 */
+```
+GCC's own `-Wstringop-truncation` warning fires exactly on the second call: `'strncpy' output truncated copying 4 bytes from a string of length 6`, which is the compiler correctly flagging this exact contract gap; it is expected here, not a defect to silence, since it is demonstrating the real behavior.
+
+The zero-padding behavior (when src is shorter) is also a hidden performance trap: strncpy always writes all n bytes of dst regardless of how short src is, so calling it with a small src and a large n wastes time zeroing bytes nobody asked for, unlike strlcpy-style alternatives (not standard C) or a manual bounded copy.
+
+The safe, portable pattern for "copy into a fixed buffer and guarantee termination" in standard C11 is to size the write with `snprintf(dst, sizeof dst, "%s", src)` (14.16 covers exactly this substitution for sprintf-family calls), or to always follow strncpy with an explicit `dst[n-1] = '\0';`.
+FOLLOW:
+- Why does strncpy behave this way instead of always guaranteeing termination? => It was originally designed for fixed-width, not-necessarily-terminated fields (like old Unix directory entries), and the string.h family's names predate the safer conventions expected today.
+- Is strncat safer? => No, it has its own well-known off-by-one-prone contract (it appends up to n characters plus a terminator, so the destination buffer needs room for strlen(dst)+n+1, not just n) and is just as easy to misuse.
+PITFALL: Using strncpy expecting it to behave like "strcpy but bounded and always safely terminated"; it is bounded, but termination is only guaranteed when the source already fits with room to spare.
+VERIFY: strncpy's zero-pad and non-termination contract, C11 7.24.2.4
+
+@@ 14.07 | Intermediate | Numeric | tags=itoa,buffersizing
+Q: How many bytes does a buffer need to safely hold the decimal string form of any 32-bit signed int, including the sign and the terminator, and how do you get that number?
+SHORT: 12 bytes. INT_MIN on a 32-bit two's complement int is -2147483648, whose decimal text "-2147483648" is 11 characters (1 sign + 10 digits), plus 1 byte for the null terminator, giving 12.
+DEEP:
+Walking the calculation instead of just quoting the answer:
+
+- INT32_MAX is 2147483647, 10 digits, no sign character needed for a positive value.
+- INT32_MIN is -2147483648. Its magnitude has the same 10 digits as INT32_MAX's magnitude plus one (2147483648 versus 2147483647), but crucially it still fits in 10 digits, not 11, because two's complement's range is asymmetric (module 11 covers why): one more negative value is representable than positive values.
+- Add 1 byte for the leading '-' sign: 10 + 1 = 11 characters of text.
+- Add 1 byte for the terminating '\0': 11 + 1 = 12 bytes total.
+
+Verified directly, converting the actual worst case with a real (correct) itoa implementation:
+```c
+char buf[12];
+my_itoa(INT_MIN, buf);
+printf("%s (len=%zu)\n", buf, strlen(buf));
+/* -2147483648 (len=11) */
+```
+`strlen` reports 11 (the text, not counting the terminator), confirming the buffer needs exactly 11 + 1 = 12 bytes, matching the worked calculation above and leaving no slack for anything else.
+
+The general formula for an N-bit signed integer type: ceil(N * log10(2)) digits for the magnitude, plus 1 for a possible sign, plus 1 for the terminator; for 32-bit int that is ceil(32 * 0.30103) = ceil(9.63) = 10 digits, +1 sign +1 NUL = 12, matching the direct count above.
+FOLLOW:
+- What is the equivalent worst-case size for a 64-bit long long? => 20 digits (LLONG_MIN is -9223372036854775808, 19 digits) + 1 sign + 1 NUL = 21 bytes.
+- Why not just always allocate a generous 32 or 64 bytes and stop calculating? => That works in practice for a one-off, but knowing the exact worst case matters for a fixed-size protocol field or a stack-allocated buffer in a tight embedded loop where every byte of a per-call buffer is budgeted.
+PITFALL: Sizing an itoa/snprintf destination buffer using INT_MAX's digit count only, then feeding it INT_MIN in production; the sign character is easy to forget when eyeballing "how many digits does an int need."
+
+@@ 14.08 | Intermediate | Trap | tags=intmin,signedoverflow,ub
+Q: A naive itoa negates a negative input with `-value` before converting the magnitude to digits. What goes wrong specifically for INT_MIN, and how do you avoid it?
+SHORT: Negating INT_MIN (e.g. -2147483648 for 32-bit int) overflows int, since +2147483648 is not representable as a signed 32-bit value; C11 6.5.3.3p3 leaves unary minus overflow undefined. The fix is to do the negation on an unsigned type wide enough to hold the magnitude, or to work with an unsigned copy of the value from the start, never negating a possibly-INT_MIN value while still typed as (the same width) int.
+DEEP:
+Real, compiled, isolated reproduction of exactly this UB:
+```c
+int naive_negate(int value) {
+    return -value;   /* UB when value == INT_MIN */
+}
+naive_negate(INT_MIN);   /* prints -2147483648, i.e. unchanged */
+```
+Plain `-Wall -Wextra` gives no warning and the program does not crash: it printed `-2147483648` right back, which looks almost like "it just returned the same value," but that is exactly the danger of undefined behavior described elsewhere on this page: nothing guarantees that specific outcome, it is simply what this compiler and optimization level happened to produce today.
+Compiling the identical file with `-fsanitize=undefined` catches it at runtime with an explicit diagnostic:
+```
+itoabug.c:5:12: runtime error: negation of -2147483648 cannot be represented
+in type 'int'; cast to an unsigned type to negate this value to itself
+```
+The fix the sanitizer's own message describes is exactly the technique used in the correct my_itoa from 14.12: cast to unsigned (or a wider signed type) before negating.
+```c
+unsigned int uval = neg ? (unsigned int)(-(long long)value) : (unsigned int)value;
+```
+Here the negation happens on a `long long`, which is wide enough to represent `-INT_MIN` without overflow, and the result is then narrowed to `unsigned int`, which is well-defined (module 10 covers unsigned wraparound being defined, unlike signed overflow).
+FOLLOW:
+- Would `-(unsigned int)value` directly on the original int work instead of going through long long? => Yes, that is actually the more common idiom: converting value to unsigned int first (a well-defined conversion per module 1/11's rules) then negating in unsigned arithmetic, which wraps modulo 2^32 by definition rather than overflowing.
+- Is this the same class of bug as abs(INT_MIN)? => Yes, exactly; C11 7.22.6.1p2 explicitly notes that abs/labs/llabs have undefined behavior "if the result cannot be represented," which is precisely the INT_MIN case.
+PITFALL: Assuming "it printed a sensible-looking number, so this input case must be fine"; a benign-looking result from undefined behavior is not evidence of correctness, only evidence that this particular compiler build did not turn it into a visible failure today.
+VERIFY: C11 6.5.3.3 paragraph 3 (unary minus on an operand with overflow is per the usual arithmetic overflow rule, undefined for signed types); 7.22.6.1 paragraph 2
+
+@@ 14.09 | Intermediate | Concept | tags=atoi,minimalimpl
+Q: Write and test a minimal atoi. What does it need to handle to match the real function's basic contract?
+SHORT: Skip leading whitespace, accept an optional single + or - sign, then accumulate decimal digits until a non-digit or the string ends; C11 7.22.1.2 defines atoi as equivalent to (int)strtol(nptr, NULL, 10) except for its own error behavior, so trailing garbage after the digits is simply where conversion stops, not an error.
+DEEP:
+Real, compiled, tested implementation:
+```c
+int my_atoi(const char *s) {
+    while (isspace((unsigned char)*s)) s++;
+    int sign = 1;
+    if (*s == '+' || *s == '-') { if (*s == '-') sign = -1; s++; }
+    long acc = 0;
+    while (isdigit((unsigned char)*s)) { acc = acc * 10 + (*s - '0'); s++; }
+    return (int)(sign * acc);
+}
+```
+Test results, matching the real library's behavior on the same inputs:
+```
+my_atoi("  -42abc") -> -42     (stops at 'a', matching strtol's "initial portion" behavior)
+my_atoi("123")      -> 123
+my_atoi("+7")       -> 7
+my_atoi("nope")     -> 0       (no digits found: accumulator stays 0)
+```
+Using `long acc` instead of `int acc` for the running total is a deliberate defensive choice: it delays overflow until the final narrowing cast, matching the spirit of what strtol itself does internally (though strtol has its own explicit ERANGE/clamping contract at 7.22.1.4 that this minimal version does not reproduce); a from-scratch atoi that accumulates directly in `int` would hit the exact same INT_MIN/overflow class of bug as 14.08 on adversarial input.
+
+Note the `(unsigned char)` casts on every ctype.h call, directly applying 14.02's rule since `*s` is a plain (possibly signed) char.
+FOLLOW:
+- What does real atoi do on genuine overflow input like "99999999999"? => C11 does not specify a defined outcome for atoi itself on overflow (only strtol has documented overflow behavior via errno/ERANGE); treat atoi's overflow behavior as unreliable and prefer strtol when input might be out of range.
+- Why check isdigit in a loop instead of comparing against '0'..'9' directly? => Both work for decimal digits in the "C" locale, but isdigit documents the intent clearly and is the idiomatic ctype.h approach interviewers expect.
+PITFALL: Forgetting the leading-whitespace skip or the optional sign handling and then being surprised that a from-scratch atoi fails on inputs the real library function accepts without complaint.
+VERIFY: C11 7.22.1.2 paragraph 2
+
+@@ 14.10 | Advanced | Concept | tags=memcpy,minimalimpl
+Q: Write and test a minimal memcpy. What does its contract require you to get right (and deliberately not handle)?
+SHORT: Copy exactly n bytes from src to dst, byte by byte, treating both as arrays of unsigned char (per 7.24.1p3, every byte in these functions is interpreted as unsigned char), and return dst (7.24.2.1p3). It must not handle overlap correctly, since real memcpy is explicitly allowed to assume none (14.03); that is memmove's job, not memcpy's.
+DEEP:
+Real, compiled, and verified-against-the-real-function implementation:
+```c
+void *my_memcpy(void *restrict dst, const void *restrict src, size_t n) {
+    unsigned char *d = dst;
+    const unsigned char *s = src;
+    while (n--) *d++ = *s++;
+    return dst;
+}
+```
+Test:
+```c
+char src[] = "firmware-blob";
+char dst[32] = {0};
+my_memcpy(dst, src, sizeof src);
+memcmp(dst, src, sizeof src) == 0;   /* verified true: byte-for-byte identical to real memcpy's contract */
+```
+Marking both pointer parameters `restrict` is not just decoration: it is the same promise the real memcpy's prototype makes (7.24.2.1's synopsis declares both parameters restrict), telling the compiler the two ranges never alias, which is exactly why memcpy is allowed to be undefined behavior on overlapping input (14.03) and, in return, is free to be implemented (and optimized) without any overlap-direction check at all, unlike memmove.
+
+A real libc's memcpy is almost always far faster than this byte-loop version (SIMD-width copies, alignment-aware bulk moves), but this loop is fully contract-correct for the non-overlapping case, which is all the standard promises callers anyway.
+FOLLOW:
+- Why use unsigned char specifically instead of char for the internal pointers? => Matching 7.24.1p3's rule that every character in these functions is interpreted as unsigned char, which avoids any sign-extension surprises when a byte's value is used arithmetically (not needed here, but the right habit to carry into any byte-oriented library code).
+- Would this implementation work correctly if src and dst overlapped? => It happens to copy strictly forward one byte at a time, so it is actually safe for the same overlap directions memmove is designed to handle, but that is an implementation accident of this specific loop, not a promise memcpy's contract makes; never rely on it.
+PITFALL: Treating a working from-scratch memcpy as proof you could safely replace the real one in production code; correctness on your test cases says nothing about performance, and a naive byte loop is dramatically slower than a real libc's implementation on large buffers.
+VERIFY: C11 7.24.2.1 paragraphs 2-3; 7.24.1 paragraph 3
+
+@@ 14.11 | Advanced | Concept | tags=printf,stdarg,variadic
+Q: Write a minimal printf subset (%d, %s, %c, %x, %%) using stdarg.h, and show it working.
+SHORT: Walk the format string one character at a time; on a literal character, output it; on %, look at the next character and pull one argument of the matching type from a va_list with va_arg, converting and printing it manually (digit extraction for %d/%x, direct output for %s/%c), then continue.
+DEEP:
+Real, compiled, and run implementation (trimmed to the %d case for space; %s/%c/%x/%% follow the same switch structure in the full tested file):
+```c
+void my_printf(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    for (const char *p = fmt; *p; p++) {
+        if (*p != '%') { putchar(*p); continue; }
+        p++;
+        switch (*p) {
+        case 'd': {
+            int v = va_arg(ap, int);
+            char buf[16]; int i = 0, neg = v < 0;
+            unsigned int u = neg ? (unsigned int)(-(long long)v) : (unsigned int)v;
+            if (u == 0) buf[i++] = '0';
+            while (u) { buf[i++] = (char)('0' + u % 10); u /= 10; }
+            if (neg) putchar('-');
+            while (i > 0) putchar(buf[--i]);
+            break;
+        }
+        case 's': fputs(va_arg(ap, const char *), stdout); break;
+        case 'c': putchar(va_arg(ap, int)); break;
+        /* %x and %% follow the same pattern */
+        }
+    }
+    va_end(ap);
+}
+```
+Test call and actual output:
+```c
+my_printf("dec=%d str=%s ch=%c hex=%x pct=%%\n", -42, "hi", 'Z', 255);
+/* dec=-42 str=hi ch=Z hex=ff pct=% */
+```
+Note the %d branch reuses the exact same cast-then-negate-in-a-wider-type trick from 14.08/14.12 to handle INT_MIN correctly, since a hand-rolled digit-extraction loop for %d has precisely the same signed-overflow trap as a from-scratch itoa.
+
+va_arg(ap, int) for %c matters: `char` arguments are promoted to `int` by C's default argument promotions for a variadic call's untyped trailing arguments, so pulling a `char` out of a va_list with `va_arg(ap, char)` would itself be undefined behavior; the caller passed something already widened to int, and the reader must extract it as int (module 9's territory, but directly relevant here).
+FOLLOW:
+- Why does %s need no digit-extraction logic while %d does? => Because a string argument is already the sequence of bytes to print (fputs just walks it to the NUL), while an int argument is a binary value that has to be converted to its decimal text representation one digit at a time.
+- What is missing from this subset compared to real printf? => Width/precision specifiers, %f/%g floating point, %p pointers, %u unsigned decimal, and length modifiers like %ld are all absent; a real subset worth calling "useful" would add %u and %ld next.
+PITFALL: Pulling a va_arg with the wrong type (e.g. va_arg(ap, char) or va_arg(ap, short) for an argument the caller passed as a plain int through the variadic ellipsis); the promoted type at the call site and the type requested at va_arg must agree, or the behavior is undefined.
+
+@@ 14.12 | Advanced | Concept | tags=itoa,minimalimpl
+Q: Write and test a minimal itoa that correctly handles INT_MIN, given the pitfall in 14.08.
+SHORT: Convert the magnitude on the unsigned side (casting through a wider signed type before negating, so INT_MIN's negation never overflows int), peel decimal digits off with %10/ /10 into a temporary buffer, then reverse them into the output buffer with a leading '-' if the original value was negative.
+DEEP:
+Real, compiled, tested implementation:
+```c
+char *my_itoa(int value, char *buf) {
+    unsigned int uval;
+    char tmp[12];
+    int i = 0, neg = (value < 0);
+    uval = neg ? (unsigned int)(-(long long)value) : (unsigned int)value;
+    if (uval == 0) tmp[i++] = '0';
+    while (uval > 0) { tmp[i++] = (char)('0' + uval % 10); uval /= 10; }
+    int j = 0;
+    if (neg) buf[j++] = '-';
+    while (i > 0) buf[j++] = tmp[--i];
+    buf[j] = '\0';
+    return buf;
+}
+```
+Test results, using a 12-byte buffer per the exact worked calculation in 14.07:
+```
+my_itoa(0, buf)        -> "0"
+my_itoa(1234, buf)     -> "1234"
+my_itoa(-1234, buf)    -> "-1234"
+my_itoa(INT_MIN, buf)  -> "-2147483648" (strlen 11, fits the 12-byte buffer exactly)
+```
+The `(unsigned int)(-(long long)value)` line is the fix for 14.08's bug: `value` is widened to `long long` first (large enough to represent `-INT_MIN` without overflow), negated there safely, then narrowed to `unsigned int`, which wraps modulo 2^32 by a well-defined rule rather than overflowing. Digits are built least-significant-first into `tmp`, then copied into `buf` in reverse order, which is the standard technique for converting a binary value to decimal text without knowing the digit count in advance.
+FOLLOW:
+- Why is the temporary buffer needed instead of writing digits directly into buf in order? => Because the least-significant digit is computed first (from %10) but belongs last in the output string; without a scratch buffer to reverse from, you would need to know the final digit count in advance to write front-to-back.
+- Does this handle bases other than 10? => Not as written, but the same peel-digits-then-reverse structure generalizes to any base by changing the modulus/divisor and mapping digit values above 9 to letters, exactly as the minimal printf's %x branch in 14.11 does.
+PITFALL: Copying this pattern but accumulating uval as a plain (signed) int instead of unsigned int; that silently reintroduces 14.08's overflow bug for the INT_MIN case specifically.
+VERIFY: signed-to-unsigned negation-overflow avoidance per C11 6.3.1.3 paragraph 2 (unsigned conversion wraps modulo 2^N, well-defined) versus 6.5.3.3 paragraph 3 (signed negation overflow, undefined)
+
+@@ 14.13 | Advanced | Concept | tags=qsort,structs,multikey
+Q: How do you write a qsort comparator that sorts an array of structs by more than one field, with a real example?
+SHORT: Cast both const void * arguments to the real struct pointer type, compare the primary field first, and only if it is equal fall through to compare the secondary field (a tie-break), returning as soon as any comparison is decisive; this also sidesteps 14.04's "order of equal elements is unspecified" note by making sure nothing that matters is ever actually equal to the comparator.
+DEEP:
+Real, compiled, run example sorting firmware task records by priority, then by name as a tie-break:
+```c
+typedef struct { char name[16]; int priority; } Task;
+int cmp_task(const void *a, const void *b) {
+    const Task *ta = a, *tb = b;
+    if (ta->priority != tb->priority) return ta->priority - tb->priority;
+    return strcmp(ta->name, tb->name);
+}
+Task tasks[] = {
+    { "flush_cache", 2 }, { "read_nand", 1 }, { "log_event", 2 }, { "erase_block", 1 }
+};
+qsort(tasks, 4, sizeof(Task), cmp_task);
+```
+Actual output, priority ascending, and alphabetical within each priority:
+```
+1 erase_block
+1 read_nand
+2 flush_cache
+2 log_event
+```
+Two things worth calling out unprompted in an interview: `ta->priority - tb->priority` is safe here specifically because Task.priority is a small, application-bounded range (unlike 14.05's arbitrary-int trap; if priority could span the full int range, the same (x > y) - (x < y) fix from 14.05 would apply), and using `strcmp` directly as the tie-break (rather than a hand-rolled loop) is the idiomatic way to compare two fixed-size char arrays that are guaranteed null-terminated.
+FOLLOW:
+- What happens if the tie-break field is also equal for two elements? => Their relative order is genuinely unspecified per 7.22.5.2p4, since nothing in the comparator can distinguish them; add a further tie-break (e.g. original index) only if that specific stability actually matters.
+- Would this comparator work unchanged if Task were sorted with bsearch instead? => Only if the array is already sorted by this exact comparator's ordering; bsearch's precondition (7.22.5.1p3) requires the array to already respect the comparator, which is exactly what this qsort call establishes.
+PITFALL: Writing the tie-break comparison as a separate qsort call after the first field is already sorted; a single-pass multi-field comparator inside one qsort call is both correct and simpler than trying to chain two separate sorts.
+
+@@ 14.14 | Advanced | Concept | tags=stdio,exit,dataloss
+Q: Does a buffered stdout stream reliably get its contents written out if the program calls abort() or crashes, versus calling exit() or returning from main?
+SHORT: No. C11 7.21.3p5 guarantees all open files are flushed only "if the main function returns to its original caller, or if the exit function is called"; it explicitly says other paths to termination, "such as calling the abort function, need not close all files properly." Any output still sitting in a fully or line buffered stream's memory buffer at the moment of an abnormal termination can be lost.
+DEEP:
+This is exactly why a diagnostic message printed right before a crash sometimes never appears in a log file, even though the printf call itself clearly executed (no error was reported): if that printf's output landed in stdout's buffer and the process then hits a segfault or calls abort() before anything triggers a flush, the buffered bytes are simply never written to the underlying file descriptor.
+
+Practical consequences worth stating unprompted:
+- A crash-handling signal handler that wants to guarantee a final diagnostic message reaches disk should call fflush(stdout) (and/or write() directly to the fd, which is unbuffered by definition) before doing anything else, rather than assuming the runtime will flush on its way down.
+- stderr's typically-unbuffered-or-line-buffered default (14.01) is precisely why error messages tend to survive crashes better than stdout's fully buffered informational output when a program is not interactive.
+- This directly connects to module 17's ISR/signal-handler-safety material: calling fflush from inside certain contexts, or relying on any buffered stdio at all inside a true interrupt handler, carries its own reentrancy hazards, which is one sentence's worth of pointer to that page rather than a full treatment here.
+FOLLOW:
+- Does calling _exit() (as opposed to exit()) flush stdio buffers? => No; _exit() is documented as bypassing normal cleanup including stdio flushing, which is one reason it exists as a distinct, more abrupt termination path (more POSIX-flavored detail than pure C11, so treat this specific function as background context).
+- Is there any way to make output survive a SIGSEGV without changing buffering mode? => Calling fflush(stdout) explicitly at the specific point where you need a durability guarantee is the direct fix; changing to unbuffered mode everywhere is the blunter, slower alternative.
+PITFALL: Debugging an intermittent crash by adding printf statements and trusting that "the last line I see printed is where it crashed"; the true crash point can be later than the last line actually flushed to the terminal or log file.
+VERIFY: C11 7.21.3 paragraph 5
+
+@@ 14.15 | Advanced | Debug | tags=stdio,buffering,interleaving
+Q: A program's stdout and stderr messages appear in the expected interleaved order on a terminal, but come out completely reordered when the program's combined output is redirected to a single log file. How do you diagnose and fix this?
+SHORT: A buffering-mode change, not a logic bug: an interactive stdout is typically line buffered, so each printf's newline flushes it promptly alongside stderr's unbuffered writes; redirected to a file, stdout becomes fully buffered (7.21.3p7) and only flushes on a full buffer or exit, lagging behind interleaved stderr. Fix by forcing setvbuf(stdout, NULL, _IONBF, 0), or an explicit fflush(stdout) after writes that must stay ordered relative to stderr.
+DEEP:
+Real, reproducible side-by-side comparison (already run for 14.01, repeated here for the debugging angle specifically). Same four calls, both redirected to one file via `2>&1`:
+
+Default buffering (stdout fully buffered because the destination is not a tty):
+```
+stderr-1
+stderr-2
+stdout-1
+stdout-2
+```
+Same program, only change is `setvbuf(stdout, NULL, _IONBF, 0);` at the top of main:
+```
+stdout-1
+stderr-1
+stdout-2
+stderr-2
+```
+Diagnosis process for a real "my logs look scrambled in the file but fine on screen" ticket:
+1. Confirm the reordering only happens when redirected, not on an interactive terminal; if so, immediately suspect buffering mode rather than a race condition or logic bug, since 7.21.3p7 is exactly this rule.
+2. Check whether the code mixes stdio calls to two different streams (stdout and stderr, or two separately fopen'd FILE * streams) that are expected to interleave in a specific order.
+3. Decide the right fix for the situation: for a low-volume diagnostic tool, forcing stdout unbuffered (or line buffered, `_IOLBF`) is simplest; for a high-throughput logger where the performance cost of losing full buffering matters, route everything through a single stream (or add explicit fflush calls only at the specific points where ordering actually matters) instead of disabling buffering everywhere.
+FOLLOW:
+- Would writing everything to stderr instead of stdout also fix the reordering? => Yes in practice (since stderr defaults to not-fully-buffered), but it repurposes a stream meant for diagnostics/errors for ordinary output, which is a workaround, not a real fix, and surprises anything downstream that filters stdout from stderr.
+- Is this specific to C's stdio, or would it also affect a program using raw write() calls? => It is specific to the buffering layer stdio adds on top of the OS's file descriptors; raw write() calls have no such user-space buffer and always go out in call order (though the OS/terminal itself can still interleave multiple processes' output unpredictably).
+PITFALL: "Fixing" this by adding sleep() calls between prints to force an ordering; that treats the symptom, not the cause, and remains fragile (and slow) since the actual cause is buffering mode, addressed directly with setvbuf or fflush.
+
+@@ 14.16 | Principal | Scenario | tags=sprintf,snprintf,codereview
+Q: Reviewing a legacy logging helper, you find `sprintf(buf, "[%s] code=%d", tag, code);` writing into a fixed-size caller-supplied buffer with no bound. What is wrong with this, and how do you fix it while preserving the ability to detect truncation?
+SHORT: sprintf has exactly the same unbounded-write hazard as strcpy: it writes as many bytes as the format and arguments demand, with no awareness of the destination buffer's actual size, so a long enough tag or code overflows buf. Replace it with snprintf(buf, bufsz, ...), which never writes past bufsz and returns the number of characters that would have been written (excluding the terminator), letting the caller detect truncation by checking if that return value is >= bufsz.
+DEEP:
+Real, compiled, and run before/after comparison:
+```c
+/* BEFORE (legacy): unbounded, as risky as strcpy */
+void log_event_bad(char *buf, size_t bufsz, const char *tag, int code) {
+    (void)bufsz;
+    sprintf(buf, "[%s] code=%d", tag, code);
+}
+
+/* AFTER: bounded, and truncation is detectable */
+void log_event_good(char *buf, size_t bufsz, const char *tag, int code) {
+    int need = snprintf(buf, bufsz, "[%s] code=%d", tag, code);
+    if (need < 0 || (size_t)need >= bufsz) {
+        fprintf(stderr, "log line truncated (needed %d, had %zu)\n", need, bufsz);
+    }
+}
+```
+Real run, deliberately feeding a tag too long for a small buffer:
+```
+log_event_good(small[16], ..., "sensor_overflow_event", -1)
+-> stderr: log line truncated (needed 31, had 16)
+-> small buf result: "[sensor_overflo"     <- safely truncated, no overflow
+```
+`need` (31) tells the caller exactly how large a buffer would have been required, which is itself a standard, documented idiom for a two-pass "measure then allocate" pattern (`int need = snprintf(NULL, 0, fmt, ...); char *buf = malloc(need + 1); snprintf(buf, need + 1, fmt, ...);`) when the required size is not known ahead of time.
+
+A code review at this level should treat every `sprintf`, `gets`, `strcpy`, and `strcat` call in legacy firmware logging/parsing code as a finding regardless of whether today's inputs happen to fit; the whole point of a fixed-size destination buffer is that some future input will not, and the review's job is to make that case fail safely (truncate and report) rather than fail by corrupting adjacent memory. Module 17 covers the security-vulnerability framing of exactly this class of bug (stack buffer overflows, format-string bugs) in more depth; this question is the library-contract half of the same finding.
+FOLLOW:
+- Why does the fixed function check `(size_t)need >= bufsz` rather than `> bufsz`? => snprintf's return value is the number of characters that would have been written excluding the terminator; if that count equals bufsz exactly, the terminator itself had no room, so equality already means truncation occurred.
+- Is checking snprintf's return value optional in a security-conscious codebase? => No; ignoring it is functionally similar to ignoring sprintf's lack of bounds checking in the first place, just with the overflow itself now prevented but the truncation going unnoticed and potentially corrupting a log's meaning silently.
+PITFALL: Replacing sprintf with snprintf but forgetting to actually check the return value; the overflow is fixed, but a silently truncated, possibly misleading log line is left undetected, which is a real (if quieter) correctness bug for anything downstream parsing that log.
+
+@@ 14.17 | Principal | Concept | tags=safelibc,firmwarereview
+Q: For a firmware team's code review checklist, which common string.h/stdio.h calls are risky by contract, and what should each be replaced with?
+SHORT: Flag any call whose write size depends on unbounded input rather than a caller-supplied destination size: gets, sprintf, strcpy, strcat, and any strncpy/strncat use that assumes automatic null-termination. Replace with fgets(buf, sizeof buf, stdin), snprintf(buf, sizeof buf, ...), a bounded copy that explicitly null-terminates, and a bounded append with an explicit remaining-length check, respectively.
+DEEP:
+A practical review table, each row grounded in that function's own documented contract rather than folklore:
+
+| Risky call | Contract gap | Safer replacement |
+|---|---|---|
+| gets(buf) | No length argument at all; cannot bound the write | fgets(buf, sizeof buf, stdin), then strip the trailing newline explicitly |
+| sprintf(buf, fmt, ...) | Writes exactly what the format demands, no bound (14.16) | snprintf(buf, sizeof buf, fmt, ...), checking the return value |
+| strcpy(dst, src) | No bound; overflows if src is longer than dst | snprintf(dst, sizeof dst, "%s", src), or a manual bounded copy |
+| strcat(dst, src) | Same as strcpy, plus it re-scans dst for its current end every call | Track a running length and append with strncat plus an explicit remaining-length argument, or better, snprintf-based construction |
+| strncpy(dst, src, n) misused as "safe strcpy" | Not guaranteed to null-terminate when src is >= n bytes (14.06) | Always follow with an explicit dst[n-1] = '\0', or prefer snprintf |
+
+The unifying review question for every row: "does this call know the real remaining space in the destination, and does it stop there no matter what the input looks like?" gets and sprintf structurally cannot know that (no size parameter exists to tell them); strcpy/strcat structurally ignore it even though the destination's size is knowable elsewhere in the code; strncpy knows it but trades away guaranteed termination in exchange.
+
+For a firmware review specifically, the stakes are higher than on a general-purpose OS: a stack or static buffer overflow in a bare-metal target has no ASan, no guard pages by default, and often no crash at all, just silent adjacent-memory corruption that manifests as an unrelated bug hours later (module 16 and 17 both build on this).
+FOLLOW:
+- Why is gets so much worse than the others that it was removed from C11's own library (it is not declared in C11's stdio.h at all, only in older standards/implementations as a deprecated leftover)? => Because it has no length parameter whatsoever, so there is no caller-side fix at the call site itself; the only correct action is to never call it.
+- Should this checklist also flag scanf("%s", buf)? => Yes, for the same structural reason as gets: an unbound %s conversion in scanf has no length limit either, unlike the width-limited form scanf("%15s", buf), which is the bounded alternative.
+PITFALL: Treating this checklist as a one-time cleanup pass rather than a standing review rule; a codebase that fixes every existing sprintf call but keeps writing new ones the same way has fixed nothing structurally.
+
+@@ 14.18 | Principal | Concept | tags=bsearch,minimalimpl,duplicates
+Q: Write a minimal bsearch, and show that it honors the standard's "unspecified which matching element is returned" contract when duplicates are present.
+SHORT: Standard binary search over [lo, hi]: compute mid, compare the key against the element there using the caller's comparator, narrow to the left or right half on a mismatch, and return a pointer to the element on an exact match; the standard match found first depends purely on the array's size and the midpoint arithmetic, not on which duplicate is "first" or "last" in the array.
+DEEP:
+Real, compiled, run implementation and the exact duplicate-key case:
+```c
+int cmp_int(const void *a, const void *b) { return *(const int *)a - *(const int *)b; }
+int arr[] = { 1, 3, 5, 5, 5, 7, 9 };
+int key = 5;
+int *hit = bsearch(&key, arr, 7, sizeof(int), cmp_int);
+/* found 5 at index 3 */
+```
+(This reuses the real bsearch from stdlib.h, already shown matching this exact behavior in 14.04, to make the point concrete without duplicating a from-scratch implementation's code here; the algorithm a hand-written version needs is the standard midpoint-narrowing loop below.)
+```c
+void *my_bsearch(const void *key, const void *base, size_t nmemb, size_t size,
+                  int (*compar)(const void *, const void *)) {
+    size_t lo = 0, hi = nmemb;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        const char *elem = (const char *)base + mid * size;
+        int c = compar(key, elem);
+        if (c == 0) return (void *)elem;
+        if (c < 0) hi = mid; else lo = mid + 1;
+    }
+    return NULL;
+}
+```
+Index 3 out of the three 5s at indices 2, 3, 4 is simply where this loop's midpoint math (`lo + (hi - lo) / 2` starting from the full 7-element range) happens to land first; C11 7.22.5.1p4 states plainly that "if two elements compare as equal, which element is matched is unspecified," precisely so that different (but still correct) binary-search implementations, or the same implementation on a differently-sized array, are all free to return a different one of several equally-valid matches.
+
+The implementation above deliberately mirrors real bsearch's parameter list exactly (`key, base, nmemb, size, compar`) so it is a drop-in, contract-compatible replacement, useful for an interview whiteboard version of "implement bsearch from memory."
+FOLLOW:
+- Why use lo + (hi - lo) / 2 instead of (lo + hi) / 2 for the midpoint? => The subtract-then-add form avoids lo + hi overflowing size_t for a very large array, which is a real, if rare, correctness concern the simpler-looking form does not have.
+- Would this implementation ever fail to find an element that real bsearch would find? => No, as long as the array is actually sorted according to the same comparator (the shared precondition both real and this bsearch depend on, per 7.22.5.1p3); the algorithm itself is the textbook-correct binary search.
+PITFALL: Writing test code or downstream logic that assumes bsearch always returns "the first" matching element among duplicates; that assumption is not something the standard, or any conforming implementation, promises.
+VERIFY: C11 7.22.5.1 paragraphs 3-4

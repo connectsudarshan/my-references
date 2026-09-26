@@ -1,0 +1,357 @@
+# Module 7: Type Qualifiers: const, volatile, restrict
+
+@@ 7.01 | Basic | Concept | tags=const,promise,readonly
+Q: What does const actually promise, and what does it not promise?
+SHORT: const on an object's declared type means the compiler rejects your own attempts to modify it through an lvalue of that type; the standard makes it undefined behavior to modify a const-qualified object through a non-const lvalue at all (C11 6.7.3p6). It does not mean the underlying storage is immutable in general: a non-const alias, another thread without synchronization, or hardware can still change it, and a const pointer to non-const data lets you reassign what you point to's contents freely.
+DEEP:
+- const is a promise **you** make to the compiler about how you will access an object through that particular type, not a hardware write-protect bit (though the implementation may put it in read-only memory, C11 footnote 132).
+- `const int *p` is a pointer to data you promise not to modify through `p`; the pointee can still be modified by someone else, e.g. a non-const alias.
+- `int *const p` is a const pointer: `p` itself cannot be reseated, but `*p = x` is fine.
+- Casting away const and then writing is undefined behavior if the underlying object was actually declared const; it is legal (if unusual) if the object was not actually const-qualified, only accessed through a const-qualified lvalue.
+FOLLOW:
+- Can you legally modify a const object via a cast? => Only if the object itself was not declared const (e.g. a non-const parameter passed as const T*); if it was declared const, modifying it through any non-const lvalue is undefined behavior.
+- Does const help the optimizer the way restrict does? => A little: it tells the compiler you will not write through that pointer, but unlike restrict it says nothing about aliasing with other pointers, so its optimization value is smaller.
+PITFALL: Assuming `const int *p` means `p` cannot change. It is the pointee that is protected through `p`; `p` itself is an ordinary, reassignable pointer.
+VERIFY: C11 6.7.3p6 and footnote 132 on read-only storage placement.
+
+@@ 7.02 | Basic | Concept | tags=volatile,contract,observable
+Q: What is volatile's real contract?
+SHORT: Every read or write of a volatile-qualified object must actually happen, in program order relative to other volatile accesses, exactly as the abstract machine would do it (C11 6.7.3p7-8) -- the compiler cannot cache the value in a register across accesses, elide a "useless" read/write, or reorder it past another volatile access. It says nothing about atomicity, about ordering relative to non-volatile memory, or about visibility across threads or CPUs.
+DEEP:
+- The abstract-machine guarantee: "at every sequence point the value last stored in the object shall agree with that prescribed by the abstract machine" (6.7.3p7).
+- What counts as an "access" to a volatile object is implementation-defined (6.7.3p7 last sentence) -- e.g. whether a struct-of-bitfields access touches one byte or the whole word is up to the compiler/ABI.
+- volatile is a compiler-only contract: it constrains code generation, not the CPU or bus. It gives you no memory barrier, no cache-coherence guarantee, and no atomic read-modify-write.
+- Classic legitimate uses: memory-mapped I/O registers, and a flag written by a signal handler and polled by the rest of the program (see 7.11).
+FOLLOW:
+- Does volatile stop the CPU from reordering the access at the hardware/bus level? => No. On architectures with weak memory ordering you still may need a hardware barrier; volatile only controls what the compiler emits, not what the bus or cache does with it afterward.
+- Is `volatile int x; x++;` a safe increment across threads? => No, it is a non-atomic read-modify-write with no synchronization; use `<stdatomic.h>` for that (see the C Advanced page's memory-model module).
+PITFALL: Treating volatile as "thread-safe" or "atomic." It only forces real, ordered accesses in source order; it provides no atomicity and no synchronization.
+VERIFY: C11 6.7.3p7-8 and footnote 134 on memory-mapped I/O and asynchronous interrupts.
+
+@@ 7.03 | Basic | Concept | tags=restrict,aliasing,optimizer
+Q: What does restrict promise the optimizer?
+SHORT: A restrict-qualified pointer parameter asserts that, for the lifetime of the enclosing block, the object it points to is accessed only through that pointer (or values derived from it) if it is also modified -- never through some other, non-derived route (C11 6.7.3.1). It is a promise from the programmer to the compiler; the compiler is free to ignore it, but if the promise is false, the behavior is undefined.
+DEEP:
+- restrict applies only to pointer types whose referenced type is an object type (6.7.3p2); it is not itself a memory-safety check.
+- The formal rule (6.7.3.1p4): if an lvalue based on a restrict pointer P is used to access object X, and X is also modified by any means, then every other access to X must also be based on P, or the behavior is undefined.
+- Practical effect: the compiler can assume `dst` and `src` in `void f(int *restrict dst, const int *restrict src, int n)` never overlap, so it can reorder loads/stores, vectorize, and avoid re-reading `src` after writing `dst`.
+- "A translator is free to ignore any or all aliasing implications of uses of restrict" (6.7.3p8) -- it is an optimization hint you promise is true, never a runtime check.
+FOLLOW:
+- Does restrict change what the function computes if the caller obeys the contract? => No, deleting all restrict qualifiers from a conforming program never changes its observable behavior (6.7.3p8); it only removes an optimization opportunity.
+- Is restrict useful on a plain local variable (not a parameter)? => It is legal but rarely useful; its real value is at function boundaries where the compiler cannot otherwise know two parameters are disjoint.
+PITFALL: Adding restrict to make code "faster" without verifying every call site truly passes disjoint objects. See 7.13 for what happens when that promise is broken.
+VERIFY: C11 6.7.3.1 (Formal definition of restrict), paragraphs 1-8.
+
+@@ 7.04 | Intermediate | Concept | tags=const,pointer-syntax,reading
+Q: How do you read const T*, T* const and const T* const, and what does each let you do?
+SHORT: Read the declaration right to left from the name: `const int *p1` is "p1 is a pointer to a const int" (reseat p1, cannot write through it); `int *const p2` is "p2 is a const pointer to int" (cannot reseat p2, can write through it); `const int *const p3` is "p3 is a const pointer to a const int" (neither).
+DEEP:
+- The rule of thumb: const binds to whatever is immediately to its **left**, unless it is the first token, in which case it binds to what is immediately to its right. `const int` and `int const` are the same type.
+- `const int *p1 = &a;` then `*p1 = 5;` is a constraint violation (write through a const-qualified lvalue); `p1 = &b;` is fine.
+- `int *const p2 = &a;` then `p2 = &b;` is a constraint violation (cannot reseat a const pointer); `*p2 = 5;` is fine.
+- `const int *const p3 = &a;` locks down both: neither `*p3 = 5;` nor `p3 = &b;` is allowed.
+```c
+#include <stdio.h>
+
+int main(void) {
+    int a = 1, b = 2;
+    const int *p1 = &a;       /* pointer to const int */
+    int *const p2 = &a;       /* const pointer to int */
+    const int *const p3 = &a; /* const pointer to const int */
+
+    p1 = &b;   /* legal: only the pointee is protected */
+    *p2 = 5;   /* legal: only the pointer itself is protected */
+    printf("*p1=%d a=%d *p3=%d\n", *p1, a, *p3);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra` and run, this prints `*p1=2 a=5 *p3=5` -- `p1` now points at `b` (value 2), `a` was modified to 5 through `p2`, and `p3` still sees `a`'s current value 5.
+FOLLOW:
+- Where does this show up in a real API? => `void log_msg(const char *msg)` promises not to modify the string; `char *const argv0` (conceptually) would promise the pointer variable itself never gets reseated.
+- How do you add a fourth qualifier, e.g. a pointer to a volatile register that itself never changes? => `volatile int *const reg = (volatile int *)0x4000; ` -- const pointer to a volatile int.
+PITFALL: Reading `const int *p` as "p is constant." The const binds to `int`, not to `p`; `p` is an ordinary variable.
+VERIFY: C11 6.7.3p4-6 (qualified types apply to lvalues) -- no single clause states the "read right-to-left" mnemonic; it is a parsing convention, not standard wording.
+
+@@ 7.05 | Intermediate | Trap | tags=const,ub,modify,cast
+Q: Why is modifying a const object through a non-const lvalue undefined behavior, even if it "just works"?
+SHORT: C11 6.7.3p6 states plainly: "If an attempt is made to modify an object defined with a const-qualified type through use of an lvalue with non-const-qualified type, the behavior is undefined." A common way to hit this is casting away const on a pointer to an object that was actually declared const, then writing through it -- the write may appear to succeed, corrupt read-only memory, or crash, and the standard does not pick which.
+DEEP:
+- The undefined behavior is tied to whether the **object** was declared const, not whether the pointer type you are holding right now says const.
+- Legal: a function takes `const int *p` for a parameter whose real, non-const object the caller owns; casting away const and writing through it there is well-defined (the object itself is not const), if unusual style.
+- Undefined: `const int x = 1; int *p = (int *)&x; *p = 2;` -- `x` was declared const, so the write through `p` is undefined behavior, even though the cast itself compiles.
+- Real risk: the implementation may have placed `x` in a read-only page (6.7.3 footnote 132), so the "just works" case can also be a segfault, not just a silently wrong value.
+FOLLOW:
+- Does `-Wall -Wextra` catch the cast-away-const write? => No, casting away const with an explicit `(int *)` cast is not warned about by `-Wall -Wextra`; `-Wcast-qual` is the flag that flags the cast itself, not the later write.
+- What is the correct way to get a writable copy of const data? => Copy it into a non-const object (e.g. via memcpy or assignment), never write through a cast pointer to the original.
+PITFALL: Believing a successful test run proves the cast-and-write is safe. Undefined behavior can "work" on one compiler/optimization level and corrupt memory on another; the standard gives no guarantee either way.
+VERIFY: C11 6.7.3p6.
+
+@@ 7.06 | Intermediate | Cross-layer | tags=volatile,register,optimizer,polling
+Q: Why does a plain (non-volatile) polling loop on a hardware status flag get "optimized away," and how do you see that the compiler actually did it?
+SHORT: Without volatile, the compiler assumes nothing else can change the variable between iterations, so at -O2 it hoists the load out of the loop entirely -- if the value it saw was false to begin with, the loop becomes an infinite `jmp` to itself that never re-reads memory. Compiling to assembly (`gcc -O2 -S`) makes the difference visible directly.
+DEEP:
+```c
+volatile int flag_v = 0;
+int flag_p = 0;
+
+int wait_volatile(void) { while (!flag_v) { } return 1; }
+int wait_plain(void)    { while (!flag_p) { } return 1; }
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -O2 -S`, the two loops generate different code:
+- `wait_volatile`: the loop body contains `movl flag_v(%rip), %eax` on every iteration -- a fresh load each time, exactly as 6.7.3p7 requires ("at every sequence point the value last stored... shall agree with... the abstract machine").
+- `wait_plain`: the compiler loads `flag_p` **once**, before the loop, sees it is 0, and emits a bare `jmp .L8` to itself -- an infinite loop with no memory access at all, because nothing in the abstract machine (as the compiler sees it) can change a plain `int` out from under a single-threaded function.
+- This is the textbook reason a status-register poll, or a flag set only by a signal handler or another core, must be volatile: the compiler's "nothing else changes this" assumption is simply false for those objects.
+FOLLOW:
+- Would `-O0` show the same problem? => No, `-O0` typically reloads every variable every time regardless of volatile, which is exactly why "it worked in debug builds" is a common way this bug reaches production.
+- Does making the whole polling function `volatile`-something fix it, or does the qualifier have to be on the object? => The qualifier belongs on the object (or the pointer's pointee) being polled, not on the function; volatile is a type qualifier on data, not a function attribute.
+PITFALL: Testing only at `-O0` (or with a debugger attached, which inhibits some optimizations) and concluding the polling loop is fine.
+VERIFY: C11 6.7.3p7 and footnote 134; the assembly-level behavior itself is compiler/version specific, not part of the standard.
+
+@@ 7.07 | Intermediate | Concept | tags=volatile,atomics,memory-barrier
+Q: Why doesn't volatile imply atomicity or a memory barrier?
+SHORT: volatile's contract (6.7.3p7) is only about the compiler emitting real, ordered accesses in the abstract machine's program order; it says nothing about the access being indivisible (atomic) or about ordering relative to non-volatile memory, other CPUs, or caches. `<stdatomic.h>` and explicit fences exist precisely because volatile does not cover those needs.
+DEEP:
+- A `volatile long long x` on a 32-bit target can be split into two 32-bit loads/stores by the compiler; volatile guarantees those two accesses happen, not that they happen together as one indivisible operation.
+- Multiple threads/cores reading and writing a shared volatile variable can still race: volatile prevents the *compiler* from caching or reordering, but the *hardware* memory model (or lack of synchronization) can still let updates be lost or seen out of order.
+- Historically (pre-C11, and still commonly in embedded code) volatile was misused as a substitute for atomics/locks; C11 gives you the real tool: `_Atomic` types and `<stdatomic.h>` with explicit `memory_order`.
+- Cross-reference: the full C11 memory model, `stdatomic.h`, and memory_order variants are covered on the C Advanced page (module 7, "Memory Model, Atomics & Ordering") -- this page's module 7 is about the single-threaded, hardware-register contract only.
+FOLLOW:
+- So when is volatile alone actually correct? => Single-threaded code where the "other writer" is hardware or a signal handler on the same thread, and the access is naturally atomic on the target (e.g. a properly aligned `sig_atomic_t` or word-sized register read).
+- What is the minimum fix for a genuinely shared flag between threads? => Use `atomic_int` (or `atomic_flag`) from `<stdatomic.h>` instead of `volatile int`, sized and ordered per the C11 memory model.
+PITFALL: Using `volatile` on a variable shared between threads and calling it "good enough." It is not a synchronization primitive.
+VERIFY: C11 6.7.3p7 scope (compiler-visible ordering only); the atomics/memory-order clauses (7.17, and 5.1.2.4) are out of this module's scope by design.
+
+@@ 7.08 | Intermediate | Numeric | tags=const,array,qualified-element
+Q: When you write const A a[2][3] for a typedef'd array type, what actually becomes const -- the array or its elements?
+SHORT: C11 6.7.3p9 says if an array type's specification includes a qualifier, the **element type** is qualified, not the array type itself. So `const A a` where `A` is `int[2][3]` gives you an array of arrays of const int; `a[0]` has type "array of 3 const int," which decays to `const int *`, not `int *`.
+DEEP:
+```c
+#include <stdio.h>
+typedef int A[2][3];
+
+int main(void) {
+    const A a = { {4, 5, 6}, {7, 8, 9} };
+    const int *pci = a[0];   /* a[0] decays to const int*, not int* */
+    printf("a[1][2]=%d pci[1]=%d\n", a[1][2], pci[1]);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra` and run, this prints `a[1][2]=9 pci[1]=5` -- reading through both indexing and the decayed const pointer works, but `int *p = a[0];` would be a constraint violation because `a[0]`'s type is `const int[3]`, not `int[3]` (this is exactly C11's EXAMPLE 2 under 6.7.3).
+- The rule matters for multi-dimensional arrays and typedefs especially, because it is easy to assume `const` on the whole aggregate makes every level uniformly const in the way you expect from a struct.
+FOLLOW:
+- Does this change if A is written directly as `const int a[2][3]` instead of through a typedef? => No, the same rule applies either way; typedefs do not change how qualifiers distribute over array types.
+- What about a pointer to such an array, e.g. `const A *p`? => `p` points to a `const int[2][3]`; `(*p)[0]` again decays to `const int *`, consistent with the element-qualification rule.
+PITFALL: Assigning `a[0]` to a plain `int *` and being surprised by a compiler error/warning about qualifier mismatch.
+VERIFY: C11 6.7.3p9 and its EXAMPLE 2.
+
+@@ 7.09 | Intermediate | Concept | tags=restrict,memcpy,disjoint,function-params
+Q: How does restrict show up in a real function signature, and what must the caller guarantee?
+SHORT: A function like `void copy_n(int *restrict dst, const int *restrict src, int n)` tells the compiler dst and src point to disjoint objects for the duration of the call -- exactly the contract the real `memcpy` (unlike `memmove`) documents in its prototype. The caller, not the compiler, is responsible for actually passing disjoint pointers; nothing checks it at runtime.
+DEEP:
+```c
+#include <stdio.h>
+
+void copy_n(int * restrict dst, const int * restrict src, int n) {
+    for (int i = 0; i < n; i++)
+        dst[i] = src[i];
+}
+
+int main(void) {
+    int a[5] = {1, 2, 3, 4, 5};
+    int b[5];
+    copy_n(b, a, 5);
+    printf("disjoint copy: ");
+    for (int i = 0; i < 5; i++) printf("%d ", b[i]);
+    printf("\n");
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -O2` and run, this prints `disjoint copy: 1 2 3 4 5 ` -- correct, because `a` and `b` really are disjoint arrays, satisfying the restrict contract.
+- This is exactly the shape of the standard library's own `memcpy(void *restrict dst, const void *restrict src, size_t n)` -- restrict is why a good `memcpy` can outperform a naive byte loop and still be simple code: the compiler knows it never needs to worry about overlap.
+- `memmove` deliberately omits restrict on its parameters because it must support overlapping ranges; that generality costs it the aliasing optimization.
+FOLLOW:
+- Why does the standard's own `memcpy` prototype use restrict but `memmove`'s does not? => memcpy's contract explicitly forbids overlap (UB if it overlaps), so restrict documents and enables optimization for that promise; memmove must work correctly even when the ranges overlap, so it cannot make that promise.
+- Can you pass the same array as both dst and src and just expect a no-op? => Only if dst == src exactly (identical pointers, not merely overlapping) is that within bounds for some implementations, but relying on it is not portable; treat "same or overlapping" as unsafe for a restrict-qualified pair unless the function documents otherwise.
+PITFALL: Assuming restrict is "just documentation." It changes what the compiler is allowed to assume and therefore what code it generates; see 7.13 for what breaking the promise actually looks like.
+VERIFY: C11 6.7.3.1 EXAMPLE 2 (the `f(int n, int *restrict p, int *restrict q)` case this mirrors).
+
+@@ 7.10 | Advanced | Debug | tags=volatile,optimization,proof
+Q: Given two otherwise-identical polling functions, one volatile and one not, how do you prove to a skeptical reviewer that the compiler treats them differently?
+SHORT: Compile both to assembly at the optimization level your firmware actually ships with (`gcc -std=c11 -Wall -Wextra -O2 -S`) and diff the loop bodies: the volatile version reloads the variable from memory every iteration, the plain version loads it once and either never re-checks it or gets optimized into a tight infinite jump. That assembly difference is the proof, not a claim about "what compilers usually do."
+DEEP:
+- Reproduced from 7.06: `wait_volatile` compiles to a loop containing `movl flag_v(%rip), %eax` inside `.L2`; `wait_plain` compiles to `movl flag_p(%rip), %eax` **once**, followed by `.L8: jmp .L8` with no further memory access.
+- This is a good interview exercise because it forces you past "the standard says volatile prevents optimizing it away" into actually demonstrating the mechanism with a real toolchain and real output, which is the level a Principal reviewer expects.
+- The method generalizes: whenever someone claims "the compiler wouldn't do that," the answer is to compile the actual code at the actual flags and read the assembly, not to argue from intuition.
+FOLLOW:
+- What if the reviewer says "but -O0 works fine"? => Point out `-O0` is not what ships; firmware release builds use optimization, and the bug is specifically an optimization-dependent one -- reproduce at the shipped flags.
+- Is there a way to see this without reading assembly, e.g. from the source alone? => Not reliably; the standard leaves this to the implementation, so the only ground truth is what your actual compiler emits for your actual flags.
+PITFALL: "Proving" volatile is unnecessary by testing only at -O0, where most compilers reload everything anyway regardless of the qualifier.
+VERIFY: Compiler/version-specific assembly output is not something the standard defines; C11 6.7.3p7 only guarantees the *semantics* volatile must have, not the code shape at each optimization level.
+
+@@ 7.11 | Advanced | Cross-layer | tags=volatile,signal,sig_atomic_t,handler
+Q: Why must a flag shared between a signal handler and the rest of the program be volatile sig_atomic_t, not just volatile int?
+SHORT: sig_atomic_t is the type the standard guarantees can be read and written as a single, indivisible action even when a signal can interrupt at any point (C11 7.14.1.1 for signal handler restrictions); plain int has no such guarantee on every implementation. volatile alone stops the compiler from caching the flag across accesses, but sig_atomic_t is what makes a single read or write of it safe to interleave with handler execution.
+DEEP:
+```c
+#include <stdio.h>
+#include <signal.h>
+
+static volatile sig_atomic_t got_signal = 0;
+
+static void handler(int signum) {
+    (void)signum;
+    got_signal = 1;
+}
+
+int main(void) {
+    signal(SIGUSR1, handler);
+    raise(SIGUSR1);
+    if (got_signal)
+        printf("handler ran, flag observed as %d\n", got_signal);
+    else
+        printf("flag never observed set\n");
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra` and run, this prints `handler ran, flag observed as 1` -- the main thread's read of `got_signal` after `raise` correctly sees the handler's write.
+- A signal handler may only safely: assign to a volatile object of a type the implementation guarantees is lock-free/atomic for signals (sig_atomic_t qualifies), call a small set of async-signal-safe library functions, or `_Exit`. It must not call most of the standard library (including malloc/free or non-reentrant stdio) because a signal can land mid-call.
+- POSIX signal masking, `sigaction` versus `signal`, and full reentrancy rules for multi-threaded signal delivery are covered on the C Advanced page; this module's scope is the language-level volatile/sig_atomic_t contract only.
+FOLLOW:
+- Is it safe to do `got_signal++` inside a handler? => Not guaranteed; increment is a read-modify-write, and sig_atomic_t only guarantees atomicity of a single load or store, not of a combined operation.
+- What happens if you use `volatile int` instead of `volatile sig_atomic_t` here? => It will likely still work on a typical desktop/embedded target where int is naturally atomic for aligned loads/stores, but it is not something the standard promises; sig_atomic_t is the portable, defined choice.
+PITFALL: Doing anything more than a simple flag set/check inside a signal handler, such as calling printf or malloc, which are not async-signal-safe.
+VERIFY: C11 7.14 (signal.h), especially 7.14.1.1 on what a signal handler may portably do, and the definition of sig_atomic_t.
+
+@@ 7.12 | Advanced | Scenario | tags=const,struct,propagation,api-design
+Q: If you have const struct s cs, is cs.mem itself const, and does that change how you design a read-only API around structs?
+SHORT: Yes -- C11's own example (6.7.3 EXAMPLE 2) shows every member of a const struct is const too: `cs.mem` has type const int, so `int *p = &cs.mem;` is a constraint violation even though mem is a plain int in the struct definition. A read-only view API just takes a `const struct s *` parameter; every member access through it is then const automatically, no per-field annotation needed.
+DEEP:
+```c
+struct s { int mem; };
+const struct s cs = { 1 };
+struct s ncs;              /* ncs is NOT const: an ordinary object */
+
+ncs = cs;                  /* valid: reading a const object to initialize a non-const one */
+/* cs = ncs; */            /* invalid: cs is const, cannot be assigned to */
+int *pi = &ncs.mem;        /* valid: ncs is not const */
+/* int *pi2 = &cs.mem; */  /* invalid: cs.mem is const-qualified */
+const int *pci = &cs.mem;  /* valid */
+```
+This is C11's own EXAMPLE 2 under 6.7.3, reproduced and compiled clean with `gcc -std=c11 -Wall -Wextra` (the commented lines are the ones that would fail to compile; printing `ncs.mem` and `*pci` after the assignment above prints `1` for both, confirming the copy).
+- Practical API pattern: write functions taking `const struct s *cfg` for read-only access; the caller's struct does not need to be declared const at its own definition site, only the parameter type needs to be const-qualified.
+- This is exactly how firmware config/descriptor structs are usually passed: one mutable struct owned by the driver, read-only const-pointer views handed to subsystems that should not modify it.
+FOLLOW:
+- Does a const struct pointer stop a nested pointer member's pointee from being modified? => No -- a const struct only makes its own scalar/aggregate members const in place; if a member is itself a pointer, only the pointer variable becomes const, not what it points to (same "shallow const" issue as pointers generally).
+- Is `const struct s cs = {1};` different in storage from `struct s cs = {1};`? => Semantically yes (writes to it are UB); the implementation may also place it in read-only memory (6.7.3 footnote 132), which a debugger write or `mprotect`-based trick would then fault on.
+PITFALL: Assuming a pointer member inside a const struct also protects the pointee. const on an aggregate is shallow, exactly like const on a pointer variable is shallow for what it points to.
+VERIFY: C11 6.7.3 EXAMPLE 2 and p9's qualifier-propagation wording (stated for arrays; the aggregate/member case is shown by the example rather than a separate normative sentence -- flagged here for that reason).
+
+@@ 7.13 | Advanced | Trap | tags=restrict,ub,aliasing-violation,optimization-level
+Q: What actually happens when you violate the restrict contract by passing overlapping pointers, and why can the answer change with the optimization level?
+SHORT: The behavior is undefined, which in practice can mean visibly different (and both wrong-looking or right-looking) results at different optimization levels, because the compiler is free to use the no-aliasing assumption however it likes at each level. Testing the exact same source at -O0 through -O3 shows this concretely rather than just asserting it.
+DEEP:
+```c
+void copy_n(int * restrict dst, const int * restrict src, int n) {
+    for (int i = 0; i < n; i++)
+        dst[i] = src[i];
+}
+int main(void) {
+    int n = 20;
+    int a[21];
+    for (int i = 0; i < 21; i++) a[i] = i;
+    copy_n(a + 1, a, n);   /* dst/src overlap: violates the restrict contract */
+    /* print a[0..20] */
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra` at each level and run, the same violated-contract code gives different results:
+- `-O0` and `-O1`: `0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0` -- the naive forward loop overwrites `src` positions before they are read, corrupting every element to 0.
+- `-O2` and `-O3`: `0 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19` -- this happens to match the *correct* shift-right result (what `memmove(a+1, a, ...)` would produce), because the vectorized/unrolled code this compiler generates loads before it stores in a way that avoids the corruption, purely as a side effect of how it optimized, not because the code is actually correct.
+- The lesson: neither outcome is "the right one" or "the proof it's fine" -- both are just what undefined behavior happened to do on one compiler, one version, one day. Never ship code that depends on either result.
+FOLLOW:
+- Is this the same bug memmove exists to fix? => Yes -- memmove has no restrict on its parameters and is specified to handle overlap correctly regardless of direction; this copy_n has restrict and explicitly disclaims that support.
+- Would a sanitizer catch this? => Not reliably; there is no standard "restrict violation" runtime check (it is not a bounds error), so this class of bug is usually found by code review of call sites or by exactly this kind of cross-optimization-level testing, not by ASan/UBSan alone.
+PITFALL: Treating a -O2 test run that "looks correct" as proof that overlapping arguments to a restrict-qualified function are safe. It is undefined behavior regardless of what one build happens to produce.
+VERIFY: C11 6.7.3.1p4 (the UB clause) and 6.7.3p8 ("a translator is free to ignore any or all aliasing implications"); the specific assembly/optimization outcomes shown are compiler-version-specific, not standard-mandated.
+
+@@ 7.14 | Advanced | Concept | tags=volatile,access,implementation-defined
+Q: The standard says "what constitutes an access to a volatile-qualified object is implementation-defined" -- why does that phrase matter for a struct of hardware registers?
+SHORT: It means the compiler/ABI, not the standard, decides exactly what counts as one access -- for example whether reading one bit-field inside a volatile struct triggers a read of the whole containing word, or just that field's byte, is up to the implementation. For memory-mapped registers where a single word read can have side effects (like clearing a status bit), this is exactly the kind of detail you must verify against your actual compiler/target, not assume from the C source alone.
+DEEP:
+- 6.7.3p7's last sentence: "What constitutes an access to an object that has volatile-qualified type is implementation-defined." This is deliberately left open because access granularity is an ABI/hardware detail, not a language one.
+- Concretely: `volatile struct { unsigned a:4, b:4; } reg;` -- reading `reg.b` might compile to a read of the entire byte or word containing both bit-fields, not just the 4 bits you asked for. If reading that hardware register has a side effect (e.g. clears a "data ready" flag), reading `.b` could silently also clear whatever `.a` represented.
+- This is why register-access code for real hardware is usually written against whole-word volatile accesses with explicit shift/mask, rather than through bit-field structs -- it makes the access granularity visible and predictable in the source instead of hidden in the ABI's bit-field layout choice (bit-field ordering is itself implementation-defined, covered in module 6).
+- Practical rule for firmware: never rely on a volatile bit-field struct's access pattern matching your device's expected read/write-clear semantics without checking the generated code for your specific compiler and target.
+FOLLOW:
+- Does using `volatile uint32_t *reg` with manual shifting avoid this ambiguity? => Yes, that pattern makes the access explicit and single-word, which is the usual recommendation for registers with read side effects.
+- Is this the same implementation-defined behavior as struct padding? => No, it is separate: padding/bit-field layout (module 6) determines *where* bits live; this determines *how much memory traffic* one source-level access to a volatile object generates.
+PITFALL: Assuming a volatile bit-field access reads/writes exactly the bits named in the source, with no side effect on neighboring bits sharing the same storage unit.
+VERIFY: C11 6.7.3p7 final sentence, exact wording "implementation-defined."
+
+@@ 7.15 | Advanced | Concept | tags=volatile,const,combined,qualifiers
+Q: What does a declaration like extern const volatile int real_time_clock mean, and where would you actually use it?
+SHORT: It is a hardware register your code promises never to write (const, so any write attempt through this lvalue is a constraint violation), but which the compiler must still treat as changeable by something outside the abstract machine (volatile, so every read is real and unreordered) -- exactly the standard's own example (C11 6.7.3 EXAMPLE 1) of a read-only hardware clock/counter register.
+DEEP:
+- const and volatile are independent qualifiers and can combine freely; order in the specifier list does not matter (6.7.3p10).
+- `const volatile` is the correct qualification for a read-only status register or free-running hardware counter: the program must never write it (const catches accidental writes at compile time) but must re-read it every time (volatile stops caching).
+- Contrast with plain `volatile` (a read/write register) and plain `const` (a compile-time constant the compiler can freely fold, cache, or place in ROM).
+- Repeated qualifiers (`const const int x;`) behave as if written once (6.7.3p5); this is rarely written directly but can arise through typedef composition.
+FOLLOW:
+- Can you cast away const on a const volatile register and write to it anyway? => Doing so and writing is undefined behavior if the object is genuinely declared const, exactly as in 7.05 -- the hardware may also simply ignore or fault on the write, since many read-only registers are physically not writable.
+- Why not just use plain const for a hardware counter that never seems to change during a debug session? => Because "never changes" is only true from the abstract machine's viewpoint if nothing outside the program can change it; a free-running counter or a register another core writes needs volatile regardless of how it appears in a single debug session.
+PITFALL: Dropping volatile from a read-only hardware register because "we never write it, so const is enough." const controls writability, not cacheability; you need both qualifiers for a register that is truly read-only yet changes externally.
+VERIFY: C11 6.7.3 EXAMPLE 1 and p10 (qualifier order/repetition).
+
+@@ 7.16 | Principal | Scenario | tags=volatile,mmio,driver,design
+Q: Design a register-access layer for a device with a status register, a data register, and a control register. What role does volatile play, and what do you still have to get right yourself?
+SHORT: Model the registers as a struct of volatile-qualified fields overlaid on the device's MMIO base address, so every field access compiles to a real load or store in source order; volatile guarantees the compiler will not optimize, cache, or reorder these accesses, but it guarantees nothing about read-modify-write atomicity, access width/granularity, or the order the *hardware* processes them once issued.
+DEEP:
+```c
+typedef struct {
+    volatile uint32_t status;
+    volatile uint32_t data;
+    volatile uint32_t ctrl;
+} dev_regs_t;
+
+dev_regs_t *regs = (dev_regs_t *)DEVICE_BASE_ADDR;
+regs->ctrl = 0x1;              /* e.g. "start" bit */
+uint32_t seen = regs->status;  /* real read, not cached */
+regs->data = 0x1234;
+```
+(Compiled and run against a simulated MMIO buffer with `gcc -std=c11 -Wall -Wextra`, this pattern round-trips exactly the values written -- confirming the volatile accesses happen in source order.)
+- What volatile does here: forces the three accesses above to actually happen, in that order, exactly once each -- no coalescing two writes to ctrl into one, no hoisting the status read out of a loop, no dead-store elimination if the value looks "unused" to the compiler.
+- What you still own: (1) whether a single struct-field access is one bus transaction of the right width (7.14) -- verify against your linker/ABI, avoid bit-fields on registers with side effects; (2) ordering guarantees between *different* registers as seen by the device itself, which volatile does not provide -- some SoCs need an explicit read-back or a memory barrier instruction to guarantee a write has actually reached the device before the next access; (3) whether the pointer cast from an integer address is valid for your target's alignment and whether the struct's compiler-chosen padding matches the real register offsets (use `_Static_assert(offsetof(...) == ...)` to catch this at compile time, module 9's static-assert technique).
+- The review pitfall an interviewer is listening for: candidates who say "I made it volatile" and stop, versus candidates who also check padding/offsets, access width, and whether a barrier is needed for register ordering.
+FOLLOW:
+- Would you ever add restrict to this struct's pointer? => No -- restrict is about disjointness between multiple pointers to ordinary memory; it says nothing useful about MMIO and does not interact with volatile's guarantees.
+- What if the status register clears itself on read (read-to-clear)? => Then the *number* of reads matters functionally, not just their presence -- an accidental double-read (e.g. from a debugger watch or a retried access) can silently lose an event; document this in the register's header comment, since nothing in the type system flags it.
+PITFALL: Declaring the struct volatile-correct and never checking that the compiler's struct layout (offsets, padding) actually matches the device's real register map.
+VERIFY: C11 6.7.3p7 (volatile access semantics); struct layout/padding is implementation-defined per module 6, so offsetof-based static assertions, not assumption, are the way to confirm it.
+
+@@ 7.17 | Principal | Debug | tags=volatile,root-cause,function-pointer,lost-qualifier
+Q: A firmware polling routine that reads a hardware status register through a function pointer sometimes hangs in release builds but never in debug builds. Walk through how you would root-cause it.
+SHORT: The classic cause is that volatile got dropped somewhere along the access path -- often through a callback typed as a plain `int (*)(int *)` instead of `int (*)(volatile int *)` -- so the compiler trusts the non-volatile signature and caches the read once optimization is on. The fix: make the qualifier follow the pointer through every typedef, parameter, and function-pointer type that touches the register.
+DEEP:
+1. **Reproduce at the shipped optimization level.** "Never in debug, sometimes in release" is the signature of an optimization-dependent bug; confirm with `-O0` versus the real release flags before touching anything else (this is the method from 7.10, applied to a real bug instead of a demo).
+2. **Grep the access chain for a qualifier drop.** Follow the pointer from its volatile-qualified declaration through every function signature, typedef, and cast between the hardware register and the polling loop. A single hop that types the parameter as `int *` instead of `volatile int *` is enough to let the compiler assume the value cannot change across that call.
+3. **Confirm with assembly, not assumption.** Compile the polling function to assembly at the release flags (7.06's technique) and check whether the load is inside or outside the loop body.
+4. **Fix at the type, not the call site.** Patching one call site with a local volatile cast is fragile; fix the declared type of the pointer/typedef/function-pointer parameter so every future caller gets the correct qualifier automatically, and the compiler enforces it.
+- This is a real, common firmware bug class: a hardware abstraction layer that defines callback types like `typedef int (*reg_read_fn)(int *addr);` for "genericity," silently stripping volatile from every register accessed through that abstraction.
+FOLLOW:
+- Why does it "never" happen in debug builds specifically? => Debug builds (`-O0`) typically reload variables from memory far more conservatively regardless of qualifiers, masking exactly the class of bug that only manifests once the optimizer trusts the (wrong) non-volatile type.
+- Could -Wcast-qual have caught this earlier? => Only if the qualifier loss happened via an explicit cast; a qualifier mismatch introduced through an ordinary (non-cast) function pointer type does not go through a cast at all, so -Wcast-qual would not fire -- the mismatch has to be caught by type review or a stricter warning about incompatible pointer types.
+PITFALL: Fixing the symptom by adding a volatile cast at the one call site where the hang was observed, instead of fixing the declared type everywhere the register is threaded through.
+VERIFY: C11 6.7.3p7 is what makes the loss of the qualifier meaningful (it is precisely what licenses the compiler to cache the read); there is no separate clause about "function pointer qualifier propagation" -- the qualifier is simply part of the pointer's type at each point in the chain.
+
+@@ 7.18 | Principal | Concept | tags=restrict,tradeoff,firmware,hot-loop
+Q: You are reviewing a firmware hot loop (e.g. a checksum or bulk-copy routine) that a teammate wants to mark restrict for a speedup. What do you check before approving it?
+SHORT: Confirm every real call site actually passes disjoint objects (not just "probably disjoint" or "disjoint in the cases we tested"), because the compiler will trust the annotation unconditionally and the failure mode is silent, optimization-level-dependent corruption (7.13), not a crash or a warning. If any call site's disjointness depends on runtime data (e.g. caller-supplied offsets into the same buffer), restrict is unsafe there regardless of how much it would help.
+DEEP:
+- The review checklist: (1) enumerate every caller of the function, including ones added later by other teams; (2) for each, prove the two pointer arguments cannot alias -- structurally (different arrays/allocations) is provable, "different offsets into the same buffer chosen at runtime" is not; (3) check whether the function is ever used generically (e.g. via a function-pointer table, module 12) where a future caller could pass overlapping ranges without the compiler or a human noticing.
+- If disjointness cannot be proven for all callers, the safer options are: keep the function without restrict (accept the smaller optimization), or provide two entry points -- a restrict-qualified fast path for callers who can prove disjointness, and a memmove-style safe path for everyone else, exactly the memcpy/memmove split the standard library itself makes (7.09).
+- The performance argument for restrict is real (it is why hand-written memcpy implementations use it), but it is only a valid trade at all once correctness is nailed down; a faster function that is occasionally wrong is a worse firmware bug than a slightly slower one that is always right, especially for something like a checksum where silent corruption defeats the checksum's whole purpose.
+- Tie-in to review method: ask for the same cross-optimization-level test from 7.13 as part of the review evidence, not just a single -O2 benchmark run.
+FOLLOW:
+- Does adding restrict ever make code slower? => Not directly, but if it lets the compiler generate a vectorized path with a fallback check that then always takes the fallback (e.g. due to alignment), the net effect on a specific input size can be a wash; measure, do not assume restrict is a free win.
+- Is there a way to get some of the benefit without the risk? => Yes -- restrict only on the specific narrower function used for the proven-disjoint case, and a differently named function without restrict for the general case, rather than restrict-qualifying one function used everywhere.
+PITFALL: Approving restrict because "it's just a hint, the compiler probably won't break anything." The compiler is explicitly permitted to break anything if the hint is false (6.7.3.1p4); it is a correctness contract, not a suggestion.
+VERIFY: C11 6.7.3.1p4 (the undefined-behavior consequence of a broken restrict promise) and 6.7.3p8 (restrict's removal must not change conforming-program behavior, which is exactly why review must hold for *every* caller, not just the ones currently in the codebase).

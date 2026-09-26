@@ -1,0 +1,369 @@
+# Module 6: Semaphores, Read-Write Locks & Barriers
+
+@@ 6.01 | Basic | Concept | tags=semaphore,mutex,ownership,counting
+Q: What is the fundamental difference between a semaphore and a mutex?
+SHORT: A mutex has an owner -- the thread that locked it is the only one allowed to unlock it, and it is strictly binary (locked/unlocked). A semaphore has no ownership at all: its value is a count, sem_wait() decrements it (blocking if it would go negative) and sem_post() increments it, and any thread -- not just the one that called sem_wait() -- may legally call sem_post(), fitting it for counting resources or cross-thread signaling a mutex's ownership model does not.
+DEEP:
+- pthread_mutex_lock()/unlock() are specified in terms of "the calling thread as its owner"; sem_wait()/sem_post() are specified purely in terms of the semaphore's numeric value, with no owner concept anywhere in the DESCRIPTION.
+- A semaphore initialized to N acts as a resource pool of N interchangeable slots: sem_wait() takes a slot (blocking if none are free), sem_post() returns one, and it does not matter which thread returns which slot -- this is precisely the shape a mutex cannot express, since a mutex requires the same thread that locked it to unlock it (or, for NORMAL/DEFAULT, invites undefined behavior if a different thread tries).
+- A binary semaphore (initialized to 1) can superficially look like a mutex, but still lacks ownership tracking: nothing stops thread B from calling sem_post() on a semaphore thread A "locked" with sem_wait(), whereas an ERRORCHECK mutex would reject exactly that as EPERM (module 4).
+- sem_post() is explicitly documented as safe to call from a signal handler ("shall be reentrant with respect to signals and may be invoked from a signal-catching function"), a use case pthread_cond_signal() explicitly disclaims (5.06) -- this is a direct consequence of not needing to track ownership or interact with a mutex to be correct.
+FOLLOW:
+- Can a semaphore be used for mutual exclusion at all? => Yes, a binary semaphore can, but a mutex is still the better tool when the accessing/releasing thread is always the same one, precisely because a mutex's ownership tracking can catch bugs (via ERRORCHECK) that a semaphore's no-ownership model cannot.
+- Why would you ever want "any thread can post" instead of strict ownership? => Whenever the releasing event is not naturally tied to the same thread that consumed a resource -- e.g. an I/O completion handler running on a different thread than the one that submitted the request and is waiting for a free slot.
+PITFALL: Using a semaphore as a drop-in mutex replacement and then relying on ownership semantics it does not have (e.g. assuming only the "locking" thread can free it). Nothing enforces that; any thread can sem_post() at any time.
+VERIFY: POSIX.1-2017, sem_wait()/sem_post() DESCRIPTION (no ownership language) versus pthread_mutex_lock() DESCRIPTION ("owner").
+
+@@ 6.02 | Basic | Concept | tags=sem-init,unnamed,pshared
+Q: What does sem_init()'s pshared argument control, and what is an "unnamed" semaphore?
+SHORT: sem_init(sem, pshared, value) initializes an unnamed semaphore's value directly in memory you already allocated; pshared=0 means it is usable only by threads of the process that initialized it, and a non-zero pshared means any process with access to that memory (typically a shared-memory mapping) may use it. "Unnamed" just distinguishes it from sem_open()'s named semaphores, which are looked up by a filesystem-like name rather than living directly in an object you allocated.
+DEEP:
+- "If the pshared argument is zero, then the semaphore is shared between threads of the process... If [it] has a non-zero value, then the semaphore is shared between processes" -- the same sem_t type and the same sem_wait()/sem_post()/sem_destroy() calls work either way; only sem_init()'s argument and where the sem_t lives change.
+- An unnamed, process-private semaphore (pshared=0) is the common case for a resource pool shared only among threads of one process, and is what 6.04's demo uses.
+- "Attempting to initialize an already initialized semaphore results in undefined behavior" -- the same re-init trap that applies to mutexes and condition variables (modules 4 and 5) applies identically here.
+- Named semaphores (sem_open(), briefly in 6.16) exist for the cross-process case where the processes involved do not already share a memory mapping to put an unnamed semaphore's sem_t into; an unnamed semaphore in a mmap()'d shared region is the leaner alternative when they do.
+FOLLOW:
+- What error does sem_init() return if value is unreasonably large? => EINVAL, if "the value argument exceeds {SEM_VALUE_MAX}" -- an implementation-defined ceiling on a semaphore's maximum count.
+- Is sem_init() guaranteed to be available on every POSIX system? => No; it is "part of the Semaphores option and need not be available on all implementations," the same optional-feature caveat that applies to barriers (6.09) and spinlocks (module 4).
+PITFALL: Calling sem_init() a second time on a semaphore that is already initialized, whether by accident (e.g. in a retry path) or intentionally to "reset" its count. Reinitializing an initialized semaphore is undefined behavior; destroy it first if a fresh one is truly needed.
+VERIFY: POSIX.1-2017, sem_init() DESCRIPTION and ERRORS (EINVAL, SEM_VALUE_MAX).
+
+@@ 6.03 | Basic | Concept | tags=rwlock,readers,writer,basics
+Q: What does a read-write lock let you do that a plain mutex cannot?
+SHORT: A pthread_rwlock_t distinguishes two kinds of access: any number of readers may hold the lock concurrently via pthread_rwlock_rdlock(), but a writer holding it via pthread_rwlock_wrlock() has it exclusively, with no readers and no other writer active at the same time. For a read-heavy workload where reads vastly outnumber writes, this lets concurrent readers proceed in parallel instead of serializing behind a mutex that cannot tell "just reading" apart from "about to mutate."
+DEEP:
+- "The calling thread acquires the read lock if a writer does not hold the lock and there are no writers blocked on the lock" (implementation-defined tie-breaking otherwise) -- multiple readers can be in this state simultaneously.
+- "The calling thread acquires the write lock if no other thread (reader or writer) holds the read-write lock" -- a writer is exclusive against everyone, readers and other writers alike.
+- Both rdlock and wrlock have a non-blocking trylock() variant (pthread_rwlock_tryrdlock()/trywrlock()) that fails with EBUSY instead of blocking, mirroring the mutex trylock pattern from module 4.
+- The trade this buys: read-heavy code gets real parallelism on reads; the cost is a more complex lock (tracking a reader count, not just locked/unlocked) and, as 6.10 shows concretely, a genuine risk of writer starvation if readers keep arriving.
+FOLLOW:
+- Can a thread hold both a read lock and a write lock on the same rwlock at once? => No, and trying to acquire a write lock while already holding a read lock on the same rwlock from the same thread is a documented deadlock risk (6.15), not a supported "upgrade" operation.
+- Is a read-write lock always faster than a mutex for a read-heavy workload? => Not automatically -- for very short critical sections, the extra bookkeeping an rwlock needs to track multiple readers can cost more than it saves; it wins when reads are numerous enough, and long enough, for real concurrent overlap to matter (6.08).
+PITFALL: Reaching for pthread_rwlock_t by default for any "mostly reads" workload without checking whether the critical section is long enough and contended enough for concurrent readers to actually matter.
+VERIFY: POSIX.1-2017, pthread_rwlock_rdlock()/pthread_rwlock_wrlock() DESCRIPTION.
+
+@@ 6.04 | Intermediate | Debug | tags=semaphore,resource-pool,compiled
+Q: Use a counting semaphore to cap concurrency at N, and confirm with a compiled program that the cap actually holds under real contention.
+SHORT: A semaphore initialized to 2 guards a "resource pool" that 6 threads all want at once; every thread does sem_wait(), records that it is "in use," holds the resource for 50ms, then sem_post()s. Across the whole run, the maximum number of threads simultaneously inside the guarded section never exceeded 2, confirmed by tracking (and printing) the high-water mark under a separate mutex.
+DEEP:
+```c
+#define POOLSIZE 2
+#define NTHREADS 6
+static sem_t pool;
+static pthread_mutex_t mtx = PTHREAD_MUTEX_INITIALIZER;
+static int in_use = 0, max_seen = 0;
+
+static void *worker(void *arg) {
+    sem_wait(&pool);
+    pthread_mutex_lock(&mtx);
+    in_use++;
+    if (in_use > max_seen) max_seen = in_use;
+    pthread_mutex_unlock(&mtx);
+    /* hold the "resource" for 50ms via nanosleep */
+    pthread_mutex_lock(&mtx); in_use--; pthread_mutex_unlock(&mtx);
+    sem_post(&pool);
+    return NULL;
+}
+/* main: sem_init(&pool, 0, POOLSIZE); create NTHREADS workers; join all;
+   print max_seen. */
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run, the output showed threads acquiring slots in varying order (e.g. thread 0, then 1 and 3 concurrently, then 4, then 2...), and the final line printed `max concurrent in_use = 2 (pool size = 2) : OK, never exceeded` -- the semaphore held all 6 threads to at most 2 concurrent holders the entire run, even though every thread requested a slot at nearly the same moment.
+- Note that in_use/max_seen still need their own mutex: the semaphore only limits how many threads can be past sem_wait() at once, it does nothing to make the increment/compare/decrement of a shared counter atomic (that is exactly 4.05's lesson, reused here).
+FOLLOW:
+- What would happen if POOLSIZE were larger than NTHREADS? => Every thread would acquire a slot immediately with no blocking at all; the demo specifically chooses POOLSIZE < NTHREADS so the blocking path in sem_wait() is actually exercised, not just the immediate-success path.
+- Does sem_post() need to be called by the same thread that called sem_wait()? => No -- and this program's structure (each worker posts its own slot back) is a choice, not a requirement; a design where a different thread posts on behalf of a worker that finished would be equally valid, which is exactly the no-ownership property from 6.01.
+PITFALL: Assuming the semaphore alone protects any shared counters you use to observe the pool's behavior. The semaphore bounds concurrency; it does not make unrelated shared state (like a hand-rolled in_use counter) safe to touch without its own mutex.
+VERIFY: POSIX.1-2017, sem_wait()/sem_post() DESCRIPTION (blocking-decrement/incrementing-unlock semantics).
+
+@@ 6.05 | Intermediate | Numeric | tags=semaphore,overhead,hedge
+Q: How does a semaphore's lock/unlock overhead compare to a mutex's?
+SHORT: Uncontended, a sem_wait()/sem_post() pair costs about the same order of magnitude as an uncontended mutex lock/unlock -- both reduce to an atomic op on a small in-memory counter with no kernel involvement (module 4 measured 70-85 ns/op for a mutex on this sandbox). Contended, both pay a context-switch-scale cost to block and wake a thread; a semaphore adds no extra overhead here, since both are thin wrappers around the same futex-style kernel primitive on Linux.
+DEEP:
+- This is a reasoned hedge, not a fetched number: this session's actual timing runs (4.12) measured mutex-vs-spinlock, not semaphore-vs-mutex directly, so the semaphore figure here is inferred from the shared underlying mechanism (an atomic counter, falling back to a futex wait/wake on contention), not independently benchmarked.
+- Where a semaphore can cost measurably more in practice is not the primitive itself but what it is used to build: a counting semaphore guarding a pool of N > 1 resources has to track which of several waiters to wake on each post, versus a binary mutex's single waiter list, which can add a small, implementation-dependent bookkeeping cost as N grows.
+- The right comparison to actually trust is one measured on your own target with your own contention pattern (4.12's before/after timing methodology, applied to a semaphore-guarded pool instead of a mutex-guarded counter), not a general online number.
+FOLLOW:
+- Does named vs unnamed semaphore change this? => Named semaphores (sem_open(), 6.16) add filesystem-namespace lookup overhead once, at open time; the actual sem_wait()/sem_post() cost afterward is the same underlying mechanism as an unnamed semaphore's.
+- Is it worth benchmarking this before choosing between a semaphore and a mutex for a resource-pool problem? => Usually not for the primitive's own cost (both are cheap uncontended); the choice should be driven by which one's semantics (ownership vs counting) actually fit the problem, per 6.01, with performance measured only if the chosen design's contention profile later looks suspicious.
+PITFALL: Choosing a semaphore over a mutex (or vice versa) based on an assumed performance difference between the two primitives themselves, rather than on which one's ownership/counting model actually matches the problem.
+VERIFY: No POSIX clause states a performance figure for either primitive; this is a reasoned hedge from shared implementation mechanism, not a benchmarked or published number -- treat it as approximate and verify on your own target if it matters.
+
+@@ 6.06 | Intermediate | Trap | tags=semaphore,no-ownership,misuse
+Q: What goes wrong if you use a semaphore to "signal a specific thread," expecting only that thread to consume the post?
+SHORT: A semaphore has no notion of a target -- sem_post() simply increments the count (or wakes whichever thread sem_wait() is implementation-chosen to unblock next if one is already waiting), and any thread currently calling or about to call sem_wait() on that same semaphore is equally eligible to consume it, not specifically the one you intended. If multiple threads share one semaphore for different purposes, a post meant for thread A can be consumed by thread B instead, silently.
+DEEP:
+- This mirrors 5.14's condition-variable "wrong waiter" trap almost exactly, but the fix is different: condition variables can carry a distinct predicate per waiter (checked in a while loop) even when sharing one cond var, giving each waiter a way to reject a wakeup that was not meant for it; a semaphore's count has no equivalent per-waiter predicate to check -- sem_wait() simply succeeds once the count allows it, with no way to inspect "was this post meant for me."
+- The fix is structural, not a code-level check: give each distinct signaling relationship its own semaphore. If thread A needs to signal specifically thread B, and thread A needs to separately signal thread C, that is two semaphores, not one shared between three parties.
+- This is exactly why 6.04's resource-pool demo is semaphore-appropriate (any of the 6 threads is equally entitled to any of the 2 slots -- there is no "specific thread" requirement) while a "wake up this one specific thread when its specific request completes" design is not, and should use a per-request condition variable or a per-request semaphore instead.
+FOLLOW:
+- Could you work around this by having each thread check "was this really for me" after waking? => Only if there is some other shared state to check, which then needs its own synchronization -- at that point you have reinvented a condition variable's predicate, just clumsily, and should use one directly instead.
+- Does this problem apply to a semaphore initialized to 1 used as a simple "event happened" flag between exactly two threads? => No, with exactly two parties and one clear meaning for the count, there is no ambiguity about who a post is "for" -- the problem only appears once a semaphore is shared among more than the two parties it was designed for.
+PITFALL: Sharing a single semaphore across more than the two specific parties a "signal this one thread" design assumes. Add parties, and the "no ownership" property that made the semaphore convenient (6.01) becomes exactly the reason a signal reaches the wrong consumer.
+VERIFY: No single POSIX clause; follows directly from sem_wait()/sem_post()'s DESCRIPTION carrying no per-waiter identity or predicate concept, unlike a condition variable's application-defined predicate.
+
+@@ 6.07 | Intermediate | Debug | tags=rwlock,readers,concurrent,compiled
+Q: Confirm with a compiled program that pthread_rwlock_rdlock() actually allows multiple readers to overlap, not just multiple readers to eventually get through one at a time.
+SHORT: Four reader threads each acquire a read lock, record that they are "active," hold it for 100ms (long enough for others to overlap if the lock design allows it), then release. Tracking the maximum number of simultaneously active readers under a separate mutex showed all 4 readers overlapping at once, every one of three runs -- proof this is real concurrent sharing, not lock contention that happens to interleave quickly.
+DEEP:
+```c
+static pthread_rwlock_t rw = PTHREAD_RWLOCK_INITIALIZER;
+static int active_readers = 0, max_concurrent_readers = 0;
+
+static void *reader(void *arg) {
+    pthread_rwlock_rdlock(&rw);
+    pthread_mutex_lock(&mtx);
+    active_readers++;
+    if (active_readers > max_concurrent_readers) max_concurrent_readers = active_readers;
+    pthread_mutex_unlock(&mtx);
+    /* hold the read lock 100ms via nanosleep, long enough to force overlap */
+    pthread_mutex_lock(&mtx); active_readers--; pthread_mutex_unlock(&mtx);
+    pthread_rwlock_unlock(&rw);
+    return NULL;
+}
+/* main: create 4 reader threads, join all, print max_concurrent_readers. */
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run three times, every run printed `max concurrent readers observed = 4 (of 4 threads): readers overlapped, as expected` -- all four readers were inside the lock at the same instant, which a mutex (which allows exactly one holder) could never produce for this same program.
+- The 100ms hold time is deliberately long relative to thread-startup jitter: it is what forces genuine overlap to be observable rather than leaving the result to chance scheduling.
+FOLLOW:
+- Would this same test distinguish "true concurrent readers" from "an implementation that just lets readers through very quickly one at a time"? => Yes -- the 100ms hold per reader means true one-at-a-time execution would take roughly 400ms of serialized reader time and the max_concurrent count would never exceed 1; observing 4 concurrently is only possible with genuine overlap.
+- Does a writer ever get to run during this test? => No writer was created in this program at all; 6.10 specifically adds a writer to the mix to study what happens to it while readers keep streaming through.
+PITFALL: Testing rwlock reader concurrency with a critical section too short to force real overlap, then concluding (incorrectly) that readers are serialized when the test simply never gave them a chance to overlap.
+VERIFY: POSIX.1-2017, pthread_rwlock_rdlock() DESCRIPTION ("the calling thread acquires the read lock if a writer does not hold the lock").
+
+@@ 6.08 | Intermediate | Scenario | tags=rwlock,read-heavy,tradeoff
+Q: You have a configuration structure read by 50 worker threads on every request and updated by an operator maybe once a minute. Does a read-write lock actually help here?
+SHORT: Yes, this is close to the ideal case for pthread_rwlock_t: reads vastly outnumber writes, many readers truly overlap (50 workers reading concurrently), and each read is short but frequent enough that serializing all 50 behind a mutex creates real, avoidable contention. Converting the config's mutex to an rwlock (readers use rdlock, the rare update uses wrlock) lets the 50 workers proceed in parallel almost always, with the rare write as the only full serialization point.
+DEEP:
+- The read/write ratio here (many reads per second, one write per minute) is exactly the profile 6.03 flags as the case an rwlock is built for; a workload with reads and writes in comparable proportion would not show the same benefit, since writers would be exclusive often enough to dominate the timeline regardless of the lock type.
+- A practical detail worth checking before converting: how expensive is a single read? If reading the config is just a few field accesses (not, say, a large struct copy or a chain of pointer dereferences doing real work), the rwlock's own bookkeeping overhead (tracking a reader count, not just locked/unlocked) could be a larger fraction of the total cost than the contention it removes -- worth a quick before/after measurement (4.12's methodology) rather than assuming the win.
+- The one thing an rwlock does not fix by itself here is writer starvation if updates ever need to happen more frequently than "once a minute" -- 6.10's demo and 6.18's diagnosis are the relevant follow-up if the update frequency ever changes.
+FOLLOW:
+- Would this workload benefit from splitting the config into smaller independently-locked pieces instead of one rwlock? => Only if different workers actually need different subsets of the config independently and contention on the single rwlock is measured to be a real bottleneck; for a once-a-minute writer, that is unlikely to be worth the added complexity (4.15's sharding trade-off, applied here and probably answered "no, not yet").
+- What if the "read" also needs to log or do I/O? => Move that outside the read lock entirely (4.06's critical-section-sizing rule, unchanged by which lock type is used) -- an rwlock does not change the rule that blocking work does not belong inside any lock's critical section.
+PITFALL: Converting a mutex to an rwlock as a reflexive "read-heavy, so use rwlock" response, without checking that individual reads are long/frequent enough for real concurrent overlap to matter more than the rwlock's own bookkeeping cost.
+VERIFY: No single POSIX clause; a design judgment applying pthread_rwlock_rdlock()/wrlock()'s DESCRIPTION (concurrent readers, exclusive writer) to a read/write-ratio-driven decision.
+
+@@ 6.09 | Intermediate | Concept | tags=barrier,phased,serial-thread
+Q: What does pthread_barrier_wait() guarantee, and what is PTHREAD_BARRIER_SERIAL_THREAD for?
+SHORT: pthread_barrier_wait() blocks the calling thread until exactly `count` threads (from pthread_barrier_init()) have all called it, then releases them all at once and automatically resets for the next phase. Exactly one released thread (unspecified which) gets PTHREAD_BARRIER_SERIAL_THREAD instead of 0, commonly used to let one thread do a single "once per phase" job (a progress line, an aggregate) without a separate check.
+DEEP:
+- "The count argument specifies the number of threads that must call pthread_barrier_wait() before any of them successfully return from the call" -- nobody proceeds past the barrier until every participant has arrived.
+- "At this point, the barrier shall be reset to the state it had as a result of the most recent pthread_barrier_init()" -- unlike a condition-variable-based gate you would have to reset by hand (5.15), a barrier is automatically reusable for a next phase with no extra bookkeeping.
+- "PTHREAD_BARRIER_SERIAL_THREAD... value shall be distinct from any other value returned" -- it is a sentinel, not a thread ID or count; exactly one arbitrary thread gets it per barrier-wait "round," and every other participant gets 0.
+- Results are undefined if pthread_barrier_init() is called while any thread is still blocked on the barrier, or if pthread_barrier_destroy() is called under the same condition -- the same "quiesce, then reinit/destroy" discipline as mutexes and condition variables (modules 4 and 5) applies here too.
+FOLLOW:
+- What happens if fewer than count threads ever call pthread_barrier_wait()? => The barrier waits forever for the missing arrivals; there is no timeout variant of pthread_barrier_wait() in POSIX, so a thread that never arrives (e.g. it crashed or deadlocked elsewhere) hangs every other participant permanently.
+- Is pthread_barrier_wait() guaranteed available on every POSIX system? => No; it is part of the Barriers option (an ADVANCED REALTIME THREADS feature) and "need not be provided on all implementations," the same optional-feature caveat as spinlocks and unnamed semaphores.
+PITFALL: Assuming every thread eventually reaches every barrier_wait() call, without checking for an early-return/error path in worker code that could skip it and hang every other participant forever.
+VERIFY: POSIX.1-2017, pthread_barrier_wait() DESCRIPTION and pthread_barrier_init() APPLICATION USAGE (Barriers option).
+
+@@ 6.10 | Advanced | Debug | fig=rwlock | tags=rwlock,writer,contention,compiled
+Q: Run a compiled test where readers continuously re-acquire a read lock back-to-back while one writer waits. Does the writer actually get starved?
+SHORT: On this glibc (2.39), no -- across three runs, the writer acquired the write lock within roughly 70-150ms despite 4 reader threads racking up tens of millions of read-lock acquisitions in that same window. Modern glibc's default rwlock kind is not purely reader-preferring, so this run does not reproduce severe starvation, but POSIX only says an implementation "may favor writers... to avoid writer starvation" -- a permission, not a guarantee.
+DEEP:
+```c
+static atomic_int stop = 0;
+static atomic_long reader_acquisitions = 0;
+
+static void *reader(void *arg) {
+    while (!atomic_load(&stop)) {
+        pthread_rwlock_rdlock(&rw);
+        atomic_fetch_add(&reader_acquisitions, 1);
+        pthread_rwlock_unlock(&rw);
+    }
+    return NULL;
+}
+static void *writer(void *arg) {
+    double t0 = now_sec();
+    pthread_rwlock_wrlock(&rw);
+    printf("writer: acquired after waiting %.4fs (reader_acquisitions so far=%ld)\n",
+           now_sec() - t0, (long)atomic_load(&reader_acquisitions));
+    pthread_rwlock_unlock(&rw);
+    return NULL;
+}
+/* main: start 4 readers in a tight loop, briefly warm them up, start 1 writer,
+   run for 500ms total, then stop readers and join everyone. */
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run three times, results were: `waiting 0.0759s (reader_acquisitions so far=3893351)`, `waiting 0.1480s (reader_acquisitions so far=7852959)`, and `waiting 0.0680s (reader_acquisitions so far=5741590)` -- the writer always got in, always within a fraction of a second, even while readers were acquiring millions of times faster than the writer could interject.
+- "Implementations may favor writers over readers to avoid writer starvation" is the entirety of what POSIX promises here -- it does not say all implementations must, and this observed non-starvation is this glibc version's specific choice (its default rwlock kind since a documented glibc version change), not a POSIX-mandated outcome.
+FOLLOW:
+- If this exact program had run on an older glibc, would the result likely differ? => Plausibly yes -- older glibc versions defaulted to a reader-preferring rwlock kind documented to be prone to writer starvation under sustained reader load; this is a Linux/glibc version-specific detail, not something this session verified directly on an older version.
+- Does this mean writer starvation is not a real concern in practice? => No -- it means this specific platform, today, happens not to exhibit it under this specific test; 6.18 covers how you would actually diagnose and fix it if a real, different rwlock implementation or workload did show it.
+PITFALL: Concluding "writer starvation isn't real" from one successful run on one glibc version. POSIX explicitly permits (does not forbid) writer starvation; portable code that cannot tolerate it should not rely on any particular implementation's current default behavior.
+VERIFY: POSIX.1-2017, pthread_rwlock_wrlock() DESCRIPTION ("Implementations may favor writers over readers to avoid writer starvation"); the specific glibc default-kind behavior is Linux/glibc-version-specific, confirmed here on glibc 2.39 only.
+
+@@ 6.11 | Advanced | Cross-layer | tags=semaphore,signal-safe,signal-handler
+Q: Why is sem_post() safe to call from an asynchronous signal handler when pthread_cond_signal() explicitly is not?
+SHORT: POSIX states directly that "the sem_post() function shall be reentrant with respect to signals and may be invoked from a signal-catching function" -- a guarantee pthread_cond_signal() does not have. The difference is structural: sem_post() only needs to atomically bump a counter and possibly wake a waiter, with no mutex of its own to acquire, so a handler calling it (which can interrupt at any point) cannot deadlock against itself the way locking a mutex from a handler could.
+DEEP:
+- Condition variables are documented as unsafe from an async signal handler for a different, sharper reason: "there would still be a race between the test of the Boolean [predicate] and the pthread_cond_wait() function that could not be efficiently eliminated" -- the handler cannot itself safely check-then-signal without the same mutex the normal-context waiter needs, and taking a mutex inside a handler is its own hazard (a handler can interrupt code that already holds that very mutex, self-deadlocking).
+- sem_post() sidesteps this because a semaphore's count update is a single atomic operation with no separate "check predicate under a lock" step for the poster to race -- the entire operation is designed to be safe without any lock of its own.
+- This makes sem_post() the standard building block for "wake up my normal-context worker thread from a signal handler" (write a byte to a self-pipe is the other classic technique, covered in the IPC module) -- a worker thread blocks in sem_wait(), and the handler's only job is one sem_post() call, nothing else.
+- The handler must still restrict itself to this one call (or other documented async-signal-safe functions); it must not, for example, also try to log or allocate memory inside the same handler just because the sem_post() part is safe.
+FOLLOW:
+- Is sem_wait() itself safe to call from a signal handler? => It is not listed among the documented async-signal-safe operations the same way sem_post() is; the safe pattern is sem_wait() in ordinary thread context and sem_post() only from the handler, not the reverse.
+- Does this mean semaphores are the "right" tool for all signal-to-thread communication? => For a simple wake-a-waiting-worker signal, yes, it is a clean fit; for passing actual data (not just a wakeup) from a handler to a thread, a pre-agreed, already-allocated buffer plus this same sem_post() wakeup is the usual safe pattern, since allocating or copying complex data inside the handler itself is not safe.
+PITFALL: Calling pthread_cond_signal() (or worse, taking a mutex) directly inside a signal handler because "it's basically the same idea as sem_post()." It is not the same idea; the mutex/predicate coupling that makes condition variables safe in normal code is exactly what makes them unsafe from a handler.
+VERIFY: POSIX.1-2017, sem_post() DESCRIPTION ("reentrant with respect to signals") and pthread_cond_signal() APPLICATION USAGE ("not safe to use... in a signal handler that is invoked asynchronously").
+
+@@ 6.12 | Advanced | Concept | tags=rwlock,priority-inversion,application-usage
+Q: What does POSIX's own text warn about priority inversion and read-write locks specifically?
+SHORT: Every rwlock function's APPLICATION USAGE section carries the same warning: applications "may be subject to priority inversion" -- a lower-priority reader or writer holding the lock can block a higher-priority waiter while an unrelated intermediate-priority thread runs indefinitely, the same hazard module 8 covers for mutexes, now applying to rwlocks too. Unlike pthread_mutex_t, no PRIO_INHERIT/PRIO_PROTECT-style protocol attribute for pthread_rwlock_t appears in this fetched set of pages.
+DEEP:
+- The identical sentence appears in pthread_rwlock_init(), pthread_rwlock_rdlock(), and pthread_rwlock_wrlock()'s APPLICATION USAGE sections, cross-referencing "the Base Definitions volume... Section 3.285, Priority Inversion" each time -- this is POSIX flagging the same hazard consistently across the whole rwlock API surface, not a one-off caveat.
+- For a mutex, module 4.17 covered the PRIO_INHERIT/PRIO_PROTECT protocol attributes that exist specifically to bound this; the pages fetched for this study guide do not show an equivalent rwlockattr protocol mechanism, so a rwlock-based critical section on a real-time system needs a different mitigation (commonly: keep the critical section short, and consider a priority-aware mutex instead of a rwlock if priority inversion risk is unacceptable and read-concurrency is not essential).
+- This is an open item worth flagging rather than guessing at: whether a specific implementation offers a real-time-safe rwlock protocol attribute is worth checking against that implementation's own documentation before relying on rwlocks in a hard real-time path.
+FOLLOW:
+- Does the writer-starvation risk (6.10) compound with the priority-inversion risk, or are they independent? => They are related but distinct: starvation is about a writer never getting in at all under sustained reader load; priority inversion is about a low-priority holder (reader or writer) blocking a higher-priority waiter while a third, unrelated thread runs -- a system could have one without the other.
+- Is this warning specific to rwlocks, or does POSIX say the same thing about mutexes and semaphores? => Semaphores and mutexes carry similar priority-inversion warnings in their own APPLICATION USAGE text (sem_wait()/sem_trywait() explicitly, and mutexes via their protocol-attribute mechanism); rwlocks get the identical warning without the protocol-attribute mitigation shown in these pages.
+PITFALL: Assuming an rwlock, because it "helps concurrency," is automatically a safer choice than a mutex for real-time-sensitive code. It carries the same priority-inversion warning POSIX gives mutexes, without the same documented mitigation mechanism in this fetched material.
+VERIFY: POSIX.1-2017, pthread_rwlock_rdlock()/pthread_rwlock_wrlock()/pthread_rwlock_init() APPLICATION USAGE; whether a specific rwlockattr priority protocol exists is flagged as VERIFY: check the target implementation's own pthread_rwlockattr_* documentation, not assumed absent everywhere.
+
+@@ 6.13 | Advanced | Scenario | tags=barrier,phased-computation,compiled
+Q: Use pthread_barrier_wait() to run a multi-phase parallel computation correctly, and confirm each phase's result with a compiled program.
+SHORT: Four worker threads run three phases; in each phase every thread adds its own contribution to a shared per-phase sum (protected by a mutex) and then calls pthread_barrier_wait() before starting the next phase, guaranteeing no thread reads phase N's final sum before every thread has actually finished contributing to it. All three phases matched their expected hand-computed sums (10, 20, 30) exactly, every time.
+DEEP:
+```c
+#define NTHREADS 4
+#define NPHASES 3
+static pthread_barrier_t barrier;
+static int phase_sum[NPHASES];
+
+static void *worker(void *arg) {
+    long id = (long)arg;
+    for (int phase = 0; phase < NPHASES; phase++) {
+        pthread_mutex_lock(&mtx);
+        phase_sum[phase] += (int)(id + 1) * (phase + 1);
+        pthread_mutex_unlock(&mtx);
+        int rc = pthread_barrier_wait(&barrier);   /* wait for all NTHREADS before next phase */
+        if (rc == PTHREAD_BARRIER_SERIAL_THREAD)
+            printf("  [phase %d complete, serial thread=%ld, sum so far=%d]\n", phase, id, phase_sum[phase]);
+    }
+    return NULL;
+}
+/* main: pthread_barrier_init(&barrier, NULL, NTHREADS); create/join NTHREADS
+   workers; compare each phase_sum[p] against the hand-computed expected sum. */
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run, it printed `phase 0 final sum=10 expect=10 OK`, `phase 1 final sum=20 expect=20 OK`, `phase 2 final sum=30 expect=30 OK` -- every phase's sum was complete and correct before the next phase began, and the PTHREAD_BARRIER_SERIAL_THREAD return value correctly identified exactly one thread per phase (1, then 0, then 3 in this run) to print the "phase complete" line.
+- Without the barrier, a fast thread could start phase 1's work (reading phase_sum[0] or starting phase 1's accumulation) before a slow thread finished contributing to phase 0 -- the barrier is what turns "four independent workers" into "four workers that provably agree on phase boundaries."
+FOLLOW:
+- Why use a mutex for phase_sum instead of an atomic add? => Either would work correctness-wise for this simple sum; a mutex was used here for consistency with the rest of the module's examples, and because a real per-phase computation is rarely just one atomic add, so the pattern generalizes better.
+- What happens if one thread's phase-0 work is much slower than the others? => The other three simply block in pthread_barrier_wait() until the slow thread arrives; this is expected and correct, not a bug -- a barrier's whole purpose is making every thread wait for the slowest one before any phase can be called "done."
+PITFALL: Reading a shared per-phase result immediately after your own thread's pthread_barrier_wait() call returns, but from a variable a different thread might still be updating at that exact instant with no mutex around the read. The barrier only guarantees every thread has *called* wait; each thread's own writes still need their own protection if read outside the barrier's implicit ordering for writes made strictly before the call.
+VERIFY: POSIX.1-2017, pthread_barrier_wait() DESCRIPTION (the count/release/reset semantics) and RETURN VALUE (PTHREAD_BARRIER_SERIAL_THREAD to exactly one thread per round).
+
+@@ 6.14 | Advanced | Trap | tags=rwlock,upgrade,edeadlk,self-deadlock
+Q: What happens if a thread holding a read lock tries to acquire the write lock on the same rwlock, expecting an "upgrade"?
+SHORT: POSIX warns "the calling thread may deadlock if at the time the call is made it holds the read-write lock" -- there is no upgrade operation, and a compiled test confirms the hang is real: the process had to be killed by a timeout after the wrlock() call, with no EDEADLK error returned on this glibc, unlike an ERRORCHECK mutex's clean error return for the analogous mistake.
+DEEP:
+```c
+int main(void) {
+    pthread_rwlock_t rw;
+    pthread_rwlock_init(&rw, NULL);
+    int rc1 = pthread_rwlock_rdlock(&rw);
+    printf("rdlock rc=%d\n", rc1);
+    int rc2 = pthread_rwlock_wrlock(&rw);   /* same thread, tries to "upgrade" */
+    printf("wrlock rc=%d\n", rc2);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run under `timeout 2 ./a.out`, it printed `rdlock rc=0` and then hung indefinitely before the wrlock line ever printed; the shell reported exit code 124 (timeout-killed). No EDEADLK was returned -- this implementation actually deadlocks the same thread against itself rather than detecting it.
+- This is a stricter, more consistently dangerous case than 4.07's NORMAL-mutex self-relock: pthread_rwlock_wrlock()'s ERRORS section does list EDEADLK as something the function "may fail" with, but POSIX's DESCRIPTION text itself only promises "may deadlock," and this test shows the actual implementation chose to deadlock rather than detect it.
+- The reason there is no upgrade path at the API level at all: a read lock, by definition, coexists with other concurrent readers; "upgrading" one reader's lock to exclusive while other readers might still be active has no well-defined semantics without first releasing the read lock and re-acquiring as a writer -- which briefly gives up exclusivity during the gap, a trade-off the application must handle explicitly, not something the API can paper over.
+FOLLOW:
+- What is the correct way to go from "I was reading" to "now I need to write"? => Unlock the read lock first, then call wrlock() fresh -- accepting that another thread could acquire the lock (for reading or writing) in the gap between the two calls, and re-checking whatever condition justified writing once the write lock is actually held.
+- Does pthread_rwlock_tryrdlock() or trywrlock() avoid this specific hang? => Only in the sense that trywrlock() would return EBUSY immediately instead of blocking forever, since "the read-write lock could not be acquired for writing because it was already locked for reading" -- avoiding the hang, but you still do not have a write lock, and still need the unlock-then-wrlock sequence to actually get one.
+PITFALL: Assuming pthread_rwlock_wrlock() called by a current read-lock holder will either succeed as an "upgrade" or fail cleanly with EDEADLK. On this implementation it does neither -- it hangs, exactly like an uncaught NORMAL-mutex self-relock.
+VERIFY: POSIX.1-2017, pthread_rwlock_wrlock() DESCRIPTION ("the calling thread may deadlock") and ERRORS (EDEADLK, "may fail" -- optional, not observed on this glibc run).
+
+@@ 6.15 | Advanced | Concept | tags=semaphore,named,sem-open
+Q: When would you reach for a named semaphore (sem_open()) instead of an unnamed one (sem_init())?
+SHORT: A named semaphore is looked up by a string name (like a filesystem path) via sem_open(), the right tool when unrelated processes -- ones that do not already share a memory mapping -- need to rendezvous without other setup, such as two independently-launched tools coordinating access to a shared device. An unnamed semaphore needs its sem_t to already live in memory the parties share (a process's threads, or an mmap()'d MAP_SHARED region, module 13), simpler when that sharing already exists.
+DEEP:
+- The scope for this study page is primarily the unnamed case (sem_init()/sem_wait()/sem_post()/sem_destroy()), since that is what every demo in this module uses; named semaphores are the same underlying wait/post/value model, just reached via a name lookup (sem_open("/myname", ...)) instead of an address, and closed with sem_close() rather than destroyed directly.
+- A named semaphore persists in the kernel (or a kernel-backed namespace) independent of any one process's lifetime until explicitly removed with sem_unlink(), which is a meaningfully different lifetime model than an unnamed semaphore embedded in memory that vanishes when that memory is freed or unmapped.
+- The choice is analogous to shared memory's shm_open() (named, filesystem-like) versus a simple mmap() of an already-shared region (module 12's IPC module covers this pairing in full); semaphores mirror the same two access patterns for the same underlying reason -- some cooperating parties already share memory, others need a name to find each other.
+FOLLOW:
+- Does a named semaphore cost more per sem_wait()/sem_post() call than an unnamed one? => Not meaningfully once opened; the extra cost is at sem_open() time (the name lookup), not on every subsequent wait/post, which use the same underlying mechanism either way.
+- If two threads in the same process want a semaphore, is there ever a reason to use the named form? => Rarely -- an unnamed semaphore with pshared=0 is simpler and sufficient for same-process threads; the named form's benefit (rendezvous without pre-shared memory) is not needed when the parties are already threads of one process.
+PITFALL: Reaching for a named semaphore by habit for a same-process, multi-threaded problem where an unnamed semaphore would be simpler and avoids managing a kernel-persistent name that must be explicitly sem_unlink()'d to avoid leaking.
+VERIFY: POSIX.1-2017, sem_init()/sem_destroy() APPLICATION USAGE and DESCRIPTION; named-semaphore specifics (sem_open(), sem_unlink()) are not among the 60 fetched pages for this study guide -- flagged as VERIFY: POSIX.1-2017, sem_open() and sem_unlink().
+
+@@ 6.16 | Principal | Scenario | tags=firmware,semaphore,resource-limiting
+Q: Design a resource-limiting layer for a validation harness that must never have more than N NVMe command queues in flight at once, across many worker threads submitting commands.
+SHORT: A counting semaphore initialized to N is close to the entire mechanism: every worker calls sem_wait() before submitting and sem_post() once completion is observed (possibly on a different thread, the no-ownership property from 6.01), and the semaphore's count is the single source of truth for free slots, no separate bookkeeping needed. The real design work is getting completion-side sem_post() right: exactly once per completed command, even on an error or timeout path.
+DEEP:
+1. **Pick N from the actual constraint.** N here is presumably the device's real queue-depth limit or a deliberately lower validation-harness limit; sem_init(&sem, 0, N) encodes it directly, and changing N later is a one-line change, not a redesign.
+2. **Submit path**: sem_wait(&sem) before submission, then submit; if submission itself can fail (before the command is actually in flight), sem_post() immediately to return the slot -- a failed submission must not silently leak a permit.
+3. **Completion path**: whatever thread or callback observes completion (an interrupt-driven completion queue poller, in this harness's case, likely a dedicated thread) calls sem_post() exactly once per completed command; if completions are batched (draining several at once), each one gets its own sem_post() call, not one call for the batch.
+4. **Timeout/error path**: a command that times out still eventually needs its slot returned once its outcome (even "abandoned") is determined -- decide explicitly whether a timed-out command's slot is returned immediately (freeing capacity for new commands, at the risk of a stale completion later double-posting) or only once its actual completion or definitive abandonment is confirmed, and document the choice, since this is the design's most likely source of a subtle double-post or leaked-slot bug.
+5. **Verify under real concurrency**, the same way 6.04 verified a smaller version of exactly this pattern: track a max_seen high-water mark under a separate mutex during a stress run and confirm it never exceeds N, across many repeated runs, not one.
+- This is 6.04's demo scaled up to a real validation-harness shape; the semaphore mechanism does not change, but the completion-path correctness (exactly-once post per real command, including error paths) is where a real system's complexity actually lives.
+FOLLOW:
+- Should command submission failures and command timeouts be handled identically? => Not necessarily -- a submission failure is usually immediate and synchronous (post the slot back right away, in the same code path); a timeout is asynchronous and needs a decision about whether a late, real completion might still arrive and double-post a slot that was already returned on timeout, which argues for tracking per-command state, not just relying on the semaphore's count alone.
+- Would a mutex-and-counter hand-rolled equivalent be simpler than a semaphore here? => Not meaningfully -- a semaphore already is exactly a synchronized counter with blocking wait built in; hand-rolling the same thing with a mutex and condition variable (5.12's shape) reimplements what sem_wait()/sem_post() give you directly, with more code and the same correctness burden on the completion path either way.
+PITFALL: Returning a slot (sem_post()) on a timeout without a definitive guarantee the real completion, if it later arrives, cannot also post -- silently over-crediting the semaphore's count above N and defeating the entire limiting guarantee this design exists to provide.
+VERIFY: No single POSIX clause covers this application design; grounded in sem_wait()/sem_post()'s no-ownership, pure-counter semantics (6.01) applied to a concrete concurrent-command-limiting problem.
+
+@@ 6.17 | Principal | Debug | tags=rwlock,starvation,production,fix
+Q: A production system using a global pthread_rwlock_t reports a writer (a config-reload thread) occasionally taking many seconds to acquire the write lock under heavy read load, on a platform or glibc version where 6.10's demo did show real starvation. How do you confirm it and fix it?
+SHORT: First confirm it is the same shape 6.10 tests for -- track and log reader acquisition counts and the writer's own wait time directly, the same instrumentation used there, rather than trusting an anecdotal "it felt slow." If confirmed, the direct fix on Linux/glibc is pthread_rwlockattr_setkind_np() with PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP, a Linux-specific rwlockattr setting that biases the lock to let a waiting writer in promptly instead of continuing to admit new readers indefinitely.
+DEEP:
+1. **Instrument before changing anything.** Add the same kind of counters 6.10's demo used (reader acquisition count, writer wait time) to the production code path, so the fix can be verified against a real measurement, not just "it feels better now."
+2. **Confirm the shape matches starvation, not general overload.** Distinguish "the writer waits a bounded, small amount even under heavy read load" (healthy, just contended) from "the writer's wait time grows with how long readers keep streaming in, with no bound" (actual starvation) -- module 4's contention-vs-deadlock diagnostic discipline, applied to a wait-time metric instead of a hang/no-hang question.
+3. **Apply the Linux-specific mitigation.** `pthread_rwlockattr_setkind_np(&attr, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP)` passed to pthread_rwlock_init() changes the lock's internal admission policy to favor a waiting writer over new readers -- this is explicitly a Linux/glibc extension (the _np suffix means "non-portable"), not a POSIX-standard API, so it is not available or spelled this way on every platform.
+4. **Re-measure with the same instrumentation.** Confirm the writer's wait-time distribution actually improved under the same load pattern that showed the problem, and check reader throughput did not regress unacceptably as the trade-off's other side.
+5. **Document the platform dependency.** Because this fix is Linux-specific, code intended to be portable needs either a documented Linux-only code path, or an application-level design that does not depend on any specific rwlock kind's fairness behavior (e.g. bounding how long readers can stay continuously active, an application-level mitigation that works on any POSIX implementation).
+- This ties directly back to 6.10's finding that this glibc's *default* already resists starvation reasonably well; a production instance still showing the problem is either on an older glibc, a different platform's rwlock implementation, or under a read pattern extreme enough to still exhibit it despite the default's improvements -- instrumentation is what tells you which.
+FOLLOW:
+- Is there a portable (non-Linux-specific) fix? => The most portable mitigation is application-level: cap how long any single burst of continuous reader activity is allowed to run before deliberately backing off (e.g. readers periodically release and immediately try to reacquire, giving a waiting writer a window), trading some reader throughput for a bounded writer wait without relying on any implementation's rwlock-kind extension.
+- Could switching to a mutex instead of an rwlock be the simpler fix? => Only if reader concurrency turns out not to matter as much as the config-reload latency does; that is a real, valid trade-off to consider, but it should be made deliberately, with the read-side throughput cost measured, not adopted as a reflexive "give up on rwlocks entirely" reaction to one starvation report.
+PITFALL: Applying the PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP fix (or any fix) without first instrumenting and confirming the actual problem, then being unable to tell afterward whether the fix helped or the symptom was intermittent to begin with.
+VERIFY: POSIX.1-2017, pthread_rwlock_wrlock() DESCRIPTION ("Implementations may favor writers... to avoid writer starvation" -- the permission this Linux extension exercises); pthread_rwlockattr_setkind_np() and PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP are Linux glibc extensions, not in the 60 fetched POSIX pages -- flagged as Linux-specific, VERIFY against glibc's own manual page.
+
+@@ 6.18 | Principal | Trap | tags=teardown,destroy,ub,sequencing
+Q: A service shuts down and calls sem_destroy(), pthread_rwlock_destroy() and pthread_barrier_destroy() on its synchronization objects while worker threads are still finishing up. What goes wrong, and what is the safe shutdown sequence?
+SHORT: All three are undefined behavior if any thread is still blocked on (or, for the barrier, has not returned from) the object being destroyed -- "destroying a semaphore upon which other threads are currently blocked is undefined," results are undefined for pthread_rwlock_destroy() "when any thread holds rwlock," and likewise if pthread_barrier_destroy() runs while a thread is blocked on it. The safe sequence: signal workers to stop, join every one so none can be mid-call, only then destroy.
+DEEP:
+1. **Signal, don't just destroy.** Set a stop flag (or close a work queue) that every worker thread's own loop checks, so workers voluntarily stop calling sem_wait()/rdlock()/wrlock()/barrier_wait() going forward, rather than being caught mid-call when destruction happens.
+2. **Wake anyone already blocked.** A worker already inside sem_wait() needs an extra sem_post() (or several, matching the count of blocked workers) to actually wake up and notice the stop flag; a worker inside pthread_rwlock_rdlock()/wrlock() needs whatever holds the lock to release it so the waiter can proceed and then notice the stop flag; a worker inside pthread_barrier_wait() needs the barrier's full count to actually be met (or a redesign that does not put shutdown-time threads through a barrier at all) since there is no way to "cancel" a barrier wait.
+3. **Join every worker thread.** pthread_join() on every worker before touching any shared synchronization object's destroy call -- this is the actual guarantee that nothing is (or ever will be again) blocked on it, not an assumption based on "they should be done by now."
+4. **Destroy in an order that will not resurrect a dependency.** If workers might touch multiple synchronization objects in sequence (e.g. a semaphore gating access to an rwlock-protected structure), destroy in the reverse order of how they are acquired during normal operation, so nothing outside the confirmed-joined workers could still reference an already-destroyed object.
+5. **Only after all of this, destroy.** By this point every destroy call is operating on an object no thread can possibly be blocked on or hold, satisfying every one of the three "safe to destroy" preconditions POSIX actually states.
+- The barrier case is the sharpest version of this problem: unlike a semaphore (extra posts can wake blocked waiters) or an rwlock (the holder can simply be told to unlock), a barrier fundamentally cannot be "woken early" -- its whole contract is waiting for `count` arrivals, so a shutdown design using barriers must ensure every participating thread either arrives normally or the barrier is never destroyed while any thread could still be an unarrived participant, which usually means barriers are a poor fit for a phase that might be aborted mid-way, and a redesign (a cancellable gate instead, 5.15) may be more appropriate for that specific case.
+FOLLOW:
+- Is there a "destroy anyway and see what happens" approach that is ever acceptable? => No -- POSIX leaves the actual outcome fully unspecified (not a guaranteed crash, not a guaranteed silent success), so "it seemed fine in testing" proves nothing about production, exactly the same undefined-behavior risk 4.13 covered for mutexes.
+- Does adding a timeout to the shutdown sequence help? => It helps as a diagnostic (log an error if workers do not join within some deadline, rather than hanging shutdown forever), but it does not change the requirement that destroy only happens after every thread has actually stopped referencing the object -- a timed-out join followed by destroy anyway reintroduces exactly the undefined behavior being avoided.
+PITFALL: Destroying a semaphore, rwlock, or barrier immediately after setting a "please stop" flag, without actually joining the worker threads first to confirm none of them is still blocked inside a call on that object.
+VERIFY: POSIX.1-2017, sem_destroy() DESCRIPTION ("destroying a semaphore upon which other threads are currently blocked is undefined"), pthread_rwlock_destroy() DESCRIPTION ("undefined if... called when any thread holds rwlock"), and pthread_barrier_destroy() DESCRIPTION ("undefined if... called when any thread is blocked on the barrier").
+
+@@ 6.19 | Principal | Concept | tags=choice,mutex,semaphore,rwlock,barrier,decision
+Q: Given a piece of shared state and an access pattern, how do you decide which of mutex, semaphore, rwlock or barrier actually fits?
+SHORT: Ask in order: does access need an owner that alone may release it (mutex, module 4), or a pure count of interchangeable resources anyone may return (semaphore, 6.01)? If exclusion, do reads/writes need different concurrency (rwlock, 6.03) or is any access equally exclusive (mutex)? Is it "N workers must all reach a point before any proceeds" rather than exclusion at all (barrier, 6.09)? Picking wrong rarely fails loudly -- it just makes the code harder to reason about.
+DEEP:
+- Mutex: state is touched by one thread at a time, and whichever thread locked it is the one that unlocks it -- the default choice for ordinary shared mutable state (module 4).
+- Semaphore: the resource is a count of interchangeable slots, and the thread that returns a slot need not be the thread that took it (6.01, 6.16's validation-harness queue-depth example) -- reach for it when "ownership" does not naturally apply.
+- Read-write lock: the access pattern itself has two different concurrency classes (many simultaneous readers, one exclusive writer) and reads are frequent/long enough for that distinction to matter (6.03, 6.08) -- not simply "there happen to be more reads than writes."
+- Barrier: the problem is not mutual exclusion at all, it is phased synchronization -- N independent workers must all finish phase K before any of them starts phase K+1 (6.09, 6.13) -- using a mutex or semaphore to hand-rollthis is possible (5.15 showed the condition-variable version) but reinvents what pthread_barrier_wait() already does correctly.
+- A common real mistake this checklist catches: reaching for a semaphore to protect ordinary shared state (module 4's territory) because "it's like a mutex," and losing ERRORCHECK-style misuse detection and clear ownership semantics in the process (6.01, 6.06).
+FOLLOW:
+- What if a design genuinely needs two of these at once, like a rwlock-protected structure whose access is also count-limited? => That is a legitimate combination, not a sign one choice is wrong -- e.g. 6.16's semaphore limits in-flight commands while a separate rwlock might protect a shared results table those commands report into; the two solve different problems and can coexist.
+- Is there a primitive from this checklist that is "safest to default to" when unsure? => A plain mutex, because its failure modes (a wrong relock, an unowned unlock) are the most heavily error-checked (ERRORCHECK type, module 4) and the best-understood; reach for the others only once the specific shape (counting, read/write split, or phased barrier) is clearly present.
+PITFALL: Choosing a primitive by surface resemblance ("this is kind of like a lock, so any lock-shaped API will do") instead of by which specific concurrency shape (ownership, counting, read/write split, or phased arrival) the actual problem has.
+VERIFY: No single POSIX clause; this is a design synthesis of the DESCRIPTION sections already cited for pthread_mutex_lock() (module 4), sem_wait()/sem_post(), pthread_rwlock_rdlock()/wrlock(), and pthread_barrier_wait() in this module.
+
+@@ 6.20 | Principal | Debug | tags=review,checklist,module6-audit
+Q: You are reviewing a PR that adds a semaphore-guarded resource pool and a rwlock-guarded cache to the same service. What do you check before approving?
+SHORT: For the semaphore: does every acquire path (including error and timeout branches) have a matching, exactly-once release, with no increment lacking a prior decrement (over-crediting, 6.16's risk)? For the rwlock: could any code path hold a read lock while calling into code that acquires the write lock on the same rwlock (6.14's self-deadlock), and has anyone measured whether concurrent reads are frequent/long enough to justify the complexity over a plain mutex (6.08)?
+DEEP:
+1. **Semaphore accounting.** Walk every sem_wait() call site and confirm a sem_post() exists on every exit path from the code between them -- success, error, and any early return -- with special attention to whether a timeout or cancellation path could double-post or skip a post entirely (6.16's exact failure mode).
+2. **Semaphore identity.** Confirm the "any thread may post" property (6.01) is actually intended here, not an accidental substitute for a mutex that should have ownership-based misuse detection (6.06's wrong-consumer trap, applied in reverse -- here, checking the design chose a semaphore on purpose).
+3. **Rwlock upgrade paths.** Specifically search for any function reachable while holding a read lock that might, directly or through a call chain, attempt to acquire the write lock on the same rwlock -- 6.14 showed this hangs silently with no error, so it will not be caught by any test that does not specifically trigger the call chain.
+4. **Rwlock justification.** Ask for (or estimate) the actual read/write ratio and read-hold duration; if reads are short and infrequent, a plain mutex is simpler and the rwlock's added bookkeeping cost may not be paying for itself (6.08's trade-off, applied as a review question rather than a design-time one).
+5. **Teardown.** Confirm both the semaphore and the rwlock are destroyed only after every worker thread that could be blocked on them has been joined (6.18's shutdown sequencing), not merely after a stop flag is set.
+- A Principal-level review does not just check "does this compile and pass tests" -- it specifically hunts for the failure modes this module demonstrated compile and pass tests just fine (6.10's writer-starvation demo ran without any error; 6.14's upgrade attempt only fails by hanging, silently, with no exception to catch in a unit test).
+FOLLOW:
+- What if the PR author says the rwlock choice was "just in case reads become frequent later"? => Push back gently -- premature complexity has the same review-worthiness as premature optimization; ask for the actual current read/write ratio, and suggest starting with a mutex and converting later (with the same before/after measurement 6.08 recommends) if and when reads actually do become frequent.
+- Is a stress test (many threads, many iterations) sufficient to catch the rwlock self-deadlock upgrade bug in review? => Only if the stress test happens to exercise the specific call path where a read-lock holder reaches code that acquires the write lock; a code-path audit (step 3) is more reliable than hoping a stress test's random scheduling happens to trigger that exact sequence.
+PITFALL: Approving a semaphore- or rwlock-based design because it "passed the tests," without auditing the specific failure modes (over-crediting, self-deadlock-on-upgrade, unjustified complexity) this module showed do not reliably surface in ordinary testing.
+VERIFY: No single POSIX clause; this composes sem_wait()/sem_post()'s accounting requirements, pthread_rwlock_wrlock()'s upgrade-deadlock warning (6.14), and the read/write-ratio judgment from 6.08 into a review checklist.

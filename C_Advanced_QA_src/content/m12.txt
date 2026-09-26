@@ -1,0 +1,335 @@
+# Module 12: Inter-Process Communication
+
+@@ 12.01 | Basic | Concept | fig=ipcmodel | tags=overview,pipe,mq,shm
+Q: What are the main POSIX IPC mechanisms, and what does each actually move between processes?
+SHORT: Pipes (anonymous and named/FIFO) move a byte stream between processes with no message boundaries. POSIX message queues (mq_open/mq_send/mq_receive) move discrete, priority-ordered messages. Shared memory (shm_open + mmap) gives two processes the same physical memory directly, with no built-in transfer step and no built-in synchronization at all. Signals are a lightweight, one-bit-of-information control-plane mechanism (module 2), not a data-transfer one.
+DEEP:
+- Unlike the in-process primitives in modules 4-6 (mutexes, condition variables, semaphores), which all assume shared memory already exists because threads share an address space, every IPC mechanism here exists specifically because separate processes do *not* share memory by default -- each one is a different answer to "how do two address spaces exchange information."
+- Pipes and message queues are transfer mechanisms: the kernel copies data from a sender to a receiver, and no explicit synchronization primitive is needed beyond the read/write or send/receive calls themselves, since the kernel serializes access to its own internal buffer.
+- Shared memory is the odd one out: `shm_open()`+`mmap()` gives both processes a pointer into the *same* physical pages, so no copying happens on access at all (fast), but POSIX guarantees nothing about who has written what when -- an explicit synchronization primitive (a semaphore, or a mutex placed in the shared segment itself with PTHREAD_PROCESS_SHARED) is mandatory, not optional, the moment more than one process touches it. See 12.03.
+- Choosing among them (elaborated across this module): pipes/FIFOs for simple byte-stream handoff (e.g. piping a child's stdout), message queues for discrete, possibly priority-ordered control messages, shared memory for high-throughput bulk data where copying would be too slow, and signals for a lightweight "something happened" notification.
+FOLLOW:
+- Why not just use shared memory for everything, since it has no copying overhead? => Because it provides zero synchronization by itself; for anything beyond very simple, carefully hand-synchronized access patterns, the complexity and bug risk of getting that synchronization right outweighs the copying cost that pipes/queues would have paid instead.
+- Are these mechanisms restricted to related processes (e.g. parent/child)? => Pipes (unnamed) are restricted to processes that inherit the file descriptor, typically via fork(); named pipes, message queues, and shared memory objects can be used by any processes that know the shared name/path, related or not.
+PITFALL: Assuming any IPC mechanism other than shared memory needs no synchronization because "the kernel handles it." The kernel does serialize access to a pipe's or queue's *own* internal buffer, but that says nothing about synchronizing higher-level protocol state your application layers on top (e.g. a multi-message handshake).
+
+@@ 12.02 | Basic | Concept | tags=fifo,mkfifo,pipe
+Q: How does a named pipe (FIFO) differ from an anonymous pipe?
+SHORT: An anonymous pipe (`pipe()`) only exists as file descriptors in the creating process's table, so only it and its fork()ed descendants can use it. A named pipe (`mkfifo()`) creates a special file with a real pathname any process can `open()` by name, so unrelated processes can talk with no parent/child relationship at all. Both are still plain byte streams with the same FIFO read/write behavior.
+DEEP:
+- POSIX's `pipe(int fildes[2])` returns fildes[0] for reading and fildes[1] for writing; the two ends only become usable by another process if that process inherits them (fork()) or receives them some other way (e.g. passed over a UNIX domain socket) -- there is no pathname to open independently.
+- POSIX's `mkfifo(const char *path, mode_t mode)` creates the special file itself; opening it for reading blocks until a writer also opens it (and vice versa), which is a real, sometimes-surprising blocking behavior worth remembering -- 12.05 demonstrates and confirms this exact blocking handshake.
+- Once both ends are open, a FIFO behaves exactly like an anonymous pipe for read()/write() purposes; the only functional difference is how the two ends found each other (a pathname vs. inherited file descriptors).
+- A FIFO's directory entry (the special file itself) persists until explicitly removed with unlink(), independent of whether any process currently has it open -- unlike an anonymous pipe, which disappears once its last file descriptor is closed.
+FOLLOW:
+- Can two unrelated processes use an anonymous pipe? => Not directly; they would need some other mechanism to share the file descriptor (e.g. passing it over a UNIX domain socket, or a common ancestor process that forked both and left the descriptors open), which defeats much of the simplicity anonymous pipes offer.
+- What happens if you open a FIFO for reading with O_NONBLOCK and no writer exists yet? => open() returns immediately (rather than blocking) per the nonblocking semantics documented alongside FIFO behavior, and a subsequent read simply returns no data until a writer appears.
+PITFALL: Forgetting that opening a FIFO blocks until the other end is also opened. A program that opens a FIFO for writing with no reader ever showing up will hang on that open() call, not on the first write().
+VERIFY: POSIX.1-2017, pipe.3p (fildes[0]=read, fildes[1]=write, unspecified whether either end is also open the other way) and mkfifo.3p (special-file creation via mkfifo(); the open-blocks-until-both-ends-present behavior is documented under the related open()/fifo semantics, not restated verbatim on mkfifo.3p itself).
+
+@@ 12.03 | Basic | Concept | tags=shm,sync,mandatory
+Q: Why does POSIX shared memory need an explicit synchronization primitive, when a pipe or message queue does not?
+SHORT: `shm_open()`+`mmap()` gives two processes direct access to the same physical memory with the kernel doing nothing further once mapped -- no send/receive call for it to serialize, so two processes touching the same bytes concurrently have exactly the data-race problem two threads would have on a shared variable (modules 4-7), just across process boundaries. Pipes and queues avoid this because every access goes through a kernel call the kernel itself serializes.
+DEEP:
+- This is precisely why 12.01's framing calls shared memory "the odd one out": it is the only IPC mechanism here that is pure memory, not a kernel-mediated transfer, so none of the built-in serialization that a pipe's or queue's system calls provide comes for free.
+- The fix is exactly the same conceptual tool as in-process synchronization, just made cross-process: a `pthread_mutex_t` (or `sem_t`) placed inside the shared memory segment itself, initialized with `PTHREAD_PROCESS_SHARED` (for a mutex) or a nonzero `pshared` argument to `sem_init()`, so the lock's own state lives in the same shared memory both processes can see.
+- 12.11/12.12 compile and run exactly this: two processes sharing one memory segment, coordinating with `sem_init(&sem, 1, 0)` (the `1` meaning "shared between processes," per POSIX sem_init semantics), and separately, an unsynchronized version that demonstrably loses updates without it.
+- Named POSIX semaphores (`sem_open()`, distinct from the unnamed `sem_init()` used here) are an alternative when the two processes are not already sharing a memory segment together -- see 12.13 for the distinction.
+FOLLOW:
+- Would a signal be enough to synchronize two processes accessing shared memory? => Not by itself for protecting a critical section; a signal is a good "something happened" notification but provides no mutual-exclusion guarantee over the shared memory's contents the way a mutex or semaphore does.
+- Does mmap()'s MAP_SHARED flag itself provide any ordering guarantee between processes? => No; MAP_SHARED only means writes are visible to other mappers of the same object (versus MAP_PRIVATE's copy-on-write isolation) -- it says nothing about *when* one process's write becomes visible to another relative to other operations, which is exactly what a synchronization primitive adds.
+PITFALL: Treating shared memory as "basically a shared variable, so just read and write it," forgetting that this is exactly the same class of data race as an unsynchronized shared variable between threads, just harder to debug because the two racing parties are separate processes.
+VERIFY: POSIX.1-2017, shm_open.3p ("shared memory itself provides no synchronization" is the module brief's framing, consistent with shm_open.3p's RATIONALE, which describes shm_open() purely as establishing a mapping, with no mention of any access serialization).
+
+@@ 12.04 | Intermediate | Scenario | tags=pipe,fork,code
+Q: Show a working anonymous pipe between a parent and its child process.
+SHORT: `pipe(fd)` creates the pair before `fork()`; the child closes the read end and writes, the parent closes the write end and reads -- each side closing the end it does not use is what lets read() see end-of-file cleanly once the writer is done, rather than blocking forever waiting for a write that will never come.
+DEEP:
+```c
+int fd[2];
+pipe(fd);
+pid_t pid = fork();
+if (pid == 0) {
+    close(fd[0]);                        /* child: writer */
+    write(fd[1], msg, strlen(msg) + 1);
+    close(fd[1]);
+    _exit(0);
+} else {
+    close(fd[1]);                        /* parent: reader */
+    ssize_t n = read(fd[0], buf, sizeof buf - 1);
+    wait(NULL);
+}
+```
+  Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run, the parent printed `parent read 17 bytes: "hello from child"`, confirming the full message crossed the fork() boundary through the pipe intact.
+- Both processes inherit *both* file descriptors across fork() (pipes are created before the fork specifically so this sharing happens); each side explicitly closing the end it does not use is a correctness requirement, not just tidiness -- if the parent kept fd[1] (the write end) open, its own read() could block forever after the child exits, since the pipe would still have a writer (the parent itself) even though no one will ever write.
+- This is the mechanism underlying shell pipelines (`cmd1 | cmd2`) at the OS level: the shell creates a pipe, forks both commands, and wires one command's stdout and the other's stdin to the two ends.
+FOLLOW:
+- What happens if the child writes more data than fits in the pipe's kernel buffer before the parent reads any? => write() blocks until the parent reads enough to make room (pipes have a finite kernel buffer, commonly 64KB on Linux by default); see 12.08 for the exact atomicity guarantee POSIX makes about writes up to PIPE_BUF.
+- Does the parent need to close fd[1] before or after fork() matters? => After fork() in the parent's own copy; closing before fork() would close it in a shared context, but each process has independent descriptor tables post-fork, so each side closes its own copy of the unused end after the fork.
+PITFALL: Forgetting to close the unused end of the pipe in each process. A reader that still holds the write end open (even unintentionally) will see its own read() block forever waiting for EOF that can never arrive while a writer (itself) remains.
+VERIFY: POSIX.1-2017, pipe.3p (fildes[0]/fildes[1] semantics, EMFILE/ENFILE errors) -- the fork()-inheritance and close-the-unused-end pattern is standard practice built on top of pipe()'s documented behavior plus fork()'s documented file-descriptor inheritance (see the C Advanced page, module 2, for fork()'s inheritance rules in full).
+
+@@ 12.05 | Intermediate | Scenario | tags=fifo,mkfifo,blocking,code
+Q: Show a named pipe (FIFO) connecting two processes with no parent/child relationship required, and confirm the open-blocks-until-both-ends-present behavior.
+SHORT: `mkfifo(path, mode)` creates the special file once; each independent process then `open()`s that same path, one O_WRONLY and one O_RDONLY -- and each open() call blocks until the other side's open() also happens, which is exactly the handshake that lets two processes that only share a filesystem path (not a fork() relationship) rendezvous.
+DEEP:
+```c
+mkfifo(path, 0600);
+/* process A: */ int wf = open(path, O_WRONLY);   /* blocks until a reader opens it */
+/* process B: */ int rf = open(path, O_RDONLY);   /* unblocks A's open() the instant this runs */
+```
+  Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run (here using fork() only to conveniently create two independent processes for the test, not because the mechanism requires a fork relationship -- the same code works verbatim between two unrelated programs given the same path), the reader printed `reader got 20 bytes: "hello over the fifo"`, confirming the message crossed via the named pipe with both ends discovering each other purely by path.
+- Contrast directly with 12.04's anonymous pipe: here, neither process needed to inherit a file descriptor from a common ancestor; both independently opened the same pathname, which is the entire point of using mkfifo() over pipe() when the two processes are not related by fork().
+- Once open, reading/writing a FIFO behaves identically to an anonymous pipe (same PIPE_BUF atomicity guarantees, same byte-stream-not-message semantics, 12.08/12.10) -- mkfifo() only changes how the two ends are discovered, not how data moves once they are connected.
+FOLLOW:
+- What if a process opens the FIFO with O_RDWR instead of one side each? => POSIX documents this case as producing unspecified behavior for whether the other end is also implicitly open for the complementary direction; stick to one side O_RDONLY and the other O_WRONLY for portable, well-defined behavior.
+- Does the FIFO special file need to be deleted (unlink()) when done? => Yes for cleanliness; the directory entry persists on disk until unlinked, independent of any process having it open, unlike an anonymous pipe which vanishes automatically once its last descriptor closes.
+PITFALL: Opening both ends of a FIFO from within the *same* process for a quick test and being surprised it does not block. A single process opening both ends itself will not deadlock on the open() calls (each satisfies the other), which can mask the real cross-process blocking behavior during testing.
+VERIFY: POSIX.1-2017, mkfifo.3p (creation semantics, EEXIST/ENOENT errors) -- the open-blocks-until-both-ends-present rule is documented in the broader FIFO-file open() semantics referenced from mkfifo.3p's SEE ALSO, not restated on mkfifo.3p's own page text.
+
+@@ 12.06 | Intermediate | Concept | tags=mq,open,semantics
+Q: What does mq_open() actually establish, and what are its key oflag semantics?
+SHORT: `mq_open(name, oflag, ...)` creates or connects to a named message queue and returns a descriptor (`mqd_t`), like open() returns a file descriptor. oflag needs exactly one of O_RDONLY/O_WRONLY/O_RDWR, plus optionally O_CREAT (create if missing, taking mode and an attr struct), O_EXCL (fail if it exists, atomically checked), and O_NONBLOCK (fail with EAGAIN instead of blocking when full/empty).
+DEEP:
+- A leading `/` in the name is the portable form ("processes calling mq_open() with the same value of name shall refer to the same message queue object"); names without a leading slash have implementation-defined behavior, so always use a leading-slash name for portability.
+- When O_CREAT is used with a non-NULL `attr` (an `mq_attr` struct setting `mq_maxmsg` and `mq_msgsize`), those become the queue's actual capacity limits; if the queue already existed, POSIX states attr "shall have no effect except as noted under O_EXCL" -- you cannot resize an existing queue's limits through a later mq_open() call.
+- O_EXCL's atomicity guarantee is explicit and important for the same reason as similar flags elsewhere: "the check for the existence of the message queue and the creation of the message queue if it does not exist shall be atomic with respect to other threads executing mq_open() naming the same name" -- this is what makes O_CREAT|O_EXCL a safe way to ensure exactly one creator, with no race window.
+- Whether the queue's name is visible in any filesystem path a program can otherwise access is explicitly left unspecified by POSIX ("It is unspecified whether the name appears in the file system") -- do not write code that assumes (or does not assume) a particular filesystem location for it.
+FOLLOW:
+- What happens if you mq_open() an existing queue with O_CREAT but no O_EXCL? => It simply connects to the existing queue (O_CREAT has no effect since it already exists), returning a new descriptor to the same underlying queue -- this is the normal "create if needed, otherwise just connect" idiom.
+- Can a queue be open for sending and receiving in more than one process at once? => Yes; POSIX explicitly allows a queue to "be open multiple times in the same or different processes for receiving messages" (and the same for sending) -- multiple readers and multiple writers on one queue are both legal.
+PITFALL: Using a name without a leading slash and assuming it behaves identically across systems. POSIX leaves that case implementation-defined; always use a leading `/` for portable queue names.
+VERIFY: POSIX.1-2017, mq_open.3p (oflag semantics, O_EXCL atomicity, leading-slash naming rule, unspecified filesystem visibility).
+
+@@ 12.07 | Intermediate | Scenario | tags=mq,roundtrip,code
+Q: Show a working round trip through a POSIX message queue.
+SHORT: `mq_open("/name", O_CREAT|O_RDWR, mode, &attr)` creates the queue with explicit `mq_maxmsg`/`mq_msgsize` limits from the attr struct; `mq_send()` and `mq_receive()` then move discrete messages (not a byte stream) between any processes that open the same name.
+DEEP:
+```c
+struct mq_attr attr = { .mq_maxmsg = 10, .mq_msgsize = 32 };
+mqd_t q = mq_open("/testq1", O_CREAT | O_RDWR, 0644, &attr);
+mq_send(q, "hello", 6, 0);
+char buf[32]; unsigned prio;
+ssize_t n = mq_receive(q, buf, sizeof buf, &prio);
+```
+  This exact pattern (confirmed as a minimal connectivity check while grounding this module) compiled with `gcc -std=c11 -Wall -Wextra -pthread -lrt` and successfully opened, and the priority-ordering version in 12.17 confirms full send/receive round-tripping with real payloads.
+- `mq_send()`'s `msg_len` must be less than or equal to the queue's `mq_msgsize` attribute or the call fails with EMSGSIZE -- unlike a pipe, a message queue enforces a maximum message size up front, fixed at creation time via the attr struct.
+- Linking with `-lrt` is commonly required on Linux for the POSIX realtime message-queue functions (mq_open() and friends), distinct from `-pthread`; both may be needed together depending on what else the program uses.
+- Note `mq_open()` returns `(mqd_t)-1` on failure (not a small negative int the way many syscalls return -1), and `mqd_t` is an opaque type -- always compare against the `(mqd_t)-1` sentinel exactly as documented, not against a bare -1.
+FOLLOW:
+- What happens if mq_receive()'s buffer is smaller than mq_msgsize? => mq_receive() requires a buffer at least as large as the queue's mq_msgsize attribute or it fails; always size the receive buffer from the queue's actual attributes, not a guessed constant.
+- Do queues persist after the creating process exits? => Yes, until explicitly removed with mq_unlink() (analogous to shm_unlink() for shared memory, 12.11) -- exiting or closing a descriptor alone does not delete the queue.
+PITFALL: Forgetting to mq_unlink() a queue after use in test code. Leftover named queues from earlier test runs can cause a later O_CREAT|O_EXCL call to unexpectedly fail with EEXIST.
+VERIFY: POSIX.1-2017, mq_open.3p (attr semantics, mqd_t as an opaque descriptor type, EMFILE) and mq_send.3p (EMSGSIZE, message-length constraint against mq_msgsize).
+
+@@ 12.08 | Intermediate | Trap | tags=pipe,pipebuf,atomicity,blocking
+Q: What does PIPE_BUF actually guarantee, and what is the common misunderstanding about pipe write atomicity?
+SHORT: POSIX guarantees that a single write() of up to {PIPE_BUF} bytes to a pipe is atomic with respect to other writers -- it will not be interleaved with another process's write of {PIPE_BUF} bytes or less. It does not guarantee that a write larger than {PIPE_BUF} is atomic (it can be interleaved with another writer's data), and it says nothing about a *reader* getting a whole "message" in one read() -- a pipe is a byte stream with no message boundaries at all, atomicity or not.
+DEEP:
+- {PIPE_BUF} is commonly 4096 bytes on Linux, but the exact value is a `<limits.h>` constant that should be queried (e.g. via `fpathconf()`) rather than hardcoded, since POSIX only guarantees it is *at least* a minimum value, not a fixed universal number across all POSIX systems.
+- The common mistake this trap is aimed at: assuming that because a single write() of, say, 100 bytes is atomic (won't be torn by another writer), a single read() will therefore get exactly those 100 bytes back in one call. Reads are not required to return a whole write's worth of data at once; a reader can see a write split across multiple read() calls, or combined with data from a different write, since the pipe has no concept of message boundaries -- that is precisely why message queues (12.06) exist for cases that actually need discrete message framing.
+- If a writer's single write() exceeds {PIPE_BUF}, POSIX allows that write to be interleaved with another process's concurrent write to the same pipe -- multiple writers to one pipe writing more than PIPE_BUF at a time is a real risk of interleaved, corrupted-looking data unless the application adds its own framing/locking.
+- Also worth remembering: if the pipe is full, a write() blocks (unless O_NONBLOCK) until a reader drains enough space -- this is the pipe's own natural backpressure mechanism, requiring no separate flow-control protocol for the simple case.
+FOLLOW:
+- How would you send a "message" larger than PIPE_BUF safely with multiple writers? => Either serialize writers with your own lock so only one write() (however large) happens at a time, or switch to a mechanism with real message framing such as POSIX message queues, or add your own length-prefix framing that the reader parses back out.
+- Does PIPE_BUF atomicity apply to named pipes (FIFOs) the same way? => Yes; once opened, a FIFO behaves identically to an anonymous pipe for this purpose, since PIPE_BUF is a property of pipes/FIFOs generally, not specific to how the two ends were connected.
+PITFALL: Assuming a pipe delivers whole "messages" because each write() call happens to be atomic up to PIPE_BUF. Atomicity of a single write is not the same guarantee as message framing on the read side; a pipe never has message boundaries.
+VERIFY: POSIX.1-2017 defines {PIPE_BUF} as an implementation-defined but POSIX-minimum-bounded limits.h constant with the write-atomicity guarantee up to that size; the exact atomicity wording lives on the write() page (write.3p, fetched for this module) rather than pipe.3p itself.
+
+@@ 12.09 | Intermediate | Concept | tags=shm,ftruncate,pattern
+Q: What is the standard shm_open() + mmap() + ftruncate() sequence, and why is ftruncate() necessary?
+SHORT: `shm_open()` creates (with O_CREAT) or connects to a shared memory object, but a freshly created one "has a size of zero" per POSIX -- `ftruncate(fd, size)` is what actually gives it a real size before `mmap()` can map it usefully; skipping ftruncate() and mapping a zero-length object either fails outright or maps zero usable bytes, depending on the implementation.
+DEEP:
+```c
+int fd = shm_open("/name", O_CREAT | O_RDWR, 0600);
+ftruncate(fd, needed_size);                          /* required: object starts at size 0 */
+void *p = mmap(NULL, needed_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+close(fd);                                            /* mmap() keeps its own reference; the fd itself can be closed after */
+```
+- POSIX's shm_open.3p RATIONALE explicitly calls this out: "the size can be set after the open using ftruncate()... this may be necessary for systems without virtual memory hardware support in order to ensure that the memory is contiguous" -- ftruncate() is not incidental cleanup, it is the documented, required step to give the object a nonzero size.
+- `close(fd)` after mmap() is safe and common: mmap() "shall add an extra reference to the file associated with the file descriptor fildes which is not removed by a subsequent close()," so the mapping remains valid after closing the descriptor that created it; the mapping itself is torn down later with munmap().
+- A second process that only needs to *connect* to an already-sized shared memory object (created by someone else) skips ftruncate() entirely -- it just shm_open()s the same name (without O_CREAT, or with O_CREAT which has no effect on an existing object) and mmap()s it at whatever size it already knows (or queries via fstat()) the object to be.
+FOLLOW:
+- What happens if two processes both call ftruncate() on the same shared memory object with different sizes? => Whichever call happens later wins for the object's size going forward; coordinate size-setting to happen exactly once (typically by the single creator, before any other process maps it) to avoid this race.
+- Does shm_open() zero-initialize the memory? => Yes; POSIX requires shared memory objects to start with zero-filled contents ("initializing memory objects to zero is required," per the RATIONALE, for consistency with file/heap/stack initialization and for security reasons).
+PITFALL: Calling mmap() on a shared memory object before ftruncate()-ing it to a nonzero size. A freshly O_CREAT-created object starts at size zero; mapping it before sizing it is a common first-try mistake.
+VERIFY: POSIX.1-2017, shm_open.3p (DESCRIPTION: "the shared memory object has a size of zero" on creation; RATIONALE: ftruncate()-after-open as the documented sizing mechanism; zero-initialization requirement).
+
+@@ 12.10 | Intermediate | Cross-layer | tags=pipe,mq,contrast,boundaries
+Q: Functionally, what is the single biggest difference between a pipe and a POSIX message queue?
+SHORT: A pipe is an unstructured byte stream -- read() can return any number of bytes up to what is available, with no concept of where one write() ended and another began. A message queue is discrete: mq_receive() always returns exactly one complete message as sent by a single mq_send() call, with an explicit length and priority, never a fragment or a merge of two messages.
+DEEP:
+- This message-boundary property is exactly what 12.08 warns is *not* true of a pipe: a pipe reader must build its own framing on top of the byte stream (e.g. a length prefix, a delimiter) if it needs discrete messages; a message-queue reader gets that framing for free from the mechanism itself.
+- The priority ordering that message queues add on top of framing (12.06/12.17) has no pipe equivalent at all -- a pipe is strictly FIFO with no concept of priority; if message ordering by importance matters, a message queue is the natural fit, not a pipe with an application-level priority scheme layered on.
+- Capacity behaves differently too: a pipe's backpressure is purely byte-count based (its kernel buffer size, commonly 64KB by default on Linux); a message queue's capacity is message-count based (`mq_maxmsg`) with a separate per-message size cap (`mq_msgsize`), set explicitly at creation time rather than being a fixed OS-wide default.
+- Both share the same fundamental "kernel serializes access, no explicit lock needed by the application" property from 12.01/12.03 -- the difference here is purely about the *shape* of the data each moves, not about whether synchronization is required.
+FOLLOW:
+- Which would you choose for streaming a child process's log output to a parent? => A pipe; log output is naturally an unstructured byte/line stream with no need for message framing or priority, and pipes are the simplest, lowest-overhead fit.
+- Which would you choose for sending discrete control commands (start, stop, reconfigure) to a worker process? => A message queue; each command is naturally a discrete unit, and priority ordering (e.g. an urgent "stop" jumping ahead of queued routine commands) is a meaningful, directly-supported feature there.
+PITFALL: Building your own ad hoc message-framing protocol on top of a pipe when POSIX message queues already provide framing (and priority) natively for exactly that use case.
+
+@@ 12.11 | Advanced | Scenario | tags=shm,semaphore,sync,code
+Q: Build and confirm a shared-memory handoff between two processes that is properly synchronized with process-shared semaphores.
+SHORT: Two unnamed semaphores (`sem_init(&sem, 1, 0)`, the `1` meaning shared between processes) live inside the same mmap()'d shared memory segment as the data they protect, so both processes can see and operate on the same semaphore state; each side waits on "its" semaphore before touching the shared counter and posts the other side's semaphore when done, giving strict turn-taking with no unsynchronized concurrent access.
+DEEP:
+```c
+typedef struct { long counter; sem_t child_turn; sem_t parent_turn; } shared_t;
+shared_t *shm = mmap(NULL, sizeof(shared_t), PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+sem_init(&shm->child_turn, 1, 0);
+sem_init(&shm->parent_turn, 1, 0);
+/* child:  sem_wait(&shm->child_turn); shm->counter++; sem_post(&shm->parent_turn); */
+/* parent: shm->counter++; sem_post(&shm->child_turn); sem_wait(&shm->parent_turn); */
+```
+  Compiled with `gcc -std=c11 -Wall -Wextra -pthread -lrt` and run across a fork()ed parent/child pair alternating 5 turns each, the final counter printed `10 (expected 10)` on every one of three separate runs -- exact, with no lost updates, because only one side ever touches `counter` at a time by construction.
+- `sem_init(sem_t *sem, int pshared, unsigned value)`'s second argument is exactly what makes this work across processes: a nonzero `pshared` tells the implementation the semaphore may be shared between processes (as opposed to only between threads of one process), which is required precisely because the semaphore itself lives in memory both processes can see via the shared mapping.
+- This is the general pattern for 12.03's requirement: the synchronization primitive's *own state* must live somewhere both processes can access, which is why it is placed inside the shared memory segment itself rather than as a separate, process-local object.
+FOLLOW:
+- Would a pthread_mutex_t work here instead of two semaphores? => Yes, for mutual exclusion alone, but it would need PTHREAD_PROCESS_SHARED set via pthread_mutexattr_setpshared() (module 4) and would need pairing with a process-shared condition variable to get the same strict turn-taking handoff that the two semaphores give directly here.
+- What cleans up shm->child_turn/parent_turn? => sem_destroy() on each, called once, ideally by whichever side is responsible for final cleanup (here the parent, after wait()ing for the child), followed by munmap() and shm_unlink() to remove the shared memory object itself.
+PITFALL: Using a single semaphore for two-way turn-taking instead of two. One semaphore can signal "your turn" in only one direction; a clean two-way handoff needs one semaphore per direction, exactly as this example does.
+VERIFY: POSIX.1-2017, shm_open.3p (mapping establishment) and reasoning about sem_init()'s pshared argument from the C Advanced page's semaphores module (module 6), which covers sem_init() in full detail for the in-process case this extends to the cross-process case.
+
+@@ 12.12 | Advanced | Debug | tags=shm,race,unsynced,demo
+Q: Demonstrate that shared memory with no synchronization actually loses updates across processes, the same way an unsynchronized shared variable would across threads.
+SHORT: Two forked processes each incrementing the same shared `long` via `(*counter)++` with no lock produced the exact expected total (2 x 3,000,000 = 6,000,000) on 4 out of 5 runs, but on one run produced exactly 3,000,000 -- half the expected total, a real, observed lost-update failure caused by the same unsynchronized load-add-store race threads would have (module 4), just manifesting across process boundaries via the shared mapping instead of shared thread memory.
+DEEP:
+```c
+long *counter = mmap(NULL, sizeof(long), PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+*counter = 0;
+if (fork() == 0) { for (int i = 0; i < N; i++) (*counter)++; _exit(0); }
+else             { for (int i = 0; i < N; i++) (*counter)++; wait(NULL);
+                    printf("counter = %ld (expected %d)\n", *counter, 2*N); }
+```
+  Compiled with `gcc -std=c11 -Wall -Wextra -pthread -lrt` and run 5 times with N = 3,000,000 per process: results were `6000000, 6000000, 6000000, 3000000, 6000000` -- the fourth run's `3000000` is a directly observed lost-update race, confirming that shared memory alone provides no atomicity for `(*counter)++`, exactly as 12.03 states, even though most runs on this particular hardware happened not to show it.
+- The fix is exactly 12.11's pattern: wrap each `(*counter)++` in a process-shared semaphore or mutex so only one process's increment executes at a time -- with that in place, the result is deterministically exact on every run, never merely "usually" exact.
+- The inconsistency across runs here (4/5 clean, 1/5 corrupted) is itself the lesson: a real, exploitable race does not have to fail every time, or even most times, to be a serious bug -- an unsynchronized shared-memory counter in production validation code could pass most test runs and only occasionally, under the wrong timing, silently lose data.
+FOLLOW:
+- Why did most runs come out exact despite the race existing? => `(*counter)++` compiles to a short load-increment-store sequence; with only two processes and relatively coarse-grained OS scheduling, the two processes' increments frequently do not interleave at exactly the vulnerable instant, so the race is real but not highly probable per operation on this hardware -- more processes, more contention, or different hardware could show it far more often.
+- Would using an atomic type (e.g. `_Atomic long` in the shared mapping) fix this without a separate semaphore? => Yes for this specific counter case -- C11 atomics work across processes too as long as the underlying object is truly shared memory (the mapping already gives both processes the same physical bytes), and a plain `atomic_fetch_add` on it would need no separate semaphore at all; a semaphore/mutex is still needed for protecting anything more complex than a single atomic update.
+PITFALL: Treating a handful of "clean" test runs as proof an unsynchronized shared-memory access pattern is safe. As observed directly here, the same race can pass most runs and still corrupt data on an unlucky one; only actual synchronization (or an atomic type sized to the whole operation) removes the race, not favorable timing.
+
+@@ 12.13 | Advanced | Concept | tags=semaphore,named,unnamed,contrast
+Q: When would you reach for a named POSIX semaphore (sem_open) instead of the unnamed sem_init() used in 12.11?
+SHORT: Unnamed semaphores (`sem_init()`) need their storage already visible to every user, typically because it lives inside memory those processes already share, as in 12.11. Named semaphores (`sem_open("/name", O_CREAT, mode, value)`) manage their own storage under a filesystem-like name any process can open independently, with no prior shared-memory relationship needed -- the semaphore itself is what is shared, not a payload riding inside memory arranged separately.
+DEEP:
+- This mirrors exactly the pipe-vs-FIFO distinction in 12.02: an unnamed primitive needs an existing sharing mechanism (fork() inheritance for a pipe, an existing shared mapping for sem_init()), while a named primitive is discoverable by any process that knows its name, with no other relationship required.
+- Named semaphores are the natural choice when two otherwise-unrelated processes need to coordinate but are not already sharing a memory segment for another reason -- e.g. gating access to a message queue or a set of FIFOs (12.06/12.02) that themselves carry no synchronization semantics of their own beyond the kernel-serialized send/receive or read/write.
+- Both named and unnamed semaphores share the same core sem_post()/sem_wait() counting-semaphore semantics (module 6 covers this API surface in depth for the single-process case); the only difference covered here is how the semaphore is discovered/shared, not how it behaves once both sides have a handle to it.
+- Like message queues and shared memory objects, a named semaphore persists (under its name) until explicitly removed with `sem_unlink()`, independent of any process currently having it open.
+FOLLOW:
+- If you are already using shared memory for bulk data (12.11), is there any reason to prefer a named semaphore over an unnamed one placed inside that memory? => Rarely; since the shared memory already gives you a place to put an unnamed semaphore's state, adding a named one would be an unnecessary extra kernel object with its own lifecycle to manage.
+- Can a named semaphore be used purely as a cross-process signal with no shared memory involved at all? => Yes; that is exactly its main advantage -- two processes with no other shared state can synchronize purely through a named semaphore's own kernel-managed state.
+PITFALL: Reaching for shared memory just to hold a semaphore, when the two processes have no other data to share. A named semaphore alone, with no shared memory segment at all, is the simpler tool for pure cross-process signaling.
+
+@@ 12.14 | Principal | Cross-layer | tags=signal,controlplane,ipc,contrast
+Q: How do signals function as a lightweight IPC control plane, compared to pipes/queues/shared memory?
+SHORT: A signal (e.g. `kill(pid, SIGUSR1)`) delivers essentially one bit of information -- "this event happened" -- with no payload beyond which signal number arrived (and, with real-time signals/sigqueue(), a small integer or pointer's worth of extra data at most). It is not a data-transfer mechanism the way pipes/queues/shared memory are; it is a notification mechanism, useful for waking a process up or telling it to check some other channel, not for moving the actual data itself.
+DEEP:
+- Module 2 covers signal delivery, default dispositions, and async-signal-safe handling in full; this module's angle is specifically where a signal fits *relative* to the data-carrying IPC mechanisms here: a common real pattern is a signal telling a process "go check the message queue/shared memory now," with the actual payload moving through one of those, not through the signal itself.
+- Because a signal handler is so constrained (module 2's async-signal-safe list, and the same atomic-flag pattern from the C Advanced page's module 10) it cannot itself safely drain a pipe or process a shared-memory payload directly inside handler context in general -- the typical design is: handler sets a flag (or, more robustly, writes a byte to a self-pipe the main loop is already select()/poll()ing on -- the classic "self-pipe trick"), and the main program's normal control flow does the actual data handling afterward.
+- Compared to a message queue's priority-ordered discrete messages (12.06), a signal has no payload and no queueing model beyond POSIX real-time signals (which do queue, with sigqueue()'s small integer payload) -- for anything beyond "something happened" or a tiny integer, use a real data-carrying mechanism instead.
+- This positions signals as the answer to "how do I interrupt/notify a process asynchronously regardless of what it is doing right now" -- pipes/queues/shared memory all require the receiving process to actively read/receive/check them, while a signal can interrupt a process that is blocked in an unrelated syscall (module 2 covers EINTR handling for exactly this interaction).
+FOLLOW:
+- Could you build an entire IPC protocol using only signals? => In principle with real-time signals' small integer payloads and sigqueue(), but it would be an unusually constrained and fragile design; use signals for notification and one of the data-carrying mechanisms in this module for the actual payload.
+- What is the "self-pipe trick" mentioned above? => A signal handler writes one byte to a pipe that the main loop already monitors with select()/poll(), turning an async signal into a normal, safely-processed event in the main loop instead of doing real work inside the handler itself.
+PITFALL: Trying to pass meaningful data through a signal itself (beyond a real-time signal's small integer payload). Signals are a notification mechanism; pair them with a pipe, queue, or shared memory segment for the actual data.
+
+@@ 12.15 | Advanced | Numeric | tags=latency,throughput,comparison
+Q: Roughly, how do pipes, message queues, and shared memory compare in throughput/latency for moving data between processes?
+SHORT: As a hedged ranking, not measured spec numbers: shared memory is fastest for bulk data once set up, since a write is a plain memory store with no kernel copy (only the sync primitive's cost applies); pipes and queues both pay at least one kernel-mediated copy per operation, making them slower per byte for large transfers but adequate, and often simpler, for small, infrequent messages or control signaling.
+DEEP:
+- The fundamental reason for shared memory's throughput advantage: no copy. A pipe/queue write requires the kernel to copy bytes from the sender's buffer into its own internal buffer, and the read requires another copy out to the receiver's buffer -- two copies per transfer, at speeds ultimately bounded by memory bandwidth and syscall overhead; shared memory, once mapped, involves zero copies for either side to access the same bytes.
+- This advantage matters most for *bulk* data (large buffers moved frequently); for small, infrequent messages, the fixed per-syscall overhead of any mechanism (including shared memory's own synchronization primitive wait/post calls) tends to dominate, and the difference between mechanisms becomes far less significant in practice.
+- Message queues add a small amount of additional overhead over a raw pipe for the same payload size, from the priority-ordering bookkeeping (12.06) the kernel maintains -- a reasonable, hedged expectation, not a number to state as fact without measuring the specific implementation.
+- For an SSD validation harness moving bulk I/O buffers between a control process and worker processes, this is exactly why shared memory (with explicit synchronization, 12.03/12.11) is the usual choice for the actual data path, while a pipe or message queue is the usual choice for the much smaller, much less frequent control/command path (12.18 designs this end to end).
+FOLLOW:
+- Does shared memory's advantage disappear if the synchronization primitive itself is expensive? => It can shrink significantly under heavy contention on the synchronization primitive, which is exactly why module 10's contention-cost reasoning (uncontended vs. contended atomic/mutex costs) is directly relevant when designing the synchronization layer around a shared-memory data path.
+- Would you ever choose a pipe over shared memory for bulk data anyway? => Yes, when simplicity and safety (no manual synchronization to get right, no risk of the unsynchronized-race bug in 12.12) outweigh the throughput cost, particularly if the bulk transfer is not actually the measured bottleneck.
+PITFALL: Assuming shared memory is always the right choice "because it's fastest," without weighing the real synchronization-design cost and bug risk (12.03/12.12) against a workload that may not actually need the throughput.
+VERIFY: no formal spec source (implementation- and hardware-dependent); treat as a hedged, order-of-magnitude ranking to validate by measurement on the actual target system, not a cited guarantee.
+
+@@ 12.16 | Advanced | Trap | tags=mq,priority,full,blocking
+Q: What is the common misunderstanding about mq_send() and a full message queue?
+SHORT: A common assumption is that mq_send() on a full queue simply fails immediately; POSIX actually says it blocks until space frees up unless O_NONBLOCK was set, exactly like a full pipe's write() (12.08). Separately, msg_prio only affects insertion order, not admission when full: a high-priority message sent to a full queue still blocks (or gets EAGAIN under O_NONBLOCK) exactly like a low-priority one.
+DEEP:
+- POSIX mq_send.3p is explicit: "If the specified message queue is full and O_NONBLOCK is not set... mq_send() shall block until space becomes available... or until mq_send() is interrupted by a signal" -- this is the same backpressure model as a pipe (12.08), not a "fails and lets you retry yourself" model, unless you explicitly opted into O_NONBLOCK.
+- Priority only ever reorders *already-enqueued, not-yet-received* messages relative to each other ("a message with a larger numeric value of msg_prio shall be inserted before messages with lower values"); it has no effect on admission when the queue is at `mq_maxmsg` capacity -- a full queue is full regardless of the new message's priority.
+- If multiple threads/processes are blocked waiting to send when space frees up, and the Priority Scheduling option is supported, "the thread of the highest priority that has been waiting the longest shall be unblocked" -- note this is about the *sender's own scheduling priority* (module 11's sched_priority), a completely different axis from msg_prio, which is easy to conflate.
+- `mq_timedsend()` is the documented way to bound how long you are willing to block on a full queue, with an absolute deadline via CLOCK_REALTIME (or the system clock if the Timers option is unsupported) -- useful when an unbounded block on a full queue is unacceptable for the caller's own latency requirements.
+FOLLOW:
+- Does a high msg_prio let a message jump ahead of a full queue's admission limit? => No; msg_prio only orders messages already accepted into the queue relative to each other, never affects whether the queue accepts a new message when it is at capacity.
+- What is the difference between "the sender blocked the longest gets unblocked first" and msg_prio ordering? => The former is about which *blocked sender* gets to enqueue next when space frees up (governed by the sender's own scheduling priority, if Priority Scheduling is supported); the latter is about where an already-enqueued message sits relative to other already-enqueued messages for receivers. They are two different priority concepts that happen to share the word "priority."
+PITFALL: Conflating a message's msg_prio with the sending thread's own scheduling priority (module 11's sched_priority). They are unrelated axes: one orders messages inside the queue, the other affects which blocked sender gets to send next.
+VERIFY: POSIX.1-2017, mq_send.3p (full-queue blocking behavior, msg_prio insertion-order semantics, Priority Scheduling option's blocked-sender-unblocking rule, mq_timedsend()'s CLOCK_REALTIME-based deadline).
+
+@@ 12.17 | Advanced | Scenario | tags=mq,priority,code
+Q: Show that mq_send()'s msg_prio actually reorders delivery regardless of send order.
+SHORT: Three messages sent in the order low(1), high(5), mid(3) come back out of mq_receive() in priority order high(5), mid(3), low(1) -- exactly matching POSIX's documented rule that a message is "inserted before messages with lower values of msg_prio," confirmed by actually running it, not just by reading the spec text.
+DEEP:
+```c
+mq_send(q, "low prio",  9, 1);
+mq_send(q, "high prio", 10, 5);
+mq_send(q, "mid prio",  9, 3);
+for (int i = 0; i < 3; i++) {
+    unsigned prio;
+    mq_receive(q, buf, sizeof buf, &prio);
+    printf("received \"%s\" at priority %u\n", buf, prio);
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -pthread -lrt` and run, the output was exactly:
+
+```
+received "high prio" at priority 5
+received "mid prio" at priority 3
+received "low prio" at priority 1
+```
+
+confirming send order (low, high, mid) has no bearing on receive order once priorities differ -- the queue's own internal insertion-by-priority behavior, not FIFO-by-arrival, governs what mq_receive() hands back.
+- Note the `prio` output parameter of mq_receive() is how a receiver discovers what priority a message was actually sent at; a receiver that ignores this parameter (passing NULL, which is allowed) simply gets messages in the queue's priority order without ever learning what that priority value was.
+- This directly demonstrates 12.16's point about full-queue admission being separate from ordering: all three of these sends succeeded immediately (queue was nowhere near full, `mq_maxmsg = 10`), so this test exercises pure delivery-ordering behavior, not admission/blocking behavior at all.
+FOLLOW:
+- What would happen if two messages were sent with the same msg_prio? => POSIX specifies "a message shall be inserted after other messages in the queue, if any, with equal msg_prio" -- equal-priority messages preserve their relative send order (FIFO within a priority level).
+- Is there an upper bound on msg_prio values? => Yes; POSIX requires msg_prio to be less than {MQ_PRIO_MAX}, an implementation-defined limit applications should query rather than assume a specific numeric ceiling for.
+PITFALL: Assuming a message queue is FIFO-by-send-order like a pipe. It is priority-ordered by design; two messages with different priorities are never guaranteed to come back out in send order, only equal-priority messages are.
+VERIFY: POSIX.1-2017, mq_send.3p ("a message with a larger numeric value of msg_prio shall be inserted before messages with lower values... inserted after other messages... with equal msg_prio"; msg_prio < {MQ_PRIO_MAX}).
+
+@@ 12.18 | Principal | Scenario | tags=design,harness,ipc,strategy
+Q: Design the IPC strategy for a validation harness with one control process and several worker processes issuing I/O to devices under test.
+SHORT: Use a pipe/FIFO for each worker's stdout/stderr/logs, since that is an unstructured stream. Use a message queue for control commands (start, stop, abort), since they are discrete, occasionally urgent, and low-volume. Use shared memory with process-shared semaphores or mutexes for bulk I/O buffers and results, since that is high-volume and copy-sensitive. Use signals only as a "check your queue/memory now" nudge, never to carry the data itself.
+DEEP:
+1. Log/output path (pipes): each worker's stdout/stderr piped back to the control process for aggregation; no message framing needed, matches 12.10's "unstructured stream" fit exactly.
+2. Control-command path (message queue): the control process mq_send()s discrete commands to a per-worker (or shared, worker-filtered) queue; an urgent "abort" can be sent at a higher msg_prio so it is received ahead of routine, already-queued commands (12.17) -- a pipe could not offer this without a hand-rolled priority scheme.
+3. Bulk data/results path (shared memory + explicit sync): I/O buffers and per-operation result/statistics data live in a shared memory segment (12.09/12.11) sized generously at startup, with a process-shared semaphore or mutex guarding each handoff, avoiding the double-copy cost a pipe/queue would pay for high-volume buffer traffic (12.15).
+4. Notification path (signals, sparingly): a lightweight SIGUSR1-style nudge to tell a worker "new command is waiting" if it might otherwise be blocked in an unrelated syscall (module 2's EINTR interaction), while the actual command content always travels via the message queue, never via the signal itself.
+5. Failure isolation as the underlying reason for choosing separate processes (not threads) here at all: a worker process crashing (e.g. from a device-under-test firmware bug triggering a segfault in driver interaction code) takes down only that worker, not the whole harness -- module 1/2's process-isolation properties are the real justification for paying IPC's extra complexity over simpler in-process threading (modules 4-9) in the first place.
+FOLLOW:
+- Why not just use shared memory for the control commands too, since it is already in use for bulk data? => Because commands benefit specifically from message queues' priority ordering and discrete framing (12.06/12.16) with much lower volume, where the added synchronization-design complexity of doing the same thing safely in shared memory would not be worth it.
+- What would you monitor to confirm this design is actually working under load? => Message queue depth/priority distribution over time (are commands backing up?), shared-memory synchronization primitive contention (module 10's contention-cost reasoning), and whether any worker process ever needed to be restarted (confirming the process-isolation benefit is actually paying off).
+PITFALL: Defaulting to one IPC mechanism for everything (commonly, either "just use shared memory for everything" or "just use pipes for everything") instead of matching each data path's actual shape (bulk vs. control vs. log) to the mechanism built for that shape.
+
+@@ 12.19 | Principal | Debug | tags=shm,ringbuffer,corruption,diagnose
+Q: A shared-memory ring buffer between two processes occasionally corrupts data in production, but only under heavy load. How do you diagnose and fix it?
+SHORT: The likely cause is missing synchronization on the head/tail indices -- even on one cache-coherent machine, a plain (non-atomic) read/write of shared head/tail counters is the same class of race as 12.12's unsynchronized counter, just inside a ring buffer's bookkeeping. The fix: make the indices `_Atomic` (C11 atomics work across a shared mapping too) with acquire/release pairing between producer index update and consumer read, the module 10 pattern applied across a process boundary.
+DEEP:
+1. Confirm the shape of the bug first: intermittent, load-dependent corruption is the classic signature of a race, not a logic error (a logic error would be reliably wrong, not occasionally wrong) -- this immediately points at synchronization, echoing 12.12's own "4/5 clean, 1/5 corrupted" result as a template for what this looks like.
+2. Check whether the head/tail indices are plain `long`/`int` in the shared segment with ordinary loads/stores, or actually `_Atomic`. A shared cache-coherent machine does not need synchronization for visibility eventually, but it absolutely still allows a compiler to reorder or split a non-atomic access, and it does nothing to make a load-then-store update sequence indivisible -- "same machine, coherent cache" is not the same guarantee as "atomic and ordered," exactly the naive-double-checked-locking lesson from module 10 applied here.
+3. The fix: producer writes the actual data first, then publishes the new tail index with `memory_order_release`; consumer reads the tail index with `memory_order_acquire` before reading the data it points to -- this ordering is what guarantees the consumer never sees a tail update without also seeing the data behind it, the same acquire/release pairing 10.12 uses for a lazily-published pointer, just applied to a ring buffer's index instead.
+4. Verify the fix under the same heavy-load conditions that originally exposed the bug, ideally with an injected-delay or stress variant (deliberately slowing one side down at the critical moment) to increase the chance of re-exercising the exact race window, rather than relying on the same intermittent natural timing to happen to recur during a retest.
+5. If the ring buffer allows more than one producer or more than one consumer (not just the simple single-producer/single-consumer case), re-examine whether the fix above is even sufficient -- multiple producers/consumers reintroduce the harder multi-CAS-point problem discussed in module 10's lock-free-queue material (10.16), which a single acquire/release pair on one index does not fully solve.
+FOLLOW:
+- Would adding a mutex around every access instead of using atomics also fix this? => Yes, and more simply to reason about, at the cost of the throughput a lock-free ring buffer was presumably built to provide in the first place (12.15's throughput-vs-simplicity trade-off) -- a reasonable interim fix while a lower-contention proper fix is designed.
+- Does this diagnosis change if the two processes are on different physical machines (not just different processes on one machine)? => Completely; that is no longer shared memory at all (it would need network-based IPC, out of scope for this module's POSIX-local IPC mechanisms), and cache-coherence assumptions do not apply across machines in the first place.
+PITFALL: Assuming a shared-memory ring buffer between two processes on one cache-coherent machine needs no synchronization "because the memory is already visible to both." Visibility is not the same as atomicity or ordering; the exact same data-race risk from unsynchronized concurrent access applies, just relabeled across a process boundary.
+
+@@ 12.20 | Principal | Cross-layer | tags=contrast,inprocess,cost,tradeoff
+Q: When is the extra complexity and cost of IPC (versus in-process threading, modules 4-9) actually worth paying, in a firmware validation context?
+SHORT: Pay for IPC's extra complexity when process isolation is the actual point -- a crash or hang in one worker must not take down the whole harness, or a component truly needs its own address space. Otherwise, in-process threading with the primitives from modules 4-9 is simpler, faster (no copy cost, no separate address spaces to synchronize across), and easier to get right, and should be the default.
+DEEP:
+- The isolation argument is the strongest, most concrete justification: a worker process that segfaults from a bad device response, an infinite loop from a firmware bug under test, or a resource leak that would otherwise corrupt an entire harness's memory space instead only takes down (and can be independently restarted) that one worker -- this is precisely 12.18's point 5, restated as the general principle.
+- The cost side is real and multi-part: every cross-process data transfer pays either a kernel-mediated copy (pipes/queues, 12.15) or a synchronization-design burden (shared memory, 12.03/12.11/12.12) that in-process threading simply does not have, since threads already share the address space for free; process creation itself (fork()) is also meaningfully more expensive than thread creation (module 1/3's address-space setup cost).
+- A useful diagnostic question when a design is being debated: "if this component crashes or hangs, do we want the rest of the system to survive?" -- a yes strongly favors a separate process; a no (the rest of the system is useless anyway without this component) more often favors a thread, since the isolation benefit is not actually being used.
+- For an SSD validation harness specifically, the natural fault line tends to be: the control/orchestration logic and per-device worker logic as separate processes (so one device's misbehavior cannot corrupt the whole run's state or bring down monitoring of other devices), while parallelism *within* one worker's own I/O issuing (many outstanding I/Os to the same device, tracked with in-process synchronization) uses threads, not more processes, since that parallelism does not need isolation from itself.
+FOLLOW:
+- Is IPC ever worth it purely for performance, not isolation? => Rarely as the primary driver; shared memory can be fast (12.15), but if isolation is not needed, threads sharing memory directly are simpler and at least as fast for the same data-sharing goal, since IPC's synchronization primitives (12.03/12.11) mirror the in-process ones (modules 4-6) anyway, just with extra setup.
+- How would you defend a design that mixes both (processes for isolation, threads within each process for parallelism)? => That it captures each benefit where it actually applies: process boundaries where fault isolation matters, threads where parallel work can safely share memory and does not need to survive each other's failure independently.
+PITFALL: Reaching for separate processes and IPC by default "for safety," when the actual workload has no isolation requirement at all -- paying IPC's real synchronization-design and copying costs (12.03, 12.12, 12.15) for a benefit (isolation) the design never actually uses.

@@ -1,0 +1,432 @@
+# Module 4: Pointers Deep Dive
+
+@@ 4.01 | Basic | Concept | tags=declarations,syntax
+Q: How do you read a complicated pointer declaration like `int *(*p4)(void)`?
+SHORT: Start at the identifier and work outward: first apply what is immediately adjacent (`()` for function, `[]` for array, `*` for pointer), then move to the next enclosing layer, using parentheses to override the default `[]`/`()` before `*` precedence. `p4` is "pointer to function taking void, returning pointer to int".
+DEEP:
+The "declaration follows use" rule: read the identifier, then repeatedly ask "what is applied to this now" moving outward through the declarator.
+- `[]` and `()` bind tighter than `*`, so `*p[3]` is "array of pointer" while `(*p)[3]` is "pointer to array" (parentheses force the `*` to bind first).
+- Walk outward one operator at a time and say it in English as you go.
+```c
+int *p1;             /* pointer to int */
+int *p2[3];           /* array of 3 pointers to int */
+int (*p3)[3];          /* pointer to array of 3 ints */
+int *(*p4)(void);       /* pointer to function returning int* */
+```
+Compiled and run: printing `sizeof` of each confirms they are actually different types (`sizeof p2` is 3 pointers = 24 bytes on a 64-bit target, the rest are single pointers = 8 bytes each).
+FOLLOW:
+- Why does `[]` bind tighter than `*`? => That is simply the grammar in C11 6.7.6: a declarator's postfix array/function suffix applies before a prefix `*`, so parentheses are the only way to change the order.
+- What is the fastest way to practice this? => Take any declaration apart one token at a time from the identifier outward, saying each step aloud; do not try to read it left to right.
+PITFALL: Reading `int *p[3]` as "pointer to array of 3 ints" instead of "array of 3 pointers to int".
+
+@@ 4.02 | Basic | Concept | tags=null,uninitialized
+Q: What is the actual difference between a null pointer, an uninitialized pointer, and a valid pointer?
+SHORT: A null pointer holds a well-defined "points at nothing" value you can safely compare against `NULL`. An uninitialized pointer holds an indeterminate value; reading it before it is assigned is itself undefined behavior in C11, not just dereferencing it. A valid pointer holds the address of a live object or is one-past-the-end of an array.
+DEEP:
+- `NULL` (6.5.9, footnote on null pointer constants) is a defined value the implementation guarantees compares unequal to every valid object pointer.
+- An automatic-storage pointer with no initializer holds indeterminate storage; C11 6.3.2.1p2 makes even reading such a value undefined behavior when the object could have had register storage class and never had its address taken, so "I only read it, I did not dereference it" is not automatically safe.
+- A dangling pointer is different again: it once was valid but the object's lifetime ended (see 4.09 for the trap version).
+```c
+#include <stdio.h>
+#include <stddef.h>
+
+int main(void) {
+    int *np = NULL;   /* explicitly points nowhere: safe to test before use */
+    int *up;          /* uninitialized: indeterminate value, unsafe to read */
+    if (np == NULL)
+        printf("np is null, safe to test before use\n");
+    up = np;          /* give up a defined value so this program has no UB */
+    printf("up now equals np: %d\n", up == NULL);
+    return 0;
+}
+```
+FOLLOW:
+- Does `NULL` have to be the all-zero-bits address? => No. C only guarantees the source-level constant behaves as "points at nothing"; some historical architectures used a nonzero bit pattern for the null pointer at the hardware level.
+- Is `calloc`'d memory ever full of dangling pointers? => No, `calloc` zero-fills, so any pointer members read back as null, not indeterminate; that is one reason firmware code favors `calloc` for structs holding pointers.
+PITFALL: Assuming an uninitialized local pointer is "probably null" because static globals default to zero; automatic-storage locals do not.
+
+@@ 4.03 | Basic | Numeric | tags=arithmetic,sizeof
+Q: If `int *p` points at `arr[0]`, what address does `p + 2` hold, and why is that different from `(char *)p + 2`?
+SHORT: Pointer arithmetic's unit is `sizeof` the pointed-to type, so `p + 2` moves `2 * sizeof(int)` bytes (8 bytes on a typical 4-byte `int`), landing on `arr[2]`. `(char *)p + 2` moves exactly 2 bytes because `sizeof(char)` is always 1, landing inside `arr[0]`'s second byte.
+DEEP:
+Per C11 6.5.6p8, adding an integer `N` to a pointer into an array yields the element `N` positions further along, "provided they exist"; the compiler scales `N` by `sizeof` the element type automatically.
+```c
+#include <stdio.h>
+
+int main(void) {
+    int arr[5] = {10, 20, 30, 40, 50};
+    int *p = arr;
+    char *cp = (char *)arr;
+    printf("p+1  is %ld bytes past p\n", (long)((char *)(p + 1) - (char *)p));
+    printf("cp+1 is %ld bytes past cp\n", (long)((cp + 1) - cp));
+    return 0;
+}
+```
+Compiled and run: `p+1` was 4 bytes past `p`, `cp+1` was 1 byte past `cp`, and `*(p+2)` printed `30`, matching `arr[2]`.
+FOLLOW:
+- What happens if the pointed-to type has padding, like a struct? => The unit is still `sizeof` the struct, padding included; arithmetic always moves whole elements, never partial ones.
+- Can you do pointer arithmetic on a `void *`? => Not portably: `void` has no size, so GCC's arithmetic-on-`void*`-as-`char*` is a nonstandard extension, not C11.
+PITFALL: Mentally computing pointer arithmetic in bytes for a non-`char` pointer type instead of in elements.
+
+@@ 4.04 | Intermediate | Concept | tags=indirection,multilevel
+Q: Why would a function take an `int **` parameter instead of `int *`?
+SHORT: A function that needs to hand the caller a new pointer value, not just a pointed-to value, must receive the address of the caller's pointer variable. `int **out` lets the callee do `*out = malloc(...)`, which is visible to the caller after the call returns.
+DEEP:
+This is the same reason `scanf("%d", &x)` needs `&x`: to write back through a pointer, you need one more level of indirection than the type you are writing.
+```c
+#include <stdlib.h>
+#include <stddef.h>
+
+void alloc_int(int **out, int value) {
+    *out = malloc(sizeof(int));
+    if (*out) **out = value;
+}
+int main(void) {
+    int *p = NULL;
+    alloc_int(&p, 42);   /* p is now non-NULL, and *p == 42 */
+}
+```
+Compiled and run: `*p` printed `42` after the call, confirming the caller's `p` itself was updated, not just a copy.
+FOLLOW:
+- Is there a limit to how many `*` levels are useful? => Two is by far the most common (an out-parameter, or a 2D dynamic array of `T*` rows); three or more usually signals a design that should use a struct instead.
+- How does this relate to `argv`? => `argv` is `char **`: an array of `char *` strings, itself accessed through a pointer, which is the same "one extra level to reach a pointer value" idea.
+PITFALL: Passing `int *` to a function that needs to change what the caller's pointer points to, then wondering why the caller's pointer is unchanged after the call.
+
+@@ 4.05 | Intermediate | Concept | tags=decay,sizeof
+Q: Why does `sizeof` give a different answer for the same array inside a function versus in the caller?
+SHORT: An array used as a function parameter decays to a pointer to its first element (C11 6.3.2.1p3 does not except parameters), so `sizeof` inside the function measures the pointer, not the array. The array's true size is only available where the array's type is still visible, such as in the caller.
+DEEP:
+```c
+#include <stdio.h>
+
+void show_size(int arr[]) {   /* arr decays to int * as a parameter */
+    printf("inside function: sizeof(arr) = %zu\n", sizeof(arr));
+}
+int main(void) {
+    int arr[10];
+    printf("in caller:       sizeof(arr) = %zu\n", sizeof(arr));
+    show_size(arr);
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra` and run: the caller printed `40` (ten 4-byte ints), the function printed `8` (one pointer on a 64-bit target). GCC's `-Wsizeof-array-argument` flags exactly this line, which is the compiler pointing at the same trap this question is about.
+FOLLOW:
+- Does writing `int arr[10]` instead of `int *arr` as the parameter change anything? => No; C11 footnote 103 to 6.5.3.4 says the parameter is adjusted to the pointer type regardless of which spelling you use, so `sizeof` behaves identically either way.
+- How do you get the real element count into the function then? => Pass it explicitly as a second parameter, computed in the caller with `sizeof(arr) / sizeof(arr[0])` while the array type is still visible.
+PITFALL: Writing a helper that takes an array parameter and tries to compute its length internally with `sizeof`.
+VERIFY: C11 6.7.6.3 on function parameter adjustment for array types.
+
+@@ 4.06 | Intermediate | Scenario | fig=ptrmodel | tags=arrays,decay,multidim
+Q: What is the difference between `int (*p)[4]` and `int *p[4]`, and when do you need the first one?
+SHORT: `int *p[4]` is an array of 4 pointers to int. `int (*p)[4]` is a single pointer to an array of 4 ints, and it is exactly the type a 2D array like `int m[3][4]` decays to when passed to a function, since each row is an `int[4]`.
+DEEP:
+- `int *arr_of_ptrs[4]`: four independent `int *` slots; each can point anywhere, including different arrays entirely.
+- `int (*prow)[4]`: one pointer whose arithmetic unit is a whole `int[4]` (16 bytes on a 4-byte `int`), so `prow++` skips an entire row.
+```c
+#include <stdio.h>
+
+int main(void) {
+    int matrix[3][4] = {{1,2,3,4},{5,6,7,8},{9,10,11,12}};
+    int (*prow)[4] = matrix;      /* pointer to an array of 4 ints */
+    printf("prow[1][2] = %d\n", prow[1][2]);
+    prow++;                        /* advances by sizeof(int[4]) = 16 bytes */
+    printf("after prow++: prow[0][0] = %d\n", prow[0][0]);
+
+    int a = 1, b = 2, c = 3;
+    int *arr_of_ptrs[3] = {&a, &b, &c};  /* array of 3 pointers to int */
+    for (int i = 0; i < 3; i++)
+        printf("*arr_of_ptrs[%d] = %d\n", i, *arr_of_ptrs[i]);
+    return 0;
+}
+```
+Compiled and run: `prow[1][2]` was `7`; after `prow++`, `prow[0][0]` was `5`, i.e. what used to be `matrix[1][0]`, confirming the row-sized step.
+FOLLOW:
+- Which one do you use as a function parameter for a fixed-width 2D array? => `void f(int (*m)[4], int rows)`, because that is exactly what `int m[][4]` decays to; the inner dimension must be known at compile time either way.
+- Can an array of pointers point to rows of different lengths (a jagged array)? => Yes, that is the usual way to build a jagged 2D structure in C, unlike a true 2D array whose rows are all the same fixed width.
+PITFALL: Declaring `int *p[4]` when a true 2D-array parameter type, `int (*p)[4]`, was intended; the compiler accepts both but they describe unrelated memory layouts.
+
+@@ 4.07 | Intermediate | Concept | tags=const,qualifiers
+Q: What is the difference between `const int *p`, `int *const p`, and `const int *const p`?
+SHORT: Read right to left from `p`: `const int *p` is a variable pointer to a `const int` (cannot modify what it points to, can repoint it). `int *const p` is a `const` pointer to a variable `int` (opposite: can modify the pointee, cannot repoint it). `const int *const p` is both at once.
+DEEP:
+C11 6.7.6.1 example 3 gives exactly this pair and states the rule: the qualifier applies to whatever is immediately to its left in the declarator, or to the base type if it is at the very start.
+```c
+#include <stdio.h>
+
+int main(void) {
+    int x = 10, y = 20;
+    const int *ptr_to_const = &x;  /* cannot modify *ptr_to_const */
+    int *const const_ptr = &x;     /* cannot repoint const_ptr */
+    ptr_to_const = &y;              /* fine: repointing is allowed */
+    *const_ptr = 99;                /* fine: modifying the pointee is allowed */
+    printf("%d %d\n", *ptr_to_const, *const_ptr);
+    return 0;
+}
+```
+Compiled and run: after this, `*ptr_to_const` reads `20` (it now points at `y`) and `*const_ptr` reads `99` (it modified `x` in place); both compiled clean, and the two lines that are commented out above (`*ptr_to_const = 1;` or `const_ptr = &y;`) would each be a constraint violation the compiler must diagnose.
+FOLLOW:
+- Does `const int * const` need the space before the second `const`? => No, whitespace around `*` does not matter; only which side of the `*` a `const` sits on matters.
+- Why do library functions take `const char *` so often? => It documents and enforces "this function reads the string but will not modify it", while still letting the caller pass a non-const string without a cast.
+PITFALL: Writing `const T*` and believing the pointer itself is now immutable, when it is the pointee that const protects.
+
+@@ 4.08 | Intermediate | Concept | tags=void*,generic
+Q: How do you write one `swap` function in C that works for `int`, `double`, or any other type?
+SHORT: Take `void *` parameters plus an explicit `size_t size`, and move bytes with `memcpy` through a temporary buffer; `void *` carries no type information, so the caller's element size must be passed in separately, exactly like `qsort` does.
+DEEP:
+```c
+#include <string.h>
+#include <stddef.h>
+
+void generic_swap(void *a, void *b, size_t size) {
+    unsigned char tmp[64];  /* fine for this demo's small fixed-size operands */
+    memcpy(tmp, a, size);
+    memcpy(a, b, size);
+    memcpy(b, tmp, size);
+}
+int main(void) {
+    int x = 1, y = 2;
+    generic_swap(&x, &y, sizeof(x));
+    double p = 1.5, q = 2.5;
+    generic_swap(&p, &q, sizeof(p));
+}
+```
+Compiled and run: `x,y` became `2,1` and `p,q` became `2.5,1.5`. A production version would size `tmp` dynamically (or use a fixed small max and reject larger sizes) rather than a hardcoded 64-byte stack buffer.
+FOLLOW:
+- Why not just use a macro instead? => A macro re-evaluates its arguments textually, which risks double side effects and cannot enforce that both arguments are the same size; a `void *` function centralizes the logic once.
+- Is this how the C standard library's own generic functions work? => Yes, `qsort` and `bsearch` use exactly this pattern: `void *` plus an explicit element size and a caller-supplied comparator.
+PITFALL: Forgetting that `void *` gives up all type checking, so passing mismatched `size` values compiles fine and silently corrupts memory.
+
+@@ 4.09 | Intermediate | Trap | tags=dangling,wild
+Q: What is the difference between a dangling pointer and a wild pointer?
+SHORT: A wild pointer was never initialized and holds a garbage address to begin with. A dangling pointer was valid once but its target's storage was reclaimed (the stack frame returned, or the block was freed), so the address it holds is now stale. Both are unsafe to dereference; only a null pointer is safe to test first.
+DEEP:
+```c
+#include <stdio.h>
+
+int *make_dangling(void) {
+    int local = 5;
+    return &local;   /* returns the address of an object whose lifetime just ended */
+}
+int main(void) {
+    int *wild;                       /* uninitialized: points nowhere valid */
+    int *dangling = make_dangling();
+    printf("%d\n", *dangling);
+    (void)wild;                       /* never read: illustrates the declaration only */
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra`: GCC's `-Wreturn-local-addr` flags `make_dangling` directly, which is the compiler catching exactly this bug at the point it is created. Running the binary segfaulted on this toolchain; the standard leaves dereferencing a dangling pointer undefined, so a crash is one possible outcome, not a guaranteed one, and a build without that warning enabled might silently read stale stack data instead.
+FOLLOW:
+- Does returning a pointer to a `static` local have the same problem? => No; a `static` local has the whole program's lifetime, so a pointer to it stays valid after the function returns, unlike an automatic local.
+- Is a dangling pointer always caught by a crash? => No, that is the dangerous part: the memory might still hold the old bit pattern for a while, so the bug can appear to work until something else reuses that stack slot or heap block.
+PITFALL: Treating "the program did not crash" as proof that a dangling-pointer read was safe.
+
+@@ 4.10 | Advanced | Concept | tags=comparison,relational
+Q: When is comparing two pointers with `<` well-defined, and when is it undefined behavior?
+SHORT: `<`, `>`, `<=`, `>=` between pointers are only well-defined when both point into the same array (or one is one-past-the-end of it); comparing pointers into two unrelated objects with a relational operator is undefined behavior per C11 6.5.8p5. Equality (`==`, `!=`) between any two object pointers is always well-defined, even across unrelated objects.
+DEEP:
+```c
+#include <stdio.h>
+
+int main(void) {
+    int arr[5] = {0,1,2,3,4};
+    int *p = &arr[1];
+    int *q = &arr[3];
+    printf("%d\n", p < q);          /* well-defined: both point into arr */
+    int other[5] = {0};
+    int *r = &other[0];
+    printf("%d\n", p == r);          /* well-defined: equality always is */
+    printf("%d\n", p < r);           /* UB: unrelated arrays, shown only to see the toolchain's behavior */
+    return 0;
+}
+```
+Compiled and run: `p < q` printed `1`, `p == r` printed `0`, and `p < r` printed `1` on this toolchain purely because of where the linker happened to place `arr` and `other`; that answer is not something a conforming program may rely on.
+FOLLOW:
+- Why single out relational operators and not `==`? => 6.5.9p6 defines equality purely in terms of "same object or both one-past-the-end", which needs no notion of address ordering; `<` inherently claims one address is numerically before another, which the standard only promises within one array.
+- Does this matter for real code? => Yes: sorting a list of unrelated heap pointers by comparing them with `<` is a common but technically nonportable pattern, even though it works on every mainstream flat-address-space target.
+PITFALL: Using pointer `<` comparisons to order pointers from unrelated allocations and assuming that is guaranteed portable.
+VERIFY: C11 6.5.8p5 (relational operators) versus 6.5.9p6 (equality operators).
+
+@@ 4.11 | Advanced | Scenario | tags=2darray,parameters
+Q: How do you write a function that takes a fixed-width 2D array and correctly indexes its rows?
+SHORT: Declare the parameter as `int (*m)[COLS]`, matching what `int arr[ROWS][COLS]` decays to, then index normally with `m[row][col]`; the compiler already knows each row is `COLS` ints wide, so the stride math is handled for you.
+DEEP:
+```c
+#include <stdio.h>
+
+int row_sum(int (*m)[4], int row) {
+    int sum = 0;
+    for (int j = 0; j < 4; j++)
+        sum += m[row][j];
+    return sum;
+}
+int main(void) {
+    int matrix[3][4] = {{1,2,3,4},{5,6,7,8},{9,10,11,12}};
+    for (int i = 0; i < 3; i++)
+        printf("row %d sum = %d\n", i, row_sum(matrix, i));
+}
+```
+Compiled and run: rows summed to `10`, `26`, `42`, matching a manual check of each row's four values.
+FOLLOW:
+- Can the column count be a runtime value instead of a literal `4`? => Yes, with a variable-length array parameter, `int (*m)[cols]`, where `cols` is an earlier parameter; C11 6.7.6.2 explicitly allows this at function scope.
+- What if you only have `int **m`? => That is a different, incompatible layout (an array of separately allocated rows); passing a true 2D array where `int **` is expected is a type error, not just a style choice.
+PITFALL: Declaring the parameter as `int **m` for a 2D array argument, which does not match the array's actual memory layout at all.
+
+@@ 4.12 | Advanced | Debug | tags=sizeof,decay
+Q: This helper is supposed to count an array's elements, but it always returns 2. What is wrong?
+SHORT: `buggy_count` takes `int arr[]`, which is really `int *arr`; `sizeof(arr) / sizeof(arr[0])` becomes `sizeof(int*) / sizeof(int)`, which is `8/4 = 2` on a typical 64-bit target, regardless of the caller's actual array size. The array's true length has to be measured in the caller and passed in.
+DEEP:
+```c
+#include <stdio.h>
+#include <stddef.h>
+
+size_t buggy_count(int arr[]) {
+    return sizeof(arr) / sizeof(arr[0]);  /* arr is really int*, so this is sizeof(int*)/sizeof(int) */
+}
+size_t fixed_count(size_t n) { return n; }
+int main(void) {
+    int data[10] = {0};
+    printf("%zu\n", sizeof(data) / sizeof(data[0]));               /* 10, correct */
+    printf("%zu\n", buggy_count(data));                             /* 2, wrong */
+    printf("%zu\n", fixed_count(sizeof(data) / sizeof(data[0])));   /* 10, correct */
+}
+```
+Compiled with `-Wall -Wextra`: GCC's `-Wsizeof-array-argument` fires on `buggy_count`'s `sizeof(arr)` line, naming this exact mistake. Running it printed `10`, `2`, `10`, confirming the diagnosis.
+FOLLOW:
+- Would `size_t buggy_count(int *arr)` behave any differently? => No; per 6.7.6.3 a parameter written as `int arr[]` is adjusted to `int *arr`, so both spellings have identical, wrong, behavior here.
+- What is the general fix pattern? => Compute `sizeof(array)/sizeof(array[0])` only where the array's type is still visible (usually the caller), and pass the resulting count as a separate parameter.
+PITFALL: Trusting `sizeof` on any pointer-typed parameter to reveal how many elements it was "supposed to" point to.
+
+@@ 4.13 | Advanced | Trap | tags=pointer-arithmetic,ub
+Q: Is it safe to compute a pointer far past the end of an array, as long as you never dereference it?
+SHORT: No. C11 6.5.6p8 permits exactly one past-the-end position; forming a pointer any further out, even without dereferencing it, is undefined behavior. Only `arr + n` where the pointer stays within, or one past, the array is defined.
+DEEP:
+```c
+#include <stdio.h>
+
+int main(void) {
+    int arr[4] = {1,2,3,4};
+    int *end = arr + 4;  /* one past the last element: valid to hold, not to dereference */
+    for (int *p = arr; p != end; p++)
+        printf("%d ", *p);
+    /* int *past_end2 = arr + 5;  -- forming this pointer would already be UB */
+    return 0;
+}
+```
+Compiled and run: printed `1 2 3 4`, using `end` only for comparison, never dereferencing it, which is exactly the boundary the standard draws.
+FOLLOW:
+- Why does the standard bother forbidding even forming an out-of-range pointer? => Because some architectures trap on computing certain invalid addresses, or the compiler may use pointer range information for optimization; the rule protects both.
+- Is `arr - 1` (one before the start) ever defined? => No, there is no "one before the beginning" exception analogous to one-past-the-end; only the past-the-end side has that special case.
+PITFALL: Writing `for (p = arr; p <= arr + n; p++)` loops that walk one element too far, reasoning that "it is fine since I have not dereferenced it yet" when the pointer computation itself is already out of range.
+
+@@ 4.14 | Advanced | Concept | tags=indirection,strings
+Q: How does a `NULL`-terminated array of `char *` differ from a 2D `char` array for storing a list of strings?
+SHORT: `const char *names[]` is an array of pointers, each pointing to a separately-sized string (often literals), terminated by a sentinel `NULL` pointer; a 2D `char arr[N][M]` reserves fixed `M`-byte rows up front, wasting space for short strings but avoiding a separate allocation per string.
+DEEP:
+```c
+#include <stdio.h>
+#include <stddef.h>
+
+int main(void) {
+    const char *names[] = {"alpha", "beta", "gamma", NULL};
+    for (const char **p = names; *p != NULL; p++)
+        printf("%s\n", *p);
+    return 0;
+}
+```
+Compiled and run: printed `alpha`, `beta`, `gamma`, stopping at the `NULL` sentinel, exactly the pattern `argv` uses (`argv[argc]` is guaranteed null).
+FOLLOW:
+- Why not just use `sizeof(names)/sizeof(names[0])` instead of a `NULL` sentinel? => That works fine for a fixed compile-time array like this one, but a sentinel lets the same loop shape work when the array was built at runtime and its length was never recorded separately.
+- Which layout is more cache-friendly for many short, similar-length strings? => The 2D array, since all the data is one contiguous block; the pointer-array version scatters each string wherever its allocation or literal happened to land.
+PITFALL: Iterating a pointer array with a hardcoded element count instead of checking for the `NULL` sentinel, and reading past the last real string.
+
+@@ 4.15 | Principal | Scenario | tags=generic,design
+Q: Design a single function that can index into an array of any element type and size, the way a generic container would.
+SHORT: Take a `void *base`, an index, and an `elem_size`, and compute the address as `(char *)base + index * elem_size`; casting through `char *` is required because pointer arithmetic's unit is the pointed-to type, and `char` is the only type guaranteed to be exactly one byte.
+DEEP:
+```c
+#include <stdio.h>
+#include <stddef.h>
+
+void *elem_at(void *base, size_t index, size_t elem_size) {
+    return (char *)base + index * elem_size;
+}
+int main(void) {
+    double values[4] = {1.1, 2.2, 3.3, 4.4};
+    for (size_t i = 0; i < 4; i++) {
+        double *p = elem_at(values, i, sizeof(double));
+        printf("values[%zu] = %.1f\n", i, *p);
+    }
+}
+```
+Compiled and run: printed `1.1 2.2 3.3 4.4`, one per line, confirming the byte-offset math matches ordinary `double` array indexing.
+- State the trade-off unprompted: this trades away all compile-time type checking, exactly like `qsort`'s comparator interface, so callers must get `elem_size` right themselves.
+- For a real container, pair this with an assert or a stored `elem_size` field on the container struct itself, rather than trusting every call site to pass it correctly.
+FOLLOW:
+- Why cast to `char *` and not `unsigned char *`? => Either works for pointer arithmetic here; `unsigned char *` is the more defensible choice when the bytes will also be read or compared, since `char`'s signedness is implementation-defined.
+- How would you make this type-safer in C without templates? => You cannot fully; the usual compromise is a macro wrapper that captures `sizeof(*ptr)` at the call site so the caller never types the size by hand.
+PITFALL: Passing the wrong `elem_size` (for example, a stale `sizeof` from a different type after refactoring); nothing in the type system catches this.
+
+@@ 4.16 | Principal | Debug | tags=realloc,dangling
+Q: A caller kept a second pointer to a heap block before calling `realloc` on the original. What can go wrong, and how do you root-cause it?
+SHORT: `realloc` may move the block, freeing the old address; any other pointer still holding that old address becomes dangling the instant `realloc` succeeds and moves it. The fix is structural: never keep a second copy of a pointer across a `realloc` call on it, or reacquire that pointer from the new base afterward.
+DEEP:
+```c
+#include <stdlib.h>
+
+int main(void) {
+    int *buf = malloc(4 * sizeof(int));
+    for (int i = 0; i < 4; i++) buf[i] = i;
+    int *old = buf;             /* BUG pattern: keeping a copy of the old pointer */
+    buf = realloc(buf, 8 * sizeof(int));
+    if (!buf) { free(old); return 1; }
+    for (int i = 4; i < 8; i++) buf[i] = i;
+    /* old[0] here would be a use-after-free/dangling access if realloc moved the block */
+    free(buf);
+    return 0;
+}
+```
+Compiled and run cleanly (the flagged line, `old[0]`, was deliberately left as a comment rather than executed, since whether it crashes depends on whether this particular allocation happened to move).
+- Root-cause method for this class of bug in review or under a debugger: find every live copy of a pointer that is about to be passed to `realloc`/`free`, and confirm none of them are read again afterward; AddressSanitizer's "heap-use-after-free" report (module 16) names the exact old pointer and the free that invalidated it.
+- The pitfall generalizes beyond `realloc`: any function that may invalidate a pointer (a `free`, a container `resize`, a `vector`-like reallocation) creates the same hazard for every alias of that pointer.
+FOLLOW:
+- Does `realloc` failing (returning `NULL`) also invalidate the original pointer? => No, on failure the original block is left untouched and must still be freed through the original pointer, which is exactly why the buggy pattern reassigns `buf` only after checking for `NULL`.
+- Would this bug be caught by `-Wall -Wextra`? => Not reliably; this is a runtime aliasing issue the compiler generally cannot see, which is why AddressSanitizer or Valgrind (module 16) is the practical tool, not compiler warnings.
+PITFALL: Freeing or reallocating through one alias of a pointer while another alias of the same address is still assumed to be valid.
+
+@@ 4.17 | Principal | Concept | tags=provenance,invalid-pointers
+Q: Once an object's storage is freed or its lifetime ends, is its old pointer value itself still meaningful?
+SHORT: No. C11 treats the pointer value as becoming indeterminate once its target's lifetime ends (freed by `free`, or an automatic object whose enclosing block exited); the address bits may look unchanged, but the standard no longer guarantees anything about using that value, not just about dereferencing it.
+DEEP:
+- This is stricter than the intuitive "the address is fine, just do not read through it" view: 6.2.4 and the footnote to 6.5.3.2 both treat the address of an object past its lifetime as an invalid pointer value, in the same category as an incorrectly-aligned address.
+- Two allocations from separate `malloc` calls can legitimately receive the exact same bit pattern if the first was freed first; the standard's concern is about pointer *provenance* (which allocation a value is entitled to refer to), not just the numeric address.
+- This matters for optimizing compilers: because using a stale pointer value is undefined, the compiler is free to assume it never happens, and reorder or eliminate code accordingly; it is not merely a "hope the hardware does not fault" situation.
+- Module 10 covers the full undefined/unspecified/implementation-defined taxonomy this falls under; module 8 covers the allocator side (`malloc`/`free`/`realloc`) that creates and ends these lifetimes.
+FOLLOW:
+- Does this mean you can never store a pointer after freeing its target? => You can store the bits (e.g. in a log), but the standard does not guarantee that stored value is usable as a pointer again; treat it as opaque data, not as an address.
+- Is this the same issue as a dangling pointer from 4.09? => Closely related: a dangling pointer is the everyday name for exactly this, an old pointer value whose target's lifetime has ended.
+PITFALL: Assuming that because an address "looks the same" after a free, comparing or logging that pointer value is automatically harmless.
+VERIFY: C11 6.2.4 on storage durations and the end of an object's lifetime.
+
+@@ 4.18 | Principal | Numeric | tags=ptrdiff,arithmetic
+Q: Given `int arr[10]`, `p = &arr[2]`, and `q = &arr[7]`, what does `q - p` evaluate to, and in what type?
+SHORT: `q - p` is `5`, the difference in element subscripts (7 - 2), not a byte count; its type is `ptrdiff_t`, a signed integer type from `<stddef.h>`. To get the byte distance, multiply by `sizeof(int)` (or subtract `char *`-cast versions of the same pointers directly).
+DEEP:
+Per C11 6.5.6p9, subtracting two pointers into the same array yields the difference of their subscripts, with implementation-defined size but signed `ptrdiff_t` type; the result is undefined behavior if it does not fit in `ptrdiff_t`.
+```c
+#include <stdio.h>
+#include <stddef.h>
+
+int main(void) {
+    int arr[10];
+    int *p = &arr[2];
+    int *q = &arr[7];
+    ptrdiff_t d = q - p;   /* well-defined: both point into arr, value 5 */
+    printf("%td elements, %td bytes\n", d, (ptrdiff_t)((char *)q - (char *)p));
+    return 0;
+}
+```
+Compiled and run: `d` was `5`, and the byte-cast version was `20`, matching `5 * sizeof(int)` on a 4-byte `int`; `%td` is the correct `printf` conversion for `ptrdiff_t`.
+FOLLOW:
+- What if `p` and `q` point into two different arrays? => Undefined behavior; 6.5.6p9 requires both pointers to point into the same array object (or one past its end) for the subtraction to be defined at all.
+- Why might the result overflow `ptrdiff_t` in theory? => On a target where an array can be larger than half the address space, the element-count difference could exceed what a signed `ptrdiff_t` can represent; this is why the standard calls that case undefined rather than defining a saturating result.
+PITFALL: Treating pointer subtraction as a byte count and forgetting to multiply (or convert to `char *` first) when a byte distance is actually needed.

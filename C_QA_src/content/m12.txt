@@ -1,0 +1,525 @@
+# Module 12: Function Pointers & C-Style Polymorphism
+
+@@ 12.01 | Basic | Concept | tags=declare,assign,call,decay
+Q: How do you declare a function pointer, assign a function to it, and call through it, and why does `fp = add;` work without `&add`?
+SHORT: `int (*fp)(int, int);` declares `fp` as a pointer to a function taking two `int`s and returning `int`; assign with `fp = add;` and call with `fp(3, 4)` or, equivalently, `(*fp)(3, 4)`. A bare function name is a "function designator," and C11 6.3.2.1p4 says a function designator is automatically converted to a pointer to that function (except as the operand of `sizeof`, `_Alignof`, or unary `&`), so `add` alone already yields the function's address, exactly like array-to-pointer decay for arrays.
+DEEP:
+```c
+#include <stdio.h>
+int add(int a, int b) { return a + b; }
+int main(void) {
+    int (*fp)(int, int);
+    fp = add;
+    printf("%d\n", fp(3, 4));
+    printf("%d\n", (*fp)(3, 4));
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra`, prints `7` twice, confirming both call syntaxes are equivalent.
+- **Reading the declaration:** `int (*fp)(int, int)` parses as "`fp` is a pointer to (`*fp`), which is a function taking `(int, int)` and returning `int`." The parentheses around `*fp` are required; without them, `int *fp(int, int)` instead declares a function `fp` returning `int *`, a completely different type.
+- **Why `fp(3, 4)` and `(*fp)(3, 4)` are both valid:** calling through a function pointer implicitly dereferences it either way; the explicit `*` form is the more literal reading (dereference to get the function, then call it) and the bare form relies on the function-call operator accepting a function pointer directly, which C has always permitted for readability.
+- **The same decay rule explains why `&add` also works** as an initializer: `&` applied to a function designator explicitly takes its address, producing the identical pointer value that the automatic decay would have produced anyway, so `fp = &add;` and `fp = add;` are equivalent, and most style guides pick one and use it consistently.
+- **Typedef makes this far more readable in practice**, and the next question in this module introduces that idiom directly, since raw function-pointer declarator syntax gets unwieldy quickly with more parameters or a more complex return type.
+FOLLOW:
+- Is int (*fp)(int, int) the same type as int (*fp)(int a, int b)? => Yes, parameter names in a function pointer's type are purely documentation and do not affect the type; only the parameter types and count (and the return type) matter for compatibility.
+- What happens if fp is called before being assigned a function? => Calling through an uninitialized function pointer is undefined behavior (it holds an indeterminate value, Module 10), which is why declaring it with an initializer, or checking against NULL before the first call, is the safer pattern shown later in this module.
+PITFALL: Writing `int *fp(int, int)` when a function pointer was intended. Without the parentheses around `*fp`, this instead declares a function returning `int *`, a easy typo with a completely different meaning.
+VERIFY: C11 6.3.2.1p4 (function designator to function pointer conversion).
+
+@@ 12.02 | Basic | Concept | tags=typedef,callback,binop
+Q: Why is a typedef almost always used for function pointer types, and how does a simple callback parameter look with one?
+SHORT: A raw function pointer type like `int (*)(int, int)` embeds the parameter list inside the pointer's own declarator syntax, which becomes hard to read and easy to mistype once it appears as a parameter, a struct member, or a return type; `typedef int (*binop_t)(int, int);` names the type once, after which `binop_t` reads exactly like any other type name everywhere it is used. This is the same motivation as typedef-ing a complex struct pointer, just applied to a function type.
+DEEP:
+```c
+#include <stdio.h>
+int add(int a, int b) { return a + b; }
+int sub(int a, int b) { return a - b; }
+typedef int (*binop_t)(int, int);
+int apply(binop_t op, int a, int b) { return op(a, b); }
+int main(void) {
+    binop_t f = add;
+    printf("%d\n", apply(f, 10, 3));
+    f = sub;
+    printf("%d\n", apply(f, 10, 3));
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra`, prints `13` then `7`.
+- **`apply` is a callback consumer**: it takes a `binop_t` parameter and calls whatever function was passed in, without knowing at compile time which specific function that will be; this is the essence of a callback pattern, and it generalizes directly to the qsort comparator pattern in the next question.
+- **Without the typedef, `apply`'s declaration would read** `int apply(int (*op)(int, int), int a, int b)`, which is still readable for two parameters but grows uncomfortably for a realistic callback signature with several parameters or a `void *` context (covered later in this module).
+- **Reassigning `f` from `add` to `sub` mid-program** is exactly why this is called a function pointer and not a function reference: the variable can be pointed at any compatible function at runtime, which is the mechanism behind dispatch tables, plugin interfaces, and every "polymorphism in C" pattern this module builds toward.
+- **Type compatibility still matters with the typedef**: `binop_t` is just a name for `int (*)(int, int)`, so assigning a function whose signature does not match (wrong parameter types, count, or return type) is a type error the compiler will catch at the assignment, not something the typedef hides.
+FOLLOW:
+- Does the typedef change how the function pointer is called at the machine level? => No, a typedef never changes representation or calling convention; it is purely a compile-time naming convenience with zero runtime effect.
+- Would apply work the same if op's type were written without the typedef? => Yes, functionally identical; the typedef only improves readability and reduces the chance of a declarator typo, it does not change what is legal.
+PITFALL: Assuming a typedef'd function pointer type is somehow "safer" than the raw declarator. It offers zero additional type checking; it is purely a readability aid.
+
+@@ 12.03 | Basic | Numeric | tags=sizeof,function-pointer,data-pointer
+Q: Is sizeof a function pointer guaranteed to equal sizeof a data pointer?
+SHORT: No. C11 does not require function pointers and object (data) pointers to have the same size or representation; on the great majority of mainstream platforms, including this x86-64 target, both happen to be 8 bytes, but the standard leaves this a platform fact, not a language guarantee, and some historical and embedded architectures (notably ones with separate code and data address spaces) use different widths for the two.
+DEEP:
+```c
+#include <stdio.h>
+int add(int a, int b) { return a + b; }
+int main(void) {
+    int (*fp)(int, int) = add;
+    int x = 5;
+    int *dp = &x;
+    printf("sizeof(fp)=%zu sizeof(dp)=%zu\n", sizeof fp, sizeof dp);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra`, prints `sizeof(fp)=8 sizeof(dp)=8` on this x86-64 target, matching because the platform's ABI happens to use a flat, uniform address space for both code and data.
+- **Why the standard does not force equality:** 6.2.5 (types) treats pointer-to-function and pointer-to-object as distinct pointer categories, and 6.3.2.3p8 only guarantees that a function pointer converted to a different function pointer type and back compares equal; it says nothing relating function pointer size to object pointer size, unlike the guarantee that every object pointer type can round-trip through `void *` (6.3.2.3p1).
+- **Where this actually differs in practice:** some Harvard-architecture microcontrollers and a few historical platforms (older segmented x86 real-mode code, for instance) have code and data living in address spaces with different widths or addressing schemes, making function and data pointers different sizes; this is rare in modern general-purpose targets but real on some embedded cores.
+- **Practical consequence for portable code:** never assume a function pointer fits where a `void *` is expected, or vice versa; POSIX's `dlsym` (covered later in this module) is the well-known case where a POSIX extension has to work around exactly this incompatibility, since ISO C itself does not define converting between function pointers and object pointers at all.
+- **`void *` specifically cannot portably hold a function pointer:** 6.3.2.3's void-pointer conversion rules are stated in terms of "any object type," and a function type is explicitly not an object type (6.2.5p2 distinguishes them), so casting a function pointer through `void *` and back is not something C11 guarantees to work, even though POSIX requires exactly this to work for its own APIs on POSIX systems.
+FOLLOW:
+- Can a function pointer be safely stored in a void*? => Not portably in ISO C; POSIX systems require it to work for POSIX API compatibility, but standard C makes no such guarantee, which is exactly the caveat covered in the Advanced Trap question on dlsym later in this module.
+- Does this affect how function pointers are used in a vtable struct? => No; a struct of function-pointer members (the vtable pattern later in this module) works uniformly regardless of the exact size, since the struct layout rules apply to whatever size the platform's function pointers actually are.
+PITFALL: Assuming `sizeof(void *) == sizeof(some_func_ptr)` is a language guarantee rather than a common but non-universal platform fact.
+VERIFY: C11 6.2.5 (object pointer types vs. function pointer types as distinct categories) and 6.3.2.3 (pointer conversions, which are stated in terms of object types for void *).
+
+@@ 12.04 | Intermediate | Concept | tags=dispatch-table,array-of-function-pointers
+Q: How does an array of function pointers implement a dispatch table, and why is this the core mechanism behind most "C is not object-oriented but acts like it" tricks?
+SHORT: An array whose element type is a function pointer lets code select and call one of several functions using an ordinary integer index, `table[i](args)`, instead of a chain of `if`/`switch` statements; this replaces "decide which function to call" with "look up the function to call," which is both faster for many cases and, more importantly, extensible without touching the dispatch code itself when a new entry is added.
+DEEP:
+```c
+#include <stdio.h>
+int op_add(int a, int b) { return a + b; }
+int op_sub(int a, int b) { return a - b; }
+int op_mul(int a, int b) { return a * b; }
+typedef int (*binop_t)(int, int);
+int main(void) {
+    binop_t table[3] = { op_add, op_sub, op_mul };
+    const char *names[3] = { "add", "sub", "mul" };
+    for (int i = 0; i < 3; i++) {
+        printf("%s(6,2)=%d\n", names[i], table[i](6, 2));
+    }
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra`, prints `add(6,2)=8`, `sub(6,2)=4`, `mul(6,2)=12`.
+- **The array initializer `{ op_add, op_sub, op_mul }` relies on the same function-designator decay** from the first question in this module: each name decays to its address automatically, with no `&` needed, exactly as when assigning a single function pointer.
+- **Contrast with an if/switch chain:** `if (op == 0) return op_add(a,b); else if (op == 1) ...` grows linearly with every new case and requires editing that one function every time a case is added; a dispatch table instead grows by adding one array entry (and, in a real design, a corresponding enum value), leaving the calling code (`table[i](a, b)`) completely unchanged.
+- **This is the direct predecessor to the struct-of-function-pointers "vtable" pattern later in this module:** an array indexed by an integer opcode is a dispatch table over one function signature; a struct with named function-pointer members is a dispatch table over several different operations for one conceptual "object," which is exactly how C emulates an interface or a virtual method table.
+- **Real-world instances of this exact pattern:** a bytecode interpreter's opcode table, a state machine's per-state handler table (this module's Advanced Scenario question), and a syscall table in an operating system kernel are all this identical array-of-function-pointers idiom.
+FOLLOW:
+- What happens if table[i] is called with i out of range? => Undefined behavior, the same out-of-bounds array access covered in Module 10; a real dispatch table should validate the index (or size the table to cover every possible value of an enum-based index) before indexing.
+- Could the array be declared const? => Yes, `static const binop_t table[3] = {...};` is a common and good practice when the table's contents never change after initialization, both documenting intent and letting the compiler potentially place it in read-only memory.
+PITFALL: Growing an if/else chain instead of reaching for a table once the number of cases passes roughly three or four. The table version stays flat and readable as cases are added; the chain does not.
+
+@@ 12.05 | Intermediate | Concept | tags=qsort,comparator,callback,void-pointer
+Q: How does qsort use a function pointer to sort generically, and what does a correct comparator look like?
+SHORT: `qsort(base, n, size, cmp)` takes a comparator function pointer, `int cmp(const void *a, const void *b)`, and calls it to compare pairs of elements without qsort itself knowing the element type; the comparator casts each `const void *` back to the real element type, compares the two values, and returns negative, zero, or positive. This callback pattern is C's generic-programming idiom: qsort is written once and works for any element type.
+DEEP:
+```c
+#include <stdio.h>
+#include <stdlib.h>
+int cmp_int(const void *a, const void *b) {
+    int ia = *(const int *)a;
+    int ib = *(const int *)b;
+    return (ia > ib) - (ia < ib);
+}
+int main(void) {
+    int arr[6] = { 5, 3, 8, 1, 9, 2 };
+    qsort(arr, 6, sizeof(int), cmp_int);
+    for (int i = 0; i < 6; i++) printf("%d ", arr[i]);
+    printf("\n");
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra`, prints `1 2 3 5 8 9`.
+- **Why `(ia > ib) - (ia < ib)` instead of `ia - ib`:** `ia - ib` is a classic bug for a general-purpose integer comparator, since it can overflow (undefined behavior, Module 10) when the two values are far apart, for example one near `INT_MIN` and one near `INT_MAX`; the two-comparisons idiom always produces exactly `-1`, `0`, or `1` with no arithmetic on the values themselves.
+- **Why the parameters are `const void *`, not `const int *`:** qsort's own prototype (7.22.5.2) is generic over any element type, so it must accept a pointer type that can point to anything; the comparator's job is to know the real element type and cast back to it, which is exactly the same "type-erased callback" idea underlying the `void *` context parameter pattern covered later in this module.
+- **The comparator's contract, precisely:** return a value less than, equal to, or greater than zero depending on whether the first argument is considered less than, equal to, or greater than the second (7.22.5.2p2); qsort relies on this contract holding consistently for every pair it compares, and a comparator that violates it (inconsistent ordering) produces an unspecified, not merely wrong, final order.
+- **This is precisely the pattern behind signal handlers too** (`void (*)(int)`, covered in the next question): a standard library function accepts a function pointer with a fixed signature and calls back into caller-supplied code at a moment the library, not the caller, controls.
+FOLLOW:
+- Would cmp_int work correctly if compiled to compare doubles by just changing the cast? => No, both the cast type and the dereferenced type need to change together (const double *, and comparing double values), and mixing them (casting to double * but the array is actually int) would be undefined behavior from an incompatible-type access, the same class of bug as Module 10's strict-aliasing question.
+- Is qsort guaranteed to be stable (preserve the relative order of equal elements)? => No, C11 makes no stability guarantee for qsort; if stable sorting is required, a different algorithm implementation, or a comparator that breaks ties using a secondary stable key such as original index, is needed.
+PITFALL: Writing a comparator that returns `a - b` directly for integer or pointer-derived values. It is both potentially undefined (signed overflow) and, for pointer subtraction between unrelated objects, doubly so per Module 10.
+VERIFY: C11 7.22.5.2 (the qsort function's parameter types and comparator contract).
+
+@@ 12.06 | Intermediate | Concept | tags=signal-handler,callback,forward-reference
+Q: How is a signal handler an example of the same function-pointer callback pattern as qsort's comparator?
+SHORT: `signal(int sig, void (*handler)(int))` (C11 7.14.1.1) takes a function pointer with the fixed signature `void (*)(int)` and stores it so the runtime can call back into it asynchronously when the named signal occurs, exactly the same "library holds a pointer, library calls it later" shape as qsort's comparator, except the call here is triggered by an asynchronous event rather than by the library's own control flow during a single function call.
+DEEP:
+```c
+#include <stdio.h>
+#include <signal.h>
+
+volatile sig_atomic_t got_signal = 0;
+
+void handler(int sig) {
+    (void)sig;
+    got_signal = 1;
+}
+
+int main(void) {
+    void (*prev)(int) = signal(SIGINT, handler);
+    (void)prev;
+    raise(SIGINT);
+    printf("got_signal=%d\n", got_signal);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra`, prints `got_signal=1`: `raise(SIGINT)` (7.14.2.1) synchronously delivers the signal within this same call, invoking `handler`, which sets the flag before `raise` returns.
+- **`signal` itself returns a function pointer** (the previous handler, or `SIG_ERR` on failure), which is why `prev`'s declared type is also `void (*)(int)`; this lets code restore the original handler later if needed.
+- **Why `got_signal` is `volatile sig_atomic_t`, not a plain `int`:** a signal handler can run at a point the compiler cannot fully predict relative to `main`'s ordinary flow, so the shared flag needs `volatile` for the same single-threaded "do not cache or reorder this access" reason Module 7 covers for hardware registers, and `sig_atomic_t` specifically because C11 guarantees reading or writing an object of that type cannot itself be interrupted into an inconsistent state by a signal.
+- **What a signal handler must never do**, briefly: call most standard library functions (only a short async-signal-safe list is permitted, 7.14.1.1p5), including `printf`, because the handler can run mid-way through library state the handler itself might reenter; this reentrancy and signal-handler-safety topic is covered fully on the C Advanced page (thread and signal-handler safety), and this module only notes the function-pointer mechanism, not the full safety rules.
+- **The forward reference from Module 7 is the same qualifier**, `volatile`, used here for a different reason than a hardware register: both cases need "every access is observable, no compiler-assumed caching," just triggered by different sources (an interrupt/signal versus a memory-mapped device).
+FOLLOW:
+- Could handler safely call printf from inside a real interrupt-like signal delivery? => Not safely in general; printf is not on the async-signal-safe function list, and calling it from a handler risks corrupting library state if the signal happens to arrive while the program was already inside a related library call.
+- Is raise(SIGINT) here run on a separate thread or context? => No; raise delivers the signal synchronously within the calling thread, which is why this single-threaded example can rely on got_signal being set before printf runs, without any actual concurrency involved.
+PITFALL: Writing signal-handler logic that assumes normal library functions are always safe to call, because "it worked in this simple test." Reentrancy issues are asynchronous, timing-dependent, and usually invisible until a rare, ill-timed real signal.
+VERIFY: C11 7.14.1.1 (signal function and its restrictions) and 7.14.2.1 (raise); reentrancy and async-signal-safety in depth is POSIX.1-2017 territory, covered on the C Advanced page.
+
+@@ 12.07 | Intermediate | Trap | tags=incompatible-function-pointer,ub,cast
+Q: Casting a function pointer to an incompatible function pointer type and calling through it compiled and ran without error here. Is that safe?
+SHORT: No. C11 6.3.2.3p8 permits converting a function pointer to a different function pointer type and back, but is explicit that "if a converted pointer is used to call a function whose type is not compatible with the referenced type, the behavior is undefined." The code below cast `int (*)(int, int)` to `void (*)(void)` and back and called it, and it happened to produce the right answer on this build, exactly the accidentally-stable undefined behavior Module 10 warns against trusting.
+DEEP:
+```c
+#include <stdio.h>
+int add(int a, int b) { return a + b; }
+int main(void) {
+    void (*wrong)(void) = (void (*)(void))add;
+    int (*right)(int, int) = (int (*)(int, int))wrong;
+    printf("%d\n", right(3, 4));
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra`, prints `7`, and separately tested with `gcc -std=c11 -Wall -Wextra -fsanitize=undefined`, still prints `7` with no runtime diagnostic; gcc's `-fsanitize=undefined` has no equivalent to clang's `-fsanitize=function` check, so this particular category of UB is invisible to this build's sanitizer entirely.
+- **What 6.3.2.3p8 actually guarantees, and what it does not:** the round-trip conversion itself (function pointer to a different function pointer type, and back again) is well-defined and guaranteed to "compare equal to the original pointer." Calling through the pointer while it is cast to the wrong type in between is the undefined part; here, the code casts back to the correct type before calling, so in this exact program the final call site's type matches the real function, which is why it worked, not because the intermediate cast was safe in general.
+- **Where this becomes a genuine bug, not just a curiosity:** calling *without* casting back correctly, for example treating any function pointer as `void (*)(void)` and invoking it directly through that type (common in a naive plugin loader that stores every callback as a generic pointer type and calls it without restoring the real signature first), is calling through an incompatible type, squarely inside 6.3.2.3p8's undefined case.
+- **Real-world consequence on some ABIs:** calling convention details (which registers or stack slots hold which arguments, how the return value is passed) are determined by the function's actual signature; calling through a pointer typed with a different signature can pass arguments in the wrong place entirely, which is why this is not merely a "type system technicality" but a genuine risk of reading garbage arguments or a garbage return value on a real target, even though this particular x86-64 example happened to work.
+- **`dlsym`'s well-known real-world version of this exact problem** (converting a `void *` returned by `dlsym` into a specific function pointer type) is covered as its own Advanced Trap question later in this module.
+FOLLOW:
+- Would this be caught by -Wall -Wextra? => No, gcc issued no warning for this cast sequence in this build; some `-Wcast-function-type`-style warnings exist on modern gcc for certain incompatible function-pointer casts, but coverage is inconsistent across compilers and cast shapes, so do not rely on a warning to catch this category.
+- Is casting a function pointer through void * (not another function pointer type) any better? => It is a separate, additional problem: ISO C does not guarantee function pointers survive a round trip through void * at all (per the earlier sizeof question), so that path has its own undefined-behavior risk on top of the incompatible-call issue.
+PITFALL: Treating "it compiled, ran, and printed the right number" as proof this pattern is fine to use in production. Both the cast and the call are undefined behavior per 6.3.2.3p8, regardless of what one specific build happened to output.
+VERIFY: C11 6.3.2.3p8 (function pointer conversion and the incompatible-type call being undefined); confirmed that gcc's -fsanitize=undefined does not flag this case on this toolchain, unlike clang's separate -fsanitize=function.
+
+@@ 12.08 | Intermediate | Concept | fig=vtable | tags=struct-of-function-pointers,interface,vtable
+Q: How does a struct of function pointers emulate an interface or virtual method table in C, dispatching to two different implementations through the same call sites?
+SHORT: Declare a struct whose members are function pointers with agreed-upon signatures (the "interface"), then build one instance of that struct per concrete implementation, each instance's members pointing at that implementation's actual functions; calling code holds the interface struct and invokes `obj.read(ctx)` or `obj.write(ctx, v)` without knowing which concrete implementation it is talking to. This is the same mechanism C++ compilers use for virtual dispatch, written out by hand in plain C.
+DEEP:
+```c
+#include <stdio.h>
+typedef struct {
+    int (*read)(void *ctx);
+    void (*write)(void *ctx, int value);
+} device_ops_t;
+
+typedef struct { int value; } mem_dev_t;
+int mem_read(void *ctx) { return ((mem_dev_t *)ctx)->value; }
+void mem_write(void *ctx, int value) { ((mem_dev_t *)ctx)->value = value; }
+
+typedef struct { int calls; } log_dev_t;
+static int last_logged = 0;
+int log_read(void *ctx) { return ((log_dev_t *)ctx)->calls; }
+void log_write(void *ctx, int value) { ((log_dev_t *)ctx)->calls++; last_logged = value; }
+
+int main(void) {
+    device_ops_t mem_vt = { mem_read, mem_write };
+    device_ops_t log_vt = { log_read, log_write };
+    mem_dev_t mem = { 0 };
+    log_dev_t log = { 0 };
+
+    mem_vt.write(&mem, 42);
+    printf("mem read=%d\n", mem_vt.read(&mem));
+
+    log_vt.write(&log, 7);
+    log_vt.write(&log, 8);
+    printf("log calls=%d last=%d\n", log_vt.read(&log), last_logged);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra`, prints `mem read=42` and `log calls=2 last=8`.
+1. **`device_ops_t` is the interface**: any two functions matching `int (*)(void *)` and `void (*)(void *, int)` can fill its slots, and code that only ever calls `ops.read(ctx)`/`ops.write(ctx, v)` never needs to know which concrete struct (`mem_dev_t`, `log_dev_t`, or a third kind added later) `ctx` actually points at.
+2. **`void *ctx` is the "this" pointer**: it plays the same role a C++ implicit `this` parameter plays, letting one shared set of function pointers operate on distinct pieces of per-instance state; each concrete function immediately casts `ctx` back to its own real type, which is the caller's responsibility to get right (nothing in the struct itself enforces which `ctx` type goes with which vtable).
+3. **Why this is "C-style polymorphism," not just callbacks:** a single callback (Module 12's qsort example) is one function pointer for one operation; a vtable groups several related operations behind one shared interface type, which is the structural difference between "pass a callback" and "implement an interface."
+4. **Real-world instances of exactly this pattern:** a device driver framework's per-device operation table (`read`/`write`/`ioctl`), a Linux kernel `file_operations` struct, and any plugin system that hands the host program a struct of function pointers to call into, all use this identical shape.
+- **What this pattern does not give you for free**, unlike C++ virtual dispatch: no compiler-enforced type safety tying a `ctx` pointer to the vtable it is used with, and no automatic vtable selection from an object's declared type; both are the caller's discipline to maintain, which is exactly what the design-review question later in this module is about.
+FOLLOW:
+- Could mem_vt.write(&log, 7) be called by mistake? => Yes, and nothing in this pattern prevents it at compile time; it would cast the log_dev_t* through mem_dev_t*'s member layout, an effective-type violation (Module 10) that a real design typically guards against with a matching type tag stored alongside ctx, checked before dispatch.
+- Is this the same technique used for qsort's comparator? => Related but simpler; qsort takes one function pointer for one operation (compare), while a vtable groups several function pointers under one struct type representing a whole interface.
+PITFALL: Passing a context pointer to the wrong vtable's functions. Nothing in the plain struct-of-function-pointers pattern catches this at compile time; it manifests as a same-class-of-bug as any other type-punned access.
+VERIFY: This is an idiom built entirely from ordinary C11 struct and function-pointer rules (6.7.2.1, 6.3.2.3), not a single cited clause; no additional language feature is involved.
+
+@@ 12.09 | Intermediate | Debug | tags=null-function-pointer,guard,crash
+Q: A dispatch table has an unused slot left as NULL, and calling code crashed. What is the correct guard, and why does it belong at the call site?
+SHORT: Calling through a null function pointer is undefined behavior, the same class of problem Module 10 covers for data pointers, so any dispatch table with unused or not-yet-registered slots must be checked for NULL before every call, never assumed to hold a valid entry. The guard belongs at the call site (or a wrapper every call site uses) precisely because the table's contents can change at runtime as entries are registered or removed.
+DEEP:
+```c
+#include <stdio.h>
+typedef int (*op_t)(int);
+int inc(int x) { return x + 1; }
+int main(void) {
+    op_t table[2] = { inc, NULL };
+    printf("%d\n", table[0](5));
+    if (table[1] != NULL) {
+        printf("%d\n", table[1](5));
+    } else {
+        printf("slot 1 empty, skipped call that would crash\n");
+    }
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra`, prints `6` then `slot 1 empty, skipped call that would crash`, demonstrating the guarded path avoids ever calling through the NULL entry.
+- **Why this is easy to get wrong in a growing dispatch table:** a table sized for future expansion (extra slots left NULL until a feature is implemented) looks identical to a fully populated one until a specific, perhaps rarely exercised, index is reached; a missing guard fails silently in code review and only crashes when that specific index is actually dispatched.
+- **The guard's placement matters:** checking once "at startup, all slots are non-NULL" does not help if a slot can legitimately be set back to NULL later (for example, unregistering a plugin or handler); the check has to happen at the point of the call, using the table's state at that moment, matching the array-of-function-pointers pattern's dynamic nature from the earlier dispatch-table question.
+- **A structurally safer alternative** where every entry is always callable: initialize unused slots to a shared do-nothing or "unimplemented" stub function instead of NULL, so every call site can call unconditionally without a guard; this trades a small amount of setup code for removing the possibility of forgetting the guard at any individual call site.
+- **This is the same underlying issue as calling any uninitialized or unassigned function pointer** (the first question in this module flags this for a lone `int (*)(int,int) fp;` left unassigned); a dispatch table is simply many such pointers at once, each independently capable of being in that state.
+FOLLOW:
+- Would -fsanitize=undefined catch a call through a NULL function pointer? => Yes; a null function pointer call is one of the specific checks bundled in -fsanitize=undefined (it reports a "call to function through pointer to incorrect type" or a null-pointer-use style diagnostic depending on the exact case), unlike the incompatible-function-pointer-type case in the earlier Trap question, which gcc's UBSan build does not check.
+- Is the do-nothing-stub approach strictly better than the NULL-check guard? => It removes the risk of a forgotten guard at some call site, at the cost of one extra function and a slightly less obvious "this slot is unset" signal than an explicit NULL check; both are legitimate, and the choice is a design preference, not a correctness requirement either way.
+PITFALL: Assuming a dispatch table populated correctly at startup stays that way for the program's whole lifetime. Any table whose entries can be unregistered or left unset needs a guard at every call site, not just at initialization.
+
+@@ 12.10 | Advanced | Concept | tags=void-star-context,this-pointer,oop-in-c
+Q: How does the `void *self` (or `ctx`) parameter let one function pointer serve multiple independent instances, and why is this the mechanism behind "objects" in C?
+SHORT: A function pointer by itself is shared code with no per-call state of its own; passing a `void *self` (or a more specifically typed instance pointer) as the first argument gives that shared code a way to access one particular instance's data on each call, exactly the role a C++ compiler's hidden `this` parameter plays. Two separate instances can share the identical function pointers in their vtables and still behave independently, because each call supplies its own `self`.
+DEEP:
+```c
+#include <stdio.h>
+typedef struct {
+    int (*get)(void *self);
+    void (*add)(void *self, int n);
+} counter_iface_t;
+
+typedef struct { counter_iface_t iface; int value; } counter_t;
+int counter_get(void *self) { return ((counter_t *)self)->value; }
+void counter_add(void *self, int n) { ((counter_t *)self)->value += n; }
+
+void counter_init(counter_t *c) {
+    c->iface.get = counter_get;
+    c->iface.add = counter_add;
+    c->value = 0;
+}
+
+int main(void) {
+    counter_t a, b;
+    counter_init(&a);
+    counter_init(&b);
+    a.iface.add(&a, 5);
+    b.iface.add(&b, 100);
+    a.iface.add(&a, 2);
+    printf("a=%d b=%d\n", a.iface.get(&a), b.iface.get(&b));
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra`, prints `a=7 b=100`: both `a` and `b` share the identical `counter_get`/`counter_add` function pointers, yet track completely independent values because each call passes its own instance's address as `self`.
+1. **`counter_init` is a constructor by convention**, not a language feature: it is an ordinary function that sets up the vtable pointers and initial state, exactly filling the role a C++ constructor's compiler-generated vtable initialization performs automatically, done here explicitly by hand.
+2. **The embedded `counter_iface_t iface` member is what lets calling code use `a.iface.add(&a, 5)` syntax**; an alternative design stores a `counter_iface_t *` pointing at one shared, static vtable instance instead of embedding a full copy in every object, saving memory per instance at the cost of one extra indirection per call, a real space/speed trade-off worth naming in a design discussion.
+3. **Why `self` must be passed explicitly every time, unlike C++:** C has no hidden parameter mechanism, so every call site must supply the instance pointer itself (`&a`, not just `a.iface.add(5)`), which is more verbose but also means nothing is hidden: the exact data every call operates on is visible in the call itself.
+4. **This pattern composes directly with the earlier struct-of-function-pointers vtable question**: that question showed two different implementations sharing one interface type; this question shows one implementation supporting multiple independent instances; a real "C object system" (Module 18's fuller treatment of dispatch systems) typically combines both.
+FOLLOW:
+- Could counter_get and counter_add be shared across every counter_t instance without being duplicated? => Yes, in this design they already are; only the data (value) differs per instance, while the function pointers themselves are identical addresses across every counter_t, which is exactly the memory-sharing benefit of the pattern.
+- What happens if a.iface.add(&b, 5) is called by mistake, passing the wrong self? => It compiles and runs, silently modifying b's value while apparently being called through a's interface, since nothing type-checks that self matches the instance the call syntax visually suggests; this is the same caller-discipline risk flagged in the previous vtable question.
+PITFALL: Forgetting to pass self (or passing the wrong instance's self) at a call site. Nothing in the plain function-pointer-plus-void-star pattern catches a mismatched instance pointer at compile time.
+
+@@ 12.11 | Advanced | Concept | tags=const-function-pointer,syntax,declarator
+Q: What does `const` mean when applied to a function pointer, and why is there no such thing as a "pointer to a const function"?
+SHORT: `int (* const cfp)(int, int) = add;` declares `cfp` itself as a const-qualified pointer variable, meaning `cfp` cannot later be reassigned to a different function, exactly parallel to a const pointer to data (`int * const p`). There is no meaningful "const-qualified function type" the way there is a const object type, since a function's code is never modified by executing it, so `const` on a function pointer only ever qualifies the pointer variable, never "the function it points to."
+DEEP:
+```c
+#include <stdio.h>
+int add(int a, int b) { return a + b; }
+int sub(int a, int b) { return a - b; }
+int main(void) {
+    int (* const cfp)(int, int) = add;
+    printf("%d\n", cfp(2, 3));
+    int (*fp2)(int, int) = sub;
+    fp2 = add;
+    printf("%d\n", fp2(2, 3));
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra`, prints `5` then `5`. `fp2` is freely reassignable (from `sub` to `add`), while `cfp` is not: uncommenting a hypothetical `cfp = sub;` would be a compile error, "assignment of read-only variable," exactly analogous to reassigning a `const`-qualified data pointer.
+- **Reading the declarator carefully:** `int (* const cfp)(int, int)` places `const` directly next to `cfp` inside the parentheses, which is what makes it qualify the pointer variable itself rather than anything else; this mirrors `int * const p` (a const pointer to non-const `int`) far more than it mirrors `const int *p` (a pointer to const `int`), because there is no function-type equivalent of the second form.
+- **Why "const function" is not a meaningful concept the way "const object" is:** `const` on a data type promises the compiler will not permit ordinary code to modify that object's stored value; a function's "value" is its code, which is never modified by executing it, so qualifying the function type itself with `const` would have nothing to protect against that is not already true of every function.
+- **Practical use for a const function pointer variable:** documenting and enforcing "this dispatch entry is fixed once initialized," useful for a lookup table entry or a fixed callback that should never be accidentally reassigned later in a long function, the same motivation as using `const` for any local variable that should not change after initialization.
+- **This is unrelated to `const` on the parameters or return type inside the function pointer's own signature**, for example `int (*fp)(const int *, int)`, which does qualify what the pointed-to function's parameter promises about its argument, a completely ordinary use of `const` on a pointer parameter, just appearing inside a function pointer's type.
+FOLLOW:
+- Would int (*const cfp)(int, int) (no space before const) mean anything different? => No, whitespace around const in a declarator does not affect its binding; `int (* const cfp)(...)` and `int (*const cfp)(...)` are identical, both binding const to cfp itself.
+- Can a function pointer parameter (in a function's own parameter list) be declared const the same way? => Yes, `void register_cb(int (* const cb)(int))` would mean the local parameter variable cb cannot be reassigned inside register_cb's body, though callers are entirely unaffected, since the const-ness only concerns the local copy of the pointer.
+PITFALL: Trying to write "a pointer to a const-qualified function type," expecting it to prevent the function's code from changing. There is nothing meaningful for that const to attach to; only the pointer variable itself can be const-qualified.
+
+@@ 12.12 | Advanced | Scenario | tags=state-machine,handler-table,enum-index
+Q: Design a small state machine using an array of function pointers indexed by state, and explain why this scales better than a switch statement as states are added.
+SHORT: Declare an enum of states, a function pointer type for a state handler returning the next state, and an array of handlers indexed by the enum value; the main loop becomes `state = table[state]();`, with no per-state branching at the call site. Adding a state means adding one enum value and one array entry, never touching the dispatch loop, the same extensibility advantage the earlier dispatch-table question described, applied to control flow.
+DEEP:
+```c
+#include <stdio.h>
+typedef enum { STATE_IDLE, STATE_RUN, STATE_DONE, STATE_COUNT } state_t;
+typedef state_t (*handler_t)(void);
+
+state_t on_idle(void) { printf("idle -> run\n"); return STATE_RUN; }
+state_t on_run(void)  { printf("run -> done\n"); return STATE_DONE; }
+state_t on_done(void) { printf("done -> done\n"); return STATE_DONE; }
+
+int main(void) {
+    handler_t table[STATE_COUNT] = { on_idle, on_run, on_done };
+    state_t s = STATE_IDLE;
+    for (int steps = 0; steps < 3; steps++) {
+        s = table[s]();
+    }
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra`, prints `idle -> run`, `run -> done`, `done -> done`, tracing the state sequence `IDLE -> RUN -> DONE -> DONE` over three steps.
+1. **`STATE_COUNT` as the array size is a deliberate idiom**: adding a new state before `STATE_COUNT` in the enum automatically grows the array's required size (assuming the array literal is also updated with a corresponding handler), and a mismatch between the enum's member count and the array's initializer count is something `-Wall`-class tooling can catch as a missing-initializer or excess-initializer warning.
+2. **Why this beats a switch for a state machine specifically**: a switch-based state machine puts every state's logic in one function with one `case` per state, which grows into an unwieldy single function as states are added; the table version lets each state's logic live in its own small, independently readable and testable function, with the dispatch mechanism itself never needing to change.
+3. **Each handler owns its own transition logic**, returning the next state directly, which keeps the "what state comes next" decision local to the state that is ending, rather than centralized in a big dispatcher that has to know about every state's exit conditions.
+4. **Extending this to accept input**: a real state machine typically needs handlers that also take an event or input parameter (`typedef state_t (*handler_t)(int event);`), a plain signature change applied uniformly to every handler and the table's declared type, without touching the dispatch loop's shape.
+- **Where this pattern shows up in firmware specifically**: USB or protocol negotiation state machines, and a link-training or power-state sequencer, are realistic examples of exactly this handler-table shape, often with dozens of states where a switch-based version would be unmanageable.
+FOLLOW:
+- What happens if a handler returns a state value not covered by the table's size? => Undefined behavior, the same out-of-bounds array indexing covered in Module 10; a real design should either make returning an invalid state a compile-time impossibility (every handler returns a value of the enum type) or explicitly validate before indexing on the next loop iteration.
+- Is there a risk in initializing the table with positional array syntax like this? => Yes, if the enum's member order and the initializer list's order ever drift apart (for example, someone reorders the enum but forgets the array), each handler silently ends up in the wrong slot; using designated initializers, `[STATE_IDLE] = on_idle`, removes that whole class of ordering bug.
+PITFALL: Relying on the enum member order and the array initializer's positional order always staying in sync by convention alone, without designated initializers to make the mapping explicit and reorder-safe.
+
+@@ 12.13 | Advanced | Cross-layer | tags=isr-vector-table,embedded,interrupt
+Q: How does an interrupt vector table in embedded firmware use the same array-of-function-pointers idiom, and what is different about how it gets called?
+SHORT: A microcontroller's interrupt vector table is, at the language level, exactly an array of function pointers indexed by interrupt number, `vector_table[irq]()`, the same idiom as the dispatch-table question earlier in this module; what differs is who calls it and when: the hardware itself (via the CPU's interrupt controller) reads an entry from this table and jumps to it directly on an interrupt event, rather than ordinary C code calling through the pointer at a moment of its own choosing.
+DEEP:
+```c
+#include <stdio.h>
+typedef void (*isr_t)(void);
+void isr_timer(void) { printf("timer ISR\n"); }
+void isr_uart(void)  { printf("uart ISR\n"); }
+void isr_default(void) { printf("unhandled IRQ\n"); }
+
+#define IRQ_COUNT 4
+static isr_t vector_table[IRQ_COUNT] = { isr_default, isr_default, isr_default, isr_default };
+
+void register_isr(int irq, isr_t handler) {
+    if (irq >= 0 && irq < IRQ_COUNT) vector_table[irq] = handler;
+}
+
+void dispatch_irq(int irq) {
+    if (irq >= 0 && irq < IRQ_COUNT) vector_table[irq]();
+    else printf("invalid irq %d\n", irq);
+}
+
+int main(void) {
+    register_isr(0, isr_timer);
+    register_isr(2, isr_uart);
+    dispatch_irq(0);
+    dispatch_irq(1);
+    dispatch_irq(2);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra`, prints `timer ISR`, `unhandled IRQ`, `uart ISR`; `dispatch_irq` here models, in ordinary user-space C, what real hardware does directly when an interrupt fires.
+- **What this simulation stands in for:** on real hardware, the vector table's address is typically fixed by the CPU architecture (for example, ARM Cortex-M places it at the start of flash by convention, with the linker script placing each entry), and the hardware's interrupt controller performs the equivalent of `vector_table[irq]()` in silicon the instant the interrupt line is asserted; `dispatch_irq` here is a stand-in for that hardware action so the idiom can be demonstrated and tested on a host machine.
+- **Default handlers matter more here than in ordinary dispatch tables:** an unconfigured real interrupt vector, if left as a null or garbage pointer, causes the CPU to jump to an invalid address the moment that interrupt fires, typically producing a hard fault; filling every unused slot with a safe default handler (as `isr_default` does here) is standard practice specifically because there may be no opportunity to check for NULL the way `dispatch_irq` does, since the hardware's own jump mechanism does not run C code to guard the call.
+- **`register_isr`'s runtime registration models a common real pattern**: many microcontroller startup sequences populate most vector slots with a weak default handler at link time and let a driver register its real ISR later during initialization, exactly this table's `register_isr` step.
+- **ISR-safety rules (what an ISR must never do: block, allocate, call non-reentrant library functions) are a separate, larger topic** covered fully in Module 17's embedded and firmware treatment; this question is scoped specifically to the function-pointer mechanism the vector table uses, not the full set of constraints on what code may safely live inside `isr_timer` or `isr_uart` themselves.
+FOLLOW:
+- Does the real hardware vector table need the irq range check dispatch_irq performs? => No, real hardware only ever indexes with an interrupt number the hardware itself generates, which is by construction within range; the check here exists because this simulation is being driven by ordinary, possibly-wrong, function-call arguments instead.
+- Why use function pointers here instead of a switch statement on irq inside one big ISR? => The same extensibility argument as the earlier dispatch-table question, plus a hardware-specific one: a switch-based single ISR entry point still needs the hardware to call into one fixed address and then branch in software, adding latency on every single interrupt regardless of type, while a real per-vector table lets hardware jump directly to the specific handler with no extra branching.
+PITFALL: Leaving an interrupt vector table slot as an uninitialized or NULL pointer on real hardware and assuming "it will just never fire." An unexpected or misconfigured interrupt jumping through a bad vector entry is a common real bring-up bug, not a hypothetical.
+
+@@ 12.14 | Advanced | Trap | tags=dlsym,void-star,function-pointer-cast,posix
+Q: Why is casting the result of `dlsym` to a function pointer type a well-known gray area, and what does POSIX do about it that ISO C does not?
+SHORT: `dlsym` returns `void *`, but ISO C never guarantees a function pointer survives a round trip through `void *` (function pointers and object pointers are distinct categories with no conversion rule between them in 6.3.2.3), so the conventional `(int (*)(int))dlsym(handle, "name")` cast is not something C11 defines. POSIX.1-2008 explicitly carved out an exception requiring this specific cast to work, a POSIX-level guarantee layered on top of, not derived from, ISO C.
+DEEP:
+- **Why this gap exists at all:** `dlopen`/`dlsym` predate any attempt to fit them cleanly into ISO C's type system; `void *` is defined in terms of object pointers (6.3.2.3p1's "a pointer to any object type"), and a function is explicitly not an object type (6.2.5), so the standard's own conversion rules simply do not cover converting a `void *` to a function pointer at all, leaving it outside the standard's scope rather than declaring it undefined within scope.
+- **POSIX's fix, precisely:** the 2008 revision of POSIX.1 (and carried into POSIX.1-2017, cited here per this page's convention of naming POSIX rather than teaching it) added explicit text permitting, on a POSIX-conforming system, the cast between `void *` and a function pointer to work, specifically to legitimize the exact idiom `dlsym` requires; this is a POSIX guarantee about POSIX's own API, not a change to the ISO C standard itself.
+- **Practical takeaway for portable code:** on any POSIX system (Linux, macOS, BSDs), the conventional dlsym cast is safe because POSIX says so, not because ISO C does; code that must remain portable to a hypothetical non-POSIX, non-dlsym-supporting C environment cannot rely on this cast at all, though in practice essentially every context that calls dlsym is already committed to a POSIX (or POSIX-like) environment.
+- **This module keeps the topic brief on purpose**: dynamic loading, shared libraries, and the full `dlopen` family belong to process and OS-level concerns outside this page's ISO-C-language scope; the point worth retaining here is narrowly the function-pointer/void-pointer boundary this specific POSIX API has to work around, connecting directly back to the earlier sizeof and incompatible-cast questions in this module.
+FOLLOW:
+- Would a hypothetical embedded target with no dynamic loading at all need to worry about this? => No, this entire question is specific to systems that actually perform runtime symbol resolution through dlopen/dlsym; firmware that links everything statically at build time never encounters this gap.
+- Is the POSIX guarantee retroactive, meaning did this cast always work on Linux even before POSIX.1-2008? => In practice, yes, on essentially every mainstream POSIX implementation the underlying ABI has always made function pointers and void * pointer-representation-compatible, which is exactly why POSIX was able to standardize the guarantee after the fact rather than requiring a language change; the standard text formalized existing common practice.
+PITFALL: Assuming the dlsym cast idiom is guaranteed by the C standard itself. It is a POSIX guarantee layered on top of a gap ISO C leaves entirely unaddressed, worth citing correctly in an interview rather than attributing to "C" generically.
+VERIFY: This is POSIX.1-2017 territory (the dlsym specification's explicit function-pointer/void-pointer cast allowance), not ISO C11; treat any deeper dlopen/dlsym mechanics as belonging on the C Advanced page.
+
+@@ 12.15 | Principal | Scenario | tags=plugin-interface,abi-stability,versioning,review
+Q: You are asked to design a stable plugin/driver interface in C using the vtable pattern, meant to stay binary-compatible as new plugin versions ship independently from the host application. What are the concrete review criteria?
+SHORT: The core risk is that a vtable struct's memory layout is the ABI; any change to member order, size, or count breaks every plugin built against the old layout the moment the host or the plugin is rebuilt independently, so the review has to check for an explicit versioning field, append-only growth, and a documented policy for how unknown or missing entries are handled, not just whether the current struct compiles and works.
+DEEP:
+1. **A version or size field must come first in the struct** (for example, `size_t struct_size;` or an explicit `int abi_version;` as the very first member), so the host can detect at load time whether a plugin was built against an older, smaller version of the interface, before touching any member the plugin's build might not know about.
+2. **Growth must be append-only.** Adding a new function pointer at the end of the struct is safe for old plugins (they simply do not know about it, and the host must check the version/size field before calling it); inserting a member in the middle, removing one, or reordering any existing member shifts every later member's offset and silently breaks every already-compiled plugin that has not been rebuilt.
+3. **Every function pointer's signature is part of the ABI too**, not just its slot: changing a callback's parameter types or count, even while keeping the struct layout otherwise identical, breaks any plugin whose function does not match the new expected signature, since the host will call through the new signature's calling convention regardless of what the plugin actually implements.
+4. **Decide and document what happens on a NULL or missing entry** (per the earlier null-function-pointer Debug question in this module): does the host skip the call, call a default no-op, or refuse to load the plugin at all; this must be a stated policy, not left to whatever each call site happens to do, since a plugin author from outside the host team relies entirely on this being documented, not inferred from source.
+5. **Prefer a `void *ctx` (or `void *self`) parameter on every callback from the start** (the earlier context-pointer question), even if the first version of the plugin API does not strictly need it, since adding it later is itself a signature-breaking, non-append-only change; reserving the slot up front avoids that entire category of future break.
+6. **Consider a get_version() or capability-query function as the very first thing the host calls**, letting a plugin report which optional features it supports beyond a bare struct-size check, which scales better than size comparisons alone once the interface grows multiple independent optional feature groups.
+- **Why this matters more for a plugin/driver boundary than for in-process code**: within one compiled binary, changing a struct's layout and rebuilding everything that touches it is always safe, since every reference gets updated together; a plugin boundary is exactly the case where the two sides are compiled and shipped independently, at different times, which is what makes ABI stability a real, ongoing constraint rather than a one-time design nicety.
+FOLLOW:
+- Is a version number sufficient, or does the host also need to store the plugin's declared version at load time? => The host needs to check the plugin's declared version against what it supports at load time and act on a mismatch (refuse to load, or load with reduced functionality), not merely record the version for later reference; an unchecked version field provides no actual safety.
+- Would using function pointers directly, without a struct, avoid these issues? => No, the identical layout and signature stability concerns apply to any array or set of function pointers a plugin boundary exposes; the struct is simply the common way to group and version them together, not the source of the ABI-stability requirement.
+PITFALL: Adding a new callback in the middle of an existing vtable struct "because it's logically grouped with related fields nearby." Any position other than the end breaks every already-compiled binary linked against the previous layout.
+
+@@ 12.16 | Principal | Debug | tags=vtable-corruption,buffer-overflow,security
+Q: A struct holding a fixed-size name buffer followed by a function pointer had its function pointer silently redirected to a different function after an unchecked copy into the name field. Reproduce and explain the mechanism.
+SHORT: `widget_t` lays out an 8-byte `name` array immediately before a `void (*on_event)(void)` function pointer, with no padding between them on this target; a copy routine that writes more bytes into `name` than it holds, with no bounds check, overwrites `on_event`'s stored bytes with whatever followed the name data in the source, including, here, the address of a different function. The next call through `on_event` then executes that different function, not the one originally assigned.
+DEEP:
+```c
+#include <stdio.h>
+#include <string.h>
+#include <stddef.h>
+
+typedef struct {
+    char name[8];
+    void (*on_event)(void);
+} widget_t;
+
+void safe_action(void) { printf("safe action ran\n"); }
+void dangerous_action(void) { printf("dangerous action ran (pointer was clobbered)\n"); }
+
+void set_name(widget_t *w, const unsigned char *src, size_t len) {
+    memcpy(w->name, src, len);   /* BUG: no bound check against sizeof(w->name) */
+}
+
+int main(void) {
+    printf("offsetof(on_event)=%zu sizeof(name)=%zu\n",
+           offsetof(widget_t, on_event), sizeof(((widget_t *)0)->name));
+
+    widget_t w;
+    w.on_event = safe_action;
+    printf("before overflow: ");
+    w.on_event();
+
+    void (*target)(void) = dangerous_action;
+    unsigned char payload[sizeof(w.name) + sizeof(w.on_event)];
+    memset(payload, 'A', sizeof w.name);
+    memcpy(payload + sizeof w.name, &target, sizeof target);
+
+    set_name(&w, payload, sizeof payload);
+
+    printf("after overflow: ");
+    w.on_event();
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra`, prints `offsetof(on_event)=8 sizeof(name)=8`, `before overflow: safe action ran`, `after overflow: dangerous action ran (pointer was clobbered)`, confirming both that `on_event` sits at exactly byte offset 8 with no padding on this target, and that overflowing `name` by exactly `sizeof(on_event)` bytes fully overwrites it with the attacker-chosen (here, deliberately constructed) function address.
+1. **The bug in `set_name` is the classic unchecked-length-copy pattern**: it trusts its `len` parameter completely, with no comparison against `sizeof(w->name)`, so any caller (or any externally-controlled length, such as one read from a network packet's header field) that supplies more bytes than the buffer holds writes past it into whatever memory follows, here the function pointer.
+2. **Why the exact byte count matters for a reliable demonstration**: this reproduction confirms via `offsetof` that there is no padding between `name` and `on_event` on this target (both are naturally 8-byte-aligned already), so a payload of exactly `sizeof(name) + sizeof(on_event)` bytes lands precisely on the boundary; a different struct layout, or a target with padding inserted for alignment, would need the exact overflow length recalculated, which is itself worth noting in a real review, since "the overflow lands exactly on the function pointer" is layout-dependent, not universal.
+3. **Why this is worse than an ordinary buffer overflow overwriting plain data**: corrupting an adjacent `int` produces a wrong value; corrupting an adjacent function pointer, when that pointer is later called, hijacks control flow to an address the attacker or the accidental overflow chose, which is precisely the mechanism behind classic function-pointer-overwrite security exploits, here reproduced with a benign, known target function for illustration rather than attacker-controlled shellcode.
+4. **The real fix is bounds-checking `set_name` itself**, not merely reordering the struct: `if (len > sizeof(w->name)) { /* truncate or reject */ }` before the `memcpy`, since reordering members only relocates which adjacent data gets corrupted, it does not remove the unchecked-copy root cause.
+5. **Defense in depth beyond the immediate fix**: placing security-sensitive function pointers in a separate, non-adjacent structure from any externally-influenced buffer, or validating lengths at the point data enters the system (the network or file boundary) rather than only inside each individual copy routine, reduces the blast radius even if one bounds check is missed elsewhere.
+- **This is the practical, worst-case version of the vtable-corruption risk hinted at in the earlier struct-of-function-pointers question**: there, the risk was calling with a mismatched (but still valid) context pointer; here, the function pointer itself is corrupted by an unrelated memory-safety bug, a distinct and more severe failure mode.
+FOLLOW:
+- Would -fsanitize=address have caught this overflow? => AddressSanitizer specifically instruments memory accesses and would likely catch memcpy writing past the bounds of a heap-allocated buffer of this size, though for a stack-local struct like widget_t here, whether it is caught depends on whether ASan's stack instrumentation covers this exact access pattern; either way, testing with -fsanitize=address is a reasonable first line of defense worth adding regardless of this specific reproduction's outcome.
+- Is bounds-checking set_name sufficient, or should the struct layout also change? => Bounds-checking the copy is the mandatory fix; changing the struct layout (for example, storing a length-prefixed or explicitly bounded string type) is a good additional hardening step but does not by itself fix a copy routine that ignores buffer size entirely.
+PITFALL: Fixing this specific reproduction by reordering the struct so name comes after on_event, declaring the bug solved. The unchecked-length copy is the actual defect; reordering only moves which neighboring data an overflow corrupts next.
+
+@@ 12.17 | Principal | Concept | tags=vtable-vs-cpp,virtual-dispatch,compiler-internals
+Q: How closely does the hand-written struct-of-function-pointers pattern in this module match what a C++ compiler actually generates for virtual dispatch?
+SHORT: Extremely closely in mechanism: a typical C++ implementation gives each polymorphic class one hidden vtable, a static array of function pointers shared by every instance, and each object carries a hidden pointer to its class's vtable; calling a virtual function compiles to "load the vtable pointer, load the function pointer from a fixed offset in it, call it," exactly the `obj.iface.method(&obj, ...)` shape this module built by hand, minus the compiler wiring it up automatically.
+DEEP:
+| Aspect | Hand-written C vtable (this module) | Typical C++ compiler-generated vtable |
+|---|---|---|
+| Vtable storage | One struct instance per implementation, built explicitly | One static array per class, generated by the compiler |
+| Object-to-vtable link | Caller passes ctx/self explicitly to each call | Hidden vptr member inserted at the start of the object, set by the constructor |
+| "this" parameter | Explicit void *self/ctx argument | Implicit this parameter, invisible in source, present in the generated calling convention |
+| Method call syntax | obj.iface.method(&obj, args) | obj.method(args), compiler inserts the vtable load and this |
+| Multiple inheritance | Not directly modeled; would need multiple embedded interface structs | Handled with additional vtables and pointer adjustment thunks, considerably more complex |
+
+- **Where the analogy is exact:** single inheritance, single-interface dispatch (one base class, one set of virtual functions) maps almost one-to-one onto this module's pattern; "call the function at this offset in the vtable, passing the object as the first hidden argument" is a fair description of both.
+- **Where C++ goes further than anything shown here:** multiple inheritance, virtual inheritance, and RTTI (`dynamic_cast`, `typeid`) all require additional bookkeeping (multiple vtables per object, vtable entries that are themselves adjustment thunks rather than plain function pointers) that a hand-rolled single-struct C vtable does not attempt to replicate; this module's pattern is a faithful model of the simple case, not a full reimplementation of C++'s object model.
+- **Compile-time versus runtime cost**: both the hand-written and compiler-generated versions pay one pointer-chase (or two, object to vtable, then vtable to function) per virtual/interface call, versus a direct call's zero indirection; this is why both C++ virtual functions and C-style vtables have a small but real per-call overhead compared to a plain function call, relevant when discussing performance trade-offs of either "interface"-shaped design.
+- **Why this comparison is a strong interview answer:** it demonstrates the candidate understands polymorphism is not "a C++ feature" conceptually but an implementation technique (indirect calls through a table of function pointers plus a per-instance state pointer) that C++ automates and C exposes by hand, which is exactly the kind of "compiles down to" understanding a Principal-level systems interview is probing for.
+FOLLOW:
+- Does every C++ compiler use exactly this vtable-pointer-as-hidden-first-member layout? => The general shape (a hidden vptr, a shared per-class vtable array) is close to universal among mainstream C++ implementations, but the exact layout details (vptr position, how multiple inheritance and virtual bases are represented) are governed by each platform's C++ ABI specification, not by the C++ standard itself, which deliberately leaves object layout unspecified.
+- Is a hand-written C vtable ever actually faster than C++ virtual dispatch? => Not fundamentally; both perform the same one or two pointer-chase indirections per call, so any real difference between a specific hand-written version and a specific compiler's generated code comes down to unrelated factors like inlining opportunities or struct layout, not the vtable mechanism itself.
+PITFALL: Describing C++ virtual dispatch as "magic" in an interview instead of naming the underlying vtable-and-vptr mechanism. Being able to describe it as "the same pattern you just hand-built in C, generated automatically" is a stronger answer.

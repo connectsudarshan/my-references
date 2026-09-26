@@ -1,0 +1,418 @@
+# Module 9: Classic Concurrency Problems
+
+@@ 9.01 | Basic | Concept | tags=classic-problems,overview,what-each-teaches
+Q: What are the three "classic" concurrency problems this module covers, and what does each one specifically teach?
+SHORT: Producer-consumer with a bounded buffer teaches correct handoff when the buffer can be full (producers wait) or empty (consumers wait). Readers-writers teaches that "more than one kind of access" needs its own fairness policy, not just mutual exclusion. Dining philosophers teaches how a symmetric, simultaneous resource grab among peers -- no producer/consumer or reader/writer asymmetry to exploit -- creates circular wait, and how to break it.
+DEEP:
+- All three are decades-old (Dijkstra formulated the bounded-buffer and dining-philosophers problems; Courtois, Heymans, and Parnas formulated readers-writers) precisely because each isolates one specific concurrency shape in its purest, smallest form -- real systems combine and complicate these shapes, but rarely invent a wholly new one.
+- Producer-consumer's shape already appeared, solved with condition variables, in module 5 (5.13); this module rebuilds it with the classic semaphore-pair solution (9.04) instead, the historically original approach and still the common textbook one.
+- Readers-writers already appeared via `pthread_rwlock_t` in module 6 (6.10, 6.17); this module rebuilds the actual scheduling policy (who gets admitted next) from raw mutexes instead of relying on the library's built-in (and, as 6.10 found, not necessarily reader-preferring) policy.
+- Dining philosophers is new territory for this study guide: five peers, each needing two shared resources at once, with no natural "producer vs consumer" or "reader vs writer" role difference to exploit for a fix -- the fix has to come from resource ordering or admission limiting alone (9.12-9.14).
+FOLLOW:
+- Why re-solve producer-consumer and readers-writers when modules 5 and 6 already covered them? => Because the *mechanism* differs meaningfully: semaphores versus condition variables for producer-consumer, and hand-rolled scheduling policy versus a library's built-in policy for readers-writers -- both real, useful alternate implementations, not redundant repetition.
+- Is there a "fourth" classic problem worth knowing? => The sleeping-barber problem is another well-known one (a bounded-buffer variant with a single server), but this study guide's scope is the three named in the module brief; the same bounded-buffer and mutual-exclusion techniques covered here transfer directly to it.
+PITFALL: Treating these as academic exercises disconnected from real systems. 9.08 maps all three directly onto real OS/firmware scenarios -- a command queue, a config cache, and a multi-lock validation harness are the same shapes in production clothing.
+VERIFY: General concurrency-theory history (Dijkstra; Courtois/Heymans/Parnas); not itself POSIX or C11 text.
+
+@@ 9.02 | Basic | Concept | tags=producer-consumer,bounded-buffer,problem-statement
+Q: What exactly is the bounded-buffer producer-consumer problem, and what makes the "bounded" part specifically hard?
+SHORT: One or more producer threads generate items and place them into a fixed-capacity buffer; one or more consumer threads remove and process them; the buffer must never be written to when full (producers must wait for a free slot) or read from when empty (consumers must wait for an item). The "bounded" part is what makes it harder than an unbounded queue: producers now have a wait condition too, not just consumers, and both conditions need correct, race-free handling.
+DEEP:
+- An unbounded (infinite) buffer only ever needs consumers to wait (on empty); a bounded buffer adds a second, symmetric wait condition on the producer side (on full), doubling the number of race conditions a correct solution must close off.
+- The two historically standard solutions are a mutex-plus-condition-variable pair with an explicit predicate loop (module 5.13's `while (count == 0) wait` / `while (count == BUFSZ) wait`), and the semaphore-pair solution this module builds (9.04): a counting semaphore for "empty slots available" and another for "items available," plus a plain mutex only for the buffer's own index bookkeeping.
+- Correctness for this problem specifically means: no item is ever lost or duplicated, no consumer ever reads a slot no producer has written yet, and no producer ever overwrites a slot a consumer has not yet read -- 9.04's compiled test checks all of this directly via an exact checksum match, not just a count.
+- The buffer's capacity (module 9.16 reasons about choosing it) is a real design parameter, not just a data-structure detail: too small serializes producers and consumers unnecessarily; too large wastes memory and can hide backpressure signals a smaller buffer would surface earlier.
+FOLLOW:
+- Is a bounded buffer strictly necessary, or could an unbounded queue always be used instead? => An unbounded queue removes the producer-side wait condition entirely, but real systems have finite memory, so "unbounded" is really "bounded by however much memory happens to be available," an implicit and much less controlled bound than an explicit, chosen capacity.
+- Does the number of producers or consumers change the fundamental problem? => Not the correctness requirements (still no lost/duplicated items, no reading unwritten slots), but it does change the bookkeeping: multiple producers now need mutual exclusion among themselves for the buffer's write index, and multiple consumers likewise for the read index (9.05 covers exactly this).
+PITFALL: Assuming a "thread-safe queue" data structure automatically handles the bounded case correctly just because it handles concurrent access safely. Bounded capacity needs its own explicit wait/signal handling (whichever primitive provides it) beyond whatever makes individual pushes and pops safe.
+VERIFY: General concurrency-theory problem statement (Dijkstra); not itself POSIX or C11 text.
+
+@@ 9.03 | Basic | Concept | tags=readers-writers,first-vs-second,problem-statement
+Q: What is the readers-writers problem, and why do "first" and "second" variants exist?
+SHORT: Any number of readers may access shared data concurrently as long as no writer is active; a writer needs exclusive access, with no readers and no other writer active. The "first" problem (Courtois/Heymans/Parnas's original formulation) is reader-preferring: a new reader is never blocked just because a writer is waiting. The "second" problem is writer-preferring: once a writer is waiting, no new reader may start, though already-active readers finish normally.
+DEEP:
+- Neither variant is "more correct" than the other -- they encode different fairness policies for the identical mutual-exclusion requirement (concurrent readers, exclusive writer), and the choice between them is a design decision, not a bug fix, driven by which side's starvation risk the application can tolerate less.
+- The first (reader-preferring) problem is exactly what 9.10 builds and reproduces: a continuous stream of readers can starve a writer indefinitely, since a new reader arriving while a writer waits is still admitted ahead of it, by design.
+- The second (writer-preferring) problem is exactly what 9.11 builds as the fix: an extra "no new readers" gate that a waiting writer closes, bounding the writer's wait to whatever readers were already active when it arrived, at the cost of now being able to starve a continuous stream of new readers instead (9.15 covers this trade-off precisely).
+- `pthread_rwlock_t` (module 6) does not commit to either variant by specification -- POSIX only says an implementation "may favor writers... to avoid writer starvation," a permission, and module 6.10 found this specific glibc's default in practice resists (but does not eliminate) writer starvation without fully committing to strict writer preference either.
+FOLLOW:
+- Is there a variant that starves neither side? => Yes -- a strict FIFO/ticket-based admission policy (9.17) serves every request, reader or writer, in arrival order, which starves neither side by construction, at the cost of more bookkeeping than either the first or second problem's simpler policies need.
+- Why would anyone choose the first (reader-preferring) variant if it can starve a writer? => When writes are rare and not latency-critical, and read throughput matters more (module 6.08's exact read-heavy-workload scenario) -- reader preference maximizes read concurrency at the cost of a risk that may simply never materialize for that specific workload's write frequency.
+PITFALL: Assuming "readers-writers problem" has one canonical solution. It names a mutual-exclusion *shape*; the specific fairness policy (first, second, or a fair ticket-based third option) is a separate decision every implementation has to make explicitly.
+VERIFY: Courtois, Heymans, Parnas (1971), "Concurrent Control with 'Readers' and 'Writers'"; general concurrency-theory, not POSIX or C11 text.
+
+@@ 9.04 | Intermediate | Debug | tags=producer-consumer,semaphore-pair,compiled,checksum
+Q: Build the classic semaphore-pair bounded-buffer solution (not the condition-variable version from module 5) and confirm it under real multi-producer, multi-consumer load.
+SHORT: Two counting semaphores (`empty_slots` starting at the buffer capacity, `full_slots` starting at 0) plus a plain mutex for the buffer's own read/write index bookkeeping. With 3 producers and 3 consumers moving 1500 items total through an 8-slot buffer, the run completed with consumed count and checksum matching produced count and checksum exactly: `produced=1500 consumed=1500 checksum_produced=150374250 checksum_consumed=150374250 match=OK`, on all three runs tested.
+DEEP:
+```c
+sem_t empty_slots, full_slots;                 /* sem_init(&empty_slots, 0, BUFSZ); sem_init(&full_slots, 0, 0); */
+pthread_mutex_t mtx = PTHREAD_MUTEX_INITIALIZER;
+
+static void *producer(void *arg) {
+    for (each item) {
+        sem_wait(&empty_slots);                 /* take a free slot */
+        pthread_mutex_lock(&mtx);
+        buffer[head] = item; head = (head + 1) % BUFSZ; checksum_produced += item;
+        pthread_mutex_unlock(&mtx);
+        sem_post(&full_slots);                  /* announce a filled slot */
+    }
+}
+static void *consumer(void *arg) {
+    for (each expected item) {
+        sem_wait(&full_slots);
+        pthread_mutex_lock(&mtx);
+        int item = buffer[tail]; tail = (tail + 1) % BUFSZ; total_consumed++; checksum_consumed += item;
+        pthread_mutex_unlock(&mtx);
+        sem_post(&empty_slots);                 /* return the slot */
+    }
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run three times (3 producers x 500 items, 3 consumers each assigned exactly 500 items to drain), every run printed `produced=1500 consumed=1500 checksum_produced=150374250 checksum_consumed=150374250 match=OK` -- exact match, no lost or duplicated items, across all three runs.
+- This is precisely 6.01/6.04's semaphore-vs-mutex distinction applied end to end: the semaphores alone bound concurrency correctly (no more than BUFSZ items ever in flight), but the shared `head`/`tail` indices still need their own mutex, which is exactly module 9.05's question.
+FOLLOW:
+- How does this differ from module 5.13's condition-variable bounded queue? => Mechanism, not outcome -- 5.13 uses one mutex and predicate-checked condition-variable waits for both "not full" and "not empty"; this uses two purpose-built counting semaphores instead, each semaphore's count directly *being* the "how many slots/items are available" state, with no separate predicate to check.
+- Would this still work correctly with only 1 producer and 1 consumer? => Yes, and more simply -- with exactly one of each, the mutex around `head`/`tail` becomes unnecessary (no concurrent writer to `head`, no concurrent writer to `tail`), the same single-writer-per-index insight module 7.16's SPSC ring buffer used to drop synchronization down to plain release/acquire.
+PITFALL: Assuming the two semaphores alone are sufficient and skipping the mutex around `head`/`tail`. With more than one producer (or more than one consumer), that is a real, unguarded data race on the shared index, identical in kind to 6.04's exact warning about the same pattern.
+VERIFY: General concurrency theory (Dijkstra's original bounded-buffer solution); POSIX.1-2017 sem_wait()/sem_post() DESCRIPTION for the semaphore semantics themselves (cited fully in module 6). Compiled and run: prodcons_sem.c (three runs, exact match each time).
+
+@@ 9.05 | Intermediate | Concept | tags=semaphore-plus-mutex,why-both,index-bookkeeping
+Q: Why does the semaphore-pair bounded-buffer solution still need a separate mutex, when the two semaphores already correctly bound how many items can be in flight?
+SHORT: The semaphores enforce a purely numeric invariant (never more than BUFSZ items in flight, never a consumer proceeding when zero are available) but do nothing about the shared `head`/`tail` indices themselves -- with more than one producer, two producers can both pass `sem_wait(&empty_slots)` concurrently and race to write `buffer[head]` and increment it, the same unprotected read-modify-write race 4.02/4.05 demonstrated for a plain counter.
+DEEP:
+- This is precisely 6.04's own finding restated in this problem's specific shape: "the semaphore only limits how many threads can be past sem_wait() at once, it does nothing to make the increment/compare/decrement of a shared counter atomic" -- here the "shared counter" is the buffer's write (or read) index.
+- With exactly one producer, no mutex is needed around `head` (only one thread ever writes it, module 7.16's single-writer-per-index insight); the mutex becomes necessary specifically once a second producer (or second consumer, for `tail`) is introduced.
+- The mutex's critical section here is deliberately tiny -- an array write, a modular increment, and a checksum update -- which is exactly the right scope: the semaphores already did the "wait until it's safe to proceed at all" work, so the mutex only needs to protect the handful of instructions that are not already made safe by the semaphore's counting.
+- A common, subtly wrong "simplification" is trying to fold the mutex's job into the semaphore itself (e.g. initializing a semaphore to 1 and using it as a de facto mutex around the index) -- this works but reintroduces exactly the ownership-less, no-ERRORCHECK downsides module 6.01/6.19 already flagged for using a binary semaphore as a mutex substitute.
+FOLLOW:
+- Would using an atomic index (module 7's atomic_size_t, CAS-based) instead of a mutex work here? => Yes in principle for the index update alone, following the same CAS-loop pattern as 7.11's Treiber stack, but for this problem's small, uncontended critical section, a plain mutex is simpler and was not shown by any measurement in this study guide to cost meaningfully more.
+- Does the mutex need to be held across the sem_post() call? => No, and 9.04's code deliberately does not -- releasing the mutex before the sem_post() keeps the critical section as narrow as module 4.06's own "critical section sizing" discipline recommends.
+PITFALL: Reasoning "the semaphores already handle synchronization, so the buffer access itself must be safe too." The semaphores synchronize *how many* threads may be past a certain point; they say nothing about races between threads that are all correctly past that point simultaneously.
+VERIFY: POSIX.1-2017, sem_wait()/sem_post() DESCRIPTION (counting semantics only, no ownership or mutual-exclusion-of-arbitrary-code guarantee); this exact point is also made directly in module 6.04.
+
+@@ 9.06 | Intermediate | Trap | tags=single-semaphore,wrong-design,ambiguous-count
+Q: What goes wrong if a bounded-buffer solution tries to use one shared semaphore instead of two (empty_slots and full_slots)?
+SHORT: A single semaphore's count cannot simultaneously represent two opposite-direction bounds -- "how many free slots remain" and "how many filled slots are available to consume" are complementary values (they always sum to the buffer's capacity), but a producer and a consumer each need to wait on a *different* one of those two conditions, and one semaphore can only ever expose one count to wait on, not both.
+DEEP:
+- If a single semaphore is initialized to BUFSZ and both producers and consumers `sem_wait()`/`sem_post()` on it indiscriminately, there is no way for a producer's wait to mean "block until there is a free slot" while a consumer's wait simultaneously means "block until there is an item" -- both waits would be checking the exact same count for two logically opposite conditions.
+- A concrete failure mode: initialize the single semaphore to 0 and have producers `sem_post()` after writing, consumers `sem_wait()` before reading (mimicking only `full_slots`) -- this correctly stops consumers from reading an empty buffer, but has completely dropped the "producer must wait for a free slot" bound entirely, since nothing stops a producer from writing past the buffer's actual capacity and corrupting adjacent slots a consumer has not yet read.
+- The two-semaphore design works precisely because `empty_slots` and `full_slots` are two independent counts that happen to be complementary (`empty_slots + full_slots == BUFSZ` is an invariant of the correct solution), each with its own dedicated waiters (producers wait on one, consumers on the other) -- collapsing them into one shared count throws away the ability to express both bounds at once.
+- This is a designed-in structural requirement of the classic solution, not an implementation detail that could be optimized away; Dijkstra's original formulation already uses exactly this two-semaphore shape for precisely this reason.
+FOLLOW:
+- Could three or more semaphores ever be useful for a variant of this problem? => Yes, for a variant with additional constraints (e.g. a priority class of "urgent" items needing a separate capacity-bounded lane) -- but that is a different, extended problem, not a simplification of the basic two-semaphore bounded buffer.
+- Is this the same mistake as module 6.06's "wrong waiter" semaphore trap? => Related but distinct -- 6.06 is about one semaphore ambiguously serving more than two *parties* for a signal meant for one specific consumer; this is about one semaphore ambiguously serving two opposite *conditions* (full versus empty) that structurally need two separate counts.
+PITFALL: "Simplifying" the classic two-semaphore bounded-buffer solution down to one semaphore because "it's the same buffer, so one counter should do." The two counts are complementary but serve two different waiting parties with two different, individually necessary conditions.
+VERIFY: General concurrency theory (Dijkstra's original two-semaphore bounded-buffer formulation); not itself POSIX or C11 text.
+
+@@ 9.07 | Intermediate | Concept | tags=dining-philosophers,problem-statement,symmetric-resource-grab
+Q: What is the dining philosophers problem, and why is the symmetric, simultaneous nature of the resource grab specifically what causes deadlock?
+SHORT: Five philosophers sit at a round table with five forks, one between each adjacent pair; each needs both their left and right fork to eat, and forks are shared with neighbors. If every philosopher simultaneously grabs their left fork first, all five forks are immediately held, and every philosopher is stuck waiting for their right fork, held by a neighbor in the identical situation -- a five-node circular wait with no asymmetry anywhere to break it.
+DEEP:
+- This is a deliberately symmetric version of the general "acquire multiple shared resources" problem module 8 covers in the two-mutex case: with only two threads and two locks (8.04), an *asymmetric* fix (both threads agree to lock A before B) is simple to state; with five peers each needing two of five circularly-shared resources, "always lock the lower-numbered fork first" needs slightly more care, since the fifth philosopher's "left" and "right" forks are numbered N-1 and 0 -- the wraparound is exactly where the naive per-philosopher "always left first" rule breaks the ordering it needs (9.12's naive version is precisely this un-fixed case).
+- Every philosopher running identical code (same left-then-right logic) is what makes the naive version deadlock *deterministically* under the right timing, not just probabilistically -- 9.12's compiled reproduction confirms this directly (all 5 philosophers picked up their left fork, then all 5 blocked trying for their right, every time this was run).
+- The two standard fixes are resource ordering (9.13: break the symmetry by having philosophers acquire whichever of their two forks has the lower index first, not always "left" first) and admission limiting (9.14: cap how many philosophers may attempt to eat simultaneously to strictly fewer than the total, using a counting semaphore, so at least one fork is always available somewhere).
+- Unlike producer-consumer or readers-writers, there is no natural role asymmetry (no "producer" versus "consumer," no "reader" versus "writer") to hang a fix on -- every philosopher's code is identical, which is exactly why the fix has to come from breaking a *structural* symmetry (acquisition order, or how many may compete at once) rather than assigning different behavior to different roles.
+FOLLOW:
+- Does the deadlock require exactly 5 philosophers? => No -- any number N >= 2 sharing N forks in a circle has the identical structural risk; 5 is simply Dijkstra's original, commonly-taught instance.
+- Is a global lock ordering (module 8.16) the same fix as 9.13's resource ordering here? => Conceptually identical -- 9.13 is module 8.16's general "assign every lock a stable, comparable identity and always acquire in increasing order" design, applied to the specific circular case where the naive per-thread rule ("always left first") already almost works except at the wraparound.
+PITFALL: Assuming any single philosopher's code, read in isolation, looks obviously correct -- lock, then lock, then unlock, then unlock. The bug is not in any one philosopher's logic; it is in what happens when all five run that same, individually-reasonable logic at the same moment.
+VERIFY: General concurrency theory (Dijkstra's dining philosophers, 1965); not itself POSIX or C11 text.
+
+@@ 9.08 | Intermediate | Cross-layer | tags=firmware-mapping,command-queue,config-cache,lock-ordering
+Q: Map each of the three classic problems onto a concrete real OS/firmware scenario -- what does each one actually look like in production code?
+SHORT: Producer-consumer is a command queue: workers submit storage commands (producers) into a bounded queue, drained by a completion thread (consumer) -- 6.16's semaphore design names these roles directly. Readers-writers is a config/cache structure read constantly by workers and updated rarely by control-plane code (6.08's scenario). Dining philosophers is any validation harness where worker threads each need more than one shared resource, in an order no single thread controls.
+DEEP:
+- The command-queue mapping is the most direct: 9.04's `empty_slots`/`full_slots` semaphore pair *is* 6.16's "resource-limiting layer... N NVMe command queues in flight at once" design, just with the producer/consumer terminology made explicit instead of "submit path"/"completion path."
+- The config/cache mapping inherits every trade-off module 6.08/9.03 already covered: if updates are rare and reads vastly outnumber them, reader preference (9.02's "first" problem) is usually fine; if updates must never be delayed unpredictably (a safety-critical configuration reload, for instance), writer preference or strict fairness (9.11, 9.17) is the safer default.
+- The dining-philosophers mapping is the least obvious but arguably the most common in practice: any test harness or driver that must acquire, say, a hardware channel lock *and* a shared results-buffer lock *and* a logging lock, where different worker threads acquire these in whatever order their specific test case happens to need them, is structurally the dining-philosophers problem with more than two "forks" -- module 8.16's global lock-ordering design is the direct, general-purpose fix for this exact shape.
+- Recognizing which of the three shapes a real design problem actually is (bounded handoff, differentiated-access mutual exclusion, or symmetric multi-resource acquisition) is itself the practical skill -- each shape has a known, well-understood family of fixes, and misidentifying the shape leads to reaching for the wrong one (e.g. trying to apply a readers-writers fairness policy to what is actually a multi-lock-ordering problem).
+FOLLOW:
+- Can a single real system exhibit more than one of these shapes at once? => Routinely -- a validation harness might have a command-queue (producer-consumer) feeding a shared results cache (readers-writers) while multiple worker threads separately need channel-plus-logging locks (dining philosophers) -- each sub-problem gets its own fix, applied independently to the part of the design that actually has that shape.
+- Is there a shape none of these three directly covers? => Phased, all-must-arrive synchronization (module 6.09's barriers) is a different shape none of the three classic problems addresses -- "wait for everyone to reach this point" is neither a handoff, nor a differentiated-access policy, nor a multi-resource acquisition problem.
+PITFALL: Reaching for a readers-writers-style fix (rwlock, or a reader/writer-preference policy) for a problem that is actually a multi-resource dining-philosophers shape, because both "sound like" they are about coordinating shared access. The correct fix families are different (fairness policy versus resource ordering/admission limiting).
+VERIFY: General systems-design synthesis of this module's own results plus module 6.08/6.16/8.16; not itself POSIX or C11 text.
+
+@@ 9.09 | Intermediate | Concept | tags=hand-rolled-vs-rwlock,structural-difference
+Q: What does hand-rolling readers-writers from a plain mutex (as this module does) let you control that pthread_rwlock_t (module 6) does not expose directly?
+SHORT: `pthread_rwlock_t`'s admission policy (which side is preferred when both wait) is up to the implementation -- POSIX only permits, never requires, writer preference, and 6.10 found this glibc's default resists but does not eliminate starvation. Hand-rolling the scheduling logic from a mutex (plus, for 9.11's fix, a "no new readers" mutex) makes the admission policy explicit and changeable in application code, instead of inherited and platform-dependent.
+DEEP:
+- 9.10's naive hand-rolled version and 9.11's fixed hand-rolled version are not "reimplementing pthread_rwlock_t badly" -- they are deliberately choosing and encoding a *specific* fairness policy (reader-preferring, then writer-preferring) that a real pthread_rwlock_t leaves to the implementation's own, usually undocumented, internal choice.
+- This matters concretely whenever the exact fairness guarantee is a hard requirement (a safety-critical config reload that must never wait unboundedly, for instance) rather than a "probably fine in practice" assumption -- module 6.17's own fix for a production rwlock-starvation report reached for a Linux-specific, non-portable rwlockattr extension (`PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP`) precisely because POSIX itself offers no portable way to request writer preference from `pthread_rwlock_t` directly.
+- Hand-rolling from a mutex (and, in 9.17, a mutex plus a condition variable and an explicit ticket counter) trades pthread_rwlock_t's simplicity and likely-optimized internal implementation for full, portable control over exactly which policy is enforced -- a real engineering trade-off, not a strictly better approach in every case.
+- The core mutual-exclusion invariant (concurrent readers, exclusive writer) is identical either way; what differs is entirely the admission/scheduling policy layered on top of that invariant, which is precisely the layer this module's 9.10/9.11/9.17 make fully explicit and testable.
+FOLLOW:
+- Is a hand-rolled version ever faster than pthread_rwlock_t? => Not automatically, and likely not for the general case -- pthread_rwlock_t's implementation is typically well-optimized for the common uncontended and lightly-contended cases; the reason to hand-roll is policy control, not raw performance, unless measurement on the actual target shows otherwise.
+- Would you ever hand-roll this in real production code, or only for learning the mechanism? => Real production code does this specifically when the portable fairness guarantee is a hard requirement pthread_rwlock_t cannot provide (6.17's own scenario); otherwise, defaulting to pthread_rwlock_t and only hand-rolling if a measured, confirmed fairness problem demands it is the more common, pragmatic path.
+PITFALL: Hand-rolling a readers-writers scheme reflexively "for control," without first confirming pthread_rwlock_t's actual, measured behavior on the target platform is insufficient for the requirement at hand. Module 6.10's own measurement found this specific glibc's default already resists starvation reasonably well -- confirm the gap exists before building a replacement for it.
+VERIFY: POSIX.1-2017, pthread_rwlock_wrlock() DESCRIPTION ("Implementations may favor writers... to avoid writer starvation" -- a permission, not a requirement); cross-referenced against module 6.10/6.17's own findings.
+
+@@ 9.10 | Advanced | Debug | tags=readers-writers,naive,writer-starvation,compiled
+Q: Reproduce real, severe writer starvation with a hand-rolled, reader-preferring readers-writers implementation (the "first" problem, not pthread_rwlock_t).
+SHORT: A resource mutex is locked by the first arriving reader and unlocked by the last departing one (tracked via a read-count mutex); 8 continuously-looping readers, each holding a brief 0.2ms simulated read, kept the resource mutex essentially always held. A waiting writer was killed after 3 seconds without ever acquiring the lock, while readers acquired it 85,223 and 85,775 times (two runs) in that window -- real, reproduced starvation.
+DEEP:
+```c
+static int read_count = 0;
+static pthread_mutex_t resource, rcount_mtx;
+
+static void *reader(void *arg) {
+    while (!stop) {
+        pthread_mutex_lock(&rcount_mtx);
+        read_count++;
+        if (read_count == 1) pthread_mutex_lock(&resource);  /* first reader locks out writers */
+        pthread_mutex_unlock(&rcount_mtx);
+
+        /* simulated read, ~0.2ms */
+
+        pthread_mutex_lock(&rcount_mtx);
+        read_count--;
+        if (read_count == 0) pthread_mutex_unlock(&resource); /* last reader lets a writer in */
+        pthread_mutex_unlock(&rcount_mtx);
+    }
+}
+static void *writer(void *arg) { pthread_mutex_lock(&resource); /* ... */ }
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run twice (8 readers looping continuously, 1 writer arriving after a brief warmup, a 3-second monitoring window), both runs printed the identical pattern: `[t=1s] writer still waiting; reader_acquisitions=~30000`, `[t=2s] ...~58000`, `[t=3s] ...~85000`, ending in `writer: STARVED -- did not acquire the lock in 3s while readers acquired it 85223 times` (run 1) and `85775 times` (run 2).
+- This is the "first" readers-writers problem (9.03) exactly as specified: a new reader arriving while a writer waits is never blocked by that waiting writer, only by other readers doing the read-count bookkeeping -- with 8 readers continuously re-arriving, `read_count` essentially never sustains a drop to zero long enough for the writer's already-blocked `pthread_mutex_lock(&resource)` call to win the race.
+- This contrasts directly with module 6.10's finding for `pthread_rwlock_t`, where this same glibc's *built-in* rwlock did not show severe starvation under a broadly similar test -- confirming 9.09's point that a specific, chosen policy (this hand-rolled reader-preferring one) can behave very differently from an implementation's own internal default.
+FOLLOW:
+- Why does this starve so much more severely than 6.10's pthread_rwlock_t test did? => This implementation has no writer-preference mechanism at all (by design, since it deliberately encodes the "first" problem's policy); 6.10's glibc rwlock, despite POSIX not requiring it, apparently applies some internal admission bias that reduces (without eliminating) starvation risk -- this hand-rolled version has no such bias.
+- Would fewer readers (say, 2 instead of 8) still starve the writer this severely? => Likely less severely, since read_count would more often reach zero between arrivals, giving the writer's already-queued lock attempt more chances to win the race -- the severity here scales with how continuously readers keep arriving relative to how long the writer has been waiting.
+PITFALL: Concluding from module 6.10's pthread_rwlock_t result ("this glibc did not show severe starvation") that reader-preferring readers-writers designs generally do not starve writers in practice. This hand-rolled version, encoding the same textbook policy without whatever internal mitigation glibc's rwlock happens to apply, starved a writer completely for the entire measured window.
+VERIFY: General concurrency theory (Courtois/Heymans/Parnas's "first" readers-writers problem). Compiled and run: rw_naive.c (two runs, writer never acquired in 3s, ~85000 reader acquisitions each).
+
+@@ 9.11 | Advanced | Debug | tags=readers-writers,writer-preferring,fixed,compiled
+Q: Fix 9.10's starved writer with the "second" readers-writers problem's writer-preferring policy, and confirm the fix with the identical measurement.
+SHORT: Adding one more mutex (`no_new_readers`) that a writer locks immediately on arrival -- blocking any reader that has not already started, while letting already-active readers finish normally -- cut the writer's wait from "never, in 3+ seconds" to a precisely measured 0.0001s and 0.0003s (two runs), even while readers had still acquired the resource over 2800 times by the moment the writer arrived.
+DEEP:
+```c
+static pthread_mutex_t no_new_readers;
+static void *reader(void *arg) {
+    while (!stop) {
+        pthread_mutex_lock(&no_new_readers);    /* blocked here while a writer is waiting/active */
+        pthread_mutex_lock(&rcount_mtx);
+        read_count++;
+        if (read_count == 1) pthread_mutex_lock(&resource);
+        pthread_mutex_unlock(&rcount_mtx);
+        pthread_mutex_unlock(&no_new_readers);
+        /* simulated read */
+        /* ... decrement read_count, unlock resource if last, same as 9.10 ... */
+    }
+}
+static void *writer(void *arg) {
+    pthread_mutex_lock(&no_new_readers);   /* stop any NEW reader from starting */
+    pthread_mutex_lock(&resource);         /* wait only for already-active readers to finish */
+    /* write */
+    pthread_mutex_unlock(&resource);
+    pthread_mutex_unlock(&no_new_readers);
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run three times, every run printed `writer: acquired after 0.0001s` / `0.0003s` / `0.0003s` (reader_acquisitions at that moment: 2825, 2828, 2802) -- a sub-millisecond, precisely bounded wait every time, versus 9.10's identical setup never acquiring at all within 3 full seconds.
+- The mechanism: a writer's very first action is to lock `no_new_readers`, which any reader must also briefly hold to even begin the "am I the first reader" check -- so from the instant the writer locks it, every reader still in its own `while (!stop)` loop that has not yet passed that check is now blocked, while readers already past it (already holding `resource`) are left alone to finish.
+- This is the "second" readers-writers problem exactly as 9.03 defines it: new readers are blocked the moment a writer is waiting, but already-active readers are never forcibly interrupted -- the writer's wait is now bounded strictly by however many readers were already active at the moment it arrived, never by readers that arrive afterward.
+- The fix is a small, additive change (one new mutex, two new lock/unlock pairs) over 9.10's code -- the entire admission-policy shift from reader-preferring to writer-preferring lives in exactly where that one extra mutex is acquired and released.
+FOLLOW:
+- Does this fix reintroduce any risk for readers instead? => Yes, directly -- 9.15 covers this precisely: a continuous stream of writers can now starve readers, the same shape as 9.10 with the roles reversed, since the fix removed one starvation risk by introducing a structurally symmetric one for the other side.
+- Could the same `no_new_readers` mutex be acquired by multiple waiting writers safely? => Yes -- if a second writer arrives while the first is still writing, it simply blocks on `no_new_readers` (already held by the first writer) the same way a reader would, giving writers themselves a FIFO-ish ordering among each other as a side effect of reusing the same gate.
+PITFALL: Declaring victory after seeing the writer's wait drop to near-zero without checking what happened to reader throughput or reader wait times. A correct writer-preferring fix can, and by design does, come at reader wait-time cost (9.15) -- that trade-off needs to be a deliberate choice, not an unexamined side effect.
+VERIFY: General concurrency theory (Courtois/Heymans/Parnas's "second" readers-writers problem). Compiled and run: rw_fixed.c (three runs, 0.0001-0.0003s writer wait each time).
+
+@@ 9.12 | Advanced | Debug | tags=dining-philosophers,naive,deadlock,compiled,hang
+Q: Reproduce a real dining-philosophers deadlock: five philosophers, each locking their left fork then their right, all seated at once.
+SHORT: Five philosophers, forced via a barrier to reach for their left fork at the same instant, all five successfully picked up their left fork (`philosopher 0/1/2/3/4: picking up left fork N`), then all five blocked trying for their right fork -- the process hung and had to be killed by `timeout 3`, exit code 124, with `philosopher N: eating` never printed for any philosopher.
+DEEP:
+```c
+#define N 5
+static pthread_mutex_t forks[N];
+static pthread_barrier_t start;
+
+static void *philosopher(void *arg) {
+    long id = (long)arg;
+    pthread_mutex_t *left = &forks[id], *right = &forks[(id + 1) % N];
+    pthread_barrier_wait(&start);          /* force all N to reach for a fork at once */
+    pthread_mutex_lock(left);
+    sleep_ms(100);                          /* hold the left fork long enough for everyone else to grab theirs too */
+    pthread_mutex_lock(right);              /* blocks forever under the right timing */
+    /* eat -- never reached */
+    pthread_mutex_unlock(right); pthread_mutex_unlock(left);
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run under `timeout 3`, the output was `philosopher 0/1/2/3/4: picking up left fork N` (all five, in some interleaved order), then `philosopher 3/0/4/2/1: picking up right fork N` (all five attempting, none succeeding) -- and nothing further; the shell reported exit code 124.
+- This is 9.07's circular-wait shape made concrete: philosopher 0 holds fork 0, wants fork 1 (held by philosopher 1, who wants fork 2, held by philosopher 2, ... who wants fork 0, held by philosopher 0) -- a five-node cycle, the exact structure this module's diagram illustrates for the fixed version's contrast (9.13).
+- The 100ms hold after the left-fork lock is the same deliberate determinism technique module 8.04 used for its two-mutex deadlock: it guarantees every philosopher has actually acquired their left fork before any of them attempts their right, removing luck from whether the demo reproduces the bug.
+- Every philosopher is running byte-for-byte identical code; there is no "buggy" philosopher to find and fix -- the bug is in the *collective* behavior of five identical, individually-reasonable actors, exactly 9.07's point about symmetric resource grabs.
+FOLLOW:
+- Would using pthread_mutex_trylock() instead of a blocking lock for the right fork avoid this specific hang? => It would avoid the *hang* (a failed trylock returns immediately instead of blocking), but naively retrying "lock left, trylock right, and if it fails, keep the left fork and just retry the right" reintroduces exactly 8.08's lockstep-livelock risk if every philosopher's retry timing stays synchronized; releasing the left fork on a failed trylock and retrying (8.07's pattern) is the version that actually avoids both deadlock and (with jittered backoff) livelock.
+- Is 5 the specific number that causes this, or would 3 or 10 philosophers deadlock identically? => Any N >= 2 with N forks in a circle and every philosopher grabbing "left" first has the identical structural risk; 5 is simply this module's (and Dijkstra's original) chosen instance size.
+PITFALL: Believing a per-philosopher timeout or retry would "eventually" resolve this hang without a code change. With every philosopher running identical blocking-lock logic and no escape hatch (no trylock, no ordering change), the cycle is stable and does not resolve itself; it hangs until externally killed, exactly as observed.
+VERIFY: General concurrency theory (Dijkstra's dining philosophers). Compiled and run: philo_naive.c (exit 124, all 5 picked up left forks, all 5 blocked on right forks).
+
+@@ 9.13 | Advanced | Debug | fig=diningphil | tags=dining-philosophers,resource-ordering,fixed,compiled
+Q: Fix 9.12's deadlock with a resource-ordering rule (lowest-numbered fork first, not "left" first), and confirm across many rounds that it never hangs.
+SHORT: Every philosopher now picks up whichever of their two forks has the lower index first, instead of always "left" -- for philosopher N-1 (whose neighbors are fork N-1 and fork 0), this means picking up fork 0 first, the same fork philosopher 0 also reaches for first, breaking exactly the wraparound that made "always left first" form a cycle. 200 full rounds of all 5 philosophers eating, run back to back, completed with zero hangs.
+DEEP:
+```c
+static void *philosopher(void *arg) {
+    long id = (long)arg;
+    long left = id, right = (id + 1) % N;
+    long first_idx  = left < right ? left : right;    /* lower-numbered fork first */
+    long second_idx = left < right ? right : left;
+    pthread_mutex_t *first = &forks[first_idx], *second = &forks[second_idx];
+    pthread_barrier_wait(&start);
+    pthread_mutex_lock(first);
+    sleep_ms(20);
+    pthread_mutex_lock(second);
+    /* eat */
+    pthread_mutex_unlock(second); pthread_mutex_unlock(first);
+}
+/* main: run 200 rounds, each with a fresh barrier and 5 fresh philosopher threads, all joined before the next round */
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run under `timeout 30`, it completed all 200 rounds in about 8.15 seconds real time and printed `200/200 rounds of all 5 philosophers eating completed, no hang, lowest-fork-first broke the cycle` -- zero hangs across 200 independent, freshly-seated rounds.
+- The key fix is entirely in philosopher N-1: with plain "left first," philosopher N-1 would lock fork N-1 first (matching everyone else's "grab my own-numbered fork first" pattern) and then want fork 0 -- but philosopher 0 also wants fork 0 as their *second* fork in that scheme, which is fine; the actual cycle in 9.12 comes from every philosopher grabbing their own index first and then reaching for `(id+1)%N`, so philosopher N-1 reaching for fork 0 while philosopher 0 already holds it (and wants fork 1) is what closes the ring. Sorting by index specifically makes philosopher N-1 grab fork 0 *first*, contending directly with philosopher 0 for the same first fork instead of forming the wraparound link in the cycle.
+- This is 8.05's/8.16's global lock-ordering fix, applied to the specific circular case: forks are locks, and "lock the lower-indexed one first" is exactly "acquire in increasing order of a stable, comparable identity" -- the fork's own array index serves as that identity here.
+- 200 independent rounds (each with fresh threads and a fresh barrier, all synchronized to reach for a fork at the same instant, the same determinism technique as 9.12) is deliberately far more repetitions than 9.12's single hung run, specifically to build confidence the fix holds under the same forced-simultaneous-grab conditions that made the naive version fail reliably.
+FOLLOW:
+- Does this fix change how many philosophers can eat concurrently? => Not directly -- at most floor(N/2) philosophers can hold two non-adjacent forks simultaneously in either the naive or fixed version; the fix changes *whether a deadlock can occur*, not the maximum steady-state concurrency, which was never the problem being solved.
+- Would assigning forks IDs in a different order (not simply their table position) work the same way? => Yes, exactly as 8.05/8.16 note generally -- any stable, total order over the forks works; table position is simply the most natural, already-available identity for this specific problem.
+PITFALL: Assuming a resource-ordering fix needs to be more complicated than "sort by an existing, already-stable identity." The entire fix here is a three-line ternary choosing which of two already-known fork indices to lock first; no new data structure or global coordinator was needed.
+VERIFY: General concurrency theory (Dijkstra's dining philosophers, resource-ordering solution); cross-referenced against module 8.05/8.16's general lock-ordering design. Compiled and run: philo_fixed.c (200/200 rounds, no hang).
+
+@@ 9.14 | Advanced | Scenario | tags=dining-philosophers,admission-limiting,semaphore,compiled
+Q: Fix the same dining-philosophers deadlock with a different technique entirely -- capping how many philosophers may attempt to eat at once -- and confirm it works without changing the fork-acquisition order at all.
+SHORT: A counting semaphore initialized to N-1 (4, for 5 philosophers) is acquired before any philosopher touches a fork, and released after eating; the fork-acquisition code is left completely unchanged from 9.12's naive "left fork, then right fork" order. With at most 4 of the 5 philosophers ever attempting to hold a fork simultaneously, at least one fork is always free, and 300 full rounds completed with zero hangs.
+DEEP:
+```c
+static sem_t room;                          /* sem_init(&room, 0, N - 1); */
+static void *philosopher(void *arg) {
+    long id = (long)arg;
+    pthread_mutex_t *left = &forks[id], *right = &forks[(id + 1) % N];
+    pthread_barrier_wait(&start);
+    sem_wait(&room);                        /* at most N-1 philosophers past this point at once */
+    pthread_mutex_lock(left);
+    sleep_ms(5);
+    pthread_mutex_lock(right);
+    /* eat */
+    pthread_mutex_unlock(right); pthread_mutex_unlock(left);
+    sem_post(&room);
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run under `timeout 30`, 300 rounds completed in about 3.19 seconds real time and printed `300/300 rounds completed, no hang, semaphore cap of 4 (N-1) broke the all-hold-left-fork deadlock` -- the naive left-then-right fork order from 9.12, otherwise completely unmodified, no longer deadlocks at all.
+- Why this works: 9.12's deadlock required *all five* philosophers to simultaneously hold their left fork before any could get their right; with the semaphore capped at N-1, at most 4 philosophers can ever be past `sem_wait()` at once, so at most 4 forks can be held simultaneously by philosophers "in the room" -- at least one fork among the 5 is guaranteed unheld, which is enough to guarantee whichever philosopher needs it next can eventually get it, breaking the all-hold-one-each precondition circular wait needs.
+- This is the identical resource-limiting mechanism module 6.16 designed for capping in-flight NVMe commands, applied here to cap in-flight *philosophers* instead of in-flight *commands* -- the same "a counting semaphore initialized to N is the entire mechanism" idea, with N chosen specifically as one less than the total contending parties.
+- Unlike 9.13's resource-ordering fix, this approach requires zero change to the order forks are acquired in -- a real advantage when the acquisition order is dictated by something outside the application's control (e.g. a hardware protocol requiring resources be requested in a specific, fixed sequence).
+FOLLOW:
+- Would capping at N-2 or lower work just as well? => Yes, and more conservatively -- N-1 is the minimum cap that still allows the maximum possible concurrency while guaranteeing the fix; any stricter cap (fewer philosophers admitted at once) is still correct, just needlessly limits throughput further than necessary.
+- Does this scale to a much larger N (say, 100 philosophers) as cleanly as the resource-ordering fix? => Yes -- the semaphore cap is O(1) regardless of N (just "N-1"), whereas the resource-ordering fix needs every one of the N participants to correctly implement the lowest-index-first rule; a single participant with a bug in that rule reintroduces the deadlock, while the semaphore cap has no per-participant logic to get wrong.
+PITFALL: Assuming a resource-ordering fix is always the "better" or "more correct" one because it does not add an extra synchronization primitive. Admission limiting is a legitimate, sometimes simpler alternative, especially when acquisition order cannot be changed or when N is large enough that auditing every participant's ordering logic (8.17's own review discipline) becomes the more expensive path.
+VERIFY: General concurrency theory (dining-philosophers admission-limiting solution family); cross-referenced against module 6.16's identical semaphore-capping mechanism. Compiled and run: philo_sem_fix.c (300/300 rounds, no hang).
+
+@@ 9.15 | Advanced | Trap | tags=writer-preference,reader-starvation,swapped-direction
+Q: 9.11's writer-preferring fix eliminated writer starvation. Does it introduce any new starvation risk, and for whom?
+SHORT: Yes -- reader starvation, the exact mirror image of 9.10's original bug. If writers arrive continuously and rapidly (the same shape 9.10's readers did), each one locks `no_new_readers` on arrival, blocking every reader that has not already started; a continuous stream of writers can keep `no_new_readers` almost permanently held, starving new readers indefinitely, the identical mechanism as 9.10 with the two roles swapped.
+DEEP:
+- This is not a flaw specific to this implementation -- it is 9.03's "second" readers-writers problem exactly as named and specified: writer preference is not "fair," it is a deliberate choice to bound writer wait time at the explicit cost of reintroducing an equivalent, direction-reversed starvation risk for readers.
+- The asymmetry that made 9.10's original bug severe (readers holding the resource mutex essentially continuously) has an exact analog here: if writers arrive back-to-back with negligible gaps, `no_new_readers` can be handed from one arriving writer to the next before any blocked reader's `pthread_mutex_lock(&no_new_readers)` call gets scheduled to win the race -- structurally identical to how 9.10's `read_count` rarely reached zero.
+- Whether this trade-off is acceptable depends entirely on the real workload's write frequency: 9.11's fix is the right choice when writes are rare but must never wait unpredictably (a safety-critical config reload); it is the wrong choice if writes can plausibly arrive in a rapid, continuous burst, where it simply relocates the starvation problem rather than solving it.
+- The actual fix for *this* new risk is not "go back to reader preference" (that reintroduces 9.10's original bug) but genuine fairness (9.17's ticket-based scheme), which starves neither side by construction, at the cost of the additional bookkeeping a strict FIFO admission policy requires.
+FOLLOW:
+- Would this reader-starvation risk actually manifest the same way 9.10's writer-starvation did, if measured? => By the identical mechanism and under an analogous continuous-arrival load, yes -- this was not separately measured in this study guide (9.10/9.11's tests used a single writer, not a continuous stream of writers), but the structural symmetry with 9.10's confirmed result is exact, not merely suspected.
+- Is there a middle ground between strict reader preference and strict writer preference that is not full ticket-based fairness? => Some rwlock-kind implementations offer a "prefer writer, but bound how long readers can be excluded" tunable (conceptually similar to module 11's real-time throttling idea applied to lock admission) -- this study guide did not build or measure such a variant directly.
+PITFALL: Treating 9.11's fix as a strictly better, side-effect-free improvement over 9.10 rather than a different point on the same fairness trade-off curve. It eliminates one specific starvation risk by introducing its structural mirror image, not by removing starvation risk from the design entirely.
+VERIFY: General concurrency theory (the symmetric nature of "first" versus "second" readers-writers problem starvation risk); not independently re-measured for the reader-starvation direction in this study guide.
+
+@@ 9.16 | Advanced | Numeric | tags=buffer-size,throughput-latency,hedge
+Q: Roughly, how should a bounded buffer's capacity be chosen, and what does getting it wrong actually cost?
+SHORT: A reasoned hedge, not a benchmarked figure: too small a capacity (1-2 slots) forces producers and consumers to synchronize on nearly every item, turning a mostly-parallel pipeline into near-lockstep handoff; too large (thousands of slots for a workload with only a handful in flight) wastes memory and can hide a real backpressure signal (a slow consumer) until the problem is already severe.
+DEEP:
+- The right-sized capacity is a function of the actual producer/consumer rate mismatch the buffer needs to absorb -- enough slots to smooth over normal, expected burstiness (a producer momentarily running ahead of a consumer) without being so large that a *sustained* rate mismatch (a permanently slower consumer) is invisible until the buffer is already nearly full and latency has already grown throughout.
+- 9.04's own demo used BUFSZ=8 for 3 producers and 3 consumers moving 1500 items -- small enough to force real blocking on both `empty_slots` and `full_slots` (exercising the actual bounded-buffer logic, not just the unbounded-equivalent fast path), which was itself a deliberate test-design choice, not a claim about a "right" production size.
+- A useful diagnostic once a system is running: track the buffer's actual occupancy distribution (module 4.12/6.05's own before/after measurement discipline, applied to occupancy instead of latency) -- a buffer that sits near-empty almost always is oversized for the actual burst pattern; one that sits near-full almost always indicates the consumer side is the real bottleneck no larger buffer will fix.
+- This is the same class of judgment as module 6.08's rwlock-vs-mutex read/write-ratio question: a real number from the actual target workload beats an assumed "reasonable-sounding" default every time, and the "reasonable-sounding" default is only a starting point to measure against.
+FOLLOW:
+- Does a larger buffer ever hurt correctness, not just efficiency? => Not correctness of the bounded-buffer protocol itself (9.04's semaphore pair is correct for any BUFSZ >= 1), but an oversized buffer can hurt *end-to-end* correctness properties like bounded latency, if the system has an implicit requirement that no item waits longer than some deadline (module 11's real-time-deadline territory) -- a huge buffer can let items queue far longer than that deadline while still being "correct" by the bounded-buffer protocol's own narrow definition.
+- Is there a formula for the "right" buffer size? => Little's Law (average items in the system equals arrival rate times average time in the system) gives a starting estimate if the arrival rate and target latency are both known, but it is a planning estimate, not a substitute for measuring the actual workload's burst behavior on the real target.
+PITFALL: Picking a bounded-buffer capacity by an arbitrary round number ("1024 sounds like a safe size") without any reasoning connected to the actual producer/consumer rate mismatch or latency requirement the buffer exists to absorb.
+VERIFY: No POSIX or C11 clause specifies a buffer-sizing rule; this is a reasoned hedge (Little's Law is a general queueing-theory result, not benchmarked directly in this study guide).
+
+@@ 9.17 | Principal | Scenario | tags=design,fair-readers-writers,ticket-based,mutex-condvar
+Q: Design a strictly fair readers-writers scheduler -- starving neither readers nor writers -- built from only a mutex and a condition variable, and confirm the fairness property under real concurrent load.
+SHORT: A ticket counter assigns every arrival (reader or writer) a strictly increasing number; a "now serving" counter tracks whose turn it is, advanced the instant any ticket is admitted (letting consecutive readers overlap), gated by "no writer active" for readers and "no readers active, no writer active" for writers. Under 8 threads issuing 4000 mixed requests (roughly 1 in 5 a writer), every admission happened in exact ticket order on all three runs tested.
+DEEP:
+```c
+static unsigned long next_ticket = 0, now_serving = 0;
+static int active_readers = 0, writer_active = 0;
+static pthread_mutex_t mtx; static pthread_cond_t cv;
+
+static void reader_lock(void) {
+    lock(mtx); unsigned long t = next_ticket++;
+    while (!(t == now_serving && !writer_active)) cond_wait(cv, mtx);
+    now_serving++; active_readers++;             /* admit; let the next ticket be considered too */
+    cond_broadcast(cv); unlock(mtx);
+}
+static void writer_lock(void) {
+    lock(mtx); unsigned long t = next_ticket++;
+    while (!(t == now_serving && !writer_active && active_readers == 0)) cond_wait(cv, mtx);
+    now_serving++; writer_active = 1;
+    unlock(mtx);
+}
+/* reader_unlock: active_readers--, broadcast if it hits 0.
+   writer_unlock: writer_active = 0, broadcast. */
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run three times (8 threads, 4000 total requests, about 1-in-5 a writer, each request briefly holding its access), every run's admission log -- recorded in the exact order tickets were actually admitted -- matched the sequence 0, 1, 2, ..., 3999 exactly, with zero out-of-order admissions in 12000 total admissions checked across the three runs.
+1. **Ticket assignment is unconditional and immediate.** Every arrival, reader or writer, gets `next_ticket++` under the mutex before waiting on anything -- this is what guarantees a later-arriving request can never even be considered for admission ahead of an earlier one, regardless of type.
+2. **"Now serving" advances on admission, not on completion.** Advancing it the instant a reader is admitted (not when it finishes) is specifically what lets consecutive readers overlap in time -- ticket K+1 can be checked and admitted while ticket K's reader is still reading, as long as ticket K+1 is also a reader and no writer is active.
+3. **A writer's admission condition additionally requires active_readers == 0.** This is what prevents a writer's ticket from being "let through" by the now-serving advance while readers admitted just before it are still active -- the writer waits at its correct ticket position until every earlier-admitted reader has actually finished, not just been admitted.
+4. **Verify the fairness property directly, not just the mutual-exclusion property.** Confirming exactly one writer active at a time and no writer/reader overlap only proves the mutual-exclusion invariant; the strict-ticket-order admission log is what specifically proves the *fairness* claim this design exists to provide.
+5. **This composes 8.16's stable-identity-and-ordering discipline with 5.12's mutex-plus-condition-variable predicate pattern**, applied to a new predicate (strict ticket order plus the reader/writer mutual-exclusion condition) rather than either technique alone.
+- Every FOLLOW-up question in 9.03/9.09 about "is there a variant that starves neither side" is answered directly and concretely by this one design, verified under real load rather than argued only in the abstract.
+FOLLOW:
+- What is the actual cost of this fairness guarantee versus 9.10/9.11's simpler policies? => More bookkeeping per request (a ticket increment, a condition-variable predicate check against two counters instead of one) and a `cond_broadcast()` on every reader admission (potentially waking threads that are not yet eligible, who simply re-check their predicate and go back to waiting) -- a real, measurable cost this study guide did not benchmark directly against 9.10/9.11's simpler versions.
+- Does this design deadlock or livelock under any condition? => No thread ever holds `mtx` while waiting (the condition variable releases it during the wait, module 5's mandatory pattern), and every admitted thread's ticket strictly and monotonically advances `now_serving`, so no cycle and no repeated-symmetric-failure pattern (8.01, 8.08) is structurally possible here.
+PITFALL: Building a "fair" scheduler and verifying only that it provides correct mutual exclusion (readers never overlap a writer), without separately verifying the actual admission *order* matches arrival order. Mutual exclusion and fairness are two different properties; this design's compiled test checks both, explicitly and separately.
+VERIFY: General concurrency-design synthesis (ticket-lock fairness, module 5's mutex/condvar predicate pattern, module 8.16's ordering discipline); not itself a single POSIX or C11 clause. Compiled and run: fair_rw.c (three runs, 4000/4000 admissions in exact ticket order each time).
+
+@@ 9.18 | Principal | Debug | tags=review,checklist,classic-problems-audit
+Q: You are reviewing a PR implementing all three classic problems (a command queue, a config cache, and a multi-lock validation step) for a new firmware validation harness. What do you check before approving?
+SHORT: Command queue: exactly two semaphores with complementary roles (9.06), and every shared index still protected by its own mutex (9.05), not assumed safe just because semaphores are present. Config cache: was the fairness policy (reader-, writer-preferring, or strict) chosen deliberately from the actual read/write ratio and latency need (6.08, 9.03), or defaulted to? Multi-lock step: a consistent resource order or admission cap (9.13, 9.14), tested under forced acquisition, not just light load.
+DEEP:
+1. **Command queue: semaphore accounting and index protection.** Walk every `sem_wait()`/`sem_post()` pair for exactly the two-semaphore complementary-count shape (9.06); separately confirm the shared buffer indices have their own mutex if there is more than one producer or consumer (9.05), since the semaphores alone do not protect that bookkeeping.
+2. **Config cache: fairness policy is a stated decision, not a default.** Ask directly: what is the expected read/write ratio, and can a write ever need to complete within a bounded time? If yes to the latter, reader preference (9.10's shape) is the wrong default; if the ratio is extremely read-heavy and no write has a hard latency bound, writer preference's own starvation risk to readers (9.15) needs the same scrutiny in the other direction.
+3. **Multi-lock step: order or cap, and prove it under forced contention.** Confirm every code path acquiring more than one of the relevant locks agrees on either a documented global order (8.16/8.17's review discipline, applied here) or a semaphore-based admission cap (9.14) -- then specifically ask whether this was tested under a forced-simultaneous-acquisition scenario (a barrier-synchronized stress test, the same technique 9.12/9.13's own compiled tests used), not merely under ordinary, lightly-loaded testing that might never trigger the exact timing window.
+4. **Cross-check for a hidden fourth shape.** If the multi-lock step's resources are ever acquired dynamically, in an order not known until runtime, check whether 8.16's dynamic global-ordering design (assign identities, sort before acquiring) is actually in place, rather than a fixed order that happens to work only for the currently-known resource set.
+5. **Ask what happens under load spikes for all three simultaneously.** A command-queue backpressure event, a config write, and a multi-lock validation step contending at the same moment is a realistic worst case for a real harness -- confirm each sub-system's own fix still holds under combined load, not just when tested in isolation.
+- A Principal-level review of this PR is not "does each of the three components pass its own unit test" -- it is confirming each component's fix matches a deliberately chosen, stated policy appropriate to its actual real-world access pattern, the same discipline module 6.20's own review checklist applied to a semaphore-and-rwlock pair.
+FOLLOW:
+- What if the PR author says the fairness policy "doesn't matter much in practice" for the config cache? => Push back the same way 6.20's FOLLOW does for premature rwlock complexity -- ask for the actual measured or estimated read/write ratio and the actual latency requirement for a write, and let that data (not an assumption) decide the policy.
+- Is a stress test with random timing sufficient to catch a multi-lock ordering violation, or does it need the forced-simultaneous-acquisition technique this module's own demos used? => Random-timing stress testing can catch it eventually but is not reliable -- a deliberately forced worst-case timing window (a barrier synchronizing all participants to acquire at once, exactly as 9.12/9.13 did) is a far more reliable way to actually exercise the exact race a subtle ordering bug depends on.
+PITFALL: Approving each of the three components because it "passed its own tests in isolation," without checking that each one's specific policy choice (semaphore accounting, fairness direction, ordering discipline) was a deliberate decision matching the real workload, and without testing any of them under the forced-contention conditions that actually expose these classes of bugs.
+VERIFY: General review synthesis of this module's own findings (9.05, 9.06, 9.10, 9.11, 9.13, 9.14) plus module 6.20's review discipline; not itself a single POSIX or C11 clause.
+
+@@ 9.19 | Principal | Concept | tags=deadlock-free-vs-starvation-free,synthesis
+Q: Why are "deadlock-free" and "starvation-free" two distinct guarantees, and can a design have one without the other?
+SHORT: Deadlock-freedom means the system can never reach a state where progress is permanently impossible for everyone; starvation-freedom means no participant is perpetually passed over while others keep progressing. A system can be deadlock-free while starving one participant indefinitely (9.10's reader-preferring readers-writers: readers keep succeeding, but one writer never does); a resource-cap or ordering fix (9.13, 9.14) can be both, or only the former.
+DEEP:
+- 9.10's naive readers-writers is the clearest demonstration in this module: it is deadlock-free (the system never gets stuck as a whole -- readers keep acquiring and releasing the resource mutex continuously, real progress by *some* thread happens forever) but not starvation-free (one specific thread, the writer, never gets to run at all in the measured window).
+- 9.12's naive dining philosophers is the mirror case: it is not deadlock-free (the whole system can and does get stuck, with *zero* threads making progress under the forced-simultaneous-grab condition) -- deadlock is a stronger, more catastrophic failure than starvation, since it stops everyone, not just one victim.
+- 9.13's and 9.14's fixes both restore deadlock-freedom (no more all-stuck-forever states), but neither one, by itself, additionally guarantees starvation-freedom for every individual philosopher -- a philosopher could in principle be repeatedly "unlucky" in the scheduling of who grabs the shared forks first, even though the system as a whole always keeps making progress; this study guide did not measure per-philosopher starvation risk directly for either fix.
+- 9.17's ticket-based fair readers-writers is the one design in this module that explicitly targets and verifies starvation-freedom directly (via the strict-ticket-order admission proof), on top of the mutual-exclusion (safety) property every version in this module already provides.
+FOLLOW:
+- Is starvation-freedom always worth its extra cost? => Not always -- 9.16's buffer-sizing judgment and 9.09's "measure before hand-rolling" discipline both apply here too: starvation-freedom's extra bookkeeping (9.17's ticket counter and broadcast) is worth it specifically when a real requirement (a bounded wait for every participant, not just most) demands it, not as a reflexive upgrade.
+- Does deadlock-freedom imply anything at all about fairness? => No -- a deadlock-free system can be maximally unfair to one participant forever while remaining, by definition, never fully stuck; the two properties are logically independent, which is exactly why this module treats them as two separate questions requiring two separate kinds of verification (a hang test for deadlock-freedom, an admission-order log for starvation-freedom).
+PITFALL: Treating "the system doesn't hang" (deadlock-freedom, verified by a many-round no-hang test like 9.13's) as proof the system is also fair to every participant. These are different, independently-verifiable properties, and this module's own 9.10 versus 9.17 contrast is the direct evidence that one does not imply the other.
+VERIFY: General concurrency theory (liveness properties: deadlock-freedom and starvation-freedom as distinct guarantees); not itself POSIX or C11 text.
+
+@@ 9.20 | Principal | Cross-layer | tags=synthesis,general-lock-ordering,firmware-harness
+Q: Generalize 9.13's dining-philosophers resource-ordering fix into a reusable design for a real validation harness where worker threads acquire an arbitrary, dynamically-determined subset of shared hardware-channel and buffer locks -- and connect it explicitly to module 8's own general design.
+SHORT: This is 8.16's dynamic global-lock-ordering design, applied concretely: assign every hardware-channel and buffer lock a stable numeric ID at registration time (channels have no natural memory address the way in-process mutexes do), require each worker thread to collect its full needed lock set before acquiring any, sort by ID, and acquire in increasing order -- structurally 9.13's "lowest fork index first" rule, generalized to an arbitrary, runtime-determined set.
+DEEP:
+1. **Assign stable identities at registration, not at use.** Every hardware channel and buffer gets a fixed numeric ID when the harness initializes, independent of which worker thread ends up needing it or in what order -- this is the direct analog of 9.13's fork indices, which are fixed at table-setup time, not chosen per-philosopher.
+2. **A worker thread determines its full lock set before acquiring anything**, the same requirement 8.16 states generally: a test case that needs "whichever channel is free, plus the results buffer" must resolve *which specific channel* first, then include it in the set to be sorted and acquired in order -- acquiring the channel first and only then discovering the buffer is also needed (breaking the "collect everything first" rule) reopens exactly the risk 8.16's design closes.
+3. **Sort and acquire in increasing ID order, unconditionally**, via a shared helper function every worker thread calls (8.16's `lock_all()`-style wrapper) rather than trusting each test case's author to remember the rule -- this is the same centralization discipline 9.14's semaphore cap achieves differently (O(1) regardless of participant count) but resource ordering achieves by making the rule impossible to accidentally skip.
+4. **Test under forced-simultaneous-acquisition conditions specifically**, the same barrier-synchronized technique 9.12/9.13 used to make their respective bugs and fixes reproduce reliably -- a validation harness's own test suite should include a stress scenario where many worker threads are deliberately synchronized to request overlapping lock sets at the same instant, not just ordinary, incidentally-timed load.
+5. **Consider whether admission limiting (9.14's alternative) fits better for this specific harness.** If hardware channels must be requested in a fixed, protocol-mandated order that the harness cannot reorder, 9.14's admission-cap technique (limit concurrent multi-lock-holding worker threads to fewer than the total available channels) sidesteps the ordering requirement entirely, the same trade-off 9.14's own FOLLOW covers.
+- This is the concrete, worked answer to 9.08's cross-layer mapping question: the dining-philosophers shape in a real validation harness is exactly "multiple worker threads, each needing more than one shared hardware/buffer resource, in an order not fully under any single thread's control" -- and the fix is not a new idea, it is 8.16's general design and 9.13's specific instance of it, applied together.
+FOLLOW:
+- Does this design need a central lock-ordering registry, or can each worker thread compute the order independently? => Independent computation is sufficient and preferred -- as long as every worker thread sorts by the same stable, shared identity (the registered numeric IDs), no central coordinator is needed at acquisition time; a registry is only needed once, at initialization, to assign the IDs themselves.
+- What if a new hardware channel is added to the harness after IDs have already been assigned to existing channels? => Assign the new channel the next available ID (higher than all existing ones) -- this preserves every existing acquisition order relationship without needing to renumber anything already in use, the same append-only discipline that keeps a global order stable as a system grows.
+PITFALL: Building the general lock-ordering design (8.16) and the dining-philosophers-specific fix (9.13) as if they were two separate techniques, when a real system needing both should recognize them as the same mechanism at two different scales -- a fixed, small, known-in-advance resource set (9.13) is simply the special case of the general, dynamic design (8.16) where the "sort and acquire" step happens to be knowable at compile time instead of only at run time.
+VERIFY: Module 8.16's general design and 9.13's specific instance, synthesized; not itself a single POSIX or C11 clause.

@@ -1,0 +1,499 @@
+# Module 3: Control Flow & Program Structure
+
+@@ 3.01 | Basic | Concept | tags=if-else,dangling-else
+Q: What is the "dangling else" problem, and how does C11 actually resolve it?
+SHORT: When an `if` without braces is followed by another `if` and then a single `else`, indentation can suggest the `else` belongs to the outer `if`, but 6.8.4.1p3 states the rule plainly: "an else is associated with the lexically nearest preceding if that is allowed by the syntax." The fix is always braces, never trusting indentation.
+DEEP:
+```c
+#include <stdio.h>
+
+int main(void)
+{
+    int a = 1, b = 0;
+    if (a)
+        if (b)
+            printf("a and b\n");
+        else
+            printf("a but not b (this is what actually runs)\n");
+    return 0;
+}
+```
+Compiled with `-Wall -Wextra`: gcc flags this exact shape with `warning: suggest explicit braces to avoid ambiguous 'else' [-Wdangling-else]`. Run output: `a but not b (this is what actually runs)`, confirming the `else` binds to the inner `if (b)`, exactly as 6.8.4.1p3 requires, regardless of how the indentation visually suggests otherwise.
+FOLLOW:
+- Does adding braces change the binding, or just make it visible? => It actually changes which `if` the `else` binds to, if you place the braces to enclose the inner `if` alone; braces make the (already-fixed) rule match your visual intent instead of fighting it.
+- Is this ambiguous in the grammar itself? => No; the grammar plus 6.8.4.1p3's rule fully disambiguates it. It only "looks" ambiguous to a human reading indentation.
+PITFALL: Relying on an auto-formatter or personal indentation style instead of braces for any `if` containing a nested `if` without its own `else`.
+VERIFY: 6.8.4.1p3
+
+@@ 3.02 | Basic | Concept | tags=switch,break
+Q: How does a `switch` statement decide where control jumps, and what happens if you omit `break`?
+SHORT: The controlling expression is integer-promoted, compared against each `case` constant (also converted to that promoted type); control jumps to the first matching label, or to `default` if none match and one exists, or skips the whole body if neither exists (6.8.4.2p5). Without `break`, execution falls through into the next label's statements instead of exiting the switch.
+DEEP:
+```c
+#include <stdio.h>
+
+int main(void)
+{
+    int day = 3;
+    switch (day) {
+    case 1: printf("Mon\n"); break;
+    case 2: printf("Tue\n"); break;
+    case 3: printf("Wed\n"); break;
+    default: printf("other\n"); break;
+    }
+    return 0;
+}
+```
+Compiled and run: prints `Wed`. Each `break` (6.8.6.3) terminates the switch immediately; removing the `break` after `case 3` would fall straight into `default`'s `printf("other\n")` too, printing both lines.
+
+There may be at most one `default` label (6.8.4.2p3), and it does not have to be last textually, though placing it last is the near-universal convention.
+FOLLOW:
+- Must every case end in break? => No; intentional fall-through (module 3's later Duff's-device and fall-through questions) is legal C, just easy to get wrong by accident.
+- What type must the controlling expression have? => Integer type (6.8.4.2p1); a `switch` on a `float` or pointer is a constraint violation.
+PITFALL: Forgetting `break` at the end of a case is the single most common `switch` bug; `-Wimplicit-fallthrough` (not in default `-Wall`/`-Wextra` on all gcc versions, but available and worth enabling) flags unmarked fall-through.
+VERIFY: 6.8.4.2p3, p5, 6.8.6.3
+
+@@ 3.03 | Basic | Concept | tags=loops,invariant
+Q: What is the actual behavioral difference between `while`, `do-while`, and `for`, beyond syntax?
+SHORT: `while` and `for` both test their controlling expression before every iteration, including the first, so the body can run zero times. `do-while` tests after each iteration, so the body always runs at least once (6.8.5.2p1). `for` additionally has a dedicated init clause and a post-body expression, both absent from `while`.
+DEEP:
+```c
+#include <stdio.h>
+
+int main(void)
+{
+    int n = 3;
+    printf("for: ");
+    for (int i = 0; i < n; i++) printf("%d ", i);
+    printf("\nwhile: ");
+    int i = 0;
+    while (i < n) { printf("%d ", i); i++; }
+    printf("\ndo-while: ");
+    i = 0;
+    do { printf("%d ", i); i++; } while (i < n);
+
+    n = 0;
+    printf("\nfor with n=0 runs: ");
+    for (int j = 0; j < n; j++) printf("%d ", j);
+    printf("(none)\n");
+    return 0;
+}
+```
+Compiled and run: `for: 0 1 2`, `while: 0 1 2`, `do-while: 0 1 2`, then `for with n=0 runs: (none)`. Setting `n = 0` before the last loop demonstrates the zero-iteration case that `for`/`while` support and `do-while` cannot.
+FOLLOW:
+- When is `do-while` the natural choice? => When the loop body must run at least once regardless of the condition, such as a menu-driven input loop or a retry-once-then-check pattern.
+- Which loop is a "loop invariant" easiest to reason about with? => `for`, because its three clauses put the initialization, condition, and progress step in one place, making the invariant ("this holds true before every condition check") easier to state and verify.
+PITFALL: Using `do-while` when the body should not run on a false initial condition; this is a common off-by-one-iteration bug when translating a `while` loop into `do-while` for style reasons alone.
+VERIFY: 6.8.5.1p1, 6.8.5.2p1, 6.8.5.3p1
+
+@@ 3.04 | Intermediate | Scenario | tags=switch,fallthrough
+Q: Show a real, legitimate use of intentional switch fall-through (not a bug).
+SHORT: Stacking multiple `case` labels with no statements between them, all sharing the code of the final label in the group, is the standard way to group multiple values into one action, e.g. classifying vowels. This is fall-through between labels with no code in between, which is a different (safe) pattern from fall-through past code.
+DEEP:
+```c
+#include <stdio.h>
+
+int is_vowel(char c)
+{
+    switch (c) {
+    case 'a': case 'e': case 'i': case 'o': case 'u':
+    case 'A': case 'E': case 'I': case 'O': case 'U':
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+int main(void)
+{
+    const char *s = "Hello";
+    for (const char *p = s; *p; p++)
+        printf("%c: %s\n", *p, is_vowel(*p) ? "vowel" : "consonant");
+    return 0;
+}
+```
+Compiled and run: `H: consonant`, `e: vowel`, `l: consonant`, `l: consonant`, `o: vowel`. All ten vowel labels share one `return 1;`; there is no code between the stacked labels for control to fall through *past*, which is exactly what makes this pattern safe and idiomatic rather than a latent bug.
+FOLLOW:
+- Is this different from Duff's device style fall-through? => Yes; here, labels with no statements between them just group alternatives. Duff's device (this module, advanced section) falls through *past executable statements*, which is a much sharper tool used deliberately for loop unrolling.
+- Does `-Wimplicit-fallthrough` warn about this pattern? => No; gcc specifically recognizes empty-label-to-label fall-through (no statements in between) as safe and does not warn on it.
+PITFALL: Adding a statement "temporarily" between two stacked case labels for debugging, then forgetting to remove it, turning a safe grouping into an unintended fall-through bug.
+VERIFY: 6.8.4.2p3
+
+@@ 3.05 | Intermediate | Concept | tags=goto,cleanup
+Q: What is the "goto for cleanup" pattern, and why is it still considered legitimate, idiomatic C rather than a code smell?
+SHORT: A function acquires several resources in sequence and jumps to one shared cleanup label on any failure, releasing exactly what was successfully acquired so far, in reverse order, then returns. This avoids duplicating cleanup code at every failure point and avoids deep nesting; it is the closest C gets to RAII-style exception safety, and it is explicitly sanctioned by the standard's own goto example (6.8.6.1p3).
+DEEP:
+```c
+#include <stdio.h>
+#include <stdlib.h>
+
+int process(int fail_at)
+{
+    int rc = -1;
+    int *buf1 = NULL, *buf2 = NULL, *buf3 = NULL;
+
+    buf1 = malloc(4 * sizeof(int));
+    if (!buf1 || fail_at == 1) goto cleanup;
+
+    buf2 = malloc(4 * sizeof(int));
+    if (!buf2 || fail_at == 2) goto cleanup;
+
+    buf3 = malloc(4 * sizeof(int));
+    if (!buf3 || fail_at == 3) goto cleanup;
+
+    rc = 0; /* success: all three resources acquired */
+
+cleanup:
+    free(buf3);
+    free(buf2);
+    free(buf1);
+    return rc;
+}
+
+int main(void)
+{
+    printf("fail_at=2 -> rc=%d\n", process(2));
+    printf("fail_at=0 -> rc=%d\n", process(0));
+    return 0;
+}
+```
+Compiled and run: `fail_at=2 -> rc=-1`, `fail_at=0 -> rc=0`. `free(NULL)` is well-defined and a no-op (7.22.3.3), which is exactly why the single shared `cleanup:` label can safely `free()` all three pointers regardless of how far acquisition actually got.
+FOLLOW:
+- Why not just nest the ifs instead of using goto? => With more than two or three resources, nested ifs indent one level per resource and duplicate (or badly complicate) the cleanup logic at every failure branch; the goto version keeps cleanup in exactly one place.
+- Is jumping backward with goto ever legitimate too? => Yes, for state-machine-style dispatch or restart logic (6.8.6.1's own example jumps into a loop's reinitialization code), though that is a less common pattern than forward cleanup jumps.
+PITFALL: Forgetting to initialize each pointer to NULL before the acquisition sequence; without that, a cleanup path reached before a given `malloc` runs would `free()` an indeterminate (not NULL) pointer, which is undefined behavior.
+VERIFY: 6.8.6.1p2-p3, 7.22.3.3
+
+@@ 3.06 | Intermediate | Numeric | tags=off-by-one,bounds
+Q: An array `int a[5]` is looped over with `for (int i = 0; i <= n; i++)` where `n = sizeof(a)/sizeof(a[0])`. Work out exactly what goes wrong and what the fix is.
+SHORT: `n` is `5` (the element count), so valid indices are `0` through `4`; `i <= n` lets `i` reach `5`, reading `a[5]`, one element past the end of the array. That access is out-of-bounds and undefined behavior, not merely "off by one in value" -- there is no guaranteed sixth element to read.
+DEEP:
+```c
+#include <stdio.h>
+
+int main(void)
+{
+    int a[5] = {10, 20, 30, 40, 50};
+    int n = sizeof(a) / sizeof(a[0]); /* 5 */
+
+    int sum = 0;
+    for (int i = 0; i < n; i++) sum += a[i]; /* correct: i in [0, n-1] */
+    printf("correct sum (i < n) = %d\n", sum);
+
+    printf("bounds check: last valid index is %d, n is %d\n", n - 1, n);
+    return 0;
+}
+```
+Compiled and run: `correct sum (i < n) = 150`, `bounds check: last valid index is 4, n is 5`. The worked numbers: `n = sizeof(a)/sizeof(a[0]) = 20/4 = 5` on a platform with 4-byte `int`; valid indices are `0..4`; `i <= n` would let `i` reach `5`, one past the last valid index, which this file deliberately does not execute since an out-of-bounds read has no defined value to show.
+FOLLOW:
+- Why is `<` idiomatic and `<=` almost always wrong for zero-based array bounds? => Because C array indices are zero-based and half-open ranges (`[0, n)`) are exactly what `<` expresses; `<=` describes a closed range `[0, n]`, which has one too many elements for a zero-based array of size `n`.
+- Does this crash immediately? => Not necessarily and not reliably; reading one past a stack or heap array often reads adjacent memory silently (appearing to "work"), which is what makes this bug dangerous rather than merely annoying.
+PITFALL: Using `<=` "by habit" when translating a 1-based mathematical description ("process elements 1 through n") directly into 0-based C indices without adjusting the comparison.
+VERIFY: 6.5.6 (pointer/array bound reasoning); accessing `a[5]` of a 5-element array is outside the object per 6.5.6p8's "one past the end" rule, which permits computing but not dereferencing that address
+
+@@ 3.07 | Intermediate | Scenario | tags=recursion,factorial
+Q: Write both a recursive and an iterative factorial, and identify which calls in the recursive version are (and are not) tail calls.
+SHORT: `fact_recursive`'s call `n * fact_recursive(n - 1)` is NOT a tail call: the multiplication happens *after* the recursive call returns, so the compiler must keep a stack frame per call to remember `n` for that pending multiply. A true tail call would return the recursive call's result directly with no further work, which this does not do.
+DEEP:
+```c
+#include <stdio.h>
+
+unsigned long fact_recursive(unsigned n)
+{
+    if (n <= 1) return 1;
+    return n * fact_recursive(n - 1); /* not a tail call: multiply happens after the call returns */
+}
+
+unsigned long fact_iterative(unsigned n)
+{
+    unsigned long r = 1;
+    for (unsigned i = 2; i <= n; i++) r *= i;
+    return r;
+}
+
+int main(void)
+{
+    printf("recursive 10! = %lu\n", fact_recursive(10));
+    printf("iterative 10! = %lu\n", fact_iterative(10));
+    return 0;
+}
+```
+Compiled and run: `recursive 10! = 3628800`, `iterative 10! = 3628800`. Both correct; the difference this question cares about is stack usage, not the result: `fact_recursive` grows one stack frame per recursive call (10 frames deep for `fact_recursive(10)`), while `fact_iterative` uses one fixed-size frame regardless of `n`.
+FOLLOW:
+- Could `fact_recursive` be rewritten as a tail call? => Yes, with an accumulator parameter: `fact_tail(n, acc)` returning `fact_tail(n-1, n*acc)` directly with nothing left to do afterward -- that call is in tail position.
+- Does C guarantee tail-call optimization even for a genuine tail call? => No (this module's later question covers this precisely); it is purely a quality-of-implementation choice some compilers make at higher optimization levels, never a standard requirement.
+PITFALL: Assuming any recursive function that "looks simple" is automatically stack-safe for large inputs; only truly tail-recursive code even has a *chance* of being optimized into a loop, and C never guarantees that optimization happens.
+VERIFY: (no direct C11 clause guarantees or defines "tail call optimization"; the standard is silent on it, which is itself the load-bearing fact for the FOLLOW-up question below)
+
+@@ 3.08 | Intermediate | Concept | tags=for-loop,scope
+Q: In `for (int i = 0; i < n; i++) { ... }`, what is the scope of `i`, and when exactly is `i`'s declaration "reached" relative to the loop's first condition check?
+SHORT: `i`'s scope extends over the entire loop, including the condition and increment clauses, but ends at the closing brace of the loop statement -- it does not leak into code after the loop (6.8.5.3p1). The declaration is reached, in execution order, before the first evaluation of the controlling expression `i < n`.
+DEEP:
+This is why the following is a compile error, not just a style question: referencing `i` after the loop's closing brace fails because `i`'s scope (6.8.4/6.8.5, "a selection/iteration statement is a block whose scope is a strict subset of the scope of its enclosing block") ended there.
+
+The declaration-part restriction (6.8.5.3p2 in this module's earlier for-statement question) also matters here: the `for`'s declaration part may only declare objects with storage class `auto` or `register` -- you cannot write `for (static int i = 0; ...)`, because `static`'s "initialized once for the whole program" semantics would be nonsensical for a loop variable whose entire point is per-loop-entry initialization.
+FOLLOW:
+- Does each iteration get a fresh `i`, or the same object reinitialized? => The same object; `i`'s declaration runs once, before the first condition check, not once per iteration -- only the increment expression re-touches it thereafter.
+- Can you shadow an outer `i` with the for-loop's `i`? => Yes; the for-loop's `i` is in a nested (inner) scope and hides an outer `i` of the same name for the loop's duration, per the general shadowing rule (6.2.1p4).
+PITFALL: Writing two adjacent `for (int i = ...)` loops at the same nesting level and assuming they share one `i`; each loop's `int i` is a fresh declaration in its own scope, not a re-use of a prior loop's variable.
+VERIFY: 6.8.5.3p1-p2, 6.8.5p5, 6.2.1p4
+
+@@ 3.09 | Intermediate | Concept | tags=continue,for-vs-while
+Q: Does `continue` behave identically in a `for` loop and a `while` loop?
+SHORT: Not quite: in a `for` loop, `continue` jumps to the increment expression (expression-3), which then runs before the next condition check. In a `while` loop, there is no separate increment clause, so `continue` jumps straight back to the condition -- if your increment logic lived in the body after a point that `continue` skips past, it never runs, which is a common source of infinite loops when converting a `for` to a `while`.
+DEEP:
+```c
+#include <stdio.h>
+
+int main(void)
+{
+    printf("for: ");
+    for (int i = 0; i < 5; i++) {
+        if (i == 2) continue; /* jumps to expression-3 (i++), then re-checks i<5 */
+        printf("%d ", i);
+    }
+    printf("\nwhile (correct):  ");
+    int i = 0;
+    while (i < 5) {
+        if (i == 2) { i++; continue; } /* must bump i by hand before continue */
+        printf("%d ", i);
+        i++;
+    }
+    printf("\n");
+    return 0;
+}
+```
+Compiled and run: `for: 0 1 3 4`, `while (correct):  0 1 3 4`. The `while` version only matches because the increment was manually duplicated onto the `continue` branch; omitting that duplication (`if (i == 2) continue;` with the `i++;` left only at the bottom of the loop body) would skip the increment entirely on that iteration and loop forever at `i == 2`.
+FOLLOW:
+- Is this exactly the 6.8.6.2p2 rule? => Yes: the standard spells out that `continue` in a `for` is equivalent to `goto` to a point just before the loop's re-test, which in a `for` statement is defined to include running expression-3 first (6.8.5.3p1).
+- Is this a good argument for preferring `for` over `while` when a manual increment is involved? => Generally yes; `for`'s structure makes the "increment always happens, even after continue" guarantee automatic instead of something you must remember to duplicate at every early-exit branch.
+PITFALL: Converting a `for` loop with a `continue` into a `while` loop by moving the increment to the bottom of the body without also duplicating it before every `continue`.
+VERIFY: 6.8.6.2p2, 6.8.5.3p1
+
+@@ 3.10 | Advanced | Trap | tags=duffs-device,fallthrough
+Q: Explain Duff's device: how does a `switch` end up nested inside a `do-while` loop, and how does it actually unroll a copy loop?
+SHORT: The `switch` picks an entry point among 8 stacked `case` labels based on `count % 8`, so the first pass runs only the remaining copies before falling through into the 8-at-a-time unrolled body; every later `do-while` iteration runs all 8. This works because a `case` label may appear anywhere inside a loop body (6.8.4.2p4, 6.8.1).
+DEEP:
+```c
+#include <stdio.h>
+
+void duff_copy(int *to, const int *from, int count)
+{
+    int n = (count + 7) / 8;
+    switch (count % 8) {
+    case 0: do { *to++ = *from++;
+    case 7:      *to++ = *from++;
+    case 6:      *to++ = *from++;
+    case 5:      *to++ = *from++;
+    case 4:      *to++ = *from++;
+    case 3:      *to++ = *from++;
+    case 2:      *to++ = *from++;
+    case 1:      *to++ = *from++;
+            } while (--n > 0);
+    }
+}
+
+int main(void)
+{
+    int src[13], dst[13] = {0};
+    for (int i = 0; i < 13; i++) src[i] = i + 1;
+    duff_copy(dst, src, 13);
+    for (int i = 0; i < 13; i++) printf("%d ", dst[i]);
+    printf("\n");
+    return 0;
+}
+```
+Compiled with `-Wall -Wextra`: gcc emits a `warning: this statement may fall through [-Wimplicit-fallthrough=]` at every stacked case, which is the entire mechanism being demonstrated, not a defect (per this page's guidance, a warning that is the point of the question is explained, not silenced). Run output: `1 2 3 4 5 6 7 8 9 10 11 12 13` -- all 13 elements copied correctly. `13 % 8 = 5`, so the switch jumps to `case 5`, executing the remaining 5 copies (elements 1-5) to finish the first partial group, then falls out of the switch into `while (--n > 0)`, and every subsequent loop iteration (n was `(13+7)/8 = 2`, so one more full pass) executes all 8 case labels from `case 0`'s `do` downward.
+FOLLOW:
+- Is Duff's device something you should write in real firmware code today? => Almost never; modern compilers' own loop unrolling (`-O2`/`-O3`) typically matches or beats hand-rolled Duff's device, and the technique is notoriously hard to review correctly. It is asked about as a "do you understand fall-through and switch/loop composition deeply" question, not as production advice.
+- Does the `case 0:` label's position (attached to the `do`) matter? => Critically: it is what makes `count % 8 == 0` (a full multiple of 8) enter at the very top of the unrolled block instead of some other point.
+PITFALL: Miscounting which `case` should handle the "count is an exact multiple of 8" remainder (`0`); it must be the one attached to the `do`, executing the full 8-copy body on every iteration including a possible first one.
+VERIFY: 6.8.4.2p4, 6.8.1p1
+
+@@ 3.11 | Advanced | Debug | tags=goto,vla,compile-error
+Q: `goto lab3;` jumps forward into a block containing a variable-length array `double a[n];`, with `lab3:` positioned after the VLA's declaration. Why does this fail to compile, and what does the standard say about it directly?
+SHORT: 6.8.6.1p1's goto constraint forbids jumping from outside the scope of a variably-modified-type identifier into its scope; a VLA is exactly such a type. gcc enforces this as a hard compile error rather than accepting it, because there would be no defined size to allocate for `a` if control arrived at `lab3` without ever executing the VLA's own declaration statement.
+DEEP:
+```c
+#include <stdio.h>
+
+int main(void)
+{
+    int n = 4, j = 0;
+    goto lab3; /* invalid: jumps INTO the scope of the VLA "a" */
+    {
+        double a[n];
+        a[j] = 4.4;
+    lab3:
+        a[j] = 3.3;
+    }
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra`: this is a genuine compile error, not a warning: `error: jump into scope of identifier with variably modified type`, pointing at the `goto`, with follow-up notes showing where `lab3` and `a` are declared. The standard's own example (6.8.6.1p4) shows the identical shape and calls it "invalid: going INTO scope of VLA," confirming this is a documented, intentional constraint, not a compiler quirk.
+FOLLOW:
+- Would a jump *within* the VLA's scope (after its declaration) be legal? => Yes; the standard's own example 2 (6.8.6.1p4) shows `goto lab4;` jumping from inside the VLA's scope to another label still inside that same scope as valid.
+- Why does a VLA specifically trigger this, but a fixed-size array does not? => A VLA's size is computed at runtime from `n`; if you skip its declaration statement, the runtime bookkeeping needed to know `a`'s size and where it lives on the stack never happens, so there is nothing well-defined for later code to index into. A fixed-size array needs no such runtime step, so jumping past its declaration (leaving it uninitialized) is legal, if unwise.
+PITFALL: Assuming this is merely a style warning like the dangling-else case; unlike that case, this is a hard constraint violation and gcc refuses to produce a binary at all.
+VERIFY: 6.8.6.1p1, p4 (Example 2)
+
+@@ 3.12 | Advanced | Cross-layer | tags=branches,codegen
+Q: At the machine level, what does an `if` or a loop's controlling expression actually compile down to, and why does this matter for embedded code reviewing branch-heavy hot paths?
+SHORT: A controlling expression compiles to a comparison instruction followed by a conditional branch (jump) that either falls through to the next instruction or jumps to a different address, depending on the flag the comparison set. Every `if`, `while`, `for`, and `switch` (the latter sometimes as a jump table instead of a branch chain) ultimately lowers to this same compare-and-branch primitive; there is no "if statement" at the instruction-set level, only conditional jumps.
+DEEP:
+For `if (a > b) x = 1; else x = 2;` compiled with `gcc -S -O0` on x86-64, the generated assembly is recognizably: load `a` and `b`, `cmp` them, a conditional jump (`jg`/`jle`-family) to one of two blocks that each set `x` and then jump to a shared continuation point. A `switch` with densely packed, contiguous `case` values is often compiled as a jump table (an array of code addresses indexed by the controlling value) instead of a chain of compares, trading a small amount of memory for O(1) dispatch regardless of how many cases exist -- this is one reason `switch` can be strictly faster than an equivalent `if`/`else if` chain for many cases.
+
+Why this matters for firmware/embedded review: branch mispredictions on a pipelined CPU cost real cycles (the pipeline speculatively executes one path and must flush/refetch if it guessed wrong), so a hot ISR or tight polling loop with a data-dependent, hard-to-predict branch can measurably slow down compared to a branch-free rewrite (e.g., using arithmetic/bitwise selection instead of a conditional, where the target actually benefits from it) -- but this is a targeted, profile-driven optimization, not a default coding style, since branch-free code is usually harder to read and the compiler's own branch-prediction hints or profile-guided optimization often already handle it well.
+FOLLOW:
+- Does C give you any way to hint branch likelihood to the compiler? => Not in standard C11 (this is a GNU extension via `__builtin_expect`, or the `[[likely]]`/`[[unlikely]]` attributes added later in C++20 and, separately, C23); C11 itself has no portable branch-hint mechanism.
+- Is a `switch` always compiled as a jump table? => No; the compiler chooses based on the case values' density and count -- sparse or few cases typically still compile as a compare chain.
+PITFALL: Assuming a `switch` is unconditionally faster than an `if`/`else if` chain; it depends entirely on how the compiler chooses to lower it, which in turn depends on the actual case values, not just the source-level construct used.
+VERIFY: (codegen behavior is outside the C11 standard's scope, which specifies observable behavior only, not translation strategy; cited here as a documented cross-layer fact, not a standard clause)
+
+@@ 3.13 | Advanced | Scenario | tags=recursion,tail-call,stack
+Q: Does the C standard require tail-call optimization? What actually happens if you write deep, truly tail-recursive C code?
+SHORT: No; C11 says nothing about tail calls at all, and every call, tail or not, is permitted (though not required) to consume stack space for its own frame. Whether a specific compiler turns an obvious tail call into a loop (eliminating its frame) is entirely a quality-of-implementation choice, commonly done at `-O2`/`-O3` for simple cases and not guaranteed at `-O0` or for complex cases even at high optimization.
+DEEP:
+This absence is worth stating precisely for an interview: unlike languages such as Scheme (whose standard *mandates* proper tail calls), C's standard defines no special treatment for a call in tail position. 6.5.2.2p11 permits recursive calls "both directly and indirectly," but permitting recursion is not the same as guaranteeing bounded stack usage for it.
+
+Practical consequence for firmware: never rely on deep recursion (tail-shaped or not) staying within a small, fixed embedded stack budget unless you have specifically verified, for your target compiler and optimization flags, that the recursion in question is actually being converted to iteration -- and even then, a compiler upgrade or flag change can silently remove that optimization, since it was never a guarantee to begin with. The safe default for firmware is to write the loop directly, or to bound recursion depth explicitly with an assertion, rather than trust an unspecified compiler behavior for a resource (stack) that is often only a few kilobytes.
+FOLLOW:
+- Is this the same standard-compliance point as `next_id()`'s static counter surviving calls (module 1)? => Different topic (storage duration vs. optimization guarantees) but the same interview instinct applies: separate "what the standard promises" from "what my one compiler happens to do today."
+- How would you actually verify whether your compiler eliminated a tail call? => Inspect the generated assembly (`-S`) for the function and check whether the recursive call became a jump back to the function's own entry with no growing stack usage, or profile actual stack depth at runtime with a known-large input.
+PITFALL: Treating "GCC optimizes simple tail recursion at -O2 in my testing" as a language guarantee; it is an optimization your specific compiler happened to apply today, not something C11 obligates any conforming implementation to do.
+VERIFY: 6.5.2.2p11 (recursion permitted); the standard has no clause governing tail-call elimination, which is itself the fact this question tests
+
+@@ 3.14 | Advanced | Trap | tags=switch,enum
+Q: You `switch` on an `enum` with 4 enumerators but only write 3 `case` labels, no `default`. What warns you, and what happens for the unhandled value at runtime?
+SHORT: `-Wswitch` (included in `-Wall`) flags any enumeration value not handled by a `switch` with no `default` label, at compile time. At runtime, if the unhandled value is actually passed in, control simply falls through the entire switch body executing nothing (6.8.4.2p5's "no part of the switch body is executed" case), which for a function expected to always return something is itself a latent bug if there is no code after the switch to catch it.
+DEEP:
+```c
+#include <stdio.h>
+
+enum state { STATE_IDLE, STATE_RUN, STATE_ERROR, STATE_DONE };
+
+const char *name(enum state s)
+{
+    switch (s) { /* STATE_DONE is not handled: -Wswitch flags this */
+    case STATE_IDLE: return "idle";
+    case STATE_RUN: return "run";
+    case STATE_ERROR: return "error";
+    }
+    return "unknown";
+}
+
+int main(void)
+{
+    printf("%s\n", name(STATE_RUN));
+    printf("%s\n", name(STATE_DONE));
+    return 0;
+}
+```
+Compiled with `-Wall -Wextra`: gcc emits `warning: enumeration value 'STATE_DONE' not handled in switch [-Wswitch]` pointing exactly at the missing case. Run output: `run`, then `unknown` (the fallback `return "unknown";` after the switch catches the unhandled case here, because this particular function was written defensively). Had that trailing `return` not existed, and had the function's return type made "falling off the end" itself UB (6.9.1p12, "if the } that terminates a function is reached, and the value of the function call is used by the caller, the behavior is undefined"), an unhandled enumerator would be a much sharper bug.
+FOLLOW:
+- Does adding a `default` label silence -Wswitch even if a real enumerator is still missing? => Yes, which is exactly why some teams deliberately omit `default` on enum-controlled switches: they want the compiler to keep flagging every new enumerator added later that is not yet handled.
+- Is this specific to `enum`, or does plain-`int` switch get the same warning? => Specific to enum; `-Wswitch` only tracks enumerator coverage, since a plain `int`'s value space is not enumerable the same way.
+PITFALL: Adding a new enumerator to an existing `enum` used widely in `switch` statements without recompiling everything with `-Wswitch` enabled; it is precisely the tool that catches every now-incomplete switch across the codebase.
+VERIFY: 6.8.4.2p5, 6.9.1p12
+
+@@ 3.15 | Principal | Scenario | tags=review,switch,firmware
+Q: You are reviewing an interrupt-driven event dispatcher: a `switch` on an `event_t` inside the ISR, with several cases and one `default`. State your review checklist for this specific shape of code.
+SHORT: Check, in order: every enumerator is handled or there is a deliberate, documented `default`; no case does anything an ISR must never do (blocking calls, unbounded loops -- forward reference to module 17); every intentional fall-through is marked with a comment so `-Wimplicit-fallthrough` distinguishes intent from omission; and the controlling expression has no side effects that could race with the interrupted code.
+DEEP:
+A concrete checklist, each item tied to a mechanism covered in this module:
+
+1. **Enumerator coverage**: compile this file with `-Wswitch` and treat any warning as a required fix or a deliberate, commented `default`, not something to suppress with `-Wno-switch`.
+2. **Fall-through intent**: for every case lacking its own `break`, is there a `/* fall through */` comment (or the newer `[[fallthrough]];` C23 attribute) immediately before the next label? Unmarked fall-through in an ISR dispatcher is exactly the kind of subtle bug that silently double-processes an event (this module's missing-break question shows the concrete failure mode).
+3. **No blocking or unbounded work in any case body**: an ISR that spins in a loop waiting on a condition, or calls a function that itself may block, can stall the whole system; this belongs to module 17's ISR-safety treatment but is the review's most safety-critical line item.
+4. **No `goto` out of the switch into arbitrary control flow inside the ISR** unless it is the disciplined single-exit cleanup pattern from this module's cleanup-goto question, and even then, only if every acquired resource in an ISR context is something that is safe to release from interrupt context.
+5. **Controlling expression has no observable side effects** (a call to a function that mutates shared state) -- if it must, that state needs the same care given to any interrupt-shared object (a forward reference to `volatile` in module 7).
+
+The Principal-level habit this question is really testing: reviewing control flow in a safety- or timing-critical context means reviewing the *shape* (coverage, fall-through discipline, blocking calls) systematically, not just reading each case for correctness in isolation.
+FOLLOW:
+- Which single compiler flag catches the most of this automatically? => `-Wswitch` for enumerator coverage and `-Wimplicit-fallthrough` for unmarked fall-through; neither catches blocking-call or reentrancy issues, which need manual review or specialized static analysis.
+- Should ISR dispatch tables prefer switch or a function-pointer array? => Both are legitimate (module 12 covers function-pointer dispatch tables); a `switch` is often clearer for a small, fixed set of cases, while a dispatch table scales better for a large or dynamically extensible event set and avoids the enumerator-coverage question entirely by construction.
+PITFALL: Suppressing a real `-Wswitch` warning with a blanket `default: break;` added purely to silence the compiler, without checking whether the newly-added enumerator actually needed handling.
+VERIFY: 6.8.4.2p5, 6.8.4.2p3
+
+@@ 3.16 | Principal | Debug | tags=switch,missing-break,firmware
+Q: A firmware event loop's RX-event counter is mysteriously always equal to (RX count + TX count) instead of just RX count. Root-cause it from this description alone, then confirm with code.
+SHORT: This exact symptom (one counter's value contaminated by exactly the next case's increments) is the signature of a missing `break` causing fall-through from that case into the next: the `EVT_RX` case increments its own counter, then falls through and also runs `EVT_TX`'s increment on every RX event. Confirming this needs no new information: the fix is adding the missing `break`.
+DEEP:
+```c
+#include <stdio.h>
+
+typedef enum { EVT_RX, EVT_TX, EVT_ERR } event_t;
+
+int counters_buggy[3] = {0};
+void handle_buggy(event_t e)
+{
+    switch (e) {
+    case EVT_RX:
+        counters_buggy[EVT_RX]++;
+        /* missing break: falls through into EVT_TX handling too */
+    case EVT_TX:
+        counters_buggy[EVT_TX]++;
+        break;
+    case EVT_ERR:
+        counters_buggy[EVT_ERR]++;
+        break;
+    }
+}
+
+int counters_fixed[3] = {0};
+void handle_fixed(event_t e)
+{
+    switch (e) {
+    case EVT_RX: counters_fixed[EVT_RX]++; break;
+    case EVT_TX: counters_fixed[EVT_TX]++; break;
+    case EVT_ERR: counters_fixed[EVT_ERR]++; break;
+    }
+}
+
+int main(void)
+{
+    handle_buggy(EVT_RX);
+    handle_fixed(EVT_RX);
+    printf("buggy:  RX=%d TX=%d ERR=%d (RX incorrectly bumps TX too)\n",
+           counters_buggy[0], counters_buggy[1], counters_buggy[2]);
+    printf("fixed:  RX=%d TX=%d ERR=%d\n",
+           counters_fixed[0], counters_fixed[1], counters_fixed[2]);
+    return 0;
+}
+```
+Compiled with `-Wall -Wextra`: gcc flags the exact fall-through with `warning: this statement may fall through [-Wimplicit-fallthrough=]` right at the `EVT_RX` case -- in a real codebase, this warning alone would have caught the bug before it ever shipped. Run output confirms the diagnosis: `buggy:  RX=1 TX=1 ERR=0 (RX incorrectly bumps TX too)`, `fixed:  RX=1 TX=0 ERR=0`.
+
+Root-cause method demonstrated here: (1) match the symptom's exact shape ("counter A always includes counter B's increments") to the known fall-through signature rather than guessing broadly; (2) locate the suspect switch and check every case for a `break` immediately before assuming a more complex bug; (3) confirm by compiling with `-Wimplicit-fallthrough` (part of `-Wall`) rather than only reading the code, since the warning is authoritative and immediate.
+FOLLOW:
+- Would this bug survive a code review that only reads the diff for the changed case? => Very plausibly; the missing `break` is invisible unless the reviewer explicitly checks that every case in the whole switch, not just the changed one, still terminates correctly.
+- Is `-Wimplicit-fallthrough` on by default with `-Wall`? => Yes, in modern gcc versions (it was added to `-Wextra` initially and later folded into `-Wall`'s effective set on many distributions); always verify with your specific toolchain rather than assuming.
+PITFALL: Fixing this kind of bug by adding a `break` and moving on without also auditing every other case in the same switch for the identical missing-break pattern; these bugs cluster.
+VERIFY: 6.8.4.2p5, 6.8.6.3p2
+
+@@ 3.17 | Principal | Numeric | tags=recursion,stack,firmware
+Q: A firmware target has an 8 KB task stack, and a recursive parser function's stack frame is roughly 48 bytes. Roughly how deep can it recurse before overflowing the stack, and how would you get real numbers instead of guessing?
+SHORT: A rough estimate is stack_bytes / frame_bytes = 8192 / 48 ~= 170 calls deep before overflow, but this is only a starting estimate: real frame size depends on the compiler, optimization level, local variables, and any inlining, so the only trustworthy number comes from measuring the actual compiled function's frame size and testing against the actual target's stack budget, not a hand-estimate.
+DEEP:
+```c
+#include <stdio.h>
+#include <sys/resource.h>
+
+int main(void)
+{
+    struct rlimit rl;
+    getrlimit(RLIMIT_STACK, &rl);
+    long stack_bytes = (long)rl.rlim_cur;
+    long frame_bytes = 48; /* estimate; see method below for the real number */
+    printf("stack limit = %ld bytes, assumed frame = %ld bytes\n", stack_bytes, frame_bytes);
+    printf("rough max recursion depth ~= %ld\n", stack_bytes / frame_bytes);
+    return 0;
+}
+```
+Compiled and run on this host (not the embedded target, since `getrlimit`/`RLIMIT_STACK` is POSIX, not C11 or available on a bare-metal firmware target -- see this page's note on POSIX content living on the C Advanced page; this host's OS-level default is shown purely to illustrate the calculation): `stack limit = 8388608 bytes, assumed frame = 48 bytes`, `rough max recursion depth ~= 174762`. On the actual 8 KB embedded target from the question, the same formula gives 8192 / 48 ~= 170.
+
+The correct method for a real firmware review, not just this arithmetic: (1) get the actual per-call frame size from the linker map file or by disassembling the function and reading its stack-pointer adjustment instruction, not from guessing based on local variable declarations, since padding, saved registers, and compiler-inserted spill slots all add to it; (2) multiply by the worst-case recursion depth the input data can actually produce (not an assumed "typical" depth); (3) compare against the *task's* stack allocation, not the whole system's, since an RTOS often gives each task a small, fixed stack independent of total RAM; (4) add margin for interrupt handlers that might fire and use the same stack while the recursion is deep, if the ISR and the task share a stack on this target.
+FOLLOW:
+- Why is 48 bytes/frame just an assumption here, not a fact? => Actual frame size depends on the specific function's locals, saved registers, and the compiler/optimization level; the only reliable number comes from inspecting the compiled function, not from estimating based on source-level variable declarations.
+- What is the safer design alternative to trusting a depth estimate? => Convert the recursion to an explicit iterative algorithm with your own bounded, heap- or static-allocated stack/queue data structure (module 15 covers iterative rewrites of classic recursive algorithms), removing the question of native call-stack depth entirely.
+PITFALL: Sizing a task's stack based on "it worked in testing" recursion depth rather than the worst-case input the code must actually handle in the field; a parser recursing on user- or network-supplied nested structures is a classic stack-exhaustion attack surface.
+VERIFY: (RLIMIT_STACK and getrlimit are POSIX, not ISO C11; flagged per this page's convention for POSIX-adjacent content -- see AUTHORING guidance; the recursion-depth arithmetic itself is ordinary division, not standard-dependent)

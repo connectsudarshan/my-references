@@ -1,0 +1,460 @@
+# Module 8: Dynamic Memory Management
+
+@@ 8.01 | Basic | Concept | tags=malloc,calloc,realloc,free,contracts
+Q: What do malloc, calloc, realloc and free each actually guarantee, in one pass?
+SHORT: malloc(size) returns a pointer to size uninitialized bytes or NULL; calloc(nmemb,size) does the same but zero-fills and checks the nmemb*size multiplication for you; realloc(ptr,size) resizes an existing allocation, preserving contents up to the smaller of the old/new size; free(ptr) releases an allocation, or does nothing if ptr is NULL (C11 7.22.3).
+DEEP:
+- All four share one property: "the pointer returned points to the start (lowest byte address) of the allocated space" and is "suitably aligned so that it may be assigned to a pointer to any type of object with a fundamental alignment requirement" (7.22.3p1).
+- The order and contiguity of successive allocations is unspecified (7.22.3p1) -- never assume two mallocs are adjacent or in any particular order in memory.
+- "Each such allocation shall yield a pointer to an object disjoint from any other object" (7.22.3p1) -- this is the standard's own restrict-like promise between separate allocations.
+- Every function here can fail by returning NULL; production code that does not check for NULL is the single most common correctness gap in this whole module.
+FOLLOW:
+- Does free zero out or otherwise change the memory it releases? => The standard does not require it to; many implementations reuse the freed block's header for free-list bookkeeping, which is exactly why a use-after-free can appear to "still work" (8.09).
+- Is it legal to free(NULL)? => Yes, explicitly: "If ptr is a null pointer, no action occurs" (7.22.3.3p2) -- no need to guard free calls with an if.
+PITFALL: Not checking malloc/calloc/realloc's return value for NULL before dereferencing it.
+VERIFY: C11 7.22.3p1-2 (shared memory-management semantics) and 7.22.3.3p2 (free's NULL handling).
+
+@@ 8.02 | Basic | Numeric | tags=calloc,overflow,zero-init
+Q: Why does calloc(nmemb, size) exist instead of everyone just writing malloc(nmemb * size), and what has to happen for that multiplication to be dangerous?
+SHORT: calloc is required to detect nmemb*size overflow and fail (returning NULL) instead of allocating a too-small buffer, while a hand-rolled malloc(nmemb*size) has no such protection -- if nmemb*size wraps past SIZE_MAX, malloc gets a small, wrapped size, succeeds, and every access based on the intended (large) size becomes a heap buffer overflow. calloc also zero-fills the space (7.22.3.2p2), which malloc never does.
+DEEP:
+```c
+#include <stdio.h>
+#include <stdlib.h>
+
+void *safe_array_alloc(size_t nmemb, size_t size) {
+    if (nmemb != 0 && size > (size_t)-1 / nmemb)
+        return NULL; /* would overflow */
+    return malloc(nmemb * size);
+}
+
+int main(void) {
+    size_t huge = (size_t)-1 / 2 + 1;   /* just over SIZE_MAX/2 */
+    void *p1 = safe_array_alloc(huge, 2); /* rejected before the overflow */
+    void *p2 = calloc(huge, 2);           /* calloc must detect this itself */
+    void *p3 = malloc(4 * sizeof(int));
+    printf("p1=%p p2=%p p3=%p\n", p1, p2, p3);
+    free(p3);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra` and run, this prints `p1=(nil) p2=(nil) p3=0x...` -- both the overflow-checked helper and the real calloc correctly refuse the impossible allocation, while the ordinary small allocation succeeds.
+- Worked overflow math: on a 64-bit `size_t`, SIZE_MAX is 2^64-1. `huge = 2^63`, and `huge * 2 = 2^64`, which wraps to 0 in `size_t` arithmetic -- `malloc(0)` would then "succeed" (implementation-defined, 8.12) with a buffer far smaller than the caller intended.
+FOLLOW:
+- Does calloc's overflow check cost anything at runtime versus malloc? => A single division or multiplication-with-check, negligible next to the cost of the allocation itself; the safety is essentially free.
+- What is footnote 296 about? => It clarifies that calloc's all-bits-zero fill "need not be the same as the representation of floating-point zero or a null pointer constant" -- zeroing bytes is not guaranteed to produce a valid 0.0 or NULL for every type, on an unusual implementation.
+PITFALL: Writing malloc(nmemb * size) for an array allocation where nmemb or size comes from untrusted/computed input, instead of using calloc or checking the multiplication yourself.
+VERIFY: C11 7.22.3.2 (calloc) and its footnote 296; the overflow-detection requirement is implicit in calloc being specified to allocate "space for an array of nmemb objects, each of whose size is size" and returning NULL when "the space cannot be allocated" (7.22.3p1) -- real implementations (glibc, musl) implement this as an explicit overflow check.
+
+@@ 8.03 | Basic | Concept | tags=alignment,malloc,fundamental-alignment
+Q: What alignment does malloc actually guarantee?
+SHORT: malloc's pointer is "suitably aligned so that it may be assigned to a pointer to any type of object with a fundamental alignment requirement" (C11 7.22.3p1) -- alignment sufficient for any basic type, not a caller-chosen or over-aligned one. For anything stricter (SIMD, DMA buffers), use aligned_alloc, posix_memalign, or a hand-rolled aligned allocation on top of malloc.
+DEEP:
+- "Fundamental alignment" excludes C11's optional over-aligned (`_Alignas`-requested) types; malloc alone does not promise to satisfy an alignment stricter than what the basic types need.
+- aligned_alloc(alignment, size) (7.22.3.1) is the standard's answer for stricter, caller-specified alignment: "size shall be an integral multiple of alignment," and alignment must be a valid, implementation-supported alignment.
+- In firmware, this matters directly for DMA buffers and certain SIMD/vector loads that fault (or are simply undefined) on misaligned access -- malloc's default guarantee is not automatically enough for those.
+- Practical check: `((uintptr_t)ptr % required_alignment) == 0` after allocation is a reasonable runtime sanity check when porting code between allocators.
+FOLLOW:
+- Is malloc's alignment guarantee the same on every platform? => The requirement (support any fundamental-alignment object) is portable, but the actual numeric alignment (8, 16 bytes, etc.) is implementation-defined and can differ by platform/ABI.
+- What does aligned_alloc do if size is not a multiple of alignment? => The standard's description requires size to be an integral multiple of alignment; passing a non-multiple is a constraint the caller must satisfy, not something aligned_alloc is specified to correct for you.
+PITFALL: Assuming a plain malloc buffer is safe for a DMA descriptor or SIMD intrinsic that needs 16- or 32-byte alignment; use aligned_alloc or posix_memalign explicitly instead.
+VERIFY: C11 7.22.3p1 ("fundamental alignment requirement") and 7.22.3.1 (aligned_alloc).
+
+@@ 8.04 | Intermediate | Numeric | tags=sizeof,strlen,off-by-one,sizing
+Q: Why is malloc(strlen(s)) almost always wrong when you are about to copy a C string into the result?
+SHORT: strlen returns the number of characters before the terminating null, not counting the terminator itself, so malloc(strlen(s)) allocates exactly one byte too few to also hold the '\0' -- writing the terminator then overflows the buffer by one byte. The fix is malloc(strlen(s) + 1).
+DEEP:
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+int main(void) {
+    const char *src = "firmware";
+    size_t n = strlen(src);      /* 8: does NOT count the terminator */
+    char *buf = malloc(n + 1);   /* +1 for '\0' */
+    if (!buf) return 1;
+    memcpy(buf, src, n + 1);     /* copy the terminator too */
+    printf("strlen=%zu malloc size=%zu copied=\"%s\"\n", n, n + 1, buf);
+    free(buf);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra` and run, this prints `strlen=8 malloc size=9 copied="firmware"` -- 8 characters plus 1 terminator byte, exactly 9 bytes.
+- This is one of the oldest, most common off-by-one bugs in C; it is essentially the dynamic-allocation twin of the `sizeof` versus `strlen` confusion covered in module 5 for fixed arrays.
+- The same rule generalizes: any time you allocate space for "n things plus a sentinel/terminator," the allocation size is n+1 units of that thing's size, not n.
+FOLLOW:
+- Does strdup handle this correctly for you? => Yes -- POSIX's strdup internally allocates strlen(s)+1 and copies the terminator; it is worth using (or writing your own equivalent) specifically to avoid re-deriving this arithmetic at every call site.
+- What if you allocate exactly strlen(s) bytes and then write the terminator anyway? => That write goes one byte past the allocated block -- undefined behavior, and exactly the shape of bug 8.11 demonstrates with valgrind.
+PITFALL: Forgetting the +1 for the null terminator when sizing a malloc for a C string, whether from strlen directly or from a computed "content length."
+VERIFY: strlen's contract (C11 7.24.6.3: "the number of characters that precede the terminating null character") -- the +1 rule follows directly from that definition, not from a separate clause.
+
+@@ 8.05 | Intermediate | Scenario | tags=realloc,grow,shrink,failure
+Q: What exactly does realloc guarantee on grow, on shrink, and on failure?
+SHORT: On success, realloc returns a (possibly different) pointer to an object whose contents match the old object "up to the lesser of the new and old sizes" (C11 7.22.3.5p2) -- growing preserves everything and leaves the new tail indeterminate, shrinking preserves the retained prefix and the rest is simply gone. On failure it returns NULL and, critically, "the old object is not deallocated and its value is unchanged" (p3) -- your original pointer and data are still valid.
+DEEP:
+```c
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(void) {
+    int *a = malloc(4 * sizeof(int));
+    for (int i = 0; i < 4; i++) a[i] = i + 1;
+
+    int *grown = realloc(a, 8 * sizeof(int));  /* grow: old contents preserved */
+    if (!grown) { free(a); return 1; }
+    a = grown;
+    for (int i = 4; i < 8; i++) a[i] = 0;
+    printf("after grow: ");
+    for (int i = 0; i < 8; i++) printf("%d ", a[i]);
+    printf("\n");
+
+    int *shrunk = realloc(a, 2 * sizeof(int)); /* shrink: first 2 ints preserved */
+    if (!shrunk) { free(a); return 1; }
+    a = shrunk;
+    printf("after shrink: %d %d\n", a[0], a[1]);
+    free(a);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra` and run, this prints `after grow: 1 2 3 4 0 0 0 0 ` then `after shrink: 1 2` -- the original four values survive the grow (tail zeroed by hand, since realloc leaves it indeterminate), and the first two survive the shrink.
+- `realloc(NULL, size)` behaves exactly like `malloc(size)` (7.22.3.5p3) -- a useful simplification when writing generic grow-a-buffer code that starts from a NULL pointer.
+- The classic bug this contract sets up: `p = realloc(p, bigger_size);` -- if realloc fails, this overwrites your only pointer to the still-valid original block with NULL, leaking it (8.18).
+FOLLOW:
+- Is the memory beyond the old size zeroed after a grow? => No, "any bytes in the new object beyond the size of the old object have indeterminate values" (7.22.3.5p2) -- you must initialize them yourself if you need defined content there.
+- Can realloc move the block even when shrinking? => Yes, the standard makes no promise the pointer stays the same in either direction; always use the returned pointer, never assume the old one is still valid.
+PITFALL: Assigning realloc's result directly back onto your only pointer to the original block (`p = realloc(p, n);`), which loses the original pointer on failure.
+VERIFY: C11 7.22.3.5p2-4 (realloc's full contract, including the "old object is not deallocated" failure case).
+
+@@ 8.06 | Intermediate | Cross-layer | fig=memmap | tags=address-space,heap,stack,layout
+Q: Where do a global, a heap allocation, and a stack local actually live relative to each other in a process's address space?
+SHORT: In the classic flat memory-model picture, text (code) sits lowest, then initialized data and BSS (globals), then the heap, which grows upward as you allocate, then a large gap, then the stack near the top of the user address space, growing downward as functions call deeper. Printing real addresses from a running program confirms the relative ordering, though exact addresses (and whether this layout is even used) depend on the OS and ASLR settings.
+DEEP:
+```c
+#include <stdio.h>
+#include <stdlib.h>
+
+int global_bss;              /* BSS: zero-initialized */
+int global_data = 42;        /* data: initialized */
+
+void show_stack(void) {
+    int local_stack;
+    printf("stack local:  %p\n", (void *)&local_stack);
+}
+
+int main(void) {
+    int *heap_ptr = malloc(sizeof(int));
+    printf("text (main):  %p\n", (void *)main);
+    printf("data (init):  %p\n", (void *)&global_data);
+    printf("bss (uninit): %p\n", (void *)&global_bss);
+    printf("heap:         %p\n", (void *)heap_ptr);
+    show_stack();
+    free(heap_ptr);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra` and run on this x86-64 Linux setup, one run printed addresses in increasing order text < data < bss < heap, with the stack address far higher than all of them -- matching the classic layout picture.
+- This is process address-space layout, not something C11 specifies at all -- the standard says nothing about "the heap" or "the stack" as memory regions; it only specifies storage durations (automatic, static, allocated) and lets the implementation place them however it wants. The picture here is the common ELF/Linux mental model, useful for intuition and for reading a crash address, not a language guarantee.
+- Where the process/thread memory-layout topic is covered in more general OS terms (including what is shared between threads) is the C Advanced page's module 1; this module's angle is specifically "where does malloc's memory live relative to locals and globals," for reasoning about pointers and lifetimes.
+FOLLOW:
+- Does every OS/ABI use exactly this layout? => No -- this is the traditional flat layout; with ASLR enabled, the heap and stack (and often text via PIE) are placed at randomized base addresses each run, though their relative order and growth direction are typically preserved.
+- Why does this matter practically? => It is the mental model behind "why did writing past the end of this stack buffer corrupt that other local variable" and "why does a heap overflow corrupt the *next* allocation," both covered later in this module.
+PITFALL: Assuming heap and stack addresses are close together or in a fixed relationship; with ASLR they can be extremely far apart and change on every run.
+VERIFY: This layout is a common OS/ABI convention, not a C11 requirement; C11 only defines storage durations (6.2.4), not physical memory regions.
+
+@@ 8.07 | Intermediate | Trap | tags=leak,valgrind,definitely-lost
+Q: What does a memory leak actually cost, and how do you prove one exists with a real tool rather than by inspection alone?
+SHORT: A leak is allocated memory whose last reference is lost before it is freed -- harmless for a one-shot program, but fatal for long-running firmware/services where leaked bytes accumulate until the system runs out of memory. valgrind's --leak-check=full reports it as "definitely lost" with the exact allocation site, which is the standard way to prove a leak rather than just suspecting one from reading code.
+DEEP:
+```c
+#include <stdlib.h>
+void make_leak(void) {
+    int *p = malloc(100 * sizeof(int)); /* never freed */
+    p[0] = 1;
+    (void)p;
+}
+int main(void) { make_leak(); return 0; }
+```
+Run under `valgrind --leak-check=full ./test_m8_leak` (compiled with `gcc -std=c11 -Wall -Wextra`), the real tool output was:
+```
+==2376== HEAP SUMMARY:
+==2376==     in use at exit: 400 bytes in 1 blocks
+==2376==   total heap usage: 1 allocs, 0 frees, 400 bytes allocated
+==2376==
+==2376== 400 bytes in 1 blocks are definitely lost in loss record 1 of 1
+==2376==    at 0x4846828: malloc (in vgpreload_memcheck-amd64-linux.so)
+==2376==    by 0x10915E: make_leak (test_m8_leak.c:4)
+==2376==    by 0x10917C: main (test_m8_leak.c:10)
+==2376==
+==2376== LEAK SUMMARY:
+==2376==    definitely lost: 400 bytes in 1 blocks
+```
+- "Definitely lost" specifically means no pointer to the block exists anywhere valgrind can find at exit -- the strongest leak category; "possibly lost" and "still reachable" are weaker categories for pointers found only via interior/offset references or still-reachable-but-unfreed globals.
+- The report gives you the exact allocation call stack (`make_leak` at line 4, called from `main` at line 10) -- that stack trace, not a guess from reading the source, is what you cite when reporting or fixing a leak.
+FOLLOW:
+- Would this leak show up without valgrind, e.g. from the program's own behavior? => Only indirectly and slowly -- via growing RSS/memory usage over time in a long-running process; a single short-lived run like this one shows nothing unusual to the naked eye, which is exactly why a leak detector is needed.
+- Does every unfreed allocation at program exit count as a real leak? => Not necessarily "still reachable" memory (e.g. a pointer kept in a global until exit) is often an intentional simplification for short-lived tools, and valgrind separates that category from "definitely lost" for this reason.
+PITFALL: Treating "the program didn't crash and produced the right output" as proof there is no leak. Leaks are invisible in a single short run; they only matter cumulatively or under a real leak-detection tool.
+VERIFY: C11 does not define "leak" as a term at all -- a leak is a lifetime/bookkeeping bug the standard is silent on (an allocation you simply never call free on remains merely un-deallocated per 7.22.3p1's lifetime wording); the "definitely lost" terminology and detection method belong to valgrind, not the C standard.
+
+@@ 8.08 | Intermediate | Debug | tags=double-free,valgrind,ub
+Q: What does a double free actually corrupt, and what does valgrind report when it happens?
+SHORT: Calling free on a pointer that was already freed is undefined behavior per C11 7.22.3.3 ("if the space has been deallocated by a call to free or realloc, the behavior is undefined") -- in practice it usually corrupts the allocator's free-list metadata, which can silently break unrelated future allocations. valgrind's memcheck reports it immediately as an "Invalid free()" with both the offending free and the original allocation site.
+DEEP:
+```c
+#include <stdlib.h>
+int main(void) {
+    int *p = malloc(sizeof(int));
+    *p = 5;
+    free(p);
+    free(p);   /* double free */
+    return 0;
+}
+```
+Compiling this with `gcc -std=c11 -Wall -Wextra` produces the compiler's own warning (`-Wuse-after-free`) pointing at the second free -- itself a useful signal, since this is exactly the kind of warning that IS the point of the question rather than something to silence. Running under valgrind gave:
+```
+==2386== Invalid free() / delete / delete[] / realloc()
+==2386==    at 0x484988F: free (in vgpreload_memcheck-amd64-linux.so)
+==2386==    by 0x1091A4: main (test_m8_doublefree.c:7)
+==2386==  Address 0x4a7d040 is 0 bytes inside a block of size 4 free'd
+==2386==    at 0x484988F: free (...)
+==2386==    by 0x109198: main (test_m8_doublefree.c:6)
+==2386==  Block was alloc'd at
+==2386==    at 0x4846828: malloc (...)
+==2386==    by 0x10917E: main (test_m8_doublefree.c:4)
+```
+- valgrind gives you three facts at once: where the invalid free happened (line 7), where the block was already freed (line 6), and where it was originally allocated (line 4) -- exactly the chain you need to fix a real double-free bug.
+- Why it matters beyond "the standard says UB": most allocators store free-list pointers inside the freed block's own memory; freeing it twice can link it into the free list twice, so a later, unrelated malloc can hand out the same memory to two different owners simultaneously.
+FOLLOW:
+- Does GCC always catch this at compile time? => No -- `-Wuse-after-free` only fires when the compiler can see both free calls in the same function on a syntactically obvious path; a double free split across functions, conditionals, or translation units usually is not caught at compile time at all.
+- Is setting the pointer to NULL after freeing it a real fix? => It converts a double free into a no-op, since `free(NULL)` does nothing (7.22.3.3p2) -- a genuinely good, cheap defensive habit, though it does not fix an underlying design that frees the same logical object twice through two different pointer variables.
+PITFALL: Freeing a pointer and forgetting to also clear any other copy of that same pointer value elsewhere in the program, leaving a second free waiting to happen.
+VERIFY: C11 7.22.3.3p2 (free's undefined-behavior clause for an already-deallocated pointer).
+
+@@ 8.09 | Intermediate | Debug | tags=use-after-free,valgrind,dangling
+Q: Why can a use-after-free print the "right" value even though it is a real bug, and how does valgrind expose it regardless?
+SHORT: free does not erase the bytes it releases, it only marks the block available for reuse -- if nothing has reallocated that memory yet, a dangling read can still see the old (now logically invalid) value, masking the bug. C11 7.22.3.3 makes any access to the block after free undefined behavior regardless of whether the value happens to still look correct; valgrind's memcheck flags the read at the moment it happens, independent of what value comes back.
+DEEP:
+```c
+#include <stdio.h>
+#include <stdlib.h>
+int main(void) {
+    int *p = malloc(sizeof(int));
+    *p = 42;
+    free(p);
+    printf("dangling read: %d\n", *p);  /* use after free */
+    return 0;
+}
+```
+This program (compiled with `gcc -std=c11 -Wall -Wextra`, which also emits its own `-Wuse-after-free` warning here, again the point of the question) actually printed `dangling read: 42` when run directly -- the "bug" looked completely harmless. valgrind told the real story:
+```
+==2391== Invalid read of size 4
+==2391==    at 0x1091BD: main (test_m8_uaf.c:8)
+==2391==  Address 0x4a7d040 is 0 bytes inside a block of size 4 free'd
+==2391==    at 0x484988F: free (...)
+==2391==    by 0x1091B8: main (test_m8_uaf.c:7)
+==2391==  Block was alloc'd at
+==2391==    at 0x4846828: malloc (...)
+==2391==    by 0x10919E: main (test_m8_uaf.c:5)
+==2391==
+dangling read: 42
+```
+- This is the core reason use-after-free is a dangerous, not just an academic, bug class: the program can appear correct for months of testing and then fail (or become an exploitable read/write) the moment an intervening allocation reuses that exact memory before the dangling access happens.
+- valgrind's memcheck instruments every load/store against its own model of allocated/freed regions, so it catches the *access*, not just a wrong *value* -- which is why it finds the bug even in a run that printed the "correct" 42.
+FOLLOW:
+- Would AddressSanitizer catch this the same way? => Yes, and typically faster (compile-time instrumentation vs. valgrind's runtime emulation); ASan is covered as a companion tool in module 16, alongside valgrind.
+- Is a dangling *write* worse than a dangling *read*? => Generally yes -- a dangling write can corrupt whatever new object has since been allocated in that memory, turning one bug into a second, unrelated-looking corruption elsewhere.
+PITFALL: Concluding a pointer is safe to keep using after free because a single test run happened to print the expected value. The access is undefined regardless of what it returns on any given run.
+VERIFY: C11 7.22.3.3p2 (undefined behavior for accessing space "deallocated by a call to free or realloc"); the fact that data survives briefly is an implementation/allocator detail, not something the standard promises or forbids.
+
+@@ 8.10 | Advanced | Scenario | tags=heap,allocator,free-list,metadata
+Q: What does "heap layout intuition" actually mean -- what is really sitting next to your allocated bytes?
+SHORT: A typical allocator stores a small header before each block, recording at least its size and often free-list links, so free() knows how much to release and coalesce; allocated and free blocks interleave in the heap, organized through free lists (or bins/arenas in real allocators like glibc's). None of this is in C11 -- 7.22.3p1 only promises disjoint objects and unspecified ordering; the mechanism is purely an implementation detail.
+DEEP:
+- Minimal mental model: `[header][user data][header][user data]...` -- the pointer malloc returns is the start of "user data," not the header; a heap buffer overflow that writes past the end of your block corrupts the *next* block's header, not necessarily your own (8.11).
+- Free-list intuition: freed blocks are linked into one or more free lists (often by size class, to reduce fragmentation and speed up allocation); a double free (8.08) can corrupt these links because the block's own memory is reused to store the link pointer.
+- "Definitely lost" in valgrind (8.07) corresponds to a block for which no live pointer exists anywhere the tool can find, from any register or reachable memory -- consistent with this mental model of blocks being independent, individually tracked regions.
+- Real allocators are considerably more sophisticated (size-class bins, per-thread arenas, mmap for very large allocations) -- the point of this intuition is not to memorize glibc internals, but to reason correctly about *why* an overflow corrupts a neighbor, and why a double free corrupts bookkeeping rather than "doing nothing twice."
+FOLLOW:
+- Does this mean allocations are always adjacent in address order? => No -- 7.22.3p1 explicitly leaves order and contiguity unspecified; a freed-and-reused slot, a different size class, or an mmap-backed large allocation can all break simple adjacency assumptions.
+- Why does a heap overflow sometimes corrupt "unrelated" data far away? => Because "the next allocation" in address order is not necessarily the next one your program allocated -- it depends entirely on the allocator's internal placement decisions, which is exactly why heap corruption bugs can look so confusing without a tool like valgrind pinpointing the actual write.
+PITFALL: Reasoning about heap corruption by assuming a specific, simple physical layout (e.g. "allocations are always contiguous in call order") instead of treating the layout as allocator-defined and unspecified.
+VERIFY: C11 7.22.3p1 (unspecified order/contiguity, disjoint objects); allocator internals (headers, free lists, bins) are implementation detail with no standard clause at all.
+
+@@ 8.11 | Advanced | Debug | tags=buffer-overflow,heap,valgrind,invalid-write
+Q: What does a heap buffer overflow into the adjacent allocation actually look like under valgrind?
+SHORT: Writing past the end of a heap block is an out-of-bounds access the standard does not define at all (the object you were given only has the requested size); valgrind's memcheck flags the exact write as "Invalid write of size N... N bytes after a block of size M alloc'd," pinpointing both the bad write and the original allocation.
+DEEP:
+```c
+#include <stdlib.h>
+int main(void) {
+    int *a = malloc(4 * sizeof(int)); /* room for indices 0..3 */
+    for (int i = 0; i <= 4; i++)      /* off-by-one: writes index 4 too */
+        a[i] = i;
+    free(a);
+    return 0;
+}
+```
+Compiled clean with `gcc -std=c11 -Wall -Wextra` (no warning here -- the loop bound bug is not something -Wall catches) and run under valgrind:
+```
+==2393== Invalid write of size 4
+==2393==    at 0x1091A3: main (test_m8_overflow.c:6)
+==2393==  Address 0x4a7d050 is 0 bytes after a block of size 16 alloc'd
+==2393==    at 0x4846828: malloc (...)
+==2393==    by 0x10917E: main (test_m8_overflow.c:4)
+```
+- "0 bytes after a block of size 16" is precise: 4 ints x 4 bytes = 16-byte block, and the write at index 4 lands exactly at offset 16, the first byte past the end -- classic off-by-one (`<=` where `<` was meant).
+- Whether this write actually corrupts another live object depends entirely on what the allocator placed there (8.10) -- it might hit another block's header (corrupting a future free), another live object's data (silent wrong-value bug elsewhere), or unmapped/guard memory (an immediate crash). Undefined behavior means the standard does not pick which, and neither does the programmer without a tool telling them.
+- This is the classic classic-coding-round root-cause skill: given "some unrelated variable's value is wrong," an out-of-bounds write to a *different* buffer earlier in the program is one of the first things to suspect, and valgrind's invalid-write report is how you confirm it directly instead of guessing.
+FOLLOW:
+- Would this necessarily crash? => Not necessarily -- a 4-byte overflow landing inside allocator padding/alignment slack can be "silently" absorbed with no visible symptom at all until a different allocation pattern exposes it; valgrind catches it regardless of whether it happens to crash.
+- Is a stack buffer overflow reported the same way? => valgrind is weaker on pure stack overflows (no allocator metadata to compare against); AddressSanitizer's redzones (module 16) generally catch stack overflows more reliably than valgrind's memcheck.
+PITFALL: Using `<=` instead of `<` in a loop bound tied to an allocation sized for exactly N elements -- the single most common way to write one element past the end of a malloc'd array.
+VERIFY: C11 does not define bounds for accesses past an allocated object's size at all (accessing an array index that is out of range is undefined behavior generally, consistent with 6.5.6's pointer-arithmetic bounds rules) -- there is no specific "heap overflow" clause; it falls out of "access only within the object you were given."
+
+@@ 8.12 | Advanced | Concept | tags=malloc,zero-size,implementation-defined
+Q: What happens when you call malloc(0)?
+SHORT: C11 leaves it implementation-defined: "If the size of the space requested is zero, the behavior is implementation-defined: either a null pointer is returned, or the behavior is as if the size were some nonzero value, except that the returned pointer shall not be used to access an object" (7.22.3p1). Code that calls malloc(0) must handle both outcomes and must never dereference whatever pointer comes back.
+DEEP:
+- glibc's malloc(0), for example, commonly returns a non-NULL, unique pointer you can legally pass to free but must not use to store or read anything through.
+- This matters for generic code that computes an allocation size from a variable (e.g. `malloc(n * sizeof(*p))` where n can be 0 at runtime) -- treating a NULL result as "always an allocation failure" is wrong if the implementation's malloc(0) legitimately returns NULL for a *zero-size, successful* request; the two cases (real failure vs. zero-size success) are indistinguishable from the return value alone.
+- The safe pattern: special-case size-zero requests in your own code before calling malloc, rather than relying on any particular implementation's malloc(0) behavior.
+FOLLOW:
+- Is realloc(ptr, 0) specified the same way? => The C11 text ties this to "the space requested," so the same implementation-defined either-NULL-or-nonzero-as-if behavior applies; note this exact corner (realloc with size 0) was tightened further in C23, so treat it as another spot where citing "C11 says X" needs the version caveat.
+- Should firmware code ever call malloc(0) deliberately? => Generally avoid it; if a zero-length buffer is a valid state in your protocol, model it explicitly (e.g. a length field of 0 with a NULL or sentinel pointer) rather than relying on allocator corner-case behavior.
+PITFALL: Treating a NULL return from malloc(0) as proof of allocation failure, when it may simply be the implementation-defined zero-size case succeeding.
+VERIFY: C11 7.22.3p1, the zero-size sentence exactly as quoted above. C17/C23: the realloc(ptr, 0) corner case's interaction with free-like behavior was clarified in later standard revisions; verify against C23 if you must rely on it precisely.
+
+@@ 8.13 | Advanced | Concept | tags=free,ub,mismatched-pointer
+Q: What exactly is undefined about calling free on a pointer that did not come from malloc/calloc/realloc?
+SHORT: C11 7.22.3.3p2 is explicit: "if the argument does not match a pointer earlier returned by a memory management function, or if the space has been deallocated by a call to free or realloc, the behavior is undefined." This covers freeing a stack or global address, freeing the middle of a heap block (pointer arithmetic off the original malloc'd pointer), and freeing an already-freed pointer (8.08) -- all three are the same clause, not three different bugs.
+DEEP:
+- "Does not match a pointer earlier returned" is stricter than "points somewhere inside a heap region" -- `free(p + 1)` where `p` came from malloc is just as undefined as `free(&some_local)`, because it is not the exact pointer malloc handed back.
+- This is why generic buffer code that hands out an offset pointer (e.g. "here's your data, starting after my internal header") must keep track of the *original* allocation pointer separately if the caller might ever need to free it -- or, better, never expose a free-able pointer that isn't exactly what malloc returned.
+- Freeing a pointer to static or automatic storage (a global or a stack variable's address) is a real, seen-in-practice mistake, usually from confusing "an address" with "a heap pointer" in a generic/void* API.
+FOLLOW:
+- Does free ever need to know the original size you requested? => Yes, internally -- which is exactly why it must be the exact pointer malloc returned: that is where the allocator's own bookkeeping (8.10) is keyed from.
+- Is this the same rule that makes free(ptr + offset) wrong even if ptr + offset is still "inside" the block? => Yes, precisely -- the clause requires matching the pointer malloc *returned*, not merely pointing somewhere valid inside the allocation.
+PITFALL: Calling free on a pointer that has been advanced by pointer arithmetic since the original allocation, instead of on the original pointer value.
+VERIFY: C11 7.22.3.3p2, full sentence as quoted.
+
+@@ 8.14 | Advanced | Scenario | tags=custom-allocator,fixed-block,free-list
+Q: How do you write a minimal fixed-block allocator, and why would you want one over malloc/free in firmware?
+SHORT: Carve a static array into N fixed-size blocks, thread them into a free list by storing each free block's "next" pointer inside its own first bytes (an intrusive free list), and implement alloc/free as O(1) pop/push on that list -- no search, no fragmentation across blocks of the same size, and no dependency on a general-purpose heap at all, which is exactly why fixed-block pools are common in firmware with hard real-time or no-heap requirements.
+DEEP:
+```c
+#include <stdio.h>
+#include <stdint.h>
+
+#define BLOCK_SIZE 32
+#define NUM_BLOCKS 4
+
+static uint8_t pool[NUM_BLOCKS][BLOCK_SIZE];
+static void *free_list;
+
+void pool_init(void) {
+    free_list = NULL;
+    for (int i = NUM_BLOCKS - 1; i >= 0; i--) {
+        *(void **)pool[i] = free_list;
+        free_list = pool[i];
+    }
+}
+void *pool_alloc(void) {
+    if (!free_list) return NULL;
+    void *block = free_list;
+    free_list = *(void **)block;
+    return block;
+}
+void pool_free(void *block) {
+    *(void **)block = free_list;
+    free_list = block;
+}
+
+int main(void) {
+    pool_init();
+    void *a = pool_alloc(), *b = pool_alloc(), *c = pool_alloc(), *d = pool_alloc();
+    void *e = pool_alloc(); /* pool exhausted */
+    printf("a=%p b=%p c=%p d=%p e=%p\n", a, b, c, d, e);
+    pool_free(b);
+    void *f = pool_alloc(); /* should reuse b's slot */
+    printf("reused b's slot as f: %s\n", (f == b) ? "yes" : "no");
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra` and run, this prints all four distinct block addresses, `e=(nil)` for the exhausted fifth request, and `reused b's slot as f: yes` after freeing and re-allocating.
+- This requires `BLOCK_SIZE >= sizeof(void *)`, since a free block must be large enough to store the next-pointer inside itself; a static assertion (`_Static_assert(BLOCK_SIZE >= sizeof(void *), "...")`, module 9) is the right way to enforce that at compile time.
+- Alignment matters too: `pool` should be at least as aligned as `void *` for the `*(void **)pool[i]` write to be well-defined; declaring pool as an array of a union containing a `void *` (or using `_Alignas`) is the portable fix over relying on `uint8_t[][]` happening to be aligned.
+FOLLOW:
+- What is the O(1) claim based on? => Both alloc and free are a fixed number of pointer operations (pop or push the head of a singly linked list), independent of pool size or fragmentation state -- unlike a general allocator's variable-time search.
+- What is the main limitation versus malloc? => Fixed block size only -- it cannot serve a request larger than BLOCK_SIZE, and any request smaller than BLOCK_SIZE wastes the difference; module 18 covers a fuller pool-allocator design with these trade-offs discussed explicitly.
+PITFALL: Sizing BLOCK_SIZE smaller than sizeof(void*) or leaving the pool under-aligned for a pointer write, which makes the free-list bookkeeping itself undefined behavior.
+VERIFY: This is not standard-library code and cites no C11 library clause directly; the alignment requirement it relies on follows from 6.3.2.3's pointer-conversion/alignment rules (a `void *` must be validly aligned at the address it is stored to and read from).
+
+@@ 8.15 | Advanced | Numeric | tags=overflow,calloc,worked-math
+Q: Work out, with real numbers, exactly where malloc(nmemb * size) breaks and calloc doesn't.
+SHORT: On a 64-bit size_t (SIZE_MAX = 2^64 - 1), requesting nmemb = 2^32 and size = 2^33 gives a mathematically correct size of 2^65, which wraps modulo 2^64 to exactly 0 -- malloc(0) then "succeeds" per its implementation-defined zero-size rule (8.12) while every subsequent index computed against the *intended* 2^65-byte buffer walks off the end of a phantom-sized allocation. calloc(2^32, 2^33) is required to detect that nmemb*size cannot be represented and return NULL instead.
+DEEP:
+- Step by step: nmemb x size = 2^32 x 2^33 = 2^65. size_t arithmetic is modulo 2^64 (unsigned wraparound, module 11), so 2^65 mod 2^64 = 0. malloc receives literally 0 as its argument.
+- A smaller, easier-to-reproduce case: SIZE_MAX = 2^64-1; nmemb = 2^63+1, size = 2: nmemb*size = 2^64+2, which wraps to 2 (mod 2^64) -- malloc(2) succeeds with a 2-byte buffer while the caller believes they got roughly 2^64 bytes for 2^63+1 elements.
+- The overflow-safe check used in 8.02 (`size > SIZE_MAX / nmemb` before multiplying) avoids ever performing the wrapping multiplication: division does not overflow, so the check itself is always safe to evaluate.
+- This is exactly the class of bug behind real historical CVEs in C code that computed allocation sizes from attacker-controlled counts (e.g. "number of records" x "record size" read from a file or network packet) without an overflow check.
+FOLLOW:
+- Does this require nmemb and size to both be attacker-controlled? => No -- even a single attacker-controlled value multiplied by a fixed struct size can overflow if the count is large enough and unchecked; both operands being variable just makes the overflow easier to hit with smaller individual values.
+- Is signed integer overflow in this same computation different? => Much worse -- signed overflow is undefined behavior outright (module 10/11), whereas unsigned (size_t) overflow is well-defined wraparound; the bug here is a *logic* error from trusting a wrapped value, not undefined behavior itself.
+PITFALL: Multiplying a count by an element size for an allocation without first checking that the multiplication cannot overflow size_t.
+VERIFY: size_t's width is implementation-defined (commonly 64-bit on modern targets, C11 7.20.3 general description of typedefs in stdint.h/stddef.h); the wraparound behavior itself follows from unsigned integer arithmetic being defined modulo 2^N (6.2.5p9).
+
+@@ 8.16 | Principal | Scenario | tags=custom-allocator,fragmentation,design-review
+Q: A teammate proposes replacing malloc/free with a single custom fixed-block pool allocator across an entire firmware image, "to eliminate fragmentation." What do you push back on in review?
+SHORT: A single fixed block size eliminates fragmentation only for requests near that size -- anything smaller wastes the difference every time, and anything larger cannot be served at all, so the real question is whether the firmware's actual allocation-size distribution is narrow enough for one pool to make sense, or whether it needs several pools (one per common size class) plus a fallback path, which is closer to what module 18's fuller pool-allocator design covers.
+DEEP:
+- Ask for allocation-size telemetry (or at least a static audit of every malloc/calloc call site) before agreeing to any single-pool design -- "eliminate fragmentation" is only true if the size distribution actually clusters near one value; a bimodal or wide distribution just moves the waste from external fragmentation (malloc's problem) to internal fragmentation (every small request rounded up to the pool's fixed size).
+- Multiple pools (a "size-class" allocator, one fixed-block pool per common request size) is the usual real answer, with either a hard failure or a fallback to a general allocator for anything outside the covered sizes -- exactly the trade-off module 18 discusses for a Principal-level pool design.
+- Push on failure behavior too: a fixed pool of N blocks has a hard ceiling; what should happen at request N+1? A firmware system needs a defined answer (fail fast and log, versus block, versus fall back) decided at design time, not discovered at the first exhaustion in the field.
+- Push on the free-list write requirement from 8.14: every pool needs blocks at least pointer-sized and pointer-aligned; a pool of very small objects (e.g. 2-byte enums) cannot use the naive intrusive-free-list trick without padding, which itself reintroduces some of the waste the design was meant to avoid.
+FOLLOW:
+- Is a single pool ever the right call? => Yes, when the workload genuinely is one dominant size (e.g. fixed-size protocol descriptors or DMA buffers all the same size) -- the review point is proving that with real data, not assuming it.
+- What is the concrete cost of getting this wrong? => Either wasted RAM (over-sized single pool for varied small requests) or a hard allocation failure in the field the first time a request exceeds every pool's size -- both are worse in a shipped firmware image than glibc-style fragmentation, which at least degrades gracefully.
+PITFALL: Approving a single fixed-block-size allocator design without first establishing the actual distribution of allocation sizes the firmware needs to serve.
+VERIFY: No C11 clause governs allocator design; this is architecture-level judgment. C11 7.22.3p1's only relevant constraint is that whatever allocator you build must still hand out mutually disjoint objects if it is meant to stand in for malloc/free semantics.
+
+@@ 8.17 | Principal | Debug | tags=heap-corruption,root-cause,methodology
+Q: You get a bug report: "the firmware crashes in an unrelated module, hours after startup, only in the field." Walk through how you would root-cause a suspected heap corruption bug like this.
+SHORT: Treat "crashes somewhere unrelated to where the bug actually is" as the signature of heap corruption (8.10, 8.11) rather than a logic bug in the crashing code itself, and work backward with tools rather than by reading code: reproduce under valgrind or ASan first (even if slower), because a corruption bug's crash site is usually far from its cause site, and only an instrumented run catches the actual bad access at the moment it happens.
+DEEP:
+1. **Do not trust the crash location.** A heap corruption bug's crash almost always happens later, in a different function, than the write that caused it (8.10's "corrupts the next block's header" pattern) -- start from "something wrote out of bounds earlier," not from the code at the crash address.
+2. **Reproduce under an instrumented build first.** valgrind (slower, no rebuild needed) or AddressSanitizer (faster, needs a rebuild with `-fsanitize=address`, module 16) both catch the actual out-of-bounds or use-after-free access directly, with a stack trace at the moment of the bad access -- this converts "crashes somewhere, sometimes, after hours" into "here is line N, right now."
+3. **If it will not reproduce under a tool** (timing-dependent, hardware-dependent, or "only after hours" in a way that is impractical to wait for under instrumentation), narrow by bisection: which recent change, which code path, which allocation pattern correlates with the failure; add targeted canary values or a lightweight custom allocator wrapper that poisons freed memory and checks for out-of-bounds writes around known allocations, as a cheaper stand-in for a full sanitizer run in the field.
+4. **Once you have a suspected write site, confirm the exact clause it violates** -- most heap corruption traces back to one of: 8.08 (double free corrupting free-list links), 8.09 (use-after-free), or 8.11 (buffer overflow into an adjacent block) -- and fix that root cause, not the symptom at the crash site.
+- The interview-level point: naming the tool ("run valgrind") is necessary but not sufficient; the Principal-level answer is the reasoning about *why* the crash site is misleading and *how* to get from "crashes hours later, unrelated module" to a concrete line number.
+FOLLOW:
+- What if the crash only happens in the field, never in a lab reproduction? => Log allocation/free call sites (or build a lightweight guard-byte wrapper around malloc/free) that can run in the field build with acceptable overhead, since full valgrind/ASan overhead is often too high for a shipped firmware image.
+- Is a watchpoint in gdb useful here? => Yes, once you have a specific suspect address or structure field -- a hardware watchpoint on that memory can catch the exact write that corrupts it, complementing (not replacing) the tool-based approach above; gdb workflows are covered in module 16.
+PITFALL: Debugging at the crash site as if the bug were local to the crashing function, instead of recognizing corrupted-heap symptoms and working backward to the actual out-of-bounds write.
+VERIFY: No single C11 clause covers "heap corruption" as a term; the underlying UB clauses are 7.22.3.3p2 (free) and the general out-of-bounds access rules this module has already cited for 8.08/8.09/8.11.
+
+@@ 8.18 | Principal | Concept | tags=realloc,leak,idiom,error-handling
+Q: Why is p = realloc(p, new_size); considered a classic bug pattern even though it looks like the obvious way to grow a buffer?
+SHORT: If realloc fails, it returns NULL while leaving the original block "not deallocated... unchanged" (C11 7.22.3.5p3) -- but `p = realloc(p, new_size);` overwrites your only pointer to that still-valid original block with NULL the instant the assignment happens, permanently leaking it even though it was never freed and is still perfectly usable.
+DEEP:
+```c
+/* the bug */
+p = realloc(p, new_size);         /* on failure, p becomes NULL; old block leaked */
+if (!p) { /* too late: no way back to the original allocation */ }
+
+/* the fix */
+void *tmp = realloc(p, new_size);
+if (!tmp) {
+    /* p is still valid here: free it, or keep using it, or report and continue */
+} else {
+    p = tmp;
+}
+```
+- The fix costs nothing but a second variable; it preserves exactly what 7.22.3.5p3 promises you (the old object is still there and unchanged on failure) instead of throwing that guarantee away with the assignment.
+- This idiom generalizes to any "reassign this pointer to the function's own return value" pattern where the function can fail and the failure value overwrites your only handle on a resource that is still valid -- realloc is simply the most common place C programmers hit it.
+- A Principal-level review answer names the exact clause (7.22.3.5p3) that makes the naive version wrong, not just "it's a known gotcha" -- the standard is explicit that the old object survives a failed realloc, which is precisely the resource the naive pattern throws away.
+FOLLOW:
+- Does this matter for a firmware system that would just reboot on allocation failure anyway? => It still matters for diagnosability -- if you plan to log-and-continue rather than reboot, or if a lower layer might retry after freeing something else, having the original pointer intact is the difference between a recoverable path and a guaranteed leak on every failed grow.
+- Is there a realloc variant that avoids this entirely? => Not in standard C; some platforms offer reallocarray-style helpers with overflow checking (8.02's concern) but the failure-pointer-clobber issue is inherent to reassigning realloc's result onto its own input, regardless of which realloc-family function you call.
+PITFALL: Writing p = realloc(p, ...) directly instead of assigning to a temporary and checking it before touching p.
+VERIFY: C11 7.22.3.5p3-4 (realloc's failure semantics: NULL return, old object unchanged).

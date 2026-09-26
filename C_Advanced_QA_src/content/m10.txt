@@ -1,0 +1,342 @@
+# Module 10: Thread-Safety Patterns & Lock-Free Basics
+
+@@ 10.01 | Basic | Concept | tags=reentrant,threadsafe,definitions
+Q: What is the difference between a reentrant function and a thread-safe function?
+SHORT: Reentrant means safe to call again before an earlier call has returned (e.g. from a signal handler that interrupts itself), which mainly rules out static/global state and un-restored shared resources. Thread-safe means safe to call concurrently from multiple threads, which mainly rules out unsynchronized shared state. Reentrant-but-not-thread-safe and thread-safe-but-not-reentrant (a function that takes a lock) both exist.
+DEEP:
+- A function using only local variables and its arguments (no static/global state, no calls to non-reentrant functions) is reentrant: `malloc` inside it is the usual exception that breaks reentrancy in signal-handler contexts even though `malloc` itself may be thread-safe.
+- A function that takes a mutex before touching shared state can be thread-safe (safe under concurrent threads, because the lock serializes them) but not reentrant (if the same thread calls it again while already holding that mutex, it deadlocks with a non-recursive mutex).
+- `strtok()` is the classic non-reentrant, non-thread-safe function: it keeps its scan position in a hidden static pointer shared by the whole process. See 10.05 for `strtok_r()`.
+- POSIX documents which C library functions are "async-signal-safe" (safe to call from inside a signal handler); that list is a reentrancy list, not a thread-safety list. See the C Advanced page, module 2, for the async-signal-safe function list.
+FOLLOW:
+- Is a pure function (no side effects, no shared state) both reentrant and thread-safe? => Yes; purity is the easiest way to get both properties for free, and it is why functional-style helpers are a common thread-safety tactic.
+- Does adding a mutex make a function reentrant? => No, it can make it non-reentrant with respect to itself on the same thread; reentrancy and thread-safety are orthogonal properties, not one a superset of the other.
+PITFALL: Assuming "thread-safe" implies "reentrant" or vice versa. They are independent properties; check each one separately for any function you rely on.
+
+@@ 10.02 | Basic | Concept | tags=tls,lockfree,overview
+Q: Why is thread-local storage considered a lock-free technique?
+SHORT: Thread-local storage (TLS) gives each thread its own private copy of a variable, so there is no shared state for concurrent accesses to race on and therefore nothing to lock. It trades a shared resource for N private ones; it is not "lock-free" in the compare-and-swap sense, but it achieves the same goal (no blocking, no contention) by removing the sharing entirely.
+DEEP:
+- C11 `_Thread_local` (or the older GNU `__thread`) gives each thread a distinct instance of the object, with its own lifetime tied to the thread.
+- See the C Advanced page, module 3, for the mechanics of declaring and initializing thread-local storage; this module focuses on where it fits among lock-free patterns.
+- Typical use: per-thread scratch buffers, per-thread random-number-generator state, per-thread performance counters that get combined (reduced) into a global total only occasionally, not on every operation (see 10.15).
+- TLS does not help when threads truly need to see each other's updates; it only helps when each thread's data is naturally private.
+FOLLOW:
+- Does TLS avoid false sharing automatically? => Not automatically; if several threads' TLS instances happen to be allocated on the same cache line by the implementation, you can still get false sharing (see the C Advanced page's memory-model module for false sharing).
+- Can TLS variables have a destructor run on thread exit? => With pthreads, use `pthread_key_create()`'s destructor argument for heap-allocated per-thread data; plain `_Thread_local` objects are just destroyed like any object with thread storage duration, no custom cleanup hook.
+PITFALL: Using TLS for data that must be visible across threads (e.g. a shared cache) and then wondering why other threads never see updates. TLS is per-thread by design.
+
+@@ 10.03 | Basic | Concept | tags=lockfree,waitfree,progress
+Q: What does "lock-free" actually guarantee, and how is it different from "wait-free"?
+SHORT: Lock-free means the system as a whole always makes progress: some thread completes its operation in a bounded number of steps, even if a particular thread could in theory be starved forever by unlucky timing. Wait-free is the stronger guarantee that every thread completes in a bounded number of steps regardless of what other threads do. Neither uses a blocking lock; both differ only in their per-thread fairness guarantee.
+DEEP:
+- A CAS-retry loop (see 10.11) is typically lock-free: the loop only fails when another thread's CAS just succeeded, so *someone* is always making progress, but one unlucky thread could keep losing the race indefinitely (in practice this is exceedingly rare, not impossible).
+- Wait-free algorithms exist but are harder to design and often slower in the common case; most production "lock-free" data structures (e.g. Linux's `RCU`-adjacent structures, many library concurrent queues) are lock-free, not wait-free.
+- "Obstruction-free" is a weaker term still: a thread makes progress only if it eventually runs alone without interference; it is mentioned here only so you recognize the term if an interviewer uses it.
+- None of these terms mean "fast." A lock-free structure can be slower than a well-tuned mutex under low contention because of retry overhead and weaker cache locality; see 10.20.
+FOLLOW:
+- Is a spinlock-protected counter lock-free? => No; a spinlock is still a lock (mutual exclusion), it just busy-waits instead of blocking in the kernel. Lock-free specifically means no mutual exclusion at all.
+- Which guarantee does `atomic_fetch_add` give? => It is effectively wait-free on hardware with a native atomic add instruction: it always completes in one bounded step, no retry loop needed.
+PITFALL: Using "lock-free" as a synonym for "fast" or "correct." It is a progress guarantee about the algorithm's structure, not a performance or safety promise by itself.
+
+@@ 10.04 | Intermediate | Concept | tags=tls,pattern,perthread
+Q: Give a concrete pattern where thread-local storage replaces a mutex.
+SHORT: A per-thread accumulator that only gets merged into a shared total occasionally (not on every update) turns N-way contention on one shared counter into zero contention on the hot path plus a small, rare, synchronized merge step. This is the standard way to make high-frequency counters (e.g. per-thread I/O completion counts in a validation harness) not bottleneck on a shared lock or even on a shared atomic.
+DEEP:
+- Without TLS: every thread does `pthread_mutex_lock(&m); total++; pthread_mutex_unlock(&m);` on every event, so the mutex is contended by every thread on every event.
+- With TLS: every thread does `local_count++` (no synchronization at all) on every event, and only occasionally (e.g. once per second, or once at thread exit) folds `local_count` into a shared atomic total.
+- 10.15 compiles and runs this exact pattern with `_Thread_local long local_count` plus one `atomic_fetch_add` per thread at the end, and confirms the combined total is exact.
+- This generalizes to per-thread histograms, per-thread free lists (reduce allocator lock contention), and per-thread log buffers that get flushed independently.
+FOLLOW:
+- What if you need the running total continuously, not just at the end? => Either pay for periodic synchronized folding (e.g. every N events or every timer tick) or fold under a read-side lock only when a reader actually asks for the total, accepting slightly stale reads.
+- Does this pattern work for values threads need to see from each other in real time? => No; it trades real-time shared visibility for zero-contention writes, so it only fits accumulate-then-report use cases.
+PITFALL: Reaching for a global atomic counter by default for every "just count something" need, when a per-thread counter folded rarely would remove essentially all contention.
+VERIFY: none (this is a design pattern, not a spec-defined API).
+
+@@ 10.05 | Intermediate | Trap | tags=strtok,reentrant,strtokr
+Q: Why is strtok() unsafe across threads, and what fixes it?
+SHORT: strtok() keeps its scan position in one hidden static variable shared by the entire process, so two threads calling strtok() at the same time race on that variable and can each see the other's partially-advanced state. strtok_r() takes an explicit `char **saveptr` argument supplied by the caller, so each thread (or each independent tokenization) uses its own state with no sharing at all.
+DEEP:
+- POSIX documents `strtok_r(char *restrict s, const char *restrict sep, char **restrict lasts)`: the caller owns `lasts` (often a local variable), so there is nothing left for two callers to share.
+- The fix is not "add a lock around strtok()" -- that would serialize unrelated tokenization work happening on unrelated strings in different threads for no reason; the real fix is to remove the shared state entirely by using the reentrant variant.
+- This is the same shape of bug as the classic C runtime functions `gmtime()`, `strerror()`, `rand()` (fixed by `gmtime_r()`, `strerror_r()`, `rand_r()` / per-thread PRNG state) -- look for a hidden static buffer or scan pointer whenever a "no explicit state" function is called from more than one thread.
+```c
+char *save = NULL;
+char *tok = strtok_r(buf, ",", &save);
+while (tok) { /* use tok */ tok = strtok_r(NULL, ",", &save); }
+```
+  Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run with two threads each tokenizing their own string with `strtok_r`, both threads report the correct token count every time (3 tokens from "a,b,c", 4 from "x,y,z,w") -- there is no shared state left to race on.
+FOLLOW:
+- Does glibc's strtok() implementation happen to be internally locked? => No; POSIX explicitly allows it to be unsafe for this reason, and glibc's strtok() is not thread-safe. Never rely on an implementation detail here.
+- Is strtok_r() also safe to call reentrantly (e.g. nested tokenization of two different strings in the same thread)? => Yes, as long as each nesting level uses its own `saveptr` variable.
+PITFALL: "Fixing" a strtok() race by wrapping every call in a mutex instead of switching to strtok_r(). That serializes all tokenization process-wide and still leaves a latent bug if anyone calls strtok() outside the lock.
+VERIFY: POSIX.1-2017, strtok_r() vs strtok() thread-safety note (not among the 60 fetched pages; reasoning from the documented `char **lasts` parameter, which is the standard fix for this class of bug).
+
+@@ 10.06 | Intermediate | Concept | tags=cas,semantics,rmw
+Q: What does compare-and-swap (CAS) actually do, atomically?
+SHORT: CAS compares the current value at a memory location to an expected value you supply; if they match, it stores a new value and reports success; if they do not match, it leaves memory unchanged, writes the current value back into your expected variable, and reports failure. The whole compare-and-conditionally-store sequence happens as one atomic read-modify-write step, so no other thread's write can land in the middle of it (C11 7.17.7.4).
+DEEP:
+- C11 gives `_Bool atomic_compare_exchange_strong(volatile A *object, C *expected, C desired)`: on success, `*object == desired`; on failure, `*expected` is updated to whatever `*object` actually held, so a retry loop always has fresh data for its next attempt.
+- The standard's own description (C11 7.17.7.4p3) is exactly `memcmp`+`memcpy` in spirit: "if the comparison is true, replace the value pointed to by object with desired; ... if false, update expected with the value pointed to by object."
+- CAS is the universal building block for lock-free code: every lock-free counter, stack, or queue in this module is a retry loop built on CAS, because CAS is what most hardware actually gives you as a single atomic instruction (`cmpxchg` on x86, `ldrex/strex` or `cas` on ARM).
+- See 10.08 for the "weak" vs "strong" distinction and why weak CAS is used inside retry loops.
+FOLLOW:
+- What happens to `expected` when CAS succeeds? => It is left unchanged (still equal to the old value), since the standard only documents updating it on the false/failure branch.
+- Can CAS be used to implement a full mutex? => Yes in principle (a CAS-based spinlock is a few lines), but a real mutex also needs blocking/wake support from the kernel for the contended case, which plain CAS does not provide by itself.
+PITFALL: Treating CAS as "check, then set" as two separate steps in your own head when reasoning about correctness. The whole point is that no other thread can act between the check and the set; reason about it as one indivisible operation.
+VERIFY: C11 7.17.7.4 (atomic_compare_exchange), paragraphs 1-3.
+
+@@ 10.07 | Intermediate | Scenario | tags=dcl,broken,naive
+Q: What is wrong with the "naive" double-checked-locking pattern that uses a plain pointer with no atomics?
+SHORT: `if (g_cfg == NULL) { lock(); if (g_cfg == NULL) { g_cfg = init(); } unlock(); }` has two problems: the outer read of `g_cfg` outside the lock is an unsynchronized (racy) access to memory another thread writes, and the assignment `g_cfg = ptr` gives the compiler and CPU no ordering guarantee that the pointed-to object's fields are visible before the pointer itself becomes visible. A reader could see a non-NULL pointer to a not-yet-fully-initialized object.
+DEEP:
+- This is a genuine C11 data race by the standard's definition (5.1.2.4): one thread writes `g_cfg`, another reads it, with no synchronization between them, and at least one is a write -- undefined behavior, independent of whether any particular compiler/CPU combination happens to reorder anything today.
+- On a strongly-ordered machine (x86-64's normal loads/stores), you may never actually observe the reordering; 10.12 compiles and runs both the naive and the fixed version and reports what was actually observed on this machine (spoiler: no visible corruption here, precisely because x86-64 hides this bug rather than because the code is correct).
+- The standard-compliant fix does not add more locking; it makes the pointer itself an atomic object with the right acquire/release pairing, so the *fast path read* is a defined, synchronized operation instead of a race. See 10.12 for the fixed code.
+- This is the single most common "looks fine, is actually undefined behavior" pattern an interviewer will ask about, because the bug is subtle: it is about the memory model, not about any missing lock.
+FOLLOW:
+- Would making g_cfg `volatile` fix this? => No; volatile only affects compiler code generation for that access (see the C Advanced page's memory-model module and the C Language page's qualifier module), it gives no atomicity and no cross-thread ordering guarantee.
+- Is the inner check (inside the lock) still necessary once you fix the outer check with atomics? => Yes; the inner check under the lock is what prevents two threads that both saw NULL from both racing into the lock and both allocating a second config object.
+PITFALL: Believing "it ran fine in testing on my x86 laptop" proves double-checked locking is safe. Absence of an observed failure on one strongly-ordered architecture is not a correctness proof; the C11 standard already calls the unsynchronized access undefined.
+
+@@ 10.08 | Intermediate | Concept | tags=cas,weak,strong,spurious
+Q: When should you use atomic_compare_exchange_weak instead of the strong version?
+SHORT: Use the weak form inside a retry loop; it may fail spuriously (return false even though the values were actually equal) on some hardware, but that is exactly the shape a retry loop already handles, and the weak form can be implemented more efficiently on load-linked/store-conditional architectures where the strong form would need an internal loop of its own. Use the strong form for a one-shot compare-and-swap outside a loop, where a spurious failure would wrongly abort real work.
+DEEP:
+- C11 7.17.7.4p4: "A weak compare-and-exchange operation may fail spuriously. That is, even when the contents of memory referred to by expected and object are equal, it may return zero."
+- The standard's own example (7.17.7.4p6, EXAMPLE) is precisely the retry-loop idiom used throughout this module: `do { des = f(exp); } while (!atomic_compare_exchange_weak(&cur, &exp, des));`.
+- On x86, `cmpxchg` never fails spuriously, so weak and strong compile to the same instruction there; on LL/SC architectures (classic ARM, POWER), strong CAS is implemented as a small internal retry loop around LL/SC, so calling weak CAS from your own retry loop avoids nesting one nested retry loop inside another.
+- Rule of thumb: "am I already in a `while`/`do-while` loop that will just try again?" -> use weak. "Do I need a definitive single yes/no answer right now?" -> use strong.
+FOLLOW:
+- Does a spurious weak-CAS failure update `expected`? => Yes, the same as a real failure; the standard does not distinguish the two cases for the caller, which is exactly why weak CAS only makes sense inside a loop that re-reads and retries anyway.
+- Is one extra spurious retry expensive? => Negligible compared to a real contended retry; it is just one more loop iteration, not a fallback to a slow path.
+PITFALL: Using atomic_compare_exchange_weak() in a single "try once" check with no surrounding loop. A spurious failure will make you incorrectly conclude the values differed.
+VERIFY: C11 7.17.7.4, paragraphs 4-6 (spurious failure and the weak-CAS retry-loop example).
+
+@@ 10.09 | Intermediate | Numeric | tags=cost,cas,mutex,contention
+Q: Roughly, how does the cost of an uncontended atomic increment compare to an uncontended mutex lock/unlock?
+SHORT: As a rough, hardware-dependent shape, not a spec figure: an uncontended `atomic_fetch_add` costs a handful of nanoseconds (one interlocked instruction), an uncontended `pthread_mutex_lock`/`unlock` pair costs tens of nanoseconds (extra bookkeeping plus its own atomic op), and a contended mutex that must block adds a syscall and a context switch on top -- roughly microseconds, a different order of magnitude again.
+DEEP:
+- These numbers are approximate and machine-dependent; the point for an interview is the *shape*: atomic op < uncontended lock < contended lock-with-blocking, each roughly an order of magnitude apart, not exact nanosecond counts.
+- The mutex's extra cost even when uncontended comes from bookkeeping (owner tracking for error-checking/recursive types, and the underlying atomic operation the mutex itself uses to implement its fast path) -- a plain atomic op has none of that.
+- Under contention, both degrade, but differently: a CAS retry loop degrades by wasting retries (still no kernel involvement, still ready to run), while a contended mutex degrades by parking the loser thread in the kernel (`futex_wait`) and later paying a real context switch and wake-up to unpark it -- see module 11 for what a context switch actually costs.
+- For validation-harness style code (module 11's high-IOPS framing), this is exactly why a per-thread or lock-free counter for a hot statistic is worth the design effort over a naive mutex-protected counter once the update rate is high enough to matter.
+FOLLOW:
+- Is a spinlock's uncontended cost closer to an atomic op or to a mutex? => Closer to an atomic op (it is often built from one CAS), which is exactly why spinlocks can win for very short critical sections -- see the C Advanced page's mutex module for when spinning beats blocking.
+- Does this ordering hold on every architecture? => The relative ordering (atomic < uncontended lock < contended/blocking lock) is a reliable rule of thumb across architectures; the actual nanosecond figures are not portable and should always be measured on the target hardware.
+PITFALL: Quoting a specific number (e.g. "20ns") from memory as if it were a portable fact. State it as an approximate, hedged order of magnitude and offer to benchmark the actual target hardware instead.
+VERIFY: no formal spec source (hardware/microarchitecture-dependent); treat as a hedged rule of thumb, not a cited guarantee.
+
+@@ 10.10 | Advanced | Scenario | tags=atomic,counter,fetchadd
+Q: Show a lock-free counter using atomic_fetch_add and confirm it does not lose updates under real contention.
+SHORT: `atomic_fetch_add_explicit(&counter, 1, memory_order_relaxed)` from every thread gives an exact final count with no lock, because the hardware add instruction is itself the atomic read-modify-write -- there is no window for another thread's increment to be lost. Contrast this with a plain `counter++` on a non-atomic `long` shared by threads, which reliably loses updates under the same load.
+DEEP:
+- `memory_order_relaxed` is enough here because the only property this counter needs is that concurrent increments do not clobber each other; it makes no promise about ordering the increment relative to any other memory access, which this use case does not need (see the C Advanced page's memory-model module for when you would need acquire/release instead).
+```c
+static atomic_long atomic_counter = 0;
+void *worker(void *arg) {
+    for (int i = 0; i < NINCR; i++)
+        atomic_fetch_add_explicit(&atomic_counter, 1, memory_order_relaxed);
+    return NULL;
+}
+```
+  Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run with 8 threads each doing 200000 increments (1,600,000 total), the atomic version printed `1600000` (matching exactly) on every run.
+- The same test with a plain, non-atomic `long plain_counter` and `plain_counter++` in each thread printed a different, too-low number on every run (e.g. 920628, then 1124788, then 996310 across three runs) -- a real, repeatable lost-update race, because `x++` on a non-atomic object is a separate load, add, and store, and two threads' load-add-store sequences can interleave and overwrite each other's result.
+FOLLOW:
+- Why did the racy version's result differ between runs? => The exact number of lost updates depends on the actual thread interleaving that the scheduler produces, which is not deterministic run to run; only the "too low, and different each time" pattern is reliably reproducible.
+- Would memory_order_seq_cst change the final count here? => No; the count is correct with relaxed ordering already, because atomicity (not ordering relative to other variables) is the only property this specific test depends on.
+PITFALL: Assuming `x++` is atomic because it is one line of C. It compiles to a separate load, increment, and store unless `x` has an atomic type; only the atomic type makes the whole sequence one indivisible operation.
+
+@@ 10.11 | Advanced | Scenario | tags=cas,counter,loop
+Q: Show a lock-free counter built from a CAS retry loop instead of atomic_fetch_add, and confirm it is also exact under contention.
+SHORT: A CAS-loop counter reads the current value, computes the desired new value, and calls atomic_compare_exchange_weak in a loop until it succeeds; this is strictly more work than atomic_fetch_add for a plain increment (which is why fetch_add exists as its own primitive), but the same retry-loop shape is what you need for any update that is not a simple add, such as "set to the max of the current value and mine."
+DEEP:
+```c
+static atomic_long cas_counter = 0;
+void *cas_worker(void *arg) {
+    for (int i = 0; i < NINCR; i++) {
+        long old = atomic_load_explicit(&cas_counter, memory_order_relaxed);
+        long want;
+        do { want = old + 1; }
+        while (!atomic_compare_exchange_weak_explicit(
+                   &cas_counter, &old, want,
+                   memory_order_relaxed, memory_order_relaxed));
+    }
+    return NULL;
+}
+```
+  Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run with the same 8-threads x 200000-increments load as 10.10, the CAS-loop counter also printed exactly `1600000` on every run, alongside the same racy plain counter losing updates in that same test binary.
+- Note the loop's own structure: `old` is re-read from the CAS call's failure output (10.06/10.08), so each retry uses the freshest observed value rather than the stale one from before the failed attempt.
+- If your update really is "add a constant," always prefer `atomic_fetch_add`; reach for a CAS loop only when the new value truly depends on a computation over the old value that no single atomic primitive covers directly.
+FOLLOW:
+- What would happen if `old` were not updated on a failed CAS? => The loop would keep retrying with a stale `old` and could spin forever comparing against a value that will never match again; this is exactly why CAS's contract updates `expected` on failure (10.06).
+- Is this CAS-loop version slower than the fetch_add version under contention? => Generally yes, since every failed attempt does a wasted compute-and-compare-exchange instead of a single hardware add; use it only when the update logic truly needs it.
+PITFALL: Writing a CAS loop for a plain increment "for practice" in production code, when the hardware already offers a dedicated, cheaper fetch-and-add primitive for exactly that case.
+
+@@ 10.12 | Advanced | Debug | tags=dcl,fixed,acquire,release
+Q: Fix the naive double-checked-locking pattern from 10.07 with C11 atomics, and confirm the fix actually runs correctly.
+SHORT: Make the pointer an `_Atomic(config_t *)`, use `memory_order_acquire` on every read and `memory_order_release` on the publishing write. The release store guarantees every write to the pointed-to object (done before the store) is visible to any thread whose acquire load sees that pointer value -- exactly the ordering the naive version was missing, with the fast-path read now a defined atomic operation instead of a race.
+DEEP:
+```c
+static _Atomic(config_t *) g_cfg_atomic = NULL;
+static pthread_mutex_t g_lock_atomic = PTHREAD_MUTEX_INITIALIZER;
+
+config_t *get_config_fixed(void) {
+    config_t *c = atomic_load_explicit(&g_cfg_atomic, memory_order_acquire);
+    if (c == NULL) {
+        pthread_mutex_lock(&g_lock_atomic);
+        c = atomic_load_explicit(&g_cfg_atomic, memory_order_relaxed);
+        if (c == NULL) {
+            c = malloc(sizeof *c);
+            c->value = 42;
+            atomic_store_explicit(&g_cfg_atomic, c, memory_order_release);
+        }
+        pthread_mutex_unlock(&g_lock_atomic);
+    }
+    return c;
+}
+```
+  Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run with 16 threads racing to call this on first use, every thread read back `value == 42` on every run -- 0/16 wrong on 3 separate runs.
+- The naive version (plain `config_t *g_cfg_naive` with a plain pointer store, no atomics) was compiled and run the same way, in the same test binary, and also showed 0/16 wrong on this x86-64 machine across 3 runs. This is the expected, honest result: x86-64's strong memory ordering for normal loads/stores tends to hide this exact bug in practice, which is precisely why the naive version is still undefined behavior rather than "safe because it happened to work here" -- a weaker-ordered CPU (or a sufficiently aggressive future compiler optimization) is free to reorder the plain store in a way that would surface it.
+- The lesson for an interview: correctness under the standard, not "no failure observed on my test box," is what makes code right. The fixed version is correct *by the standard's rules*, not just by luck of the target CPU.
+FOLLOW:
+- Why use memory_order_relaxed for the second (inside-the-lock) read? => Because that read is protected by the mutex already, which provides its own synchronization; no extra atomic ordering is needed for a read that can only race with writers who are also holding the same lock.
+- Would this whole pattern be unnecessary with C11's pthread_once() or a function-local static initializer? => Largely yes for simple one-time lazy init -- pthread_once() (see the C Advanced page's threads module) already solves this exact problem correctly; double-checked locking is worth knowing because it appears in older codebases and because the reasoning generalizes to other lazily-published shared pointers.
+PITFALL: Reasoning "I ran it N times and it was fine" as proof of correctness for a memory-ordering bug. Only the C11 standard's rules (and tools like ThreadSanitizer, covered in module 15) can tell you the code is actually race-free; empirical testing on one architecture cannot.
+VERIFY: C11 7.17.3 (memory_order semantics for acquire/release) as the basis for why the release-then-acquire pairing here is sufficient.
+
+@@ 10.13 | Advanced | Debug | tags=lockfree,stack,aba,reclamation
+Q: Build a minimal lock-free stack with CAS, and explain the ABA problem it is vulnerable to.
+SHORT: Push and pop both use a CAS retry loop on the head pointer: push links the new node in front of the observed head and CASes head to the new node; pop reads head, remembers its ->next, and CASes head to that next pointer. The classic danger is the ABA problem: if a node is popped, freed, and a *new* node happens to be reallocated at the same address before a stalled thread's CAS runs, that CAS can succeed by matching the address even though the list underneath it has completely changed.
+DEEP:
+```c
+typedef struct node { struct node *next; int val; } node_t;
+static _Atomic(node_t *) head = NULL;
+
+void push(int v) {
+    node_t *n = malloc(sizeof *n); n->val = v;
+    node_t *old_head;
+    do { old_head = atomic_load_explicit(&head, memory_order_relaxed);
+         n->next = old_head; }
+    while (!atomic_compare_exchange_weak_explicit(&head, &old_head, n,
+               memory_order_release, memory_order_relaxed));
+}
+
+int pop(int *out) {
+    node_t *old_head;
+    do { old_head = atomic_load_explicit(&head, memory_order_acquire);
+         if (old_head == NULL) return 0; }
+    while (!atomic_compare_exchange_weak_explicit(&head, &old_head, old_head->next,
+               memory_order_acq_rel, memory_order_relaxed));
+    *out = old_head->val; free(old_head);
+    return 1;
+}
+```
+  Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run with 8 threads each pushing 50000 items (400,000 total) concurrently, then popped from a single thread afterward: exactly 400,000 items came back off, matching the push count on every run.
+- This test does not (and cannot easily) demonstrate the ABA problem itself: it needs a very specific interleaving (thread A reads head and old_head->next, then stalls; another thread pops and frees that exact node, then pushes a new node that the allocator happens to reuse at the same address; A's CAS then wrongly succeeds). It is a well-documented failure mode of naive CAS-based structures, not something safe to rely on reproducing on demand.
+- The free() in `pop()` is only safe in this test because nothing else can still be dereferencing that node afterward within the test's own logic; a real multi-producer/multi-consumer stack needs a reclamation scheme (hazard pointers or epoch-based reclamation) precisely to prevent use-after-free and ABA, which is exactly the kind of complexity 10.16 says to reach for a library over.
+FOLLOW:
+- Does using a 128-bit "tagged pointer" (pointer plus a monotonically increasing counter) fix ABA? => It is the classic mitigation (double-word CAS on architectures that support it): the counter changes on every pop, so a stale CAS attempt sees a counter mismatch even if the pointer address matches, but it needs wide-CAS hardware support and careful counter-overflow handling.
+- Why is this pattern called a "stack" and not a generic lock-free list? => Because it only ever pushes/pops at one end (head); a lock-free structure that needs insertion/removal at both ends or in the middle is considerably harder and is exactly the Michael-Scott-queue-and-beyond territory referenced in 10.16.
+PITFALL: Shipping a hand-rolled lock-free stack/queue with `free()` on pop and calling it done. Without a reclamation scheme it is subject to ABA and use-after-free under real multi-threaded load, even though a simple single-threaded-pop test (like this one) will not reveal it.
+
+@@ 10.14 | Advanced | Cross-layer | tags=signal,atomic,flag
+Q: How does an atomic flag make a signal handler safely hand off work to the rest of the program?
+SHORT: A signal handler cannot safely call most functions or take locks (see the C Advanced page, module 2, for the async-signal-safe function list), so the standard-safe pattern is: the handler does nothing but `atomic_store_explicit(&flag, 1, memory_order_relaxed)` (or the plain `volatile sig_atomic_t` form for pre-C11 code), and the main program polls that flag in its normal control flow and does the real work outside signal context.
+DEEP:
+- `sig_atomic_t` predates C11's `<stdatomic.h>` and is what signal-handler code historically used for exactly this purpose; a C11 `atomic_flag` or `atomic_int` gives the same safety with the additional benefit of well-defined memory_order semantics if the flag is also read by another thread (not just the interrupted thread itself).
+- The write inside the handler and the read in the main loop are not "racing" in the harmful sense here because a single-threaded program's own signal handler interrupting itself is sequenced with the rest of that thread's execution; the atomic type mainly matters once a *separate thread* also reads the flag, or when you want defined behavior without relying on `volatile`'s weaker, compiler-only guarantee (see the C Advanced page's memory-model module on why volatile is not a substitute for atomics).
+- This is the signal-handling analogue of the mutex-forbidden-in-an-ISR rule covered in module 14 for interrupt context; a POSIX signal handler and a hardware ISR share the same core constraint (no blocking, minimal work) for related reasons.
+FOLLOW:
+- Can the handler safely write more than a single flag, e.g. a small struct? => Not atomically as a whole; keep the handler to setting one atomic/sig_atomic_t flag (or writing to a pre-allocated, already-sized buffer with async-signal-safe functions only) and do any complex work after the signal returns.
+- Is `errno` safe to touch inside a signal handler? => Only if you save and restore the handler's own errno value, since an interrupted async-signal-safe library call in the main flow may have its errno clobbered by a call made inside the handler.
+PITFALL: Calling `printf()`, `malloc()`, or taking a mutex directly inside a signal handler because "it worked in testing." None of those are guaranteed async-signal-safe; the flag-and-poll pattern exists specifically to avoid needing any of them in handler context.
+
+@@ 10.15 | Advanced | Scenario | tags=tls,aggregate,perthread
+Q: Implement and confirm a per-thread counter pattern that avoids all lock/atomic contention on the hot path.
+SHORT: Each thread increments its own `_Thread_local long local_count` with a plain, unsynchronized `local_count++` on every event (zero contention, since nothing is shared), and only folds that thread's total into one shared atomic once, at the end of the thread's work. The combined total across all threads still comes out exact.
+DEEP:
+```c
+static _Thread_local long local_count = 0;
+static atomic_long total = 0;
+
+void *worker(void *arg) {
+    for (int i = 0; i < NOPS; i++) local_count++;      /* no sharing, no lock */
+    atomic_fetch_add_explicit(&total, local_count, memory_order_relaxed);
+    return NULL;
+}
+```
+  Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run with 6 threads each doing 500000 increments (3,000,000 total), the printed total was exactly `3000000`.
+- The hot loop (`local_count++`) touches only thread-local memory, so there is no cache-line contention between threads at all during the busy work; the only shared-memory traffic is the one `atomic_fetch_add` per thread at the very end.
+- This is the pattern referenced in 10.04 and is directly applicable to validation-harness statistics: per-worker-thread IOPS/error counters that get summed once per reporting interval rather than incremented through a shared atomic on every single I/O completion.
+FOLLOW:
+- What if a thread never calls the final fold (e.g. it is cancelled mid-loop)? => That thread's partial count is lost from the shared total; a pthread cleanup handler (pthread_cleanup_push, see the C Advanced page's threads/cancellation material) or a periodic fold instead of an end-of-thread-only fold avoids this.
+- Does this scale better than a single global atomic counter under heavy contention? => Yes for the write side, since the global atomic version still has every thread hammering the same cache line on every increment (real hardware contention even though each op is individually atomic), while this version has zero cross-thread traffic until the final fold.
+PITFALL: Folding into the shared total inside the hot loop instead of once at the end, which silently reintroduces the exact contention this pattern exists to avoid.
+
+@@ 10.16 | Advanced | Concept | tags=lockfree,queue,library,mpmc
+Q: What does a real lock-free queue need beyond the CAS retry loops shown so far, and why does that push most engineers toward a library?
+SHORT: A production multi-producer/multi-consumer queue (e.g. Michael-and-Scott) needs concurrent enqueue-at-tail and dequeue-at-head handled by two CAS points kept consistent with each other, plus a reclamation scheme so a freed node cannot be read or reused (ABA) by a thread not yet done with it. Getting that right is a research-paper-sized problem, which is why a well-tested library beats hand-rolling one beyond a single counter or single-consumer ring buffer.
+DEEP:
+- The single-CAS stack in 10.13 works because there is exactly one point of contention (head); a queue with independent head and tail pointers needs both ends kept consistent under concurrent access, typically via a "dummy node" trick and a helper CAS that other threads can use to finish a half-completed enqueue they observe.
+- Reclamation is the harder half: hazard pointers (each thread publishes which nodes it is currently touching, so a reclaiming thread checks that list first) and epoch-based reclamation (defer frees until every thread has passed a synchronization point) are the two dominant real-world answers; both are nontrivial to implement correctly and are exactly what a mature library (e.g. a well-reviewed lock-free queue implementation, or a language runtime's concurrent collections) already gets right.
+- A single-producer/single-consumer (SPSC) ring buffer with a fixed-size array and two atomic indices (see the C Language page's Principal module for a plain-C ring buffer) is the one lock-free structure that is reasonable to hand-roll: no dynamic node allocation, no ABA risk, no reclamation problem, because the buffer's memory is never freed.
+- The practical guidance for a Principal-level interview: know how to reason about and even sketch a CAS-based structure (as 10.10-10.13 do), but state plainly that anything beyond a counter or an SPSC ring buffer in production code should go through a reviewed library rather than a hand-rolled one, because the failure modes (ABA, reclamation bugs) are subtle, rare, and expensive to debug.
+FOLLOW:
+- What is a reasonable line for "hand-roll it" vs "use a library" in an interview answer? => Counters, flags, and fixed-size SPSC ring buffers: fine to hand-roll. Anything with dynamic node allocation and more than one producer or more than one consumer: state you would reach for a proven library or a mutex-protected structure instead, and explain why.
+- Is a mutex-protected queue ever the better engineering choice over a lock-free one? => Often yes; if the queue is not the measured bottleneck, a plain mutex-and-condition-variable queue (module 5) is simpler, easier to review, and easier to get right, and premature lock-free optimization is a common source of hard-to-find bugs.
+PITFALL: Hand-rolling a general multi-producer/multi-consumer lock-free queue for a production system "because a counter version was easy." The queue case is a different, much harder problem than the counter case, specifically because of the two-ended contention and reclamation issues above.
+
+@@ 10.17 | Principal | Scenario | tags=design,decision,lockfree,library
+Q: As a Principal engineer, what is your decision framework for choosing a lock-free structure over a mutex?
+SHORT: Default to a mutex; only move to lock-free after profiling shows the lock itself is the measured bottleneck (not a guess), the critical section is short and the update fits a known safe shape (counter, SPSC ring buffer, or a well-reviewed library structure), and you can articulate the exact memory-order guarantees you need and verify them with a tool (module 15's ThreadSanitizer/helgrind), not just by testing on one CPU.
+DEEP:
+1. Measure first: use the actual workload's contention profile (perf lock stats, or simply timing with/without the lock) to confirm the mutex is the bottleneck, not memory allocation, I/O, or something else entirely.
+2. Prefer a narrower fix before a structural rewrite: shrink the critical section, split one lock into several (per-shard locking), or move to a per-thread-accumulate-then-fold pattern (10.04/10.15) before reaching for full lock-free code.
+3. If lock-free is still justified, prefer a known-safe shape (atomic counter, atomic flag, SPSC ring buffer) over a general MPMC structure; if a general structure is truly required, use a reviewed library rather than writing one (10.16).
+4. State explicitly which memory_order each operation needs and why (relaxed for pure counting, acquire/release for publishing a pointer, as in 10.12) -- an answer that just says "I'd use atomics" without naming the ordering is an incomplete answer at Principal level.
+5. Verify with ThreadSanitizer/helgrind (module 15) under realistic concurrent load before trusting it, because passing a single-architecture manual test (as 10.12 did) is not proof of correctness.
+FOLLOW:
+- What would make you reject a lock-free proposal from a teammate? => No profiling evidence the lock was actually the bottleneck, no stated memory-order reasoning, or a general dynamic-node MPMC structure with no reclamation plan and no sanitizer run.
+- How would you explain this trade-off to a non-concurrency-specialist reviewer? => "We only pay this extra complexity where we've measured it matters, and everywhere it does not, we keep the simple, obviously-correct mutex version."
+PITFALL: Treating "lock-free" as an engineering goal in itself rather than a targeted answer to a measured, specific bottleneck.
+
+@@ 10.18 | Principal | Debug | tags=review,redflags,lockfree
+Q: You are reviewing a teammate's hand-rolled lock-free data structure in an interview or a real code review. What are your top red flags?
+SHORT: No stated memory_order reasoning (everything defaulted to the plain, implicitly-seq_cst operators, or everything relaxed with no justification); a CAS retry loop with no plan for ABA on any structure that frees and reallocates nodes; a `free()` immediately after a successful pop with nothing preventing another thread from still dereferencing that node; and no test run under ThreadSanitizer or a stress harness with many threads, only "I ran it once and it worked."
+DEEP:
+- Look specifically for a compare-and-swap on a pointer immediately followed by `free()` of the old value, exactly like 10.13's pop(), with no accompanying hazard-pointer or epoch mechanism -- flag it as an ABA/use-after-free risk even if the reviewer's own quick test did not reproduce it, exactly as 10.13's writeup does not claim to have reproduced ABA.
+- Look for `memory_order_relaxed` used on a pointer publish (as in 10.12's naive version, if it had used atomics at all) where an `acquire`/`release` pair is actually required; relaxed ordering silently drops the guarantee that the pointee's writes are visible.
+- Ask "what happens if this loses the CAS race 1000 times in a row under real contention" -- a correct lock-free design should degrade to wasted retries, not to any incorrect result; if the answer is unclear, that is itself a red flag.
+- Ask what tool confirmed correctness. "It passed my manual test on my laptop" is not evidence for a concurrency bug; "it ran clean under ThreadSanitizer with N threads for M iterations" is a meaningfully stronger claim (module 15).
+FOLLOW:
+- Is a lock-free structure with no unit test for the contended path automatically wrong? => Not automatically wrong, but automatically unproven; treat it as unreviewed until it has been exercised under real concurrent load with a race detector.
+- What is an acceptable amount of hand-rolled lock-free code to approve without a library? => A counter or flag: yes. Anything with dynamic node lifetime and more than one contended access point: only with a clear reclamation story and sanitizer evidence, or a recommendation to use a library instead (10.16).
+PITFALL: Approving lock-free code because "the logic looks right" without checking for ABA, checking the exact memory orders used, or asking what tool verified it under contention.
+
+@@ 10.19 | Principal | Cross-layer | tags=design,firmware,stats,validation
+Q: Design a thread-safe statistics collector for a high-IOPS SSD validation harness where many worker threads each complete I/Os and need to report latency/error counts.
+SHORT: Give each worker thread its own thread-local histogram/counter set (10.04/10.15) updated with plain, unsynchronized increments on the hot completion path; fold each thread's data into one shared, mutex- or atomic-protected aggregate only on a slow-path timer (e.g. once per second) or at thread shutdown, never per-I/O. This removes contention from the part of the code that runs millions of times per second and puts the only synchronization on a path that runs a few times per second.
+DEEP:
+1. Hot path (per I/O completion, called at full IOPS rate): increment `_Thread_local` counters/histogram buckets only; no locks, no atomics, no shared-memory writes at all.
+2. Slow path (periodic, e.g. a dedicated reporting thread waking every second): each worker thread's slow-path code (or a signal/flag-driven check) folds its thread-local snapshot into a shared structure protected by one mutex, or via a set of `atomic_fetch_add` calls if the aggregate is just a handful of counters.
+3. For latency histograms specifically, keep the bucket boundaries fixed and thread-local, so folding is just an element-wise add across a fixed-size array under the mutex -- a short, bounded critical section even at fold time.
+4. If the harness needs a live, always-current total (not just periodic), that requirement should be weighed explicitly against the contention cost; a shared atomic per bucket (still relaxed ordering, since only atomicity of the add matters, per 10.10) is the next-cheapest option if periodic folding is not acceptable.
+5. Verify under real load with the sanitizer tooling from module 15, and confirm no I/O completion path ever calls `malloc()`, takes a lock, or otherwise risks the real-time concerns raised in module 11 for the hot path.
+FOLLOW:
+- Why not just use one shared atomic counter per statistic directly on the hot path? => At high IOPS with many worker threads, every thread would contend on the same cache line for every single completion; that is real, measurable hardware contention even though each individual atomic op is correct, exactly the cost this design avoids.
+- What if the harness needs per-I/O tracing, not just aggregate counts? => That is a different problem (a high-throughput logging pipeline, typically per-thread ring buffers flushed independently), not a fit for the aggregate-counter design described here.
+PITFALL: Building the "live always-current shared total" version by default because it sounds more correct, when the workload never actually needed sub-second freshness and paid unnecessary contention for it.
+
+@@ 10.20 | Principal | Trap | tags=benchmark,performance,assumption
+Q: Why can a "lock-free" version of a data structure end up slower than a well-tuned mutex-based one?
+SHORT: Lock-free correctness (10.03) says nothing about speed: CAS retries redo wasted work under contention, atomic ops still cost real cache-coherence traffic (a contended add is not free just because it never blocks), and lock-free code often has worse cache locality than a mutex briefly holding a batch of updates together. A short, rarely-contended critical section behind a mutex can beat lock-free code paying retry and cache-line-ping-pong costs every operation.
+DEEP:
+- Under low contention, an uncontended mutex lock/unlock (10.09) is already cheap; the "lock-free is always faster" belief mostly comes from generalizing the high-contention case, where locks do get expensive (blocking, context switches), to the common case, where they usually are not the bottleneck at all.
+- Cache-coherence cost is real for atomics too: every CAS or fetch_add that another core also touches generates the same cross-core cache-line traffic (MESI protocol invalidations) that a mutex's own internal atomic operations would generate; lock-free code does not opt out of this physics, it just avoids the *additional* kernel-blocking cost on top of it.
+- A mutex-protected structure can batch several logically-related updates under one lock acquisition; a lock-free structure built from independent CAS operations often cannot batch as naturally, trading one lock/unlock pair for several separate atomic operations, each with its own coherence cost.
+- The only way to know which is actually faster for a given workload and hardware is to benchmark both under the real contention profile expected in production, not to assume based on the "lock-free" label; 10.09's numbers are exactly the kind of hedged, order-of-magnitude figures to use as a starting point, not a substitute for measuring the real target system.
+FOLLOW:
+- Does this mean lock-free structures are rarely worth it? => Not rarely; under truly high contention with short operations they usually do win, especially by avoiding blocking/context-switch costs -- the trap is assuming that without checking the actual contention level first.
+- What is the single most reliable way to settle a "which is faster" question here? => A microbenchmark against the real (or realistically simulated) contention profile of the target workload, on the target hardware, not a general rule memorized from an article or an interview answer.
+PITFALL: Choosing lock-free code for a low-contention path "because it should be faster" without ever benchmarking it against the simpler mutex version on the actual target hardware and workload.

@@ -1,0 +1,559 @@
+# Module 2: Process Control: fork, exec, wait, signals
+
+@@ 2.01 | Basic | Concept | tags=fork,copy-on-write,return-value
+Q: What does fork() actually duplicate, and what does its return value tell each side?
+SHORT: fork() creates a new process that is an exact copy of the calling process's address space, fds, and most other attributes (POSIX fork.3p), duplicated lazily via copy-on-write rather than by an immediate physical copy. It returns twice: 0 to the new child, and the child's positive PID to the parent; -1 (with no child created) if it fails.
+DEEP:
+- Per POSIX, the child gets its own copy of the parent's file descriptors (each referring to the SAME underlying open file description as the parent's, module 12), its own copy of pending signals reset to empty, and a fresh, single thread even if the parent was multithreaded (2.10).
+- What is NOT copied or is reset: the child's PID and parent PID differ from the parent's; alarm/interval timers are reset; file locks held by the parent are not inherited; memory locks (mlock) are not inherited.
+- "Both processes shall continue to execute from the fork() function" (fork.3p) -- this is why the idiomatic pattern branches immediately on the return value, covered in 2.06.
+FOLLOW:
+- Does fork() copy threads too? => No; POSIX is explicit that "a process shall be created with a single thread" even if the parent had many (2.10 covers exactly this).
+- What if fork() fails? => It returns -1 to the parent, no child is created, and errno is set to EAGAIN (resource/process limits) or ENOMEM; nothing runs on the "child side" because there is no child.
+PITFALL: Forgetting that fork() returns in BOTH processes, and writing code that assumes only one return happens. Every fork() call needs an if/else (or equivalent) on the return value, in the same function, for both branches.
+VERIFY: POSIX.1-2017, fork() (fork.3p): the copy-on-write behavior for MAP_PRIVATE mappings and the address-space duplication are as quoted; some listed inherited/reset attributes are extensive and are summarized here, not reproduced in full.
+
+@@ 2.02 | Basic | Concept | tags=exec,image-replacement,fd-inheritance
+Q: What does exec() do to the calling process, and what survives across it?
+SHORT: The exec family replaces the calling process's entire image (code, data, heap, stack) with a new program's image in place -- same PID, but a fresh main() -- and never returns on success. Open file descriptors survive unless marked FD_CLOEXEC, and the process signal mask, current working directory, PID, and parent PID are all preserved; installed signal HANDLERS are reset to default (exec.3p).
+DEEP:
+- "There shall be no return from a successful exec, because the calling process image is overlaid by the new process image" (exec.3p) -- if execve()/execl() et al. DO return, that itself means failure (-1, errno set), which is why the idiomatic pattern (2.06) treats any return from exec() as an error path.
+- Explicitly inherited per POSIX: process ID, parent process ID, process group ID, real user/group IDs, current working directory, file mode creation mask, and the process signal mask (sigprocmask()) -- notably NOT the installed signal handlers themselves (those revert to SIG_DFL, except signals already set to SIG_IGN, which stay ignored).
+- File descriptors: "File descriptors open in the calling process image shall remain open in the new process image, except for those whose close-on-exec flag FD_CLOEXEC is set" -- this is the standard mechanism for deciding which fds a child inherits across an exec (module 12 uses this for pipe-based IPC setup).
+FOLLOW:
+- Why would a handler that was installed reset to default across exec but SIG_IGN survive? => POSIX special-cases SIG_IGN specifically so a parent that intentionally silenced a signal (e.g., to avoid it being disruptive) does not have that intent silently undone by exec; an installed catching function, by contrast, points at code that no longer exists after the image is replaced, so it cannot sensibly survive.
+- Does exec() change the process's memory address space layout? => Yes completely; text/data/BSS/heap/stack are all rebuilt fresh from the new executable, exactly as if that program had been started directly (see the C page, module 8, for what that layout looks like for a freshly started program).
+PITFALL: Assuming a signal handler installed before exec() will still be in effect in the new program image. Only the signal MASK (blocked/unblocked set) and SIG_IGN dispositions survive; actual catching functions do not, since the code they pointed to is gone.
+VERIFY: POSIX.1-2017, exec() (exec.3p): the exact inherited-attributes list quoted here is drawn directly from the DESCRIPTION section; the SIGCHLD SIG_IGN-across-exec case is explicitly called out as unspecified by the standard.
+
+@@ 2.03 | Basic | Concept | tags=zombie,orphan,wait
+Q: What is a zombie process, and what is an orphan, and how does wait()/waitpid() relate to each?
+SHORT: A zombie is a child that has terminated but whose exit status has not yet been collected by a wait()/waitpid() call from its parent -- it holds a minimal kernel-side entry (PID, exit status) until reaped. An orphan is a child whose ORIGINAL parent exited first; POSIX requires it be reassigned a new parent (an implementation-defined system process, module 2.12), so it can still eventually be reaped and does not become permanently unreapable.
+DEEP:
+- wait() and waitpid() are how a parent both learns a child's exit status AND releases that last bit of kernel bookkeeping (wait.3p); until that call happens, the terminated child stays a zombie, visible as state `Z` in tools like `ps`.
+- A process leaks zombies (module 2.17) specifically when it forks children, never calls wait()/waitpid() for them, and does not set SIGCHLD to SIG_IGN or SA_NOCLDWAIT (which, per sigaction.3p, tells the kernel not to transform terminating children into zombies at all).
+- Orphaning and zombie status are independent: an orphaned child that is still RUNNING is simply reparented and keeps running; a zombie that becomes orphaned (its original parent exited without reaping it) is reparented too, and the NEW parent (commonly PID 1 or a subreaper) is expected to reap it.
+FOLLOW:
+- Can a zombie process be killed with kill()/SIGKILL to free its resources faster? => No; a zombie has already terminated and holds essentially no killable resources beyond its exit-status entry -- only a wait()/waitpid() by its parent (or reparented parent) removes that entry.
+- Does every terminated child become a zombie, even briefly? => Normally yes, unless the parent has SIGCHLD set to SIG_IGN or SA_NOCLDWAIT (sigaction.3p), in which case POSIX says the child is not transformed into a zombie at all.
+PITFALL: Confusing "zombie" (terminated, unreaped) with "orphan" (parent gone, child possibly still alive). A process can be one, the other, both (an unreaped child whose parent also exited), or neither.
+VERIFY: POSIX.1-2017, wait()/waitpid() (wait.3p) and sigaction() (sigaction.3p, SA_NOCLDWAIT); the "implementation-defined system process" that adopts orphans (PID 1 on most Unix-likes, or a designated subreaper via prctl() on Linux) is implementation-defined by POSIX's own wording.
+
+@@ 2.04 | Intermediate | Concept | fig=forkmodel | tags=cow,address-space,fork
+Q: Immediately after fork() returns in both processes, what does the parent's and child's address space actually look like, and when does the "copy" in copy-on-write actually happen?
+SHORT: Both processes see the exact same virtual addresses mapping to what is, at that instant, literally the SAME physical pages, marked read-only and copy-on-write in both page tables; the moment either process writes to one of those pages, the kernel takes a page fault, allocates a new physical page for the WRITING process only, copies the old contents into it, and lets that one process's page table point at the new page -- the other process is unaffected and keeps seeing the original page.
+DEEP:
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/wait.h>
+
+int global_val = 100;
+
+int main(void) {
+    printf("before fork: pid=%d global_val=%d addr=%p\n", getpid(), global_val, (void *)&global_val);
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid == 0) {
+        global_val = 999;
+        printf("child:  pid=%d global_val=%d addr=%p\n", getpid(), global_val, (void *)&global_val);
+        fflush(stdout);
+        _exit(0);
+    } else {
+        int status;
+        waitpid(pid, &status, 0);
+        printf("parent: pid=%d global_val=%d addr=%p (unchanged)\n", getpid(), global_val, (void *)&global_val);
+    }
+    return 0;
+}
+```
+Compiled and run, this printed the SAME virtual address (`0x55...010`) for `global_val` in all three lines, but the value diverged the moment the child wrote to it: `child: ... global_val=999 ...` versus `parent: ... global_val=100 (unchanged) ...`. Same address, different physical page after the write -- exactly the copy-on-write fault firing once, only in the child, only for that one page.
+- This is why fork() is cheap even for a process with a large heap (1.05): nothing is actually copied at fork() time, only the page tables are set up to fault; pages that neither process ever writes to are never duplicated at all.
+FOLLOW:
+- What about MAP_SHARED mappings (module 13) across fork()? => Those are NOT copy-on-write; a write by either process is visible to the other, since MAP_SHARED means the underlying physical pages, not just the mapping, are shared.
+- Does this mean the child's stack is copy-on-write too? => Yes; the entire address space, including the child's copy of the parent's stack, heap, and data/BSS, is covered by the same copy-on-write mechanism -- there is nothing special-cased about any one segment.
+PITFALL: Believing fork() "copies the process," full stop, and therefore assuming a large parent process makes fork() itself proportionally slow. The copy is deferred per-page and often never happens at all for pages neither side writes; only the (much smaller) page-table setup cost is paid up front.
+VERIFY: POSIX.1-2017 fork() (fork.3p) requires the child to be "an exact copy" observationally, but leaves the copy-on-write mechanism itself as the (nearly universal) implementation technique, not a POSIX mandate.
+
+@@ 2.05 | Intermediate | Numeric | tags=fork,exec,cost
+Q: Given that fork() alone is cheap due to copy-on-write (2.04), why is fork()+exec() together usually cited as noticeably more expensive, and roughly what adds the cost?
+SHORT: exec() cannot rely on copy-on-write the way fork() does, because it discards the ENTIRE old address space and builds a brand-new one from the target binary -- loading the executable's headers, setting up fresh page tables, and (for a dynamically linked binary) running the dynamic linker to map and resolve shared libraries -- work fork() alone never has to do at all.
+DEEP:
+- 1.05 measured fork()+waitpid() alone at about 0.11 ms/iteration on one machine for a tiny process; adding an exec() of even a small static binary typically adds a comparable or larger amount again, and a dynamically linked binary with several shared-library dependencies (symbol resolution, relocations) can cost several times that -- these are order-of-magnitude, hedge-heavily numbers, not a benchmark result, since no exec() timing was actually measured here.
+- The classic optimization for "spawn many short-lived subprocesses" workloads is posix_spawn() (which can avoid a full fork() when the implementation supports vfork()-like semantics internally) or, more simply, keeping a small pool of already-exec'd worker processes alive and feeding them work over a pipe (module 12) instead of paying fork()+exec() per unit of work.
+- For an SSD validation harness specifically, the fork()+exec() cost matters most when a test invokes many short-lived external tools (a vendor CLI, a diagnostic utility) in a tight loop; if that loop dominates wall-clock time, batching or reusing a long-lived helper process is usually the fix, not micro-optimizing the fork() call itself.
+FOLLOW:
+- Does vfork() avoid the address-space-rebuild cost of exec()? => No; vfork() only optimizes away the fork() side (by not even setting up copy-on-write page tables, sharing the parent's address space until exec() or _exit()), it does nothing to reduce what exec() itself has to rebuild.
+- Is a statically linked binary meaningfully faster to exec() than a dynamically linked one? => Generally yes, since it skips the dynamic linker's symbol resolution work entirely, though it pays that cost back in a larger binary to read from disk; the actual crossover depends on the number of shared library dependencies involved.
+PITFALL: Quoting a specific fork()+exec() millisecond figure as if it were portable or standardized. No such number is measured here or specified by POSIX; treat any such figure, including ones from a specific benchmark, as machine- and workload-specific.
+VERIFY: No exec() timing was actually run for this question; the qualitative claim (exec rebuilds the address space and cannot use copy-on-write the way fork() does) follows directly from exec.3p's DESCRIPTION, but any specific ms figure should be re-measured on the target system before being cited as fact.
+
+@@ 2.06 | Intermediate | Scenario | tags=fork,exec,wait,pattern
+Q: What is the idiomatic fork()+exec()+wait() pattern for running an external program and getting its exit status?
+SHORT: fork(); in the child, call one of the exec family and treat any return from it as failure (since exec never returns on success); in the parent, waitpid() on the child's PID and decode the status with the WIF*/W* macros (wait.3p).
+DEEP:
+```c
+#include <stdio.h>
+#include <unistd.h>
+#include <sys/wait.h>
+
+int main(void) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        execl("/bin/echo", "echo", "hello-from-child", (char *)0);
+        perror("execl"); /* only reached if execl() itself failed */
+        _exit(127);
+    }
+    int status;
+    waitpid(pid, &status, 0);
+    if (WIFEXITED(status))
+        printf("parent: child exited with status %d\n", WEXITSTATUS(status));
+    return 0;
+}
+```
+Compiled and run, this printed `hello-from-child` (from the exec'd `/bin/echo`) followed by `parent: child exited with status 0`.
+- The `_exit(127)` after a failed exec (rather than `exit()`) matters in real code: it avoids flushing/duplicating any of the PARENT's buffered stdio state that fork() copied into the child (2.04's copy-on-write picture includes the stdio buffers), and 127 is the conventional shell-style "command not found/exec failed" status.
+- fork() itself is async-signal-safe (fork.3p RATIONALE); calling one of the exec family immediately afterward in the child, before touching much else, is exactly the pattern POSIX's own RATIONALE recommends for multithreaded parents (2.10) to minimize the window of undefined-safety operations.
+FOLLOW:
+- Why check `pid == 0` for the child branch rather than checking for a positive value? => POSIX guarantees exactly 0 in the child and the child's PID (always positive) in the parent, so branching on `== 0` is the unambiguous, standard-mandated test; `-1` (fork failure) falls through to neither branch's intended path and must be checked separately.
+- What if you need the child's stdout captured rather than inherited? => Set up a pipe and dup2() the write end onto fd 1 in the child before exec() (module 12); fds surviving exec() (2.02) is exactly what makes this work.
+PITFALL: Calling exit() instead of _exit() in the child after a failed exec(). exit() would flush and close stdio state the child inherited (via fork's copy-on-write, 2.04) from the parent, which can produce duplicated or unexpected output; _exit() skips all of that.
+VERIFY: POSIX.1-2017, exec() (exec.3p) return-value contract ("no return... on success") and wait()/waitpid() (wait.3p) for the WIFEXITED/WEXITSTATUS macros used to decode status.
+
+@@ 2.07 | Intermediate | Concept | tags=wait,status-macros,decode
+Q: How do you correctly decode a status value from wait()/waitpid() to tell "exited normally with code N" apart from "killed by signal N"?
+SHORT: Check WIFEXITED(status) first; if true, WEXITSTATUS(status) gives the low-order 8 bits the child passed to _exit()/exit() or returned from main(). Otherwise check WIFSIGNALED(status); if true, WTERMSIG(status) gives the signal number that killed it. Per POSIX, exactly one of WIFEXITED/WIFSIGNALED (or WIFSTOPPED with WUNTRACED) is true for a given status value; never treat the raw int as a shell-style exit code directly.
+DEEP:
+```c
+#include <stdio.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <signal.h>
+
+static const char *signame(int sig) {
+    switch (sig) {
+        case SIGKILL: return "SIGKILL";
+        case SIGTERM: return "SIGTERM";
+        case SIGSEGV: return "SIGSEGV";
+        case SIGINT:  return "SIGINT";
+        default:      return "?";
+    }
+}
+
+static void report(pid_t pid) {
+    int status;
+    waitpid(pid, &status, 0);
+    if (WIFEXITED(status))
+        printf("pid %d: exited normally, status=%d\n", pid, WEXITSTATUS(status));
+    else if (WIFSIGNALED(status))
+        printf("pid %d: killed by signal %d (%s)\n", pid, WTERMSIG(status), signame(WTERMSIG(status)));
+}
+
+int main(void) {
+    pid_t p1 = fork();
+    if (p1 == 0) _exit(42);
+    pid_t p2 = fork();
+    if (p2 == 0) { raise(SIGKILL); _exit(1); }
+    report(p1);
+    report(p2);
+    return 0;
+}
+```
+Compiled and run, this printed `pid <p1>: exited normally, status=42` and `pid <p2>: killed by signal 9 (SIGKILL)` -- the second child's `_exit(1)` was never reached because SIGKILL cannot be caught or ignored, terminating it immediately.
+FOLLOW:
+- Why is the raw status int not the same as the exit code? => The kernel packs the exit code, signal number, and flags (core-dumped, stopped/continued) into different bit ranges of one int; the WIF*/W* macros are the only portable way to unpack it, since the exact bit layout is unspecified by POSIX.
+- What does a shell's `$?` show for a signal-terminated command? => Conventionally 128+signal number (a shell convention, not a POSIX wait() guarantee); `$?` for the SIGKILL case above would typically show 137 (128+9) in a shell, even though `WTERMSIG(status)` itself is just 9.
+PITFALL: Passing the raw `status` int to code expecting a plain 0-255 exit code (e.g., comparing it directly to 0 for "success"). Always run it through WIFEXITED()/WEXITSTATUS() (or WIFSIGNALED()/WTERMSIG()) first.
+VERIFY: POSIX.1-2017, wait()/waitpid() (wait.3p): the WIFEXITED/WEXITSTATUS/WIFSIGNALED/WTERMSIG macro contracts are quoted directly from the DESCRIPTION section.
+
+@@ 2.08 | Intermediate | Trap | tags=zombie,sigchld,leak
+Q: If a process forks several children and never calls wait() or waitpid() on them, what state do they end up in, and can you see it directly?
+SHORT: Each child that has exited but not been reaped sits as a zombie (state `Z`) until the parent calls wait()/waitpid() (or exits itself, orphaning them for reparenting, 2.12) -- this is directly observable via `/proc/<pid>/stat`'s state field, and disappears the instant a WNOHANG wait loop reaps them.
+DEEP:
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <string.h>
+
+static void print_state(pid_t pid) {
+    char path[64], line[256];
+    snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+    FILE *f = fopen(path, "r");
+    if (!f) { printf("pid %d: /proc entry gone\n", pid); return; }
+    fgets(line, sizeof(line), f);
+    fclose(f);
+    char *rparen = strrchr(line, ')');
+    char state = rparen ? rparen[2] : '?';
+    printf("pid %d state=%c\n", pid, state);
+}
+
+int main(void) {
+    pid_t kids[3];
+    for (int i = 0; i < 3; i++) {
+        kids[i] = fork();
+        if (kids[i] == 0) _exit(0);
+    }
+    sleep(1);
+    printf("-- before reaping --\n");
+    for (int i = 0; i < 3; i++) print_state(kids[i]);
+    int status;
+    while (waitpid(-1, &status, WNOHANG) > 0) {}
+    printf("-- after waitpid(WNOHANG) loop --\n");
+    for (int i = 0; i < 3; i++) print_state(kids[i]);
+    return 0;
+}
+```
+Compiled and run, the `-- before reaping --` section printed `state=Z` for all three PIDs, and the `-- after waitpid(WNOHANG) loop --` section printed `/proc entry gone` for all three -- the zombie entries existed exactly as long as they were unreaped, confirmed directly rather than inferred.
+FOLLOW:
+- Why does `/proc/<pid>/stat`'s state field show `Z` specifically? => That is the Linux kernel's documented process-state character for a zombie (terminated, awaiting a parent's wait()); other characters (`R` running, `S` sleeping, `D` disk-wait) cover live processes.
+- Does setting SIGCHLD to SIG_IGN prevent zombies from forming at all? => Per POSIX (SA_NOCLDWAIT / SIG_IGN on SIGCHLD, sigaction.3p), yes -- terminating children are not transformed into zombies in that case, but then wait()/waitpid() also fails with ECHILD once there are no unwaited-for zombie children left to report, which changes how a supervisor loop (2.16) must be written.
+PITFALL: Believing zombies are a minor cosmetic issue ("they don't do anything"). Each one still consumes a PID and a kernel process-table slot until reaped; a long-running server that leaks zombies steadily can exhaust the system's PID space (module 2.17 walks through diagnosing exactly this).
+
+@@ 2.09 | Intermediate | Scenario | tags=waitpid,wnohang,nonblocking
+Q: How do you check on a child's status without blocking, for use inside an event loop that also has other work to do?
+SHORT: Call waitpid(pid, &status, WNOHANG); it returns 0 immediately if the child has not yet terminated (letting the loop go do other work and poll again later), or the child's PID with status filled in once it has, exactly like a blocking waitpid() otherwise.
+DEEP:
+```c
+#include <stdio.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <time.h>
+
+static void nap(long ms) {
+    struct timespec ts = { .tv_sec = ms / 1000, .tv_nsec = (ms % 1000) * 1000000L };
+    nanosleep(&ts, NULL);
+}
+
+int main(void) {
+    pid_t pid = fork();
+    if (pid == 0) { nap(300); _exit(7); }
+    int polls = 0;
+    for (;;) {
+        int status;
+        pid_t r = waitpid(pid, &status, WNOHANG);
+        if (r == 0) { polls++; nap(50); continue; }
+        printf("reaped after %d non-blocking WNOHANG polls, exit status=%d\n", polls, WEXITSTATUS(status));
+        break;
+    }
+    return 0;
+}
+```
+Compiled and run, this printed `reaped after 6 non-blocking WNOHANG polls, exit status=7` -- the loop polled roughly every 50 ms while the child slept 300 ms, doing (in a real event loop) other useful work between polls, then picked up the real exit status the instant it became available.
+FOLLOW:
+- Is polling with a sleep the only way to do this without blocking? => No, and it is the least efficient; a real event loop typically installs a SIGCHLD handler (2.15) or waits on a signalfd/self-pipe (module 12) so it is notified rather than having to poll on a timer.
+- What if you WNOHANG-poll a PID that is not actually your child? => waitpid() fails with ECHILD (wait.3p), the same error as for any nonexistent or already-reaped child.
+PITFALL: Busy-polling with WNOHANG in a tight loop with no sleep at all between calls. That turns "non-blocking" into "spinning," burning CPU for no benefit; always pace WNOHANG polls (a timer, an event-loop tick, or better, a SIGCHLD-driven wakeup).
+
+@@ 2.10 | Advanced | Cross-layer | fig=forkmodel | tags=fork,multithreaded,thread-count
+Q: If a multithreaded process calls fork(), what happens to its OTHER threads in the child, and can you observe this directly?
+SHORT: Per POSIX, "a process shall be created with a single thread" -- only the thread that CALLED fork() exists in the child; every other thread the parent had simply does not exist there, with no destructor, no cleanup handler, nothing. This is directly observable by comparing each process's live thread count right after the call.
+DEEP:
+```c
+#include <stdio.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <sys/wait.h>
+#include <string.h>
+
+void *bg_thread(void *arg) { (void)arg; for (;;) sleep(10); return NULL; }
+
+static void print_threads(const char *who) {
+    FILE *f = fopen("/proc/self/status", "r");
+    char line[128];
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "Threads:", 8) == 0) { printf("%-28s: %s", who, line); break; }
+    }
+    fclose(f);
+}
+
+int main(void) {
+    pthread_t t;
+    pthread_create(&t, NULL, bg_thread, NULL);
+    sleep(1);
+    print_threads("parent (before fork)");
+    pid_t pid = fork();
+    if (pid == 0) {
+        print_threads("child (after fork)");
+        fflush(stdout);
+        _exit(0);
+    }
+    waitpid(pid, NULL, 0);
+    print_threads("parent (after fork, still)");
+    return 0;
+}
+```
+Compiled and run, this printed `Threads: 2` for the parent both before and after the fork, but `Threads: 1` for the child -- the background thread the parent created never existed in the child at all, exactly as POSIX specifies.
+- This is precisely why POSIX's fork() RATIONALE warns that a resource (like a lock) held by a NON-forking thread is "never released in the child process because the thread whose job it is to release the resource does not exist in the child" -- module 2.11's pthread_atfork() exists specifically to work around this.
+FOLLOW:
+- Does the child's single surviving thread keep the SAME thread ID it had in the parent? => Yes, per POSIX; the calling thread's state (including, practically, its stack and TLS) is duplicated into the child exactly as the rest of the address space is, via the same copy-on-write mechanism (2.04).
+- Why is this dangerous specifically, not just "a fact to know"? => If any OTHER thread held a mutex when fork() happened, that mutex is now permanently locked in the child (no thread exists there to unlock it), and any malloc()/free() call in the child between fork() and exec() risks deadlocking on an internal allocator lock left held by a non-existent thread (module 2.18 covers the guidance this leads to).
+PITFALL: Calling anything beyond a small, async-signal-safe set of operations in a multithreaded process's child between fork() and exec(). Locks other threads held (mutexes inside malloc(), stdio, etc.) may be stuck locked forever in the child, since no thread exists there to release them.
+VERIFY: POSIX.1-2017 fork() (fork.3p): "A process shall be created with a single thread. If a multi-threaded process calls fork(), the new process shall contain a replica of the calling thread... the child process may only execute async-signal-safe operations until such time as one of the exec functions is called."
+
+@@ 2.11 | Advanced | Concept | tags=pthread_atfork,handlers,ordering
+Q: What does pthread_atfork() actually let you do about the 2.10 problem, and in what order do its handlers run?
+SHORT: pthread_atfork() registers three callbacks -- prepare (parent, before fork()), parent (parent, after fork()), and child (child, after fork()) -- so a library can lock its own mutexes in prepare and unlock them in parent/child, giving the child a consistent, unlocked view of that library's state despite 2.10's "only the calling thread survives" fact. Prepare handlers run in REVERSE registration order; parent/child handlers run in registration order.
+DEEP:
+```c
+#include <stdio.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <sys/wait.h>
+
+static void prepare(void)  { printf("prepare handler  (pid=%d)\n", getpid()); fflush(stdout); }
+static void parent_h(void) { printf("parent handler   (pid=%d)\n", getpid()); fflush(stdout); }
+static void child_h(void)  { printf("child handler    (pid=%d)\n", getpid()); fflush(stdout); }
+
+int main(void) {
+    pthread_atfork(prepare, parent_h, child_h);
+    printf("calling fork() (pid=%d)\n", getpid());
+    pid_t pid = fork();
+    if (pid == 0) { _exit(0); }
+    waitpid(pid, NULL, 0);
+    return 0;
+}
+```
+Compiled and run, this printed, in order: `calling fork() (pid=P)`, `prepare handler (pid=P)`, `child handler (pid=C)`, `parent handler (pid=P)` -- prepare ran before the fork actually split the process, and then EACH side ran its own designated handler with its own (correct) PID, exactly as POSIX describes.
+- The expected real usage (per POSIX's RATIONALE) is a multithreaded library supplying a prepare handler that locks all of the library's internal mutexes, and parent/child handlers that unlock them again -- so any thread inside that library at fork() time leaves the child (and parent) in a defined, unlocked state rather than 2.10's "maybe still locked by a thread that no longer exists."
+FOLLOW:
+- Can application code use pthread_atfork(), or is it only for library authors? => Both; POSIX frames it as protecting "multi-threaded libraries" specifically because application code often does not even know a library it calls is multithreaded internally, but any code with fork()-sensitive shared state can register handlers.
+- What if a child handler itself needs to call something that is not async-signal-safe? => POSIX flags this as unspecified/dangerous when fork() was called from a signal handler; outside that case, child handlers run as ordinary code in the (single-threaded) child, so ordinary library calls are fine there -- the async-signal-safety restriction (2.10) applies to code the CHILD runs on its own between fork() and exec(), not specifically to atfork handlers.
+PITFALL: Registering pthread_atfork() handlers but forgetting that the RATIONALE's whole point is to protect state a DIFFERENT thread might be modifying at the moment of fork(); if only the forking thread ever touches the relevant state, atfork handlers add complexity without fixing anything 2.10 didn't already handle safely.
+VERIFY: POSIX.1-2017, pthread_atfork() (pthread_atfork.3p): registration-order semantics ("parent and child fork handlers shall be called in the order in which they were established... prepare fork handlers shall be called in the opposite order") are quoted directly from the DESCRIPTION.
+
+@@ 2.12 | Advanced | Debug | tags=orphan,reparenting,getppid
+Q: If a parent exits before its child, what happens to the child's parent process ID, and can you confirm the reparenting actually happens rather than just assuming it?
+SHORT: POSIX requires that "if a parent process terminates without waiting for all of its child processes to terminate, the remaining child processes shall be assigned a new parent process ID corresponding to an implementation-defined system process" (wait.3p) -- calling getppid() again after the original parent is gone shows the new value directly.
+DEEP:
+```c
+#include <stdio.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <time.h>
+
+static void nap(long ms) {
+    struct timespec ts = { .tv_sec = ms / 1000, .tv_nsec = (ms % 1000) * 1000000L };
+    nanosleep(&ts, NULL);
+}
+
+int main(void) {
+    pid_t parent_pid = getpid();
+    pid_t pid = fork();
+    if (pid == 0) {
+        nap(50);
+        printf("child: pid=%d initial ppid=%d (parent's real pid)\n", getpid(), getppid());
+        fflush(stdout);
+        nap(500);
+        printf("child: after parent exited, ppid is now %d (was %d)\n", getppid(), parent_pid);
+        fflush(stdout);
+        _exit(0);
+    }
+    nap(200);
+    printf("parent: pid=%d exiting now without waiting for the child\n", getpid());
+    fflush(stdout);
+    _exit(0);
+}
+```
+Compiled and run, this printed the child's initial ppid matching the real parent's PID, then, 500 ms later (well after the parent's 200 ms nap and exit), `child: after parent exited, ppid is now 1 (was <parent_pid>)` -- reparented to PID 1 in this environment, confirmed by the child's own getppid() call rather than assumed from the spec text alone.
+FOLLOW:
+- Is the new parent always PID 1 ("init")? => Not necessarily; POSIX only says "an implementation-defined system process" -- on modern Linux, a process can designate itself a "child subreaper" (via prctl(), a Linux-specific mechanism outside POSIX) to adopt orphans in its own subtree instead of letting them go all the way to PID 1.
+- Does the orphaned child know or care that it was reparented? => Not unless it explicitly checks getppid() again; nothing about the child's own execution is disrupted, it simply now reports a different value from that call going forward.
+PITFALL: Writing cleanup logic that assumes a specific parent PID will always be reachable via getppid() for the life of a child process. A parent can exit at any time (deliberately or via a crash), reparenting the child out from under any such assumption.
+VERIFY: POSIX.1-2017, wait()/waitpid() (wait.3p) RATIONALE-adjacent text on reparenting; the specific new-parent process (PID 1 versus a subreaper) is implementation-defined by the standard's own wording, and the PID 1 result shown here reflects this run's environment, not a portable guarantee.
+
+@@ 2.13 | Advanced | Concept | tags=signal,disposition,default
+Q: What determines whether a given signal, delivered with no handler installed, terminates the process, is ignored, or does something else?
+SHORT: Every signal has a default disposition defined by POSIX -- most (SIGTERM, SIGINT, SIGSEGV, SIGKILL, SIGUSR1/2, and others) default to terminating the process; a couple (SIGCHLD, SIGURG) default to being ignored; some (SIGSTOP, SIGTSTP) default to stopping it. sigaction() (or signal()) can override the default with SIG_IGN, SIG_DFL, or a handler, except SIGKILL and SIGSTOP, which POSIX guarantees can never be caught, blocked, or ignored.
+DEEP:
+- The two signals every candidate should know cannot be overridden at all: SIGKILL (unconditional termination) and SIGSTOP (unconditional stop) -- sigaction.3p explicitly notes these "shall not be added to the signal mask... this restriction shall be enforced by the system without causing an error to be indicated," meaning an attempt to block/catch them silently has no effect rather than failing loudly.
+- SIGCHLD defaulting to "ignored" is specifically why a parent that never installs a SIGCHLD handler and never calls wait() still accumulates zombies (2.08) rather than the OS silently discarding terminated children -- "ignored" here means the SIGNAL delivery is a no-op, it does not mean terminated children are discarded, that requires the explicit SA_NOCLDWAIT/SIG_IGN mechanism (2.08).
+- A process's disposition table is inherited across fork() (fork.3p: same in parent and child) but partially reset across exec() (2.02: caught signals revert to default, SIG_IGN and the mask survive).
+FOLLOW:
+- Why can SIGKILL and SIGSTOP never be caught? => POSIX reserves them specifically so there is always a way for a supervising process (or a human at a terminal/job-control shell) to unconditionally stop or terminate a runaway process, regardless of what that process's own signal handling code does.
+- Does installing a handler for a signal change its default disposition for OTHER signals? => No; each signal's disposition is set independently via its own sigaction() call, keyed by signal number.
+PITFALL: Assuming a signal is always fatal (or always ignorable) without checking its actual documented default. SIGCHLD's default (ignored) surprises engineers coming from a "signals usually kill the process" mental model built from SIGTERM/SIGSEGV/SIGINT.
+VERIFY: POSIX.1-2017, sigaction() (sigaction.3p) for the SIGKILL/SIGSTOP masking restriction; the full per-signal default-disposition table itself lives in the <signal.h> "Signal Concepts" reference material, which is outside the specific man pages fetched for this page -- treat any specific signal's default not explicitly confirmed here as a VERIFY item against POSIX.1-2017 <signal.h>.
+
+@@ 2.14 | Advanced | Trap | tags=async-signal-safe,handler,malloc
+Q: Why is calling printf() or malloc() inside a signal handler dangerous, and what is the safe alternative pattern?
+SHORT: printf() and malloc() are not async-signal-safe -- POSIX says handler behavior is undefined if it calls a standard-library function outside the async-signal-safe list (sigaction.3p); a signal landing mid-call (possibly inside a lock that function holds) risks self-deadlock or corrupted state. The safe pattern: call only guaranteed-safe functions (write(), a few others) in the handler, and set a `volatile sig_atomic_t` flag for the rest of the program to act on afterward.
+DEEP:
+```c
+#include <stdio.h>
+#include <signal.h>
+#include <unistd.h>
+#include <string.h>
+
+static volatile sig_atomic_t flag = 0;
+
+static void handler(int sig) {
+    (void)sig;
+    const char msg[] = "handler: signal caught (async-signal-safe write(), no printf)\n";
+    write(1, msg, sizeof(msg) - 1);
+    flag = 1;
+}
+
+int main(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = handler;
+    sigaction(SIGUSR1, &sa, NULL);
+    raise(SIGUSR1);
+    printf("main: flag=%d after handler ran\n", flag);
+    return 0;
+}
+```
+Compiled and run, this printed the handler's write()-based message followed by `main: flag=1 after handler ran` -- the handler itself never touched printf(), malloc(), or any other non-safe function; all it did was an async-signal-safe write() and a plain assignment to a sig_atomic_t.
+- The actual danger with something like malloc() inside a handler: if the interrupted code was itself in the middle of a malloc()/free() call holding the allocator's internal lock, and the handler also calls malloc(), that thread deadlocks on its own lock -- self-deadlock, not a race with another thread.
+- POSIX's own guidance (sigaction.3p APPLICATION USAGE) is that even the FUNCTIONS ON THE SAFE LIST may still have effects worth caring about (they can modify errno, for instance) -- a careful handler that calls a safe function should save and restore errno if the interrupted code's own errno value matters.
+FOLLOW:
+- Is it ever acceptable to call malloc() from a signal handler? => Not portably; POSIX explicitly leaves this as undefined behavior outside a small safe-function list. In practice, allocator implementations vary in how badly this can go wrong, but relying on any particular allocator's leniency here is not portable code.
+- What's the minimum-viable pattern for "the handler needs to do real work"? => Set the flag (or write a byte to a self-pipe, module 12), and have the MAIN program's normal control flow (not the handler) check the flag and do the real work -- exactly the pattern this demo's `main()` follows by checking `flag` after `raise()` returns.
+PITFALL: Calling printf(), malloc(), or free() -- or any function that internally does -- from inside a signal handler "because it seemed to work in testing." Undefined behavior can appear to work reliably under light load and then deadlock or corrupt state under real contention.
+VERIFY: POSIX.1-2017, sigaction() (sigaction.3p) APPLICATION USAGE: "the behavior is undefined if the signal handler calls any function in the standard library other than one of the functions listed in the table above" -- the specific enumerated safe-function table itself lives in the <signal.h> reference material, outside the man pages fetched for this page; treat any claim about a SPECIFIC function's async-signal-safety not confirmed here as a VERIFY item against POSIX.1-2017's actual table.
+
+@@ 2.15 | Advanced | Scenario | tags=sigchld,wnohang,reap-loop
+Q: If several children can exit close together, is one SIGCHLD guaranteed per child, and how should a SIGCHLD handler reap all of them correctly?
+SHORT: No -- POSIX explicitly allows SIGCHLD deliveries to be coalesced (an implementation is not required to queue one per terminated child), so a correct handler must loop calling waitpid(-1, &status, WNOHANG) until it returns 0 (no more exited children right now), not just call it once per signal delivery.
+DEEP:
+```c
+#include <stdio.h>
+#include <unistd.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <string.h>
+#include <time.h>
+#include <errno.h>
+
+static volatile sig_atomic_t reaped = 0;
+
+static void sigchld_handler(int sig) {
+    (void)sig;
+    int status;
+    pid_t pid;
+    while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+        reaped++;
+    }
+}
+
+static void nap(long ms) {
+    struct timespec ts = { .tv_sec = ms / 1000, .tv_nsec = (ms % 1000) * 1000000L };
+    while (nanosleep(&ts, &ts) == -1 && errno == EINTR) { } /* resume across the SIGCHLD interruptions */
+}
+
+int main(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = sigchld_handler;
+    sigaction(SIGCHLD, &sa, NULL);
+    for (int i = 0; i < 5; i++) {
+        pid_t pid = fork();
+        if (pid == 0) { nap(50 * (i + 1)); _exit(i); }
+    }
+    nap(500);
+    printf("reaped=%d children via one SIGCHLD handler looping on WNOHANG (expected 5)\n", reaped);
+    return 0;
+}
+```
+Compiled and run, this printed `reaped=5 children via one SIGCHLD handler looping on WNOHANG (expected 5)`. Getting this right required a second fix beyond the reap loop itself: nanosleep() returns early (interrupted, EINTR) when a signal arrives during it, so main()'s own 500 ms wait had to retry with the REMAINING time (`nanosleep(&ts, &ts)` in a loop) -- without that, the very first SIGCHLD would cut main's wait short and the count would be read as 1 instead of 5.
+FOLLOW:
+- Why loop on WNOHANG instead of just calling waitpid(-1, &status, 0) once per handler invocation? => A blocking waitpid() inside a handler could stall if there happens to be no exited child left to report at that exact instant (a race with coalesced signals), and it does nothing to reap a SECOND child that also exited before this handler got a chance to run.
+- Does this mean SA_RESTART would have avoided the nanosleep()-interruption issue? => SA_RESTART affects whether an INTERRUPTIBLE function automatically resumes after a handler returns; nanosleep() specifically is not guaranteed to auto-restart even with SA_RESTART (it is a timed wait, not a simple blocking call), so the retry-with-remaining-time pattern shown here is the portable fix regardless.
+PITFALL: Writing a SIGCHLD handler that calls waitpid() exactly once and assuming that accounts for exactly one terminated child. Coalesced signal delivery means one SIGCHLD can correspond to zero, one, or several newly-exited children; only a WNOHANG loop reaps all of them correctly.
+VERIFY: POSIX.1-2017, wait.3p RATIONALE: "reliable queuing of all SIGCHLD signals... the system will run out of memory for the queue [eventually]... the guarantee cannot be made" -- i.e., POSIX deliberately does not promise one signal per child, which is exactly why the WNOHANG loop pattern is necessary rather than merely convenient.
+
+@@ 2.16 | Principal | Scenario | tags=supervisor,restart,sigterm,design
+Q: Design a minimal process supervisor: it starts a worker child, restarts it if it crashes, and shuts down the worker cleanly on its own SIGTERM. What are the moving parts?
+SHORT: A SIGTERM handler that only sets a `volatile sig_atomic_t` flag (2.14's safe pattern); a main loop that waitpid()s on the current worker, checks WIFSIGNALED() (2.07) to detect a crash versus a clean exit, forks a replacement worker on crash (unless the shutdown flag is set), and on shutdown sends SIGTERM to the current worker and waitpid()s for it once more before exiting.
+DEEP:
+```c
+#include <stdio.h>
+#include <unistd.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <string.h>
+#include <time.h>
+
+static volatile sig_atomic_t shutting_down = 0;
+static void on_term(int sig) { (void)sig; shutting_down = 1; }
+
+static void nap(long ms) {
+    struct timespec ts = { .tv_sec = ms / 1000, .tv_nsec = (ms % 1000) * 1000000L };
+    nanosleep(&ts, NULL);
+}
+
+static pid_t spawn_worker(int crash_after_ms) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        nap(crash_after_ms);
+        if (crash_after_ms < 1000) raise(SIGKILL); /* simulate a crash */
+        _exit(0);
+    }
+    return pid;
+}
+
+int main(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_term;
+    sigaction(SIGTERM, &sa, NULL);
+
+    int restarts = 0;
+    pid_t worker = spawn_worker(100);
+    while (!shutting_down && restarts < 2) {
+        int status;
+        pid_t r = waitpid(worker, &status, 0);
+        if (r == worker) {
+            if (WIFSIGNALED(status)) {
+                printf("supervisor: worker %d died on signal %d, restarting\n", worker, WTERMSIG(status));
+                restarts++;
+                worker = spawn_worker(restarts >= 2 ? 1500 : 100);
+            } else {
+                printf("supervisor: worker %d exited cleanly, done\n", worker);
+                return 0;
+            }
+        }
+    }
+    printf("supervisor: done restarting, shutting down last worker %d\n", worker);
+    kill(worker, SIGTERM);
+    waitpid(worker, NULL, 0);
+    printf("supervisor: clean shutdown complete\n");
+    return 0;
+}
+```
+Compiled and run, this printed two `worker <pid> died on signal 9, restarting` lines (the first two simulated crashes), then `done restarting, shutting down last worker <pid>` and `clean shutdown complete` -- the third worker was deliberately given a long sleep so the supervisor's own shutdown path (kill + waitpid) is what ends it, not a simulated crash.
+- The design generalizes directly: swap the fixed `restarts < 2` cap for a real policy (max restarts per time window, exponential backoff) and swap SIGTERM's handler for whatever the harness's real shutdown signal is; the fork/waitpid/WIFSIGNALED skeleton stays the same.
+FOLLOW:
+- Why does the supervisor's own SIGTERM handler only set a flag rather than directly killing the worker? => Because a signal handler must stay in the async-signal-safe set (2.14); actually sending SIGTERM to the worker and waitpid()ing for it involves work that is safer to do from the main loop's ordinary code once it observes the flag.
+- What happens if the supervisor itself is killed with SIGKILL (which it cannot catch, 2.13)? => The worker becomes an orphan and is reparented (2.12), left running with no supervisor; a production version of this design typically also arranges for the worker to notice its supervisor is gone (e.g., via a pipe that closes) and exit or re-attach, since SIGKILL on the supervisor cannot be intercepted to clean up first.
+PITFALL: Doing the actual cleanup (kill()+waitpid()) work directly inside the SIGTERM handler instead of setting a flag and doing it from the main loop. kill() and waitpid() are not on the guaranteed async-signal-safe list for arbitrary use inside a handler in every context, and mixing real supervisory logic into the handler makes the safe-flag pattern (2.14) pointless.
+
+@@ 2.17 | Principal | Debug | tags=zombie-leak,method,diagnosis
+Q: A long-running test harness process's PID table usage grows steadily over days until the system refuses to fork new processes. How do you confirm zombie accumulation is the cause, and what's the fix?
+SHORT: Run `ps -eo pid,ppid,stat,cmd` (or read `/proc/*/stat`, as in 2.08's demo) periodically and look for a growing count of `Z`-state entries all sharing the harness's PID as their parent; if that count tracks the growth in system-wide process usage, the fix is either an explicit WNOHANG reap loop (2.09/2.15) on a timer or SIGCHLD handler, or, if child exit STATUS is never needed, setting SIGCHLD's disposition so children are never turned into zombies at all (SA_NOCLDWAIT, 2.08).
+DEEP:
+1. **Confirm the symptom, not just the guess.** Count `Z`-state processes whose ppid matches the harness's PID, sampled over time (`watch -n 5 "ps -eo pid,ppid,stat | grep ' Z'"` or a small script); a steadily growing count that correlates with the harness's own fork() rate is strong evidence, versus a flat or bounded count which would point elsewhere (e.g., a real fd or memory leak instead).
+2. **Check whether the harness calls wait()/waitpid() for every child it forks, on every path.** A common real cause: an early-return or exception-like error path after fork() that skips the eventual waitpid() call for that specific child, so only the ERROR path leaks zombies while the happy path is fine -- this is why a symptom that appears only "sometimes" over days, rather than immediately, deserves checking every fork() call site, not just the main one.
+3. **Check the SIGCHLD disposition.** If a signal handler for SIGCHLD was added later (for the 2.15-style async reap pattern) but its WNOHANG loop has a bug (single waitpid() call instead of a loop, matching 2.15's exact pitfall) it can reap SOME children per signal but fall behind under bursty exits, looking like a slow leak rather than an obvious total failure.
+4. **Fix and verify.** After the fix, re-run the same `Z`-state count over the same duration and confirm it stays bounded near zero (occasional very-short-lived zombies between exit and reap are normal and not a leak) rather than merely "looking better" on a short manual test.
+- This is a direct extension of 2.08's confirmed demonstration (zombies are real, observable kernel state) applied as a debugging METHOD rather than a scripted illustration.
+FOLLOW:
+- Could this instead be an orphan/reparenting issue rather than a zombie leak? => Check the `ppid` column specifically: zombies reparented to PID 1 (or a subreaper) are usually fine, since init/systemd reaps its own adopted zombies; a leak specifically anchored on the HARNESS's own PID as parent, growing over time, points at the harness's own missing wait() calls.
+- Is there a way to make this fail loudly in testing rather than slowly in production? => Run the harness's test suite under a tight RLIMIT_NPROC (module 3, 3.14's technique) in CI, so a zombie/PID leak that would take days to matter in production causes an EAGAIN from fork() within minutes in CI instead.
+PITFALL: Fixing the one fork() call site you happen to be looking at and declaring the leak solved, without checking every OTHER fork() call site (including error/exception paths) in the same codebase for the same missing-wait() bug.
+
+@@ 2.18 | Principal | Concept | tags=fork,multithreaded,guidance
+Q: Given 2.10's "only the calling thread survives" fact and 2.11's atfork mechanism, what is the actual interview-level guidance for using fork() safely in a multithreaded process?
+SHORT: Fork and exec() as close together as possible in the child, doing essentially nothing else except the small async-signal-safe operations POSIX allows (fork.3p); if the child must do real work before exec() (or never execs), audit every call between fork() and that point for hidden locks (malloc(), stdio, any library with its own mutexes) some OTHER parent thread might have held at fork() time, and use pthread_atfork() to protect state your own code owns.
+DEEP:
+- The safest, most common real pattern (and the one 2.06's fork+exec+wait skeleton already follows): fork(), and in the child, call exec() essentially immediately. Since exec() replaces the entire image (2.02), whatever locks or partially-mutated state existed in the copied address space becomes irrelevant the instant exec() succeeds -- there is no window for those stuck locks to matter.
+- If the child CANNOT exec() (it needs to keep running as a forked worker doing real work in the same binary), then every library the child's code path touches between fork() and doing that work needs auditing: does it use pthread_atfork() itself to protect its own state (many libc allocators do, precisely for this reason), and if not, could the calling thread deadlock on a lock some other, now-nonexistent, parent thread held?
+- Concretely for a validation harness: forking off worker processes that then exec() a test binary is safe by construction (the exec() erases the risk); forking off a long-lived worker that stays in the SAME binary and calls into the same threaded libraries the parent used (a database client, a logging library, an allocator with per-thread arenas) is exactly the risky pattern that needs the pthread_atfork() audit, or should be redesigned to spawn true worker THREADS (module 3) inside one process instead of fork()ing a long-lived copy.
+FOLLOW:
+- Does calling fork() from a single-threaded program avoid all of this? => Yes entirely; 2.10's problem only exists because OTHER threads' state (locks, buffers) gets duplicated-but-orphaned in the child. A single-threaded parent has no other threads to leave anything inconsistent.
+- Is vfork() ever a reasonable way to sidestep this? => vfork() (module 2.05's mention) shares the parent's address space until exec()/_exit(), which is even MORE restrictive about what the child may safely do beforehand (it can corrupt the parent's own stack if misused), so it is not a general workaround, only a narrow optimization for the fork-then-immediately-exec() case.
+PITFALL: Treating "fork() in a multithreaded process" as simply "slower" or "a bit wasteful" rather than a genuine correctness hazard. The real risk is a silent, intermittent deadlock in the child from a lock some now-nonexistent thread held at fork() time, which reproduces rarely and is easy to misdiagnose as an unrelated hang.
+VERIFY: POSIX.1-2017, fork() (fork.3p) RATIONALE: "the child process may only execute async-signal-safe operations until such time as one of the exec functions is called" -- this is the normative basis for the "fork then exec immediately" guidance; the specific claim that many libc allocators use pthread_atfork() internally is a common implementation practice, not something POSIX itself mandates of allocators.

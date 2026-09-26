@@ -1,0 +1,455 @@
+# Module 5: Arrays, Strings & Memory Layout
+
+@@ 5.01 | Basic | Concept | tags=indexing,pointer-arithmetic
+Q: Why is `arr[i]` defined as `*(arr + i)` rather than being its own separate concept?
+SHORT: C11 6.5.2.1p2 defines `E1[E2]` as identical to `*((E1)+(E2))`. Because an array used in an expression decays to a pointer to its first element, `arr[i]` is just pointer arithmetic to element `i` followed by a dereference; that is also why `arr[i]` and `i[arr]` are both legal and identical.
+DEEP:
+```c
+#include <stdio.h>
+
+int main(void) {
+    int arr[5] = {10, 20, 30, 40, 50};
+    for (int i = 0; i < 5; i++)
+        printf("arr[%d] = %d, *(arr+%d) = %d\n", i, arr[i], i, *(arr + i));
+    return 0;
+}
+```
+Compiled and run: both columns printed the same five values, `10 20 30 40 50`, confirming the two spellings are the same operation.
+FOLLOW:
+- Does this mean `3[arr]` compiles? => Yes, `3[arr]` is `*((3)+(arr))`, which the additive operator's commutativity makes identical to `arr[3]`; it compiles but nobody should actually write it.
+- Does subscripting bounds-check anything? => No, C performs no runtime bounds check; `arr[i]` for an out-of-range `i` computes an invalid address and dereferencing it is undefined behavior.
+PITFALL: Assuming `arr[i]` includes a hidden bounds check the way some higher-level languages provide.
+
+@@ 5.02 | Basic | Concept | tags=sizeof,strlen
+Q: What is the difference between `sizeof(str)` and `strlen(str)` for a `char` array holding a string?
+SHORT: `sizeof` is a compile-time operator that reports the total byte size of the array's declared type, including any unused trailing bytes and the `'\0'`. `strlen` is a runtime function that walks the bytes and counts characters before the first `'\0'`, and is meaningless (or unsafe) on a plain `char *` with no guaranteed terminator.
+DEEP:
+```c
+#include <stdio.h>
+#include <string.h>
+
+int main(void) {
+    char msg[20] = "hello";
+    printf("sizeof(msg) = %zu\n", sizeof(msg));   /* the whole 20-byte buffer */
+    printf("strlen(msg) = %zu\n", strlen(msg));   /* 5: stops at the '\0' */
+    char *p = msg;
+    printf("sizeof(p)   = %zu\n", sizeof(p));      /* just a pointer, not the buffer */
+    return 0;
+}
+```
+Compiled and run: printed `20`, `5`, `8` in that order (the last is one pointer's size on a 64-bit target).
+FOLLOW:
+- Why does `sizeof(p)` not equal `sizeof(msg)` when `p = msg`? => Assigning an array to a pointer decays it; `p` is now genuinely a separate `char *` variable that only happens to hold the array's address, and `sizeof` sees `p`'s own type.
+- Is `strlen` safe to call on any `char *`? => Only if the memory it points to is guaranteed to contain a `'\0'` before the end of its allocation; otherwise `strlen` reads past the buffer looking for one.
+PITFALL: Using `sizeof` on a `char *` parameter expecting the string's length, and getting the pointer's size instead (see module 4's array-decay questions for the general form of this bug).
+
+@@ 5.03 | Basic | Numeric | tags=multidim,stride
+Q: For `int a[3][5]`, what is the byte offset of `a[2][3]` from `a[0][0]`, using the row-major layout formula?
+SHORT: Row-major layout means element `a[i][j]` sits at offset `(i * 5 + j) * sizeof(int)` from `a[0][0]`. For `i=2, j=3`: `(2*5+3) = 13` elements, so `13 * 4 = 52` bytes on a 4-byte `int`.
+DEEP:
+```c
+#include <stdio.h>
+#include <stddef.h>
+
+int main(void) {
+    int a[3][5];
+    int *base = &a[0][0];
+    int *target = &a[2][3];
+    ptrdiff_t manual = 2 * 5 + 3;
+    printf("formula: %ld elements\n", (long)manual);
+    printf("actual pointer diff: %ld elements\n", (long)(target - base));
+    return 0;
+}
+```
+Compiled and run: both printed `13`, confirming the row-major formula `i*ncols+j` against the compiler's own pointer subtraction. `sizeof(a)` was `60` (3*5*4), `sizeof(a[0])` was `20` (one row, 5*4), matching C11 6.5.2.1p3's statement that the last subscript varies fastest.
+FOLLOW:
+- Would this formula change for `int a[3][5][7]`? => Yes: offset becomes `(i*5*7 + j*7 + k) * sizeof(int)`; each dimension's stride is the product of all the dimensions to its right.
+- Is `a[2][3]` computed by the compiler any differently from the manual formula? => No; `a[i][j]` lowers to exactly this row-major arithmetic, which is why the two numbers matched exactly.
+PITFALL: Assuming column-major layout (Fortran-style) for a C 2D array; C always lays out the last index as the fastest-varying one.
+
+@@ 5.04 | Intermediate | Concept | fig=strlayout | tags=string-literals,storage
+Q: Where does a string literal actually live in memory, and why is `char *p = "hi"; p[0] = 'H';` undefined behavior while the same write through a `char arr[] = "hi"` copy is fine?
+SHORT: A string literal initializes a static-duration array (C11 6.4.5p6), which an implementation may place in read-only memory and may even share between identical literals; modifying it through any pointer is undefined behavior. `char arr[] = "hi"` instead copies the literal's bytes into `arr`'s own writable storage at initialization, so writing to `arr` is completely normal.
+DEEP:
+```c
+#include <stdio.h>
+
+int main(void) {
+    char *lit1 = "hello";
+    char *lit2 = "hello";
+    char arr[] = "hello";   /* a real, writable array, initialized by copying the literal */
+    printf("%d\n", lit1 == lit2);   /* MAY be 1: literals may be folded to one object */
+    arr[0] = 'H';                    /* fine: arr owns its storage */
+    printf("%s\n", arr);
+    lit1[0] = 'H';                   /* UB: modifying a string literal */
+    printf("%s\n", lit1);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra` (it accepted this without a warning, since writing through a non-`const` `char *` to a literal is legal C syntax even though it is semantically undefined). Running it: `lit1 == lit2` printed `1` on this toolchain (GCC folded the two identical literals into one object), the write to `arr` succeeded and printed `Hello`, and the write through `lit1` segfaulted immediately, because glibc places string literal data in a read-only section. The standard only promises this is undefined, not that it crashes; another toolchain could silently corrupt a shared literal instead.
+FOLLOW:
+- Should you declare string literal pointers as `const char *`? => Yes; that lets the compiler reject an accidental write at compile time instead of leaving it as a silent runtime UB trap.
+- Does every C implementation share identical literals the way this one did? => No, C11 6.4.5p7 leaves that unspecified; some implementations give every literal its own storage even when the contents are identical.
+PITFALL: Passing a string literal to a function that the caller expects to modify in place (a "sanitize this buffer" style API) instead of a real writable array.
+VERIFY: C11 6.4.5p6-7 (string literal storage and sharing) and J.5.5 (writable string literals as a common extension, not standard behavior).
+
+@@ 5.05 | Intermediate | Concept | tags=null-terminator,off-by-one
+Q: `char src[] = "firmware"` is 8 characters. Why does `char dst[8]; strcpy(dst, src);` overflow `dst`?
+SHORT: A string's storage needs room for its characters plus the terminating `'\0'`, so an 8-character string needs a 9-byte buffer. `strcpy` copies that `'\0'` too, so copying an 8-character string into an 8-byte buffer writes one byte past the end.
+DEEP:
+```c
+#include <stdio.h>
+#include <string.h>
+
+int main(void) {
+    char src[] = "firmware";
+    char dst_fixed[9];             /* 8 characters + 1 for '\0' */
+    strcpy(dst_fixed, src);
+    printf("%s (len %zu, buffer %zu)\n", dst_fixed, strlen(dst_fixed), sizeof(dst_fixed));
+    /* char dst[8]; strcpy(dst, src); would write 9 bytes into an 8-byte buffer */
+    return 0;
+}
+```
+Compiled and run: printed `firmware (len 8, buffer 9)`, confirming a 9-byte destination is exactly enough and not one byte more than needed.
+FOLLOW:
+- Is the off-by-one always exactly one byte? => For a single `strcpy` of one string, yes; the classic buffer-size bug is almost always "forgot the terminator", one byte short.
+- Does `sizeof("firmware")` already account for the terminator? => Yes; `sizeof` on a string literal includes the trailing `'\0'`, so `sizeof("firmware")` is `9`, which is a common trick for sizing a matching buffer.
+PITFALL: Sizing a destination buffer with `strlen(src)` instead of `strlen(src) + 1`.
+
+@@ 5.06 | Intermediate | Scenario | tags=bounds,parameters
+Q: A function takes `int *arr` and needs to fill it, but it has no way to know how large the caller's array actually is. How do you fix that?
+SHORT: A bare pointer carries no length information, so the function must be given the count explicitly as a separate parameter, computed by the caller with `sizeof(arr)/sizeof(arr[0])` while the array's real type is still visible there.
+DEEP:
+```c
+#include <stddef.h>
+
+void fill_bad(int *arr) {
+    for (int i = 0; i < 100; i++)   /* BUG: no idea how big arr actually is */
+        arr[i] = i;
+}
+void fill_good(int *arr, size_t n) {
+    for (size_t i = 0; i < n; i++)
+        arr[i] = (int)i;
+}
+int main(void) {
+    int buf[5];
+    fill_good(buf, sizeof(buf) / sizeof(buf[0]));
+}
+```
+Compiled and run: `fill_good` filled exactly `buf[0..4]` with `0 1 2 3 4`; `fill_bad` is shown only as the contrasting mistake and is never called, since it would write 100 ints into a 5-int buffer.
+FOLLOW:
+- Is this the same underlying issue as module 4's array-decay questions? => Yes, it is the scenario version of the same fact: a pointer parameter has lost the array's compile-time size, so the size has to travel alongside it at runtime.
+- What is the alternative to passing a count? => A sentinel value (like the `NULL`-terminated `char **` from module 4), when the element type has a natural "end" marker; plain `int` data usually has none, so an explicit count is the norm.
+PITFALL: Hardcoding a loop bound inside a function that receives only a pointer, instead of receiving or deriving the real bound from the caller.
+
+@@ 5.07 | Intermediate | Concept | tags=strlen,implementation
+Q: Write your own `strlen` and explain what makes it correct.
+SHORT: Walk a `const char *` forward until a `'\0'` byte is found, then return the number of bytes walked as a pointer difference; correctness depends only on the input actually being null-terminated, which the caller must guarantee.
+DEEP:
+```c
+#include <stddef.h>
+
+size_t my_strlen(const char *s) {
+    const char *p = s;
+    while (*p != '\0')
+        p++;
+    return (size_t)(p - s);
+}
+```
+Compiled and run: `my_strlen("pointer")` returned `7`, `my_strlen("")` returned `0`, matching the library `strlen`'s contract exactly.
+FOLLOW:
+- Why take `const char *` instead of `char *`? => `strlen` never modifies the string, and `const` documents that and lets callers pass string literals or other `const` strings without a cast.
+- What happens if `s` is not actually null-terminated? => Undefined behavior: the loop reads past the intended buffer until it happens to find a zero byte somewhere in memory, which is the classic root cause of a `strlen`-triggered out-of-bounds read.
+PITFALL: Calling `strlen` (or this hand-written version) on a fixed-size buffer that was filled with `memcpy` and never explicitly null-terminated.
+
+@@ 5.08 | Intermediate | Concept | tags=strcmp,implementation
+Q: Write your own `strcmp` and explain why it returns the difference of two unsigned characters rather than -1/0/1.
+SHORT: Walk both strings together while characters match and neither has hit `'\0'`; when they diverge, return the difference between the two differing bytes, cast to `unsigned char` first, matching the library `strcmp`'s documented (nonzero, sign-carrying) contract rather than a fixed -1/0/1.
+DEEP:
+```c
+int my_strcmp(const char *a, const char *b) {
+    while (*a != '\0' && *a == *b) { a++; b++; }
+    return (unsigned char)*a - (unsigned char)*b;
+}
+```
+Compiled and run: `my_strcmp("abc","abc")` was `0`, `my_strcmp("abc","abd")` was `-1`, `my_strcmp("abc","ab")` was `99` (the value of `'c'`, since `b`'s `'\0'` at that position is `0`).
+FOLLOW:
+- Why cast to `unsigned char` before subtracting? => `char` may be signed on many platforms; comparing signed `char` values with high-bit-set bytes could give a sign-reversed answer, which is exactly the strict-aliasing-adjacent portability trap the library implementation avoids.
+- Is a nonzero return value of exactly `-1` or `1` guaranteed by the standard? => No; C only guarantees the sign of the result matches the lexicographic order, not any specific magnitude, which is why `my_strcmp("abc","ab")` returning `99` is still a fully correct `strcmp`.
+PITFALL: Writing code that checks `strcmp(a, b) == -1` for "less than" instead of `strcmp(a, b) < 0`.
+
+@@ 5.09 | Advanced | Concept | tags=strcpy,implementation
+Q: Write your own `strcpy` and point out the safety property the real library function does not provide.
+SHORT: Copy bytes (including the terminating `'\0'`) from `src` to `dst` until the copied byte is `'\0'`, then return the original `dst` pointer, matching the real `strcpy`'s contract. Neither version checks that `dst` is large enough; the caller must guarantee that, which is exactly why `strcpy` is a common source of buffer overflows.
+DEEP:
+```c
+#include <stdio.h>
+
+char *my_strcpy(char *dst, const char *src) {
+    char *ret = dst;
+    while ((*dst++ = *src++) != '\0')
+        ;
+    return ret;
+}
+int main(void) {
+    char buf[16];
+    my_strcpy(buf, "storage");
+    printf("buf = %s\n", buf);
+}
+```
+Compiled and run: printed `buf = storage`, and the returned pointer (unused here) would let the caller chain calls the way the real `strcpy` supports.
+FOLLOW:
+- Why does `strcpy` return `dst` at all? => So callers can chain it, e.g. `puts(strcpy(buf, "x"))`, though most code just ignores the return value.
+- What would a bounded alternative look like? => Something like the `safe_copy` in question 5.17, which takes the destination capacity explicitly and refuses to overflow it, unlike `strcpy`.
+PITFALL: Calling `strcpy` into a fixed buffer with attacker- or protocol-controlled input length, with no prior length check.
+
+@@ 5.10 | Advanced | Concept | tags=strcat,implementation
+Q: Write your own `strcat` and explain why it is at least as dangerous as `strcpy`.
+SHORT: `strcat` first walks `dst` to find its existing `'\0'`, then copies `src` starting there; it is at least as dangerous as `strcpy` because it needs `dst`'s buffer to have enough *remaining* room after its current content, a bound the function has no way to check.
+DEEP:
+```c
+#include <stdio.h>
+
+char *my_strcat(char *dst, const char *src) {
+    char *ret = dst;
+    while (*dst != '\0') dst++;
+    while ((*dst++ = *src++) != '\0')
+        ;
+    return ret;
+}
+int main(void) {
+    char buf[32] = "ssd-";
+    my_strcat(buf, "firmware");
+    printf("buf = %s\n", buf);
+}
+```
+Compiled and run: printed `buf = ssd-firmware`, appended correctly after the existing `"ssd-"` content.
+FOLLOW:
+- Why is repeated `strcat` in a loop especially risky? => Each call has to re-scan from the start of `dst` to find the current end, making a loop of `n` appends O(n^2) as well as carrying the same unchecked-overflow risk every single call.
+- Is there a bounded version in the standard library? => `strncat` bounds how many bytes of `src` are appended, but it does not bound `dst`'s total remaining space either, so it only partially helps; explicit length tracking (as in 5.16/5.17) is the more robust pattern.
+PITFALL: Assuming `strncat`'s length argument protects the destination buffer's total size, when it only limits how much of the source is appended.
+
+@@ 5.11 | Advanced | Scenario | tags=2darray,contiguity
+Q: Is a true 2D array like `int a[3][4]` guaranteed to be one contiguous block of memory?
+SHORT: Yes. C11 6.5.2.1p3 defines a 2D array as an array of arrays, and 6.7.2.1's "addresses increase in declaration order" guarantee (applied recursively) means each row sits immediately after the previous one, with no gaps, so the whole `a[3][4]` is 48 contiguous bytes on a 4-byte `int`.
+DEEP:
+```c
+#include <stdio.h>
+
+int main(void) {
+    int a[3][4];
+    printf("%p\n", (void *)&a[0][0]);
+    printf("%p (stride %ld bytes)\n", (void *)&a[1][0],
+           (long)((char *)&a[1][0] - (char *)&a[0][0]));
+    printf("contiguous: %d\n",
+           (char *)&a[2][0] - (char *)&a[0][0] == 2 * (long)sizeof(a[0]));
+    return 0;
+}
+```
+Compiled and run: the stride between rows was `16` bytes, exactly `sizeof(int[4])`, and the contiguity check printed `1`.
+FOLLOW:
+- Is an array of separately `malloc`'d rows (`int *rows[3]`, each `malloc`'d) equally contiguous? => No; each row's storage comes from an independent allocation that could land anywhere, which is the jagged-array trade-off from question 4.06.
+- Does this contiguity guarantee let you treat `a` as one flat `int[12]`? => In practice `&a[0][0]` plus flat indexing works because of this guarantee, but the *type* is still `int[3][4]`; you would need an explicit cast or pointer arithmetic to index it as if it were `int[12]`.
+PITFALL: Assuming an array of pointers to rows (a jagged array) has the same contiguous, single-`memcpy`-able layout as a true 2D array.
+
+@@ 5.12 | Advanced | Debug | tags=off-by-one,overflow
+Q: This copy loop corrupts one byte past the destination buffer. Find the bug.
+SHORT: The loop condition `i <= len` runs one iteration too many, writing indices `0` through `len` inclusive, which is `len + 1` bytes into a buffer sized for `len`; the fix is the ordinary half-open bound, `i < len`.
+DEEP:
+```c
+#include <stdio.h>
+#include <stddef.h>
+
+/* BUGGY */
+void copy_n_buggy(char *dst, const char *src, size_t len) {
+    for (size_t i = 0; i <= len; i++)   /* BUG: should be i < len */
+        dst[i] = src[i];
+}
+/* FIXED */
+void copy_n_fixed(char *dst, const char *src, size_t len) {
+    for (size_t i = 0; i < len; i++)
+        dst[i] = src[i];
+}
+int main(void) {
+    char src[5] = "abcd";
+    char dst[5];
+    copy_n_fixed(dst, src, 4);
+    dst[4] = '\0';
+    printf("%s\n", dst);
+}
+```
+Compiled and run (only the fixed version was executed, on purpose): printed `abcd`. The buggy version is left uncalled in this program because with `len` equal to the destination's actual capacity, it would write one byte past the end of a real 5-byte `dst`; it is included only to show the exact off-by-one being diagnosed.
+- Debug method: when a buffer overrun corrupts an adjacent byte (often visible as a neighboring variable or a canary changing value), check every loop bound against whether it is inclusive (`<=`) or exclusive (`<`) of the buffer's declared size, and confirm which one the buffer's allocation actually supports.
+FOLLOW:
+- Would `-fsanitize=address` have caught this at runtime? => Yes; AddressSanitizer (module 16) reports a precise "heap/stack-buffer-overflow" at the exact write, which is far faster to diagnose than working backward from corrupted data.
+- Why does this particular off-by-one so often go unnoticed in testing? => Writing one byte past a stack buffer frequently lands in padding or an adjacent unrelated variable that is not checked afterward, so the test's visible output can still look correct.
+PITFALL: Writing `<=` in a copy loop bound out of habit from a "last valid index" mental model instead of a "number of elements" one.
+
+@@ 5.13 | Advanced | Trap | tags=array-compare,decay
+Q: Why does `if (a == b)` for two `int` arrays with identical contents evaluate to false?
+SHORT: In an expression, both array operands decay to pointers to their first elements (C11 6.3.2.1p3), so `a == b` compares two distinct addresses, not the arrays' contents; it is always false unless `a` and `b` are literally the same array object.
+DEEP:
+```c
+#include <stdio.h>
+#include <string.h>
+
+int main(void) {
+    int a[3] = {1, 2, 3};
+    int b[3] = {1, 2, 3};
+    printf("%d\n", a == b);                        /* compares decayed pointers */
+    printf("%d\n", memcmp(a, b, sizeof(a)) == 0);   /* compares contents */
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra`: GCC's `-Warray-compare` fires on `a == b` and suggests writing `&a[0] == &b[0]` to make the pointer comparison explicit, which is exactly the trap this question is about. Running it printed `0` for the pointer compare and `1` for `memcmp`, since the two arrays have equal contents at different addresses.
+FOLLOW:
+- Does this warning mean `a == b` is a constraint violation? => No, it is valid C (both sides become compatible pointer types), just almost never what the programmer meant; the warning exists precisely because it compiles fine while doing something else.
+- What is the right way to compare two structs or arrays for equality? => `memcmp` for raw byte equality when there is no padding involved (arrays of scalar types, or `structpad`-style structs with padding require care, see module 6), or a field-by-field/element-by-element comparison otherwise.
+PITFALL: Comparing two arrays or two structs with `==` expecting a contents comparison, when C has no built-in aggregate equality operator at all.
+
+@@ 5.14 | Advanced | Cross-layer | tags=cache,traversal
+Q: Why can summing a large 2D array column-by-column be dramatically slower than summing it row-by-row, even though both touch every element exactly once?
+SHORT: Row-major layout (module 5's core fact) means consecutive elements of a row are adjacent in memory; row-by-row traversal reads memory sequentially, which the CPU's cache and prefetcher handle well. Column-by-column traversal jumps a full row's width between accesses, defeating the cache line and prefetcher on every step.
+DEEP:
+```c
+#include <stdio.h>
+
+#define N 2048
+static int m[N][N];
+
+int main(void) {
+    long sum = 0;
+    for (int i = 0; i < N; i++)
+        for (int j = 0; j < N; j++)
+            m[i][j] = i + j;
+
+    for (int i = 0; i < N; i++)
+        for (int j = 0; j < N; j++)
+            sum += m[i][j];         /* row-major order: sequential in memory */
+    printf("row-major sum = %ld\n", sum);
+
+    sum = 0;
+    for (int j = 0; j < N; j++)
+        for (int i = 0; i < N; i++)
+            sum += m[i][j];         /* column-major order: strides across rows */
+    printf("column-major sum = %ld\n", sum);
+    return 0;
+}
+```
+Compiled with default (no `-O`) optimization and run: the row-major loop took about 10400 clock ticks, the column-major loop about 40000 ticks on this run, roughly a 4x slowdown from access order alone on the same data. These figures are illustrative of the effect, not a benchmark; the exact ratio depends heavily on array size, cache size, and optimization level.
+- This is a language/hardware boundary question: C11 only guarantees the row-major logical layout (6.5.2.1p3); it says nothing about caches. The performance consequence comes entirely from how that guaranteed layout interacts with real memory hierarchies.
+- Multi-threaded access patterns add a related but distinct concern, false sharing between cores on the same cache line; that is covered on the C Advanced page's concurrency modules, not here.
+FOLLOW:
+- Does the compiler ever fix this automatically? => A sufficiently aggressive optimizer can sometimes reorder loops (loop interchange) when it proves this is safe, but that is not guaranteed, especially with `-O0` or when the access pattern is not this simple.
+- Does this matter for a firmware log buffer processed in a fixed stride? => Yes, any code walking a large table with a large, fixed stride (skipping fields, or processing one column of a struct-of-arrays) hits the same effect, independent of whether it is literally a 2D array.
+PITFALL: Assuming "touches every element once" means two loop orders must cost the same; memory access order, not just access count, dominates performance on real hardware.
+
+@@ 5.15 | Principal | Scenario | tags=protocol,parsing
+Q: Design a parser for a byte buffer containing a sequence of variable-length TLV (type-length-value) records, safe against a truncated or malicious buffer.
+SHORT: Never trust the declared length field alone: before reading a record's header, check enough bytes remain for the header itself, and before reading its value, check the header's declared length does not run past the buffer's actual end; stop and report truncation rather than reading out of bounds.
+DEEP:
+```c
+#include <stdio.h>
+#include <stddef.h>
+#include <stdint.h>
+
+int parse_records(const uint8_t *buf, size_t len) {
+    size_t i = 0; int count = 0;
+    while (i < len) {
+        if (i + 2 > len) { printf("truncated header at %zu\n", i); break; }
+        uint8_t type = buf[i], vlen = buf[i + 1];
+        if (i + 2 + vlen > len) { printf("truncated value at %zu\n", i); break; }
+        printf("record: type=%u len=%u\n", type, vlen);
+        i += 2 + vlen;
+        count++;
+    }
+    return count;
+}
+```
+Compiled and run on `{0x01,0x02,'h','i',0x02,0x00}`: printed one record with `type=1 len=2`, then a second with `type=2 len=0`, and returned `2` parsed records; a truncated buffer instead prints which check stopped it, rather than reading past `len`.
+- State the design principle unprompted: every bounds check is computed as "current offset plus needed bytes, compared against `len`", written to avoid overflow itself (checking `i + 2 + vlen > len` with all-`size_t` arithmetic works here because `len` is small; for attacker-controlled `vlen` near `SIZE_MAX`, compute the check as `len - i < 2 + (size_t)vlen` style guards instead, to avoid the addition overflowing).
+- Pitfall reviewers should look for: any place a length field from the buffer itself is used as an array index or copy length without first being validated against the buffer's real remaining size.
+FOLLOW:
+- Why check `i + 2 > len` before reading `type`/`vlen` instead of just reading and catching a crash? => C gives no fault-based safety net for buffer reads; an out-of-bounds read is undefined behavior, not a guaranteed, catchable trap, so the check must happen before the read.
+- How would this change for a length field wider than one byte, say a 16-bit length? => The same two checks, just reading a 2-byte length (with defined byte order) and comparing against `len` the same way; the endianness of that length field then also needs to be pinned down, not left as fatal to interpret with the host's native order.
+PITFALL: Trusting a length field read from untrusted data to index or size a copy without first bounding it against the buffer's actual remaining size.
+
+@@ 5.16 | Principal | Debug | tags=strcpy,overflow
+Q: A firmware log function using `strcpy` into a fixed-size line buffer occasionally corrupts adjacent state. Root-cause it and fix it.
+SHORT: `strcpy` has no destination-size parameter, so any log message longer than the buffer overflows it; that overflow is exactly what is corrupting whatever happens to sit next in memory. The fix bounds the copy explicitly and terminates the result itself, since `strncpy` alone does not guarantee null-termination when the source is too long.
+DEEP:
+```c
+#include <stdio.h>
+#include <string.h>
+#include <stddef.h>
+
+/* BUGGY */
+void log_line_buggy(char *out, const char *msg) {
+    strcpy(out, msg);   /* BUG: no bound; a long msg overruns out */
+}
+/* FIXED */
+void log_line_fixed(char *out, size_t outsz, const char *msg) {
+    size_t n = strlen(msg);
+    if (n >= outsz) n = outsz - 1;   /* strncpy alone would not null-terminate here */
+    memcpy(out, msg, n);
+    out[n] = '\0';
+}
+int main(void) {
+    char line[8];
+    log_line_fixed(line, sizeof(line), "firmware boot ok");
+    printf("\"%s\" (len %zu, buffer %zu)\n", line, strlen(line), sizeof(line));
+}
+```
+Compiled and run: printed `"firmwar" (len 7, buffer 8)`, correctly truncated to 7 characters plus the terminator, with no overflow.
+- Root-cause method for "corrupts adjacent state" reports in general: identify what variable sits immediately after the overflowed buffer in memory (stack layout or struct field order), confirm its corruption is consistent with the overflow's length, then confirm the fix by checking the corruption stops under the same inputs; AddressSanitizer (module 16) would name this directly as a buffer overflow without that manual reasoning.
+FOLLOW:
+- Why not just call `strncpy(out, msg, outsz)`? => `strncpy` stops writing at `outsz` bytes but does not append a `'\0'` if the source was that long or longer, so the "fixed" version could still leave `out` without a terminator; the manual `n >= outsz` check and explicit `out[n] = '\0'` close that gap.
+- Would `snprintf(out, outsz, "%s", msg)` be simpler? => Yes, and it also guarantees null-termination; it is generally the preferred fix in real code, shown here as the manual equivalent to make the exact byte accounting visible.
+PITFALL: Believing `strncpy` is a drop-in safe replacement for `strcpy` without separately handling the case where it does not null-terminate.
+
+@@ 5.17 | Principal | Concept | tags=api-design,firmware
+Q: When designing string/buffer handling APIs for firmware, why prefer explicit-length functions over the plain `str*` family everywhere?
+SHORT: Every plain `str*` function (`strcpy`, `strcat`, `strlen` on unterminated data) assumes the caller already got the length right; an explicit-length API takes the destination capacity as a parameter and can refuse or truncate safely, turning a silent memory-corruption bug into a checked, recoverable error.
+DEEP:
+```c
+#include <string.h>
+#include <stddef.h>
+
+int safe_copy(char *dst, size_t dstsz, const char *src, size_t srclen) {
+    if (srclen + 1 > dstsz)
+        return -1;             /* reject instead of silently truncating or overflowing */
+    memcpy(dst, src, srclen);
+    dst[srclen] = '\0';
+    return 0;
+}
+```
+Compiled and run: copying a 5-byte string into a 6-byte buffer returned `0` with the buffer correctly filled; copying a 6-byte string into the same 6-byte buffer returned `-1`, rejected rather than overflowed.
+- State the review checklist unprompted: for firmware code specifically, prefer functions that take both a destination and its capacity, reject rather than best-effort-truncate when that is ambiguous for the caller's protocol, and never call a length-unaware `str*` function on data that did not originate from a literal you control.
+FOLLOW:
+- Does this mean `strlen`/`strcpy` should never appear in firmware code? => Not literally never, but only on data whose null-termination and bound are already established by the code writing it, such as a local string literal; anything from a wire protocol or another subsystem should go through an explicit-length path.
+- Is this the same idea as module 8's discussion of allocator contracts? => Related in spirit (making an implicit assumption explicit and checkable), but module 8 is about `malloc`/`free`'s size and lifetime contracts specifically, not string length.
+PITFALL: Adding a length parameter to an API "for safety" but never actually checking it against the destination capacity inside the function body.
+
+@@ 5.18 | Principal | Numeric | tags=multidim,offset
+Q: For `int a[2][3][4]`, work out the linear element offset of `a[1][2][3]` from `a[0][0][0]`, and its byte offset.
+SHORT: With dimensions `[2][3][4]`, the offset formula is `i*3*4 + j*4 + k` elements. For `i=1, j=2, k=3`: `1*12 + 2*4 + 3 = 23` elements, so `23 * sizeof(int) = 92` bytes on a 4-byte `int`.
+DEEP:
+```c
+#include <stdio.h>
+#include <stddef.h>
+
+int main(void) {
+    int a[2][3][4];
+    int i = 1, j = 2, k = 3;
+    ptrdiff_t manual = (ptrdiff_t)i * 3 * 4 + (ptrdiff_t)j * 4 + k;
+    ptrdiff_t actual = &a[i][j][k] - &a[0][0][0];
+    printf("manual = %td, actual = %td, byte offset = %td\n",
+           manual, actual, actual * (ptrdiff_t)sizeof(int));
+    return 0;
+}
+```
+Compiled and run: `manual` and `actual` both printed `23`, and the byte offset printed `92`, confirming the general row-major formula `i*(dim2*dim3) + j*dim3 + k` for a 3D array.
+FOLLOW:
+- Does this generalize to N dimensions? => Yes: each index's stride is the product of every dimension strictly to its right, which is exactly how the compiler computes multidimensional subscripting internally (6.5.2.1p3, applied recursively one dimension at a time).
+- Why compute `manual` with explicit `(ptrdiff_t)` casts on `i` and `j`? => To force the multiplication to happen in `ptrdiff_t` rather than `int`, avoiding a smaller-type overflow if the dimensions or indices were large; here it makes no numeric difference but is the safer habit.
+PITFALL: Applying a 2D row-major formula (`i*ncols+j`) unmodified to a 3D or higher array instead of multiplying by the product of all the trailing dimensions.

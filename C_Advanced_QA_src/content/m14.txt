@@ -1,0 +1,386 @@
+# Module 14: Interrupts, ISRs & Embedded Concurrency
+
+@@ 14.01 | Basic | Concept | tags=interruptcontext,isr,taskcontext
+Q: What is interrupt context, and how is it different from a normal thread's context?
+SHORT: Interrupt context is where an ISR runs when hardware signals the CPU; it has no process/thread of its own, often runs on a limited special stack, cannot be preempted by a lower-priority interrupt, and must never block or sleep. A normal thread runs in task context, has its own full stack, can be preempted and rescheduled, and can block on a mutex or I/O without harm.
+DEEP:
+- POSIX itself does not define interrupt handling at all; it is a hardware/embedded-OS concept below the API layer POSIX standardizes, so nothing here is a POSIX citation the way earlier modules are. Treat implementation-specific claims in this module as VERIFY against your actual RTOS or kernel's documentation.
+- The interrupted task's own context (registers, program counter) is saved by hardware/firmware before the ISR runs and restored afterward, so from the interrupted task's point of view it simply "lost some time," not that anything about its own state changed.
+- Because an ISR is not a schedulable entity, there is nothing to block it "into" -- if it called something that could sleep, there would be no scheduler decision that ever wakes it back up in the way a thread gets rescheduled; this is the root reason behind the "an ISR must never block" rule in 14.02.
+- The closest POSIX-level analog available for hands-on practice is a signal handler (grounded via sigaction.3p): it also runs asynchronously, interrupting whatever the process was doing, and has its own (smaller) list of things it may safely do. This module uses that analogy for compiled, runnable examples, always labeled as an analogy, not the real thing.
+FOLLOW:
+- Does every architecture even have a fully separate interrupt stack? => Many embedded targets do (a small, fixed interrupt stack distinct from any task's stack) precisely because task stacks are not guaranteed to have headroom for an ISR; whether a given platform does this is implementation-specific (VERIFY).
+- Can an ISR itself be interrupted by another, higher-priority interrupt? => Often yes, this is "nested interrupts," covered in 14.05 and 14.08; whether it is allowed and how priorities are enforced is hardware/config-specific.
+PITFALL: Treating "interrupt context" as just "a really high-priority thread." It is not a thread at all; the entire toolkit of blocking primitives (mutexes, sleep, blocking syscalls) that assumes a schedulable thread simply does not apply.
+
+@@ 14.02 | Basic | Concept | tags=isr,blocking,malloc,mutex
+Q: Why can an ISR never call malloc(), take a mutex, or make a blocking syscall?
+SHORT: All three can block or take unbounded time: malloc() may need to take an internal lock or extend the heap, a mutex lock can put the caller to sleep waiting for the owner to release it, and a blocking syscall waits for an event that only normal scheduling delivers. An ISR has no scheduler slot to be put to sleep in and often runs with interrupts masked, so if it blocks, nothing can ever unblock it -- in the worst case the whole system hangs, not just one thread.
+DEEP:
+- A subtler version of the mutex danger: if the ISR interrupts the very thread that currently holds that mutex, and the ISR tries to take it too, that specific pairing deadlocks immediately and permanently on many designs, since the thread that could release the mutex cannot run again until the ISR itself returns (see 14.11 and 14.18 for exactly this trap).
+- "Blocking" here also covers anything with unbounded or highly variable latency, not just an explicit wait: a malloc() that can trigger a page fault (module 13) or a call that can trigger disk I/O both introduce exactly the kind of latency an ISR must never have.
+- The fix pattern that recurs through this whole module is: do the absolute minimum non-blocking work in the ISR (read a status register, copy a fixed amount of data, set a flag or push a fixed-size record into a preallocated lock-free structure), and defer everything else to a bottom half that runs in normal, schedulable context where blocking is fine again (14.03).
+FOLLOW:
+- Is "the ISR only ever does O(1) work with no loops over unbounded data" a fair summary rule? => Close, but the real requirement is bounded, predictable latency with no possibility of sleeping; a fixed, small loop is fine, an unbounded one (e.g. draining a queue of arbitrary depth) is not.
+- What about printf() or similar logging calls inside an ISR? => Very commonly unsafe (may allocate, may take an internal stdio lock) and, per sigaction.3p's async-signal-safety framing (used here by analogy), your embedded environment's own documentation should be checked for exactly which calls its ISR context permits (VERIFY).
+PITFALL: Assuming "it worked in testing" proves an ISR's malloc()/mutex call is safe. The deadlock or block only manifests under the specific timing where the ISR fires while the resource is actually held/unavailable, which testing may simply not have hit yet.
+
+@@ 14.03 | Basic | Concept | fig=isrflow | tags=tophalf,bottomhalf,deferredwork
+Q: What is the top-half/bottom-half split, and why defer work out of the ISR at all?
+SHORT: The "top half" is the actual ISR: the minimal, non-blocking code that runs in interrupt context to acknowledge the hardware and capture just enough state (or data) to know what happened. The "bottom half" is the real processing, deferred to run later in ordinary, schedulable context (a worker thread, a kernel softirq/tasklet, or a signal-flag-polling loop), where it is free to block, allocate, and take as long as it needs.
+DEEP:
+- This split exists because interrupt context's constraints (14.02) are incompatible with most real processing work, but the hardware event still needs to be acknowledged quickly so the device can keep operating and so the CPU is not stuck with interrupts effectively masked for too long.
+- Different platforms name this differently: Linux calls it hardirq/softirq or tasklet; a bare-metal or RTOS design might just call it "ISR sets a flag, main loop polls it," which is exactly what 14.07's compiled example demonstrates. The concept (defer everything non-urgent out of interrupt context) is the constant; the exact mechanism name is platform-specific (VERIFY).
+- fig=isrflow shows this split visually: normal task execution interrupted by the ISR (top half, minimal work), which hands off to a deferred bottom half that runs later in normal context.
+- A completion queue in an SSD controller is a concrete, on-topic example: the top half acknowledges the interrupt and reads just enough of the completion entry to know a command finished; the bottom half does the protocol-level work of matching it to the original request, updating higher-level state, and invoking any callback (14.15 develops this scenario further).
+FOLLOW:
+- Does the bottom half always run in a different context (a separate thread) from the top half? => Not necessarily; some designs run the bottom half on the same execution context slightly later (e.g. right before returning from interrupt handling but with interrupts re-enabled), while others hand it to a fully separate worker thread/task -- which one depends heavily on the OS/RTOS (VERIFY).
+- If the bottom half is slow, can it starve the top half from being serviced again in time? => Yes if they compete for the same resource (e.g. the CPU, or a lock the top half also needs); this is a real design tension, not just a naming exercise.
+PITFALL: Treating the split as "ISR does the hard part fast, main loop does the easy part slow." It is the opposite framing that matters: the ISR does whatever part MUST be non-blocking, regardless of how conceptually simple or complex that part is; everything else moves to the bottom half.
+
+@@ 14.04 | Intermediate | Concept | tags=disableinterrupts,mutex,locking
+Q: Disabling interrupts and taking a lock both "protect a critical section" -- what problem does each one actually solve, and why is disabling interrupts not just "a faster mutex"?
+SHORT: A mutex protects a critical section against other threads the scheduler could run interleaved; disabling interrupts protects specifically against an ISR preempting code on that same CPU, which a mutex cannot do since an ISR is not a thread and never participates in mutex-based scheduling. They solve distinct problems, and on multi-core hardware disabling interrupts on one CPU does not stop a thread running concurrently on another.
+DEEP:
+- Because an ISR cannot take a (blocking) mutex safely (14.02), the only tool task-context code has to keep an ISR out of a shared data structure is to disable the specific interrupt (or all interrupts) for the duration of the critical section, then re-enable them.
+- This is exactly the pattern in 14.12/14.13: mask the signal (the userspace analog of disabling that specific interrupt) around the shared-data update, rather than trying to protect it with a mutex the "ISR" side could never safely take anyway.
+- On a genuine multi-core/multi-CPU embedded system, protecting data shared between an ISR and task-context code that can run on another core simultaneously typically needs both: disable interrupts on the local core (to stop the local ISR) and take a spinlock (to stop the other core's task or ISR) -- a combined primitive often named something like "spinlock with IRQ save" in a given kernel/RTOS. Treat the exact primitive name and its guarantees as platform-specific (VERIFY).
+- Disabling interrupts for too long has its own cost: it directly increases interrupt latency for every other interrupt source on that CPU, which matters a great deal in a real-time system (module 11) -- it is a blunt, systemwide tool, not a cheap, scoped one.
+FOLLOW:
+- If a thread disables interrupts and then tries to take a mutex that is currently held by another thread, what happens? => On most designs this is itself a bug: with interrupts disabled, the scheduler generally cannot run anything else on that CPU (including whatever thread would release the mutex), so the wait may never end; the two tools are meant to be used for different, not nested, purposes.
+- Is "disable interrupts" the same operation regardless of which interrupt you care about? => No; you can typically disable one specific interrupt line/source or mask all interrupts globally, and the scope you choose changes both the safety guarantee and the latency cost to unrelated interrupts.
+PITFALL: Reaching for "just disable interrupts" as a general-purpose lock between two ordinary threads. It solves the ISR-vs-task problem specifically; using it as a substitute for a real mutex between two schedulable threads is both unnecessary and, on multi-core hardware, not even sufficient.
+
+@@ 14.05 | Intermediate | Concept | tags=reentrancy,nestedinterrupts
+Q: What does reentrancy mean for an ISR, and what is the difference between an ISR interrupting itself versus a higher-priority ISR nesting into a lower-priority one?
+SHORT: An ISR is reentrant if it can be safely re-entered while an earlier invocation has not finished; the same interrupt line typically cannot interrupt its own running handler (the controller usually masks that line meanwhile), but a different, higher-priority interrupt commonly can preempt a lower-priority ISR mid-execution -- "nested interrupts." ISR code must be safe for that nesting case even when safe from re-entering itself.
+DEEP:
+- The usual hardware behavior (masking the source interrupt line while its own handler runs) is what typically prevents true self-reentrancy of the exact same ISR; but this is a hardware/controller configuration detail, not a universal law, so treat it as VERIFY for a specific platform rather than assumed.
+- Nested interrupts mean an ISR's own critical assumptions ("nothing else touches this register/variable while I'm running") can be false if a higher-priority ISR that touches the same state fires partway through -- this is a genuine, and easy to overlook, concurrency hazard purely between two pieces of interrupt-context code, with no thread involved at all.
+- Any shared static/global state an ISR touches needs the same discipline as shared state between an ISR and task context (14.04): either structure the access so it cannot be torn by a higher-priority nested interrupt, or explicitly mask that higher-priority source for the duration if the platform allows it (at a real latency cost to that other interrupt).
+FOLLOW:
+- Does a userspace POSIX signal handler have an equivalent nested-invocation concern? => Yes in spirit: sigaction.3p describes how the sa_mask field adds signals to the mask during the handler's execution specifically to control which other signals can interrupt it, which is the userspace analog of interrupt priority masking.
+- If nested interrupts are allowed, does the stack depth become a real concern? => Yes, especially on a small embedded interrupt stack; deeply nested interrupts consume that limited stack, which is one practical reason some platforms limit nesting depth or disallow it for certain interrupt classes (VERIFY for a given platform).
+PITFALL: Assuming an ISR is safe from concurrent access to its own state just because "only this ISR touches this variable." If a higher-priority interrupt's handler touches the same state, that assumption is false regardless of how the code looks.
+
+@@ 14.06 | Intermediate | Cross-layer | tags=signalhandler,asyncsignalsafe,sigaction
+Q: How is a POSIX signal handler the closest userspace analog to interrupt context, and what does "async-signal-safe" actually mean?
+SHORT: A signal handler, like an ISR, runs asynchronously, interrupts whatever the thread was doing, and can only safely call a restricted set of functions -- POSIX calls that set "async-signal-safe." sigaction.3p's APPLICATION USAGE says calling an unsafe function from an asynchronous handler, or touching a static object other than `volatile sig_atomic_t`, is undefined behavior, mirroring the "no malloc, no blocking" discipline an ISR needs.
+DEEP:
+- Direct quote worth internalizing: "if such a call fails, the value of errno is unspecified" and, more importantly, sigaction.3p states the behavior is undefined "if the signal handler calls any function in the standard library other than one of the functions listed in the table above or refers to any object with static storage duration other than by assigning a value to a static storage duration variable of type volatile sig_atomic_t" for a signal not raised by abort()/kill()/raise().
+- This is why every compiled example in this module that uses a signal handler as an ISR stand-in restricts the handler itself to touching only `volatile sig_atomic_t` flags/counters (14.07, 14.12, 14.13) -- that is the one thing POSIX explicitly names as always safe for this purpose.
+- The analogy has real limits, made explicit in 14.19: a POSIX signal is scheduled and delivered by the kernel to a thread, with real, variable context-switch cost, and can be coalesced (multiple pending occurrences of a non-realtime signal collapse into one delivery) -- a real bare-metal or RTOS interrupt vector is a different, typically lower-latency and non-coalescing mechanism. Use the analogy for the discipline it teaches, not as a latency model.
+FOLLOW:
+- Is sigaction.3p's async-signal-safe function list the same list a real embedded ISR is allowed to call? => No, they are different environments entirely (POSIX process/signal semantics versus bare-metal/RTOS interrupt semantics); the *shape* of the restriction (no blocking, minimal safe operations) is the useful parallel, not the literal function list.
+- Why does the handler in 14.07 only ever touch a flag, never the "real" data? => Because that flag is the only thing guaranteed safe to touch per sigaction.3p's rule above; the real data handling happens in the bottom half, in normal context, exactly per the top-half/bottom-half pattern in 14.03.
+PITFALL: Treating async-signal-safety as a POSIX curiosity irrelevant to embedded work. It is the closest grounded, testable analog available for the exact discipline ("minimal, safe operations only, no blocking") that a real ISR needs, even though the underlying mechanisms differ.
+
+@@ 14.07 | Intermediate | Concept | tags=tophalf,bottomhalf,sigatomic
+Q: Show a real, compiled top-half/bottom-half pattern using a POSIX signal handler as the ISR stand-in.
+SHORT: The signal handler (top half) does nothing but set a `volatile sig_atomic_t` flag; the main loop (bottom half, ordinary schedulable context) polls that flag and does all the real work, exactly the discipline sigaction.3p requires and an ISR needs.
+DEEP:
+- SIGALRM fires repeatedly via setitimer(); each delivery is the "interrupt." The handler is intentionally trivial.
+```c
+#define _POSIX_C_SOURCE 200809L
+#include <stdio.h>
+#include <signal.h>
+#include <string.h>
+#include <sys/time.h>
+#include <time.h>
+
+static volatile sig_atomic_t irq_pending = 0;
+static volatile sig_atomic_t total_irqs = 0;
+
+static void top_half(int sig) {
+    (void)sig;
+    irq_pending = 1;     /* async-signal-safe: only touches sig_atomic_t */
+    total_irqs++;
+}
+
+int main(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = top_half;
+    sigaction(SIGALRM, &sa, NULL);
+
+    struct itimerval it;
+    memset(&it, 0, sizeof it);
+    it.it_interval.tv_usec = 20000;  /* fire every 20ms */
+    it.it_value.tv_usec = 20000;
+    setitimer(ITIMER_REAL, &it, NULL);
+
+    int serviced = 0;
+    while (serviced < 5) {
+        if (irq_pending) {
+            irq_pending = 0;
+            serviced++;
+            printf("bottom half: servicing irq #%d (deferred work here)\n", serviced);
+        }
+        struct timespec ts = {0, 2000000L};
+        nanosleep(&ts, NULL);
+    }
+    struct itimerval off;
+    memset(&off, 0, sizeof off);
+    setitimer(ITIMER_REAL, &off, NULL);
+    printf("total irqs delivered: %d, serviced: %d\n", (int)total_irqs, serviced);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run, this printed 5 "bottom half: servicing irq #N" lines followed by `total irqs delivered: 5, serviced: 5` -- every delivered signal was picked up and serviced by the polling loop, with the handler itself doing only a flag set.
+FOLLOW:
+- Why is `total_irqs` also incremented in the handler instead of the main loop? => It has to be, to accurately count deliveries even if the main loop is momentarily busy with `printf()`'s own work between polls; it is still just a `sig_atomic_t` increment, which stays within the safe set.
+- What would break if `irq_pending` were a plain `int` instead of `volatile sig_atomic_t`? => The compiler could legally cache the main loop's read of it in a register across iterations and never observe the handler's write; this ties directly to the volatile discussion in the C page's module 7 and is exactly 14.09's trap.
+PITFALL: Putting real work (even something as "small" as a `printf()`) inside the handler itself instead of the main loop. It defeats the entire point of the split and risks calling something not async-signal-safe from interrupt-like context.
+
+@@ 14.08 | Intermediate | Concept | tags=priority,nestedinterrupts,race
+Q: How do interrupt priority levels create a race between an ISR and the task it interrupted, distinct from the reentrancy question in 14.05?
+SHORT: When a higher-priority interrupt fires while a task (or lower-priority ISR) is mid-update on shared data, it can observe or modify that data in a state never meant to be visible -- the same "torn update" hazard as any data race, just triggered by priority preemption instead of thread scheduling. The fix is the same family of tools as elsewhere: mask the relevant interrupt (or priority level) for the duration of the update.
+DEEP:
+- This is functionally identical to 14.04's disable-interrupts-vs-lock framing, but stated from the "priority level" angle common in RTOS documentation: many embedded platforms let you mask "all interrupts at this priority or below" rather than only a single named interrupt line, which is a coarser but sometimes simpler tool.
+- 14.13 demonstrates exactly this class of bug directly: a shared two-field struct torn between a main-loop write and a signal-handler ("ISR") write landing in the middle of it, with real, observed corruption counted and reported.
+- The fact that this can happen purely between task code and one ISR, with no other thread anywhere in the picture, is often the detail that surprises engineers coming from a pure multi-threaded background: "single-threaded" embedded code can still have a genuine, classic data race, because interrupts are a second, independent source of concurrent execution on the same core.
+FOLLOW:
+- Is this specific race preventable purely by making the shared variable `_Atomic`? => For a single-word value on a platform where the compiler generates a truly atomic load/store for it, that can help; for a multi-field struct like 14.13's, a single atomic operation cannot cover both fields together, so masking (or a lock-free design built for that exact case) is still needed.
+- Does raising the task's own priority prevent this? => No; the hazard is about the interrupt preempting the CPU regardless of what priority the interrupted task code is running at (task priority and interrupt priority are typically separate mechanisms) -- only masking the relevant interrupt (or disabling interrupts generally) stops the preemption itself.
+PITFALL: Assuming "this code only runs in one thread, so there's no race here" for code that is also touched by an ISR. Interrupt preemption is concurrency too, just without a second thread in the traditional sense.
+
+@@ 14.09 | Intermediate | Trap | tags=volatile,sigatomic,flag
+Q: What goes wrong if the flag shared between an ISR (or signal handler) and the main loop is a plain int instead of volatile sig_atomic_t, and why doesn't a mutex fix it?
+SHORT: A plain (non-volatile) `int` gives the compiler license to cache the main loop's read of it in a register and never re-check memory, so the loop can spin forever even though the handler already updated it in actual memory -- this is a compiler-reordering/caching bug, not a data race the hardware creates, and a mutex does not touch it at all because the ISR side can never safely take a mutex (14.02) in the first place.
+DEEP:
+- This is the module 7 volatile lesson (from the C Language page) landing at its sharpest: volatile's actual guarantee is that every access happens, in order, exactly as the abstract machine specifies; without it, the compiler is free to prove (correctly, under the as-if rule, since it does not know about asynchronous handler execution) that the loop never writes the variable, so it never needs to re-read it.
+- `sig_atomic_t` adds the second half of the guarantee this specific case needs: a data type for which a read or write, by itself, is guaranteed not to be interrupted partway through by a asynchronous signal delivery -- exactly what a flag touched by both a handler and the main line of execution needs, on top of volatile's compiler-ordering guarantee.
+- A mutex is the wrong tool category entirely here, not just an insufficient one: even if you ignored 14.02's rule and somehow made the ISR side "work" with a mutex, a mutex protects against other schedulable contention, not against the compiler's freedom to cache a plain variable's value across a loop with no visible write in that loop's own code.
+FOLLOW:
+- Would marking the variable `_Atomic` instead of `volatile sig_atomic_t` also work? => For this specific "flag set by a handler, polled by a loop" pattern, yes in effect (atomics also prevent this kind of caching and add real ordering guarantees); `volatile sig_atomic_t` is the traditionally POSIX-sanctioned minimum for signal-handler-shared data specifically (sigaction.3p), while `_Atomic` is the more general, and stronger, C11 tool (module 7).
+- If the flag is declared volatile but is a plain `int` rather than `sig_atomic_t`, is that enough? => volatile alone fixes the compiler-caching half of the problem, but sig_atomic_t's own guarantee (that access to it cannot itself be torn by an interrupt/signal) is a separate property; on most common platforms a plain int read/write happens to be atomic too, but that is not something POSIX or C promises for an arbitrary int the way it does for sig_atomic_t.
+PITFALL: "Fixing" a hung polling loop by adding a mutex around the flag check. It does not address the actual cause (compiler caching of a non-volatile read) and, if applied to the handler side too, reintroduces the exact blocking-in-interrupt-context danger from 14.02.
+
+@@ 14.10 | Advanced | Concept | tags=isrsync,sharedstate,lockfree
+Q: Since an ISR cannot safely take a mutex, what tools actually exist for protecting data shared between an ISR and task-context code?
+SHORT: The task-context side can disable the relevant interrupt (or all interrupts) around its own critical section (14.04); the ISR side, since it cannot block, generally needs either a lock-free structure sized and designed for exactly this producer/consumer shape (a fixed-size ring buffer with atomic or carefully ordered index updates), or must itself be the only thing touching that data with the task side excluded via the same interrupt-disable mechanism during its own access.
+DEEP:
+- A single-producer/single-consumer (SPSC) lock-free ring buffer, where only the ISR ever writes the head index and only the task ever writes the tail index, is a common, well-understood pattern for exactly this ISR-to-task handoff, because each side only needs to atomically publish its own index and read the other's -- no mutual exclusion between the two is required at all if the buffer is sized correctly and the indices are handled with the right memory ordering.
+- This is precisely the design 14.16/14.17 develop for a real firmware handoff scenario; the memory-ordering half of "handled with the right ordering" ties directly back to module 7's acquire/release discussion, applied here across an ISR/task boundary instead of a thread/thread one.
+- On a real multi-core system, "disable interrupts on this core" only ever protects against this core's own ISR; a spinlock (potentially combined with local interrupt disabling) is still needed against a different core's task or ISR touching the same data (14.04) -- treat the exact combined primitive as platform/kernel-specific (VERIFY).
+FOLLOW:
+- Can the task side use a full mutex around its own access, even though the ISR side cannot? => Yes for excluding OTHER threads from that same critical section, but it does nothing to exclude the ISR itself; the task side still needs to separately disable the relevant interrupt if the ISR also touches that data, on top of any mutex used against other threads.
+- Is a lock-free ring buffer always the right answer? => Only when the producer/consumer shape actually fits (one ISR producer, one task consumer, bounded fixed-size records); a more complex sharing pattern may need a different, still non-blocking-for-the-ISR-side design, and hand-rolling one is exactly the kind of thing module 10's "know when to stop and use a library" guidance applies to.
+PITFALL: Assuming any "atomic" data type magically makes ISR-shared access safe regardless of shape. Atomicity of a single field does not compose into correctness for a multi-field structure or a queue's full head/tail/wraparound logic without deliberate design.
+
+@@ 14.11 | Advanced | Cross-layer | tags=deadlock,spinlock,interruptcontext
+Q: What happens if task code holds a spinlock and gets interrupted by an ISR that tries to take that same spinlock?
+SHORT: On a single core, this deadlocks immediately and permanently with an ordinary (non-IRQ-aware) spinlock: the task holding the lock cannot run again to release it until the ISR returns, but the ISR is spinning forever waiting for a lock only the now-preempted task can release. The standard fix on real kernels is an IRQ-safe locking primitive that disables interrupts on the local core as part of taking the lock, so the scenario cannot arise in the first place.
+DEEP:
+- This is a direct interrupt-context instance of the deadlock module's necessary conditions (module 8): here, "mutual exclusion" and "no preemption of the lock holder in a way that lets it release" combine in a single-core-specific way that a pure multi-thread deadlock analysis does not usually have to consider.
+- The Linux kernel's own answer to exactly this is the family of "spinlock with IRQ save" primitives (which disable local interrupts for the duration of holding the lock, specifically to prevent this pairing); treat the exact API and guarantees as kernel-version/platform documentation, since this is well outside POSIX (VERIFY).
+- On a multi-core system this same bug can also occur across cores even with IRQ-safe locking done correctly on the core taking the interrupt, if the *other* core is the one legitimately holding the lock for a normal, bounded duration -- that case is not a bug, just ordinary contention, since the lock holder on the other core is still runnable and will release it; the dangerous case is specifically same-core ISR-vs-self-preempted-task.
+FOLLOW:
+- Would using a mutex instead of a spinlock make this better or worse? => Worse in one sense (14.02: the ISR should never even attempt a blocking mutex in the first place) and moot in another (the scenario as posed assumes the ISR tries to take the same lock the task holds, which is exactly the situation 14.02's rule exists to prevent).
+- Is this the same bug as 14.18's "wrapped the ISR's shared-data access in pthread_mutex_lock" trap? => Closely related in spirit (both are "the ISR tried to take a lock it should never take"), but 14.18 is about a mutex specifically (always wrong for the reasons in 14.02); this question is about a spinlock, which has a correct IRQ-safe variant on real systems, unlike a blocking mutex.
+PITFALL: Assuming "spinlocks don't block, so they must be safe for an ISR to use." A plain spinlock is non-blocking in the sense of not sleeping, but it can still spin forever against a lock holder that preemption has made unable to ever release it -- safety requires the IRQ-aware variant, not just "not a mutex."
+
+@@ 14.12 | Advanced | Concept | tags=sigprocmask,criticalsection,masking
+Q: Show real code that protects a task-side critical section from a signal-handler "ISR" by masking the signal, the userspace analog of disabling that interrupt.
+SHORT: sigprocmask(SIG_BLOCK, ...) around the critical section prevents the handler from running at all until sigprocmask(SIG_SETMASK, ...) restores the previous mask -- the direct userspace analog of disabling a specific interrupt line around a task-context critical section (14.04).
+DEEP:
+- This is the fixed counterpart to 14.13's broken version; both share the same shared struct and handler, differing only in whether the main loop masks the signal around its own two-statement update.
+```c
+#define _POSIX_C_SOURCE 200809L
+#include <stdio.h>
+#include <signal.h>
+#include <string.h>
+#include <sys/time.h>
+#include <time.h>
+
+struct pair { long hi; long lo; };
+static volatile struct pair g = {0, 0};
+static volatile sig_atomic_t tears_seen = 0;
+static volatile sig_atomic_t fires = 0;
+
+static void isr(int sig) { (void)sig; fires++; g.hi = -1; g.lo = -1; }
+
+int main(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = isr;
+    sigaction(SIGALRM, &sa, NULL);
+    struct itimerval it;
+    memset(&it, 0, sizeof it);
+    it.it_interval.tv_usec = 50;
+    it.it_value.tv_usec = 50;
+    setitimer(ITIMER_REAL, &it, NULL);
+
+    sigset_t alarm_set, old_set;
+    sigemptyset(&alarm_set);
+    sigaddset(&alarm_set, SIGALRM);
+
+    time_t start = time(NULL);
+    long i = 0;
+    while (time(NULL) - start < 1) {
+        sigprocmask(SIG_BLOCK, &alarm_set, &old_set);  /* "disable this interrupt" */
+        g.hi = i;
+        g.lo = i;
+        if (g.hi != g.lo) tears_seen++;
+        sigprocmask(SIG_SETMASK, &old_set, NULL);      /* re-enable */
+        i++;
+    }
+    struct itimerval off;
+    memset(&off, 0, sizeof off);
+    setitimer(ITIMER_REAL, &off, NULL);
+    printf("fixed version: %ld iterations, %d isr fires, %ld torn pairs observed\n",
+           i, (int)fires, (long)tears_seen);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run three times, this printed e.g. `fixed version: 1138066 iterations, 11102 isr fires, 0 torn pairs observed` each time -- thousands of real handler firings, zero torn pairs, confirming the masking actually closes the window rather than the race simply not triggering.
+FOLLOW:
+- Why re-check `g.hi != g.lo` inside the masked section at all, if it can never be torn there? => It is the same check as the broken version specifically so the two programs are otherwise identical, isolating the fix to the one thing that changed: the masking.
+- Does sigprocmask() itself block if a signal is already pending when you try to block it? => No; sigprocmask() only changes which signals are blocked going forward, it does not wait for anything, which is exactly why it is safe to call from ordinary task-context code without introducing a new blocking risk.
+PITFALL: Forgetting to restore the mask with SIG_SETMASK (or blocking the signal permanently by mistake). The masked window must be as short as the actual critical section; leaving signals blocked longer than necessary delays real interrupt-equivalent handling unnecessarily.
+
+@@ 14.13 | Advanced | Debug | tags=race,torn,sigalrm
+Q: Demonstrate, with real compiled output, the actual data corruption from NOT masking the signal around a shared two-field update.
+SHORT: Without masking, a signal ("ISR") that fires between the main loop's two writes to a shared struct's two fields can leave one field holding the handler's value and the other the main loop's, a torn pair -- and running the broken version repeatedly shows this really happening thousands of times per second, not just in theory.
+DEEP:
+- The struct has two fields, `hi` and `lo`, which a correct writer always keeps equal; the handler sets both to -1. If the handler lands between the main loop's `g.hi = i;` and `g.lo = i;`, the final state after the handler returns and the main loop finishes its own second write is `hi = -1` (the handler's, never overwritten again this iteration) and `lo = i` (the main loop's) -- a directly observable, persistent mismatch, not a value that "heals itself."
+```c
+#define _POSIX_C_SOURCE 200809L
+#include <stdio.h>
+#include <signal.h>
+#include <string.h>
+#include <sys/time.h>
+#include <time.h>
+
+struct pair { long hi; long lo; };
+static volatile struct pair g = {0, 0};
+static volatile sig_atomic_t tears_seen = 0;
+static volatile sig_atomic_t fires = 0;
+
+static void isr(int sig) { (void)sig; fires++; g.hi = -1; g.lo = -1; }
+
+int main(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = isr;
+    sigaction(SIGALRM, &sa, NULL);
+    struct itimerval it;
+    memset(&it, 0, sizeof it);
+    it.it_interval.tv_usec = 50;
+    it.it_value.tv_usec = 50;
+    setitimer(ITIMER_REAL, &it, NULL);
+
+    time_t start = time(NULL);
+    long i = 0;
+    while (time(NULL) - start < 1) {
+        g.hi = i;             /* NOT masked: isr() can land right here */
+        g.lo = i;
+        if (g.hi != g.lo) tears_seen++;
+        i++;
+    }
+    struct itimerval off;
+    memset(&off, 0, sizeof off);
+    setitimer(ITIMER_REAL, &off, NULL);
+    printf("broken version: %ld iterations, %d isr fires, %ld torn pairs observed\n",
+           i, (int)fires, (long)tears_seen);
+    return 0;
+}
+```
+Compiled and run three times, this printed real, nonzero torn-pair counts every time: `213730891 iterations, 15080 isr fires, 5924 torn pairs`, `379439699 iterations, 19743 isr fires, 7862 torn pairs`, and `308048622 iterations, 19671 isr fires, 7559 torn pairs` -- a substantial fraction of every isr firing actually landed in the vulnerable window and produced a torn pair. 14.12's masked version, same struct and handler, showed zero torn pairs across thousands of firings.
+FOLLOW:
+- Why does roughly a third of isr firings produce a tear here, rather than a rarer fraction? => The vulnerable window (between the two main-loop writes) and the timer period were deliberately sized close enough together in this demo to make the race easy to observe reliably; a real ISR/task pairing's actual odds depend entirely on its own relative timing, which is exactly why "it hasn't happened yet" is not evidence of safety (14.02, 15.05).
+- Does this same bug and fix generalize to a real embedded ISR, not just a POSIX signal? => Yes, the underlying mechanism (an asynchronous handler landing mid-update on shared multi-field state) is the same class of bug a real ISR can cause; the specific masking call differs by platform, but the "mask the interrupt around the critical section" fix is the same shape (VERIFY the exact API for a given RTOS/kernel).
+PITFALL: Concluding from a single clean run that the race does not exist. This demo's own numbers show it firing on a large fraction of interrupts once conditions are right; a differently-timed system could show it far more rarely while still being just as broken.
+
+@@ 14.14 | Advanced | Concept | tags=latency,realtime,minimalisr
+Q: Why does "do the minimum in the ISR" matter for real-time behavior, beyond just avoiding blocking calls?
+SHORT: Every extra instruction executed inside an ISR directly adds to that interrupt's own latency and, because interrupts are often masked at or below the firing interrupt's priority while it runs, also adds to the latency of every other interrupt at that priority or below trying to fire during that window -- a long ISR does not just slow itself down, it can push back an unrelated interrupt's deadline (module 11's real-time framing applies directly here).
+DEEP:
+- This is a systemwide latency-budget problem, not a local one: in a real-time system with a hard deadline on some other interrupt-driven event, a needlessly long ISR anywhere in the priority chain above or equal to it is a direct threat to that deadline, even if the long ISR's own device has no deadline pressure at all.
+- The top-half/bottom-half split (14.03) is the primary tool for keeping ISR execution time both short and, more importantly, roughly constant/bounded regardless of how much total work resulted from the interrupt -- variable-length work belongs in the bottom half specifically so the ISR's own duration stays predictable.
+- "Minimal" is relative to the platform: what counts as an acceptably short ISR on a fast, deeply-pipelined core with a small interrupt controller overhead is different from a slower embedded core; there is no universal instruction-count budget, only "as short as the real-time budget for this system's other interrupts requires" (VERIFY against the actual system's deadline analysis).
+FOLLOW:
+- Does this mean an ISR should never do a for loop at all? => A short, fixed-bound loop (a known small number of iterations, e.g. draining exactly N hardware FIFO entries) is fine; the concern is unbounded or data-dependent iteration count, not loops themselves.
+- How would you actually measure a given ISR's real execution time on hardware? => Commonly with a hardware trace/profiling tool or a GPIO toggled at ISR entry/exit observed on a scope/logic analyzer; this is hardware- and toolchain-specific and outside what this POSIX-grounded page can specify (VERIFY).
+PITFALL: Optimizing an ISR's average-case execution time while ignoring its worst case. Real-time budgets care about the worst case that could ever occur, not the common case.
+
+@@ 14.15 | Advanced | Scenario | tags=nvme,completion,firmware
+Q: For an SSD controller's host-interface interrupt (a command completion), what belongs in the ISR versus the deferred bottom half?
+SHORT: The ISR (top half) should do only what is time-critical and bounded: acknowledge the interrupt at the controller, read the minimal completion-entry data needed to identify what finished, and hand that fixed-size record off (e.g. into a lock-free queue per 14.10). Everything else -- matching the completion to the original outstanding command, updating higher-level state, invoking any registered callback, and any logging -- belongs in the bottom half, running in normal, schedulable context.
+DEEP:
+- This maps the abstract top-half/bottom-half split (14.03) onto a concrete, on-topic device: a real NVMe-style completion path has exactly this shape, with a completion queue the controller writes and the host reads, and a doorbell-style mechanism the host uses to tell the controller it has consumed entries.
+- "Matching to the original request" often means walking a command-tracking table by tag/ID -- an operation with data-dependent cost (however small) that is exactly the kind of variable-latency work the ISR should not do itself, per 14.14's "keep ISR duration bounded" reasoning.
+- Any registered upper-layer callback is especially important to keep out of the ISR: that callback is arbitrary application code the interrupt-handling layer cannot make any latency or blocking guarantees about, so invoking it from interrupt context risks violating 14.02's rules through code the interrupt handler's author does not even control.
+FOLLOW:
+- Should the "acknowledge the interrupt at the controller" step itself ever be deferred to the bottom half? => Generally no; leaving the controller's interrupt unacknowledged for longer than necessary risks it re-firing or the device believing the host has not yet noticed, so that specific step is exactly the kind of minimal, must-happen-now work the top half exists for.
+- Where would a lock-free ring buffer (14.10) fit in this picture? => Between the top half (single producer: the ISR, writing completion records as they arrive) and the bottom half (single consumer: a worker task processing them), which is precisely the SPSC shape that pattern is designed for.
+PITFALL: Putting the command-tracking-table lookup directly in the ISR "because it's usually fast." Usually fast is not the same as bounded, and a real-time interrupt-latency budget cares about the worst case, not the usual case (14.14).
+
+@@ 14.16 | Principal | Scenario | fig=isrflow | tags=ringbuffer,lockfree,handoff
+Q: Design the hand-off between an embedded interrupt handler and its bottom-half task when the ISR must post a variable amount of work without any dynamic allocation.
+SHORT: Use a fixed-size, preallocated single-producer/single-consumer ring buffer of fixed-size records: the ISR (sole producer) writes a record and atomically publishes the new head index; the bottom-half task (sole consumer) reads records starting from tail and atomically publishes the new tail index after consuming. No allocation, no lock, and no blocking on either side, because each side only ever writes its own index and only ever reads the other's.
+DEEP:
+1. Size the ring for the worst-case burst the real-time budget can tolerate before the consumer is guaranteed to have run at least once; an undersized ring turns "no allocation" into "silent data loss" the moment a burst exceeds it, so this sizing decision needs an explicit worst-case analysis, not a guess.
+2. Each record is fixed-size and self-contained (e.g. a completion tag plus a small fixed payload) specifically so the ISR never needs a variable-size write or any allocation per 14.02's rule.
+3. The head index is written only by the ISR and read only by the consumer; the tail index is written only by the consumer and read only by the ISR (to check for a full ring before producing) -- this single-writer-per-index discipline is what avoids needing a lock between the two sides at all.
+4. Publish each index update with the right memory-ordering guarantee (an atomic store with release semantics publishing the new index, an atomic load with acquire semantics reading it) so the record's contents are guaranteed visible to the consumer once it observes the updated head -- this is module 7's acquire/release pairing applied across the ISR/task boundary instead of a thread/thread one.
+5. What to instrument once running: high-water mark of ring occupancy (how close to full it has actually come, to validate the sizing decision), and a counter of any detected overflow/drop events, so an under-sized ring shows up as a measurable signal rather than silent corruption.
+6. Pitfall to state explicitly to a reviewer: a ring buffer sized "generously" without an actual worst-case burst analysis is not actually proven correct, only probably fine -- state the analysis, not just the buffer size, as the actual deliverable.
+FOLLOW:
+- Why single-producer/single-consumer specifically, rather than a general multi-producer queue? => Because the whole point is avoiding any lock; SPSC is the one shape where each side can safely own exactly one index with no coordination beyond ordered publication, and generalizing to multiple producers (e.g. two different interrupt sources) reintroduces a real mutual-exclusion problem between them.
+- What happens if the bottom-half task itself gets starved and never runs? => The ring fills, and the ISR's next produce attempt finds it full; the design must define (and the instrumentation above must reveal) what happens next: drop the newest record, drop the oldest, or some other explicit policy -- silently overwriting live data is rarely the right default.
+PITFALL: Reaching for a general-purpose thread-safe queue (mutex-protected) for this handoff out of habit. The ISR side can never safely take that mutex (14.02), so a lock-free SPSC design tailored to the actual producer/consumer shape is not an optimization here, it is the only correct option.
+
+@@ 14.17 | Principal | Debug | tags=heisenbug,ringbuffer,memoryordering
+Q: A device driver's completion queue occasionally corrupts under load, but only after hours of operation and never under a debugger. Walk through diagnosing an ISR-vs-task race in a lock-free ring buffer.
+SHORT: This is the classic embedded Heisenbug shape (15.01): a timing-dependent ISR/task race a debugger's own overhead perturbs away. The method is stress plus instrumentation, not guessing: reproduce under sustained load with no debugger attached, add lightweight tripwire assertions (e.g. a sequence counter each record must satisfy), and audit every read/write of the ring's head/tail indices for the memory-ordering guarantee 14.16 step 4 requires.
+DEEP:
+1. Confirm the debugger-hides-it pattern for real: does attaching a debugger change the interrupt's own timing (breakpoints, single-stepping, or even just the process being paused) enough to close the exact race window? If so, that itself is diagnostic evidence pointing at a timing-sensitive ISR interaction, not a logic bug that would reproduce identically every time.
+2. Add a cheap, always-on tripwire: a monotonically increasing sequence number written into each record by the producer and checked by the consumer on read, or a checksum over the fixed-size record -- something that can catch "this record is not what the producer actually wrote" without needing to catch the race in the act.
+3. Audit the index publication code specifically for missing or wrong memory-order semantics: a plain, non-atomic increment of the head/tail index, or an atomic index update without the acquire/release pairing 14.16 specifies, is exactly the kind of bug that "usually" works because the compiler/CPU happens to order things correctly on the common path, and fails only under specific timing and optimization-level combinations -- which is consistent with an hours-long time-to-failure.
+4. Once a suspect line is found, write the smallest possible reproduction that exercises just that index-publication path under deliberately adversarial timing (e.g. injecting an artificial delay right at the suspected window) rather than relying on the full multi-hour system test every iteration.
+5. Fix the ordering, then re-run both the full-system stress test for the original multi-hour timeframe (not just the fast repro) and, if the platform and toolchain allow, any available race-detection tooling appropriate to that environment -- module 15 covers ThreadSanitizer for pure pthreads code, but note plainly that TSan does not model interrupt-context/task-context races the way it models thread races (VERIFY whether your specific toolchain has an equivalent for ISR-vs-task checking; many do not).
+6. Add the tripwire from step 2 as a permanent, low-overhead assertion in the shipped driver (or at minimum in a debug/validation build), so a regression of this exact class surfaces quickly instead of silently, next time.
+FOLLOW:
+- Why not just add a lock somewhere to make this go away? => The ISR side of this handoff cannot take a blocking lock (14.02); "just add a lock" either does not compile with that constraint respected, or reintroduces exactly the deadlock-shaped danger from 14.11 if applied carelessly to the ISR side.
+- Is a checksum or sequence-number tripwire itself totally free of overhead? => No, it costs a small, fixed, bounded amount of extra work per record on both sides; that bounded cost is exactly why it is an acceptable permanent addition even in the ISR, unlike the unbounded-latency operations 14.02 rules out.
+PITFALL: Declaring the bug fixed after the fast, deliberately-adversarial repro stops failing. The original multi-hour stress condition is the actual specification for "fixed"; a fix that only survives the fast repro may have narrowed the window without eliminating it.
+
+@@ 14.18 | Principal | Trap | tags=mutex,isr,deadlock
+Q: An engineer "fixes" an ISR/task data race by wrapping the ISR's shared-data access in pthread_mutex_lock(). Why is this actually dangerous, and what should have been done instead?
+SHORT: A real hardware ISR taking a blocking mutex violates 14.02's core rule: if the ISR fires while a task holds that mutex, the ISR blocks forever (no scheduler slot to block in), and that task cannot run again to release it until the ISR returns -- a hang, only under the specific timing where the lock is held. The fix is one of 14.10's real tools: disable the relevant interrupt around the task-side section, or use a lock-free structure the ISR can touch without blocking.
+DEEP:
+- This trap is dangerous specifically because it can look correct in testing: on a system where the mutex is rarely actually held when the interrupt fires, or in an environment (like a POSIX-signals stand-in) where blocking might be silently and confusingly handled by the OS in a way that masks the real embedded-ISR danger, the bug hides until the exact unlucky timing occurs in the field.
+- On bare-metal or a simple RTOS with no scheduler running "underneath" interrupt context at all, this is not just a hang risk, it may not even be a well-defined operation to attempt -- there is no code path in the system that would ever run to release the lock while the ISR is spinning/blocked inside interrupt context, and it can be strictly worse than the pthread-on-Linux picture, where at least some scheduler exists elsewhere in the system.
+- Distinguish this from 14.11's spinlock-vs-IRQ-safe-spinlock trap: 14.11 is about a lock that has a truly correct IRQ-aware form the ISR CAN safely use; this trap is about a lock (a blocking mutex) that has no safe form for direct use by an ISR at all, on any platform, under any configuration -- the fix is never "use the IRQ-safe version of a mutex," it is "do not let the ISR touch a mutex, full stop."
+- The correct fix, restated from 14.10: either the task side disables the specific interrupt around its own critical section (giving the ISR nothing to race against when it does eventually fire), or the shared structure is redesigned as something lock-free that the ISR can touch without any blocking primitive at all (a ring buffer being the most common shape, 14.16).
+FOLLOW:
+- Is there ever a "mutex-like" primitive an ISR IS allowed to use? => A non-blocking primitive like a correctly-implemented, IRQ-aware spinlock (14.11) can be safe on platforms that provide one correctly, precisely because it never sleeps; a POSIX pthread_mutex is a blocking primitive by design and is never the right tool for the ISR side regardless of platform.
+- How would a code reviewer catch this without deep embedded expertise? => A simple, mechanical rule catches most instances: grep the ISR/interrupt-handler code paths for any call to a function that can block (a mutex lock, a blocking syscall, malloc()) and treat every hit as a required finding, not a judgment call.
+PITFALL: Believing this is fixed because "it hasn't hung yet." The hang requires the specific timing of the interrupt firing while the lock is held; a system that happens to rarely hold that lock for long, or rarely gets that interrupt under load, can run for a long time before the exact unlucky window occurs.
+
+@@ 14.19 | Principal | Cross-layer | tags=signalanalogy,latency,limitations
+Q: Where does the POSIX-signal-as-ISR analogy used throughout this module actually break down, and why does that matter for someone using it to reason about real embedded interrupts?
+SHORT: A POSIX signal is scheduled and delivered by the kernel with real, variable scheduling latency, and a non-realtime signal already pending when it recurs is coalesced into one delivery, not queued -- a real bare-metal/RTOS interrupt vector typically has lower, steadier latency and does not drop a second occurrence that way. The analogy is reliable for the discipline (minimal, non-blocking handler code deferring to a bottom half), unreliable for actual latency or delivery-count numbers.
+DEEP:
+- This is exactly why 14.20's latency numbers are kept as an explicitly hedged order-of-magnitude discussion rather than derived from the signal-handler timing observed in this module's own compiled examples -- the two are not measuring the same underlying mechanism.
+- The coalescing behavior specifically means a stress test built on repeated SIGALRM delivery (as in 14.07, 14.12, 14.13) can systematically under-count how many "interrupts" actually occurred relative to a real hardware interrupt controller that queues or at least counts every pending assertion up to some depth; this is a real limitation of the demonstrations in this module, disclosed here rather than glossed over.
+- What the analogy DOES reliably preserve: the async-signal-safety restriction (sigaction.3p, 14.06), the requirement to avoid blocking inside the handler (14.02), and the general shape of masking-as-the-tool-for-excluding-the-handler-from-a-critical-section (14.04, 14.12) -- these are the structural lessons this module is actually built to teach, using signals only because they are the closest thing available for real, compiled, runnable POSIX-grounded demonstrations.
+FOLLOW:
+- Should a candidate cite this module's SIGALRM-based demos as evidence about real interrupt latency in an interview? => No; they should cite them as evidence of understanding the discipline (top-half/bottom-half, masking, async-signal-safety) and be explicit that real interrupt latency numbers are a separate, hardware/platform-specific question (14.20).
+- Is there a POSIX or Linux mechanism that models real interrupt behavior more closely than a plain signal handler? => Realtime signals (queued rather than coalesced, per the Realtime Signals Extension option referenced in sigaction.3p) are closer in the queuing respect, but still run in a scheduled thread context, not true interrupt context -- still an analogy, just a better one for that specific property (VERIFY whether your platform supports and how it implements this option).
+PITFALL: Walking away from this module believing "a POSIX signal handler basically IS an ISR." It is a deliberately chosen, explicitly limited teaching analogy for a mechanism POSIX does not define at all; treat every latency or delivery-count claim from it as illustrative, not as a fact about real interrupt hardware.
+
+@@ 14.20 | Principal | Numeric | tags=latency,approximate,realtime
+Q: What are reasonable order-of-magnitude interrupt latency figures to reason with when budgeting a real-time embedded design, and how should they be used?
+SHORT: As rough, approximate reference points only: a fast microcontroller's raw interrupt latency (event to first ISR instruction) is roughly tens of nanoseconds to a few microseconds; on a general-purpose OS like plain Linux, worst-case interrupt-to-handler latency can run tens to low hundreds of microseconds or worse under load. These vary enormously by hardware and configuration -- use them only as sanity-check ballparks, never as a spec-level number without measuring the real target.
+DEEP:
+- The dominant sources of variability are: interrupt controller design and priority scheme, whether interrupts are currently masked by other code (14.04's cost), cache state at the moment of the interrupt (a cold instruction cache for the ISR's own code adds real latency), and, on a general-purpose OS, scheduler and other interrupt-source contention.
+- A hard-real-time-certified system's whole design point is bounding and guaranteeing a specific worst-case latency number for its actual hardware and configuration, which is a measured, certified property of that specific system, not something derivable from generic figures like these.
+- For an SSD firmware validation angle: if a test harness's own measurement of "time from command submission to completion interrupt" needs to attribute latency correctly between the device, the interrupt path, and the driver's own bottom-half processing, these rough figures at least tell you which end of the latency budget is even plausible for the interrupt-handling portion versus the device's own internal latency.
+FOLLOW:
+- Why would a hard-real-time embedded design avoid a general-purpose OS like plain Linux for its most latency-sensitive interrupt path? => Because plain Linux's interrupt-to-task latency, while often fine on average, does not carry the same bounded worst-case guarantee a real-time kernel variant or a bare-metal/RTOS design aims to certify; "usually fast" and "provably bounded" are different claims.
+- Is it meaningful to compare this module's SIGALRM demo timing to any of these figures? => No, per 14.19; the demo's signal-delivery timing reflects POSIX signal scheduling on this specific test environment, not real interrupt-controller-to-ISR latency on any embedded target.
+PITFALL: Presenting any of these figures as a guaranteed number in a design review without a citation to the actual target hardware's datasheet or a real measurement. State them, as done here, as hedged, approximate, order-of-magnitude reasoning aids only.
+VERIFY: All latency figures here are general, commonly-cited approximate orders of magnitude, not measurements taken in this session on specific hardware; treat every number in this answer as VERIFY against the actual target platform before using it in a real design decision.
+</content>

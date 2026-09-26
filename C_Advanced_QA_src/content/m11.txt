@@ -1,0 +1,307 @@
+# Module 11: OS Scheduling & Real-Time Concurrency
+
+@@ 11.01 | Basic | Concept | fig=scheduling | tags=preemption,states,scheduler
+Q: What does "preemptive multitasking" actually mean for a running thread?
+SHORT: The kernel can suspend a running thread at essentially any point (usually on a timer interrupt or a higher-priority thread becoming ready) and hand the CPU to another thread, without the running thread doing anything to give it up. Each thread moves between running, ready-to-run, and blocked (waiting on I/O, a lock, or a signal) states, and only the scheduler decides which ready thread runs next and for how long.
+DEEP:
+- Contrast with cooperative multitasking, where a task keeps the CPU until it explicitly yields; preemptive scheduling is what lets one runaway or CPU-bound thread not freeze the whole system.
+- The three core states worth naming precisely: running (actually on a CPU right now), ready (runnable, waiting only for a CPU), and blocked (waiting on something else -- I/O completion, a mutex, a condition variable, a signal). A thread can also be in the process of being created or having exited, but those are transient.
+- A timer interrupt (the periodic tick) is the classic trigger for preemption of a CPU-bound thread that never blocks on its own; a thread can also be preempted the instant a higher-priority thread becomes ready, without waiting for the next tick, on modern schedulers.
+- This module is Linux-flavored where noted; POSIX itself standardizes the scheduling *policies and priorities* API (sched_setscheduler(), sched_get_priority_max(), etc.) but leaves the actual scheduling algorithm implementation-defined.
+FOLLOW:
+- Does a single-threaded, single-core system still need preemption? => Yes, for multiple processes to share the one CPU; preemption is what lets the OS run more logical tasks than it has physical cores.
+- What moves a blocked thread back to ready? => Whatever it was waiting on becoming available -- I/O completing, a mutex being unlocked and this thread being woken, a signal arriving, or a timer expiring.
+PITFALL: Assuming a thread only gets preempted when it calls something like sleep() or a blocking syscall. A CPU-bound thread with no blocking calls at all is still preempted by the timer tick or a higher-priority thread becoming ready.
+VERIFY: POSIX standardizes sched_setscheduler()/sched_get_priority_max() as the policy-and-priority API; the underlying preemption mechanism itself is implementation-defined, not POSIX-mandated.
+
+@@ 11.02 | Basic | Concept | tags=policy,priority,nice
+Q: What is the difference between a scheduling policy, a priority, and a nice value?
+SHORT: A scheduling policy (SCHED_OTHER, SCHED_FIFO, SCHED_RR, ...) is the algorithm the scheduler uses for a thread; priority is a number meaningful within that policy (real-time policies use sched_priority from sched_get_priority_min()/max()); nice value is a separate, coarser hint (-20 to 19 on Linux) that only affects the default time-sharing policy (SCHED_OTHER), tilting its share of CPU time, not giving hard precedence the way a real-time priority does.
+DEEP:
+- `sched_setscheduler(pid_t pid, int policy, const struct sched_param *param)` sets both the policy and, via `param->sched_priority`, the priority within that policy in one call (POSIX.1, sched_setscheduler.3p).
+- `sched_get_priority_min()`/`sched_get_priority_max()` return the valid priority range for a given policy; for SCHED_FIFO/SCHED_RR on Linux this is typically 1-99, and nice/niceness has no effect on threads running under either real-time policy.
+- nice() and setpriority() only retune SCHED_OTHER's (the default, non-real-time) share of CPU time under contention; a nice-19 SCHED_OTHER thread still preempts nothing running under SCHED_FIFO or SCHED_RR, no matter how low its own priority is set.
+- See 11.04 for what SCHED_OTHER, SCHED_FIFO, and SCHED_RR each actually do differently.
+FOLLOW:
+- Can a normal (non-privileged) process lower another process's nice value? => No, only raise it (make it "nicer," lower priority) for processes it does not own sufficient privilege over; lowering nice value (raising priority) below the default typically requires elevated privilege.
+- Does setting a real-time priority require root? => On stock Linux, yes by default (CAP_SYS_NICE capability), which is exactly the permission behavior sched_setscheduler() describes as implementation-defined ("appropriate privilege").
+PITFALL: Trying to fix a real-time thread's scheduling problem by adjusting its nice value. nice only matters under SCHED_OTHER; a real-time policy thread's precedence is governed by its sched_priority and policy, not nice.
+VERIFY: POSIX.1-2017, sched_setscheduler(): "the conditions under which one process has appropriate privilege... are implementation-defined" -- confirm root/CAP_SYS_NICE is specifically a Linux implementation choice, not a POSIX mandate.
+
+@@ 11.03 | Basic | Concept | tags=contextswitch,save,restore
+Q: What does a context switch actually save and restore?
+SHORT: The kernel saves the outgoing thread's CPU register state (including the program counter and stack pointer) into its kernel-maintained thread control block, then loads the incoming thread's saved register state so it resumes exactly where it left off. If the switch also crosses process boundaries, the kernel additionally swaps the virtual-memory mappings (page tables / the CR3 register on x86), which is the more expensive part.
+DEEP:
+- A same-process, thread-to-thread context switch is cheaper than a process-to-process one because the address space (page tables) does not need to change; only register state and scheduler bookkeeping change.
+- A cross-process switch typically also invalidates parts of the TLB (translation lookaside buffer), which then has to be refilled by real page-table walks on subsequent memory accesses -- this "TLB cold cache" cost is a large, often-overlooked chunk of a context switch's real-world price beyond the raw register save/restore.
+- The switch itself is triggered by the scheduler deciding to run something else, whether from a timer interrupt, a syscall returning to a different priority thread, or a voluntary block (I/O wait, lock wait); see 11.10 for approximate cost figures.
+- This ties directly to the process/thread distinction in module 1: what a context switch has to swap is exactly the "per-thread" vs "per-process" state boundary drawn there.
+FOLLOW:
+- Is switching between two threads of the same process always cheaper than switching between two different processes? => Generally yes, for the page-table/TLB reason above, though cache-locality effects (which data is still hot in L1/L2) matter too and are workload-dependent.
+- Does the FPU/vector register state (e.g. AVX registers) also need saving? => Yes if the thread used those registers; modern kernels track this lazily in some cases to avoid the cost when a thread never touches floating-point/vector state.
+PITFALL: Assuming all context switches cost the same. A thread-to-thread switch within one process is meaningfully cheaper than a cross-process switch, mainly because of the address-space (page table/TLB) reload.
+
+@@ 11.04 | Intermediate | Concept | tags=fifo,rr,other,linux
+Q: What actually differs between SCHED_OTHER, SCHED_FIFO, and SCHED_RR?
+SHORT: SCHED_OTHER is the default time-sharing policy (Linux's CFS): fair-ish, only nice-tunable, no hard ordering guarantee. SCHED_FIFO is fixed-priority: a runnable thread runs until it blocks, yields, or a higher-or-equal-priority real-time thread preempts it, with no time-slicing among equals. SCHED_RR is the same fixed-priority model but adds a quantum, so equal-priority SCHED_RR threads round-robin against each other.
+DEEP:
+- Both SCHED_FIFO and SCHED_RR are marked (REALTIME) in POSIX (sched_setscheduler.3p); a higher fixed priority always wins the CPU over a lower one under either policy, unconditionally, unlike SCHED_OTHER's fairness-based, no-guaranteed-latency behavior.
+- SCHED_FIFO's lack of time-slicing among equal-priority threads means two SCHED_FIFO threads at the same priority, both CPU-bound and neither blocking, will not automatically share the CPU -- whichever one is running keeps running until it blocks or yields. This is a common real-world surprise.
+- SCHED_RR fixes exactly that surprise for threads at the same priority level, at the cost of some scheduling overhead for the periodic quantum expiry.
+- POSIX's sched_setscheduler() explicitly notes it is not atomic with respect to other threads in the process and that the effect depends on scheduling contention scope (system vs process) -- Linux uses 1:1 (system scope) threading, so in practice each pthread maps to its own schedulable kernel entity and this caveat is mostly academic on Linux.
+FOLLOW:
+- Which policy would you pick for a strict single always-highest-priority worker thread with nothing else at its priority? => SCHED_FIFO is simplest and sufficient, since there is no equal-priority sibling to round-robin against.
+- What happens if a SCHED_FIFO thread never blocks and nothing preempts it? => It runs forever, starving everything at an equal or lower priority -- see 11.08 and Linux's real-time throttling safeguard in 11.09.
+PITFALL: Assuming SCHED_RR's round-robin behavior also applies across different priority levels. Round-robin only happens among threads at the *same* priority; a strictly higher-priority thread still fully preempts, regardless of policy.
+VERIFY: POSIX.1-2017, sched_setscheduler.3p (REALTIME marking, contention-scope caveat) for SCHED_FIFO/SCHED_RR as POSIX-standard policies; Linux CFS internals for SCHED_OTHER's actual fairness algorithm are Linux-specific, not POSIX-specified.
+
+@@ 11.05 | Intermediate | Scenario | tags=sched_setscheduler,code,fifo
+Q: Show code that puts the calling process under SCHED_FIFO and confirms the change.
+SHORT: `sched_setscheduler(0, SCHED_FIFO, &sp)` with `pid == 0` sets the *calling* process's policy and priority; POSIX documents its return value as the process's *former* policy on success, and -1 with errno set on failure (commonly EPERM without sufficient privilege).
+DEEP:
+```c
+#include <sched.h>
+#include <stdio.h>
+
+int main(void) {
+    struct sched_param sp = { .sched_priority = 10 };
+    int prev = sched_setscheduler(0, SCHED_FIFO, &sp);
+    if (prev == -1) { perror("sched_setscheduler"); return 1; }
+    printf("sched_setscheduler ok, previous policy was %d\n", prev);
+    printf("SCHED_FIFO priority range: [%d, %d]\n",
+           sched_get_priority_min(SCHED_FIFO), sched_get_priority_max(SCHED_FIFO));
+    return 0;
+}
+```
+  Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run as root, it printed `sched_setscheduler ok, previous policy was 0` (0 is SCHED_OTHER, confirming the prior policy) and `SCHED_FIFO priority range: [1, 99]`, matching the documented behavior.
+- Note `pid == 0` specifically means "the calling process," per POSIX ("If pid is zero, the scheduling policy and scheduling parameters shall be set for the calling process"); a negative pid's behavior is explicitly unspecified by POSIX, not "all processes" or anything else intuitive.
+- For a single *thread* within a multi-threaded process (rather than the whole process), use `pthread_setschedparam()` instead, as 11.11 does, since sched_setscheduler() targets a process ID.
+FOLLOW:
+- What errno would this typically fail with as an unprivileged user? => EPERM ("The requesting process does not have permission to set... the scheduling policy"), matching the documented ERRORS list.
+- Does the priority value 10 mean anything universal? => No; it is only meaningful relative to other threads' priorities within the same real-time policy set, and only within the [1, 99] range this system's SCHED_FIFO reports.
+PITFALL: Calling sched_setscheduler() with a negative pid expecting well-defined behavior. POSIX states this case is unspecified; do not rely on any particular outcome.
+VERIFY: POSIX.1-2017, sched_setscheduler.3p RETURN VALUE ("shall return the former scheduling policy") and the pid==0 / pid<0 semantics.
+
+@@ 11.06 | Intermediate | Concept | tags=yield,sched_yield
+Q: What does sched_yield() guarantee, and why is it rarely the right tool?
+SHORT: sched_yield() forces the calling thread to give up the CPU and go to the back of its own priority level's ready queue ("relinquish the processor until it again becomes the head of its thread list," per POSIX); it does not guarantee any particular thread runs next, does not block on anything, and provides zero ordering or signaling guarantee with any other thread. It is almost never the right way to wait for another thread to do something -- a condition variable (module 5) is.
+DEEP:
+- POSIX sched_yield.3p is explicit and minimal: it takes no arguments, defines no errors, and its only documented effect is what is quoted above -- there is no promise about *which* other thread (if any) runs, or for how long.
+- A common anti-pattern is a spin-loop with `while (!ready) sched_yield();` hoping to "be polite" while waiting -- this still burns CPU repeatedly checking a flag, provides no wakeup guarantee, and (if the waiting thread has a higher priority than the thread that will set the flag) can even make progress worse by yielding back into contention with equal-or-lower-priority threads instead of just blocking.
+- The correct tool for "wait until another thread does something" is almost always a blocking primitive that the kernel can use to schedule you out entirely and wake you precisely when the condition changes: a mutex/condition-variable pair, a semaphore, or a blocking read on a pipe/queue (module 12) -- not a spin-and-yield loop.
+- A legitimate niche use: a spinlock implementation that, after some bounded number of failed spin attempts, calls sched_yield() once before giving up and falling back to blocking, to avoid wasting a full time slice spinning against a thread that is not currently scheduled.
+FOLLOW:
+- Does sched_yield() put the calling thread to sleep? => No; the thread remains ready-to-run, just moved to the back of its own priority level's queue -- it can be rescheduled again almost immediately if nothing else at that priority is ready.
+- Is sched_yield() useful on a single-core system to let another thread run? => It can nudge the scheduler, but it is still just a hint about ordering within the same priority level, not a synchronization primitive; prefer a real blocking wait wherever one is available.
+PITFALL: Using sched_yield() as a substitute for real synchronization ("wait until X happens" via a yield-and-recheck loop). It provides no wakeup guarantee and wastes CPU that a proper blocking wait would not.
+VERIFY: POSIX.1-2017, sched_yield.3p ("No errors are defined"; description text quoted above).
+
+@@ 11.07 | Intermediate | Cross-layer | tags=nice,cfs,weight,linux
+Q: How does a Linux nice value actually change a SCHED_OTHER thread's share of the CPU?
+SHORT: Linux's CFS (Completely Fair Scheduler) converts each SCHED_OTHER thread's nice value into a scheduling "weight," and threads accumulate virtual runtime inversely proportional to that weight -- a heavier-weighted (lower nice) thread's virtual runtime grows more slowly for the same real CPU time, so the scheduler (which always runs the ready thread with the smallest virtual runtime) picks it more often. This is a Linux implementation detail, not a POSIX-specified algorithm.
+DEEP:
+- Each nice step changes the weight by roughly a factor of 1.25 in Linux's actual weight table (`sched/core.c`'s prio_to_weight table, e.g. nice 0 = weight 1024, nice -1 = 1277, nice 1 = 820) -- a well-known approximate ratio, not a POSIX-mandated one, and worth treating as a Linux-specific, version-checkable fact rather than a memorized constant.
+- CFS deliberately has no fixed time slice; instead it targets a "target latency" for how long the lowest-virtual-runtime thread waits before getting the CPU, and derives an actual, weight-scaled slice length from that target.
+- None of this applies to SCHED_FIFO/SCHED_RR threads at all -- CFS and its virtual-runtime bookkeeping only governs SCHED_OTHER (and the low-priority SCHED_IDLE/SCHED_BATCH Linux extensions); nice values are simply not consulted for real-time-policy threads (11.02).
+- This is squarely a "how Linux happens to implement fairness" answer, not something POSIX specifies; POSIX only guarantees that some policy named SCHED_OTHER-equivalent exists and that priority/policy can be queried and set through the standard API.
+FOLLOW:
+- Would a different OS's default policy implement nice the same way? => No guarantee; POSIX does not mandate CFS or virtual runtime at all, only that an implementation-defined default time-sharing policy exists and that nice/setpriority influence it in some implementation-defined way.
+- Does raising one thread's nice value ever starve it completely under CFS? => Not completely under normal CFS behavior (it still gets a share, just a smaller one), unlike a lower real-time priority under SCHED_FIFO which can be starved completely by a higher one that never blocks.
+PITFALL: Quoting a precise nice-to-CPU-percentage formula as if it were a POSIX guarantee. It is a Linux CFS implementation detail (and an approximate one at that); other POSIX-conformant systems are free to implement their default policy differently.
+VERIFY: Linux kernel scheduler internals (CFS weight table, virtual runtime) -- not covered by the POSIX pages fetched for this page; treat any exact numeric ratio as an approximate, Linux-specific figure.
+
+@@ 11.08 | Intermediate | Trap | tags=fifo,starvation,priority
+Q: Why can a single SCHED_FIFO thread silently starve every other thread on a system?
+SHORT: SCHED_FIFO gives its thread the CPU unconditionally over any lower-priority (or SCHED_OTHER) thread, with no time-slicing forcing it to give the CPU back; if that thread enters a loop that never blocks, never yields, and never lowers its own priority, every lower-priority thread on that CPU -- including, on a single-core system, threads doing critical system work -- simply never runs again until something external intervenes.
+DEEP:
+- This is not a bug in the scheduler; it is exactly what SCHED_FIFO's specification promises: strict fixed-priority preemption with no fairness mechanism at all for the highest-priority runnable thread.
+- The classic real failure mode: a real-time thread takes a lock that a lower-priority thread also needs, then spins waiting for something that in turn depends on that lower-priority thread running -- a specific priority-inversion shape covered fully in the C Advanced page's deadlock module (module 8); the fix there (priority-inheritance mutexes) is the standard answer.
+- On Linux, this exact scenario is exactly what the real-time throttling safeguard (11.09) exists to catch: by default, real-time tasks are only allowed to consume a bounded fraction of each scheduling period, specifically so a runaway SCHED_FIFO thread cannot permanently lock out the rest of the system.
+- On a multi-core system the damage is contained to whichever CPU(s) the runaway thread is affine to or gets scheduled on, but on that CPU the effect is identical: total starvation of anything at an equal or lower priority.
+FOLLOW:
+- Is this the same failure mode as a deadlock? => No; a deadlock is two or more threads each permanently blocked waiting on each other. This is a live thread that never blocks at all, actively consuming the CPU and preventing anything else at that priority level or below from running.
+- What is the simplest mitigation for a real-time worker that must run a long computation? => Have it voluntarily call sched_yield() or briefly block at safe checkpoints, or better, keep real-time-priority code strictly bounded and short, moving any long computation to a lower-priority thread.
+PITFALL: Assigning SCHED_FIFO priority to a thread "to make it fast" without auditing that its logic is guaranteed to eventually block or exit. An unbounded busy loop at real-time priority can take down system responsiveness entirely.
+
+@@ 11.09 | Intermediate | Concept | tags=linux,throttling,rtruntime
+Q: What is Linux real-time throttling, and what problem does it solve?
+SHORT: Linux (by default, via `/proc/sys/kernel/sched_rt_runtime_us` and `sched_rt_period_us`) limits how much of each scheduling period real-time-policy (SCHED_FIFO/SCHED_RR) threads may consume in total -- by default 95% of every 1-second period, leaving 5% guaranteed for SCHED_OTHER threads (and crucially, kernel housekeeping) even if a real-time thread never blocks. This is a Linux-specific safety net against exactly the total-starvation scenario in 11.08, and it is not part of the POSIX standard.
+DEEP:
+- Setting `sched_rt_runtime_us` to -1 disables the limit entirely (unlimited real-time CPU consumption is then possible again), which is sometimes deliberately done on dedicated real-time systems where the operator has already audited every real-time thread's behavior.
+- This mechanism only throttles in aggregate over a period; it does not guarantee any individual real-time thread's latency or that it will never be delayed -- it is a coarse safety valve, not a real-time scheduling guarantee.
+- Because this is entirely a Linux kernel tunable, not a POSIX API, an interviewer asking "how do you stop a runaway real-time thread from locking up the box" is testing Linux-specific systems knowledge on top of the POSIX-standard scheduling API covered in 11.02/11.04.
+- For SSD validation harness code specifically, this matters if any test tooling itself uses SCHED_FIFO/SCHED_RR: the safety net is helpful, but the correct fix is still to bound real-time-priority code paths (11.16/11.17), not to rely on the throttle catching a bug.
+FOLLOW:
+- Does throttling affect SCHED_OTHER threads directly? => Not directly; it reserves headroom for them (and the kernel) by capping real-time consumption, rather than changing SCHED_OTHER's own scheduling.
+- Is this the same mechanism as a cgroup CPU quota? => No, though conceptually similar (both cap CPU consumption over a period); cgroup CPU quotas are a separate, more general resource-control mechanism that can apply to any process group, not specifically to real-time policies.
+PITFALL: Assuming every POSIX-conformant OS has an equivalent real-time throttling safety net. This is a Linux-specific tunable; do not assume it exists (or has these defaults) on another POSIX system.
+VERIFY: Linux-specific (`sched_rt_runtime_us`/`sched_rt_period_us`); not part of the POSIX.1 sched_setscheduler.3p specification fetched for this page.
+
+@@ 11.10 | Advanced | Numeric | tags=contextswitch,cost,latency
+Q: Roughly, what does a context switch cost, and why is that number hard to pin down?
+SHORT: As a hedged, order-of-magnitude figure, not a spec value: a same-process thread-to-thread context switch is commonly hundreds of nanoseconds to low single-digit microseconds on modern x86-64; a cross-process switch is usually higher (often several microseconds) once TLB/page-table reload and lost cache locality are counted. The real cost depends heavily on cache footprint, TLB size, and how cold the incoming thread's working set is, not just the raw register save/restore.
+DEEP:
+- The raw register save/restore itself is actually cheap (well under 100ns on modern CPUs); most of the commonly-quoted "microseconds" figure for a context switch is actually the *indirect* cost of cache and TLB pollution once the new thread starts running and has to refill caches/TLB entries that the outgoing thread had warmed.
+- This is exactly why module 10's counter-cost comparisons (10.09) treat a *contended, blocking* mutex path as roughly another order of magnitude worse than an uncontended one: the difference is precisely this context-switch cost being paid on top of the lock operation itself.
+- For high-IOPS validation code, this cost is the concrete reason to minimize unnecessary blocking on the hot path (avoid a syscall or a contended lock per I/O if at all possible) -- each one risks a full context switch's worth of latency, which at high IOPS rates can dominate the actual useful work being done.
+- Any specific number quoted here should be treated as a starting intuition to validate, not a fact to cite verbatim; the only reliable way to know the real cost on a given target system is to measure it there (e.g. with a ping-pong benchmark between two threads/processes).
+FOLLOW:
+- Is a context switch cost that matters at 1000 IOPS the same concern at 1,000,000 IOPS? => No, the concern scales directly with IOPS rate; at very high IOPS, even a small per-operation context-switch cost multiplies into a large aggregate latency/throughput hit, which is why lock-free/TLS patterns (module 10) matter more as IOPS scales up.
+- Would pinning threads to specific CPUs (sched_setaffinity, Linux-specific) reduce this cost? => It can help by keeping a thread's cache/TLB state warm on one core rather than migrating across cores, which is a related but distinct cost from the context-switch itself.
+PITFALL: Quoting one specific context-switch nanosecond/microsecond number from memory as an authoritative fact in an interview. State it as an approximate range and offer to benchmark the specific target hardware and workload instead.
+VERIFY: no POSIX or C11 spec source (hardware- and workload-dependent); treat as a hedged order-of-magnitude estimate only.
+
+@@ 11.11 | Advanced | Scenario | tags=fifo,other,starvation,affinity,code
+Q: Demonstrate SCHED_FIFO priority actually starving a SCHED_OTHER thread for the CPU.
+SHORT: Pin both threads to one CPU (so priority, not extra cores, decides who runs) with `sched_setaffinity()`, give one thread SCHED_FIFO priority via `pthread_setschedparam()`, let both busy-loop incrementing their own counter for a fixed wall-clock window, then compare iteration counts -- the SCHED_FIFO thread should dominate almost completely.
+DEEP:
+```c
+struct sched_param sp = { .sched_priority = 10 };
+pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);   /* inside fifo_worker */
+/* other_worker just busy-loops under the default SCHED_OTHER policy */
+```
+  Full program pins both threads to CPU 0 via `sched_setaffinity()`, runs both as busy loops incrementing separate atomic counters for 0.5 real seconds, then prints both totals. Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run as root (real-time policy changes need privilege, 11.02), two separate runs produced:
+  - Run 1: `SCHED_FIFO iters = 199516801, SCHED_OTHER iters = 2813006` (FIFO thread got about 98.6% of the CPU time).
+  - Run 2: `SCHED_FIFO iters = 100018185, SCHED_OTHER iters = 2764637` (FIFO thread got about 97.3%).
+  Both runs confirm the expected result: pinned to one core, the SCHED_FIFO thread overwhelmingly dominates, while the SCHED_OTHER thread still gets a small trickle of CPU time (Linux's CFS/real-time throttling, 11.09, is exactly why it is not driven fully to zero).
+- Note `sched_setaffinity()` is a Linux extension, not POSIX; it is used here specifically to force both threads onto one core so priority alone (not simply "there happen to be enough cores for both") explains the result.
+FOLLOW:
+- Why did SCHED_OTHER still get a small, nonzero share instead of exactly zero? => Linux's real-time throttling (11.09) reserves a small default fraction of CPU time (5% per period) for non-real-time work even when a real-time thread never blocks; that residual is what SCHED_OTHER's ~1.4-2.7% reflects here.
+- Would this result differ without pinning both threads to the same CPU? => Yes; with two free cores available, the scheduler could simply run both threads simultaneously on separate cores, showing no visible starvation at all -- pinning is what makes the priority effect actually observable.
+PITFALL: Running a scheduling-priority experiment like this on a multi-core box without pinning both threads to the same core, then concluding "priority doesn't matter" because both threads got to run the whole time on separate cores.
+VERIFY: Linux-specific (sched_setaffinity(), CPU_SET/CPU_ZERO); not part of the POSIX pages fetched for this page.
+
+@@ 11.12 | Advanced | Debug | tags=priority-inversion,mutex,realtime
+Q: A high-priority SCHED_FIFO thread blocks for a surprisingly long time on a mutex also used by a low-priority thread. What is happening, and what fixes it?
+SHORT: This is priority inversion: the low-priority lock holder gets preempted by an unrelated medium-priority thread that does not need the mutex, so the high-priority waiter is effectively stuck behind a thread of lower priority than its own preemptor -- an inversion of the intended order. The fix is a priority-inheritance mutex (`PTHREAD_PRIO_INHERIT`), which temporarily raises the holder's effective priority to that of the highest-priority waiter.
+DEEP:
+- This exact scenario, its terminology, and the Mars Pathfinder incident that made it famous are covered in full in the C Advanced page's deadlock/priority-inversion module (module 8); this module's angle is specifically the real-time-scheduling side: priority inversion is precisely what happens when SCHED_FIFO/SCHED_RR's strict priority ordering meets an ordinary mutex with no priority awareness at all.
+- `pthread_mutexattr_setprotocol(&attr, PTHREAD_PRIO_INHERIT)` (a POSIX-standard mutex attribute, not Linux-only) configures priority inheritance on a mutex created with that attribute; the alternative `PTHREAD_PRIO_PROTECT` (priority ceiling) pre-declares a ceiling priority for the mutex instead of dynamically inheriting.
+- For a real-time validation harness, this is the concrete reason a real-time-priority thread should avoid taking any mutex that an unrelated lower-priority thread also holds for anything non-trivial -- either use priority-inheritance mutexes explicitly, or (often simpler) keep real-time-priority code lock-free (module 10) or restricted to locks that only other real-time-priority code ever touches.
+- Diagnosing this in practice: an unexpectedly long block time on a mutex, correlated with the lock holder having been preempted, is the signature; tracing tools that show scheduler events (e.g. `perf sched`, ftrace) alongside lock-wait times are the way to actually confirm it rather than guess.
+FOLLOW:
+- Does SCHED_OTHER suffer from priority inversion the same way? => The same mechanism can occur but matters far less, since SCHED_OTHER has no strict priority guarantee to invert in the first place; priority inversion is a real-time-scheduling concern specifically because SCHED_FIFO/SCHED_RR promise strict ordering that this bug silently breaks.
+- Is priority inheritance free? => No; it adds bookkeeping overhead to every lock/unlock to track and adjust effective priorities, which is why it is an opt-in mutex attribute rather than the default.
+PITFALL: Diagnosing "my real-time thread is randomly slow" as a scheduler bug rather than checking whether it is blocked on a lock also held by a lower-priority thread that got preempted -- priority inversion, not the scheduler, is the far more common real cause.
+VERIFY: POSIX.1-2017 defines PTHREAD_PRIO_INHERIT/PTHREAD_PRIO_PROTECT as standard mutexattr protocol values (not among the 60 fetched pages here; cross-reference against the C Advanced page's mutex/deadlock modules, which cite pthread_mutexattr_init.3p directly).
+
+@@ 11.13 | Advanced | Cross-layer | tags=realtime,pagefault,malloc,mlockall
+Q: Why must a real-time hot path avoid page faults and malloc(), and what fixes that?
+SHORT: A page fault or malloc() call can trigger unbounded-latency work (disk I/O for a swapped page, or the allocator locking internally and possibly asking the kernel for more memory), and no scheduling priority protects against that. `mlockall(MCL_CURRENT | MCL_FUTURE)` locks pages in physical memory so they cannot be paged out, and pre-allocating (or a pool allocator, C Language page module 18) avoids malloc() on the hot path.
+DEEP:
+- Scheduling priority only controls *when* the CPU is given to a thread; it says nothing about how long an individual operation that thread performs will take. A page fault serviced from disk can take milliseconds -- utterly incompatible with a microsecond-scale real-time budget, regardless of how high that thread's SCHED_FIFO priority is.
+- malloc() is a double risk: it may take an internal lock shared with other threads (a lower-priority allocation elsewhere can inversion-block a real-time malloc call, tying back to 11.12), and it may call mmap()/brk() to get more memory from the kernel, which is itself an unbounded-latency syscall.
+- The standard real-time-systems fix, beyond mlockall(), is to pre-fault and pre-allocate everything the hot path will ever touch during a quiet/startup phase (touch every page you will use so it is already resident; allocate every buffer up front from a pool), so the actual real-time execution path performs no allocation and triggers no first-touch page faults.
+- This connects directly to module 14's ISR constraints (no blocking, no malloc in interrupt context) -- a real-time thread's hot path and a hardware ISR share this exact discipline for a related reason: both need a bounded, predictable execution time, and both are one dropped guarantee away from missing a real hardware or system deadline.
+FOLLOW:
+- Does mlockall() guarantee zero page faults forever? => It guarantees the currently-mapped (and, with MCL_FUTURE, future) pages will not be paged *out* to swap; it does not prevent a fault on a brand-new mapping the process creates later (e.g. a fresh mmap or growing the heap) unless that memory is also pre-faulted.
+- Is a pool allocator's own internal bookkeeping ever itself a risk? => Yes if the pool allocator takes a lock internally; a real-time-safe pool typically uses a lock-free free-list (module 10) or per-thread pools to avoid reintroducing the exact problem it was meant to solve.
+PITFALL: Locking memory with mlockall() and considering the real-time-safety problem solved, while the hot path still calls malloc() for new allocations that were never pre-faulted or pre-allocated.
+VERIFY: mlockall()/MCL_CURRENT/MCL_FUTURE are POSIX-standard (Realtime option, not among the 60 fetched pages here) -- reasoning from the well-documented Linux mlockall(2) behavior since the fetched pages did not include this specific page; hedge exact wording as `VERIFY: POSIX.1-2017, mlockall()`.
+
+@@ 11.14 | Advanced | Scenario | tags=clock,monotonic,deadline,code
+Q: Show code that measures whether a periodic task actually meets its deadline, using the right clock.
+SHORT: Use `CLOCK_MONOTONIC` (never `CLOCK_REALTIME`, which can jump backward or forward on a wall-clock adjustment) with `clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL)` to sleep to an absolute deadline, then re-check the actual wake-up time against that same clock to measure how late the task actually ran.
+DEEP:
+```c
+struct timespec next;
+clock_gettime(CLOCK_MONOTONIC, &next);
+for (int i = 0; i < N; i++) {
+    add_ns(&next, period_ns);                                  /* advance target */
+    clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);
+    struct timespec actual; clock_gettime(CLOCK_MONOTONIC, &actual);
+    long late_ns = (long)(ns(actual) - ns(next));
+    if (late_ns > 200000) misses++;                            /* >0.2ms late */
+}
+```
+  Compiled with `gcc -std=c11 -Wall -Wextra -pthread` (needs `_POSIX_C_SOURCE 200809L` defined before the includes for `clock_nanosleep` under `-std=c11`) and run for a 2ms period over 20 iterations, one run reported `1/20 periods missed the 2ms deadline by more than 0.2ms`, showing real, measurable scheduling jitter even on an otherwise idle system with no explicit real-time priority set.
+- Sleeping to an *absolute* deadline (`TIMER_ABSTIME`) rather than a *relative* duration each iteration is what prevents drift: a relative `nanosleep(period)` called after variable-length work each iteration would accumulate error over many periods, while re-targeting an absolute clock value does not.
+- CLOCK_MONOTONIC is specifically the right choice here because it is guaranteed not to go backward and is unaffected by wall-clock (CLOCK_REALTIME) adjustments such as NTP corrections or a manual date change, either of which would corrupt a deadline measurement based on CLOCK_REALTIME.
+FOLLOW:
+- Would giving this task SCHED_FIFO priority reduce the miss count observed here? => Likely yes on a loaded system (less preemption by other work), though on this otherwise-idle test system the jitter observed was already scheduler/timer-resolution noise rather than contention, so the effect may be small here specifically.
+- Why not just measure wall-clock time with time() or gettimeofday()? => Both are based on CLOCK_REALTIME-equivalent time sources that can jump on clock adjustments, which would produce a false deadline-miss reading (or a false "on time" reading) unrelated to actual scheduling behavior.
+PITFALL: Using CLOCK_REALTIME (or time()/gettimeofday()) to measure real-time-deadline jitter. A wall-clock adjustment during the measurement window can produce a completely misleading result.
+VERIFY: POSIX.1-2017, clock_gettime.3p for CLOCK_MONOTONIC's non-adjustment guarantee (fetched page); clock_nanosleep()/TIMER_ABSTIME behavior reasoned from the closely related nanosleep.3p page fetched for this module, since clock_nanosleep() itself was not among the 60 fetched pages.
+
+@@ 11.15 | Advanced | Concept | tags=quantum,timeslice,rr
+Q: What is the SCHED_RR time-slice quantum, and what happens when it expires?
+SHORT: When a SCHED_RR thread's time slice (quantum) expires while another thread at the same priority is also runnable, the kernel preempts it and moves it to the back of the ready queue at its priority level, giving the next equal-priority thread a turn; if no other thread at that priority is currently runnable, the quantum expiring has no visible effect and the same thread simply continues. The quantum length itself is implementation-defined by POSIX, not a fixed standard value.
+DEEP:
+- This is the mechanism that gives SCHED_RR its name and its key difference from SCHED_FIFO (11.04): SCHED_FIFO threads at the same priority never get this forced hand-off; SCHED_RR threads do, on a periodic quantum.
+- On Linux, the default RR quantum is commonly around 100ms in modern kernels (this has changed across kernel versions and is tunable via `/proc/sys/kernel/sched_rr_timeslice_ms`) -- treat this as a Linux-specific, version-dependent detail, not a POSIX-mandated number.
+- The quantum only matters when there is contention at the *same* priority level; a strictly higher-priority thread preempts a running SCHED_RR thread immediately regardless of how much of its quantum remains, and a strictly lower-priority thread never gets the CPU while any higher-priority thread is runnable, quantum or not.
+- `sched_rr_get_interval()` (POSIX-standard, not among the pages fetched for this module) lets a program query the current quantum length for a given thread's policy, if it needs to reason about it programmatically.
+FOLLOW:
+- Does a SCHED_RR thread's quantum reset if it voluntarily blocks and later becomes runnable again? => Conceptually yes; a thread that blocks and later wakes reenters the ready queue and effectively starts a fresh quantum, since the whole point of blocking was giving up the CPU voluntarily already.
+- Is the quantum the same across all priority levels? => POSIX leaves this implementation-defined; Linux uses one tunable RR quantum value applied uniformly across SCHED_RR regardless of priority level.
+PITFALL: Assuming the RR quantum is some specific, memorable, portable number (e.g. "always 100ms"). It is implementation-defined by POSIX and has actually changed across Linux kernel versions; query it with `sched_rr_get_interval()` if the exact value matters to your code.
+VERIFY: POSIX.1-2017 leaves the RR time-slice interval implementation-defined; sched_rr_get_interval() is the POSIX-standard way to query it (not among the 60 fetched pages for this module).
+
+@@ 11.16 | Advanced | Trap | tags=nice,realtime,scope
+Q: A teammate tries to fix a real-time-priority thread's scheduling problem by lowering its nice value. Why won't that work?
+SHORT: nice values only affect SCHED_OTHER's share of CPU time (11.02/11.07); a thread already running under SCHED_FIFO or SCHED_RR is not scheduled using nice/CFS virtual-runtime logic at all, so changing its nice value has no effect on how the scheduler treats it. The actual lever for a real-time-policy thread is its sched_priority value (and policy choice) via sched_setscheduler()/pthread_setschedparam(), not nice()/setpriority().
+DEEP:
+- This is a common confusion precisely because nice values feel like "the" priority knob in Linux tooling (`top`, `nice`, `renice` are all extremely visible), but they are specifically scoped to the default time-sharing policy; POSIX's real-time policies (SCHED_FIFO/SCHED_RR) use an entirely separate priority axis (sched_priority, range from sched_get_priority_min()/max()) that nice does not touch.
+- Symptom this confusion produces in practice: a teammate renice()s a real-time-priority thread expecting it to preempt more aggressively, observes no change at all, and (incorrectly) concludes the scheduler itself is misbehaving, when the real fix is to raise its sched_priority or confirm its policy is actually SCHED_FIFO/SCHED_RR in the first place.
+- The fastest way to check what is actually going on: inspect the thread's actual policy and priority (e.g. via `chrt -p <tid>` on Linux, or reading `/proc/<pid>/task/<tid>/sched`) rather than assuming from nice value alone.
+- This ties back to 11.02's core distinction: policy and (real-time) priority are one axis, nice is a completely separate axis that only applies within SCHED_OTHER.
+FOLLOW:
+- Does raising a SCHED_OTHER thread's priority via nice ever let it preempt a SCHED_FIFO thread? => No, never; every SCHED_FIFO/SCHED_RR thread unconditionally outranks every SCHED_OTHER thread regardless of nice value, by policy definition.
+- What is the correct call to actually fix a real-time thread's priority? => `pthread_setschedparam(thread, SCHED_FIFO or SCHED_RR, &sched_param)` for a specific thread, or `sched_setscheduler()` for a whole process (11.05), setting sched_priority within the policy's valid range.
+PITFALL: Using nice()/renice on a thread already under a real-time policy and expecting any scheduling effect. Confirm the actual policy first (chrt -p, or /proc/<pid>/task/<tid>/sched) before reaching for either knob.
+
+@@ 11.17 | Principal | Scenario | tags=design,realtime,firmware,hotpath
+Q: Design a real-time-safe hot path for an SSD firmware validation harness that must issue and complete I/Os on a strict per-operation deadline.
+SHORT: Assign the hot-path thread(s) SCHED_FIFO at a bounded priority; pin them with sched_setaffinity() away from other work; pre-allocate and pre-fault every hot-path buffer and call mlockall() at startup; keep the hot path lock-free or restricted to priority-inheritance mutexes; and measure actual deadline compliance continuously with CLOCK_MONOTONIC timing (11.14), never just trust the design on paper.
+DEEP:
+1. Scheduling: `sched_setscheduler()`/`pthread_setschedparam()` to SCHED_FIFO at a priority high enough to preempt ordinary test-harness bookkeeping threads, but deliberately not at the system's absolute maximum, to leave room above it for anything (e.g. a watchdog) that must be able to preempt this path if it ever misbehaves.
+2. Affinity and isolation: pin the hot-path thread(s) to specific cores away from cores fielding hardware interrupts or other harness work (11.11's affinity technique), so priority is not diluted by unrelated core-sharing.
+3. Memory: `mlockall(MCL_CURRENT | MCL_FUTURE)` plus pre-allocating and pre-touching every buffer used on the hot path during a startup/warm-up phase (11.13), so the steady-state hot path performs zero allocation and faults zero pages.
+4. Synchronization: prefer lock-free counters/queues (module 10) on the hot path; where a lock is unavoidable, use a priority-inheritance mutex (PTHREAD_PRIO_INHERIT, 11.12) so a lower-priority holder cannot inversion-block this path.
+5. Verification: instrument with CLOCK_MONOTONIC-based per-operation latency measurement (11.14) running continuously (not just in a one-off test), and treat both the FIFO priority's real-time throttling interaction (11.09) and any observed page faults (via `/proc/<pid>/stat` minor/major fault counters) as things to actively monitor, not assume away.
+FOLLOW:
+- What single measurement would you add first if you could only add one? => Per-operation latency histograms via CLOCK_MONOTONIC timestamps at issue and completion, since that directly measures the thing the deadline is actually about, rather than any proxy metric.
+- How would you validate this design before trusting it in a long overnight validation run? => Run it under sustained synthetic contention (other harness threads competing for the same cores/locks) for hours, watching for any deadline-miss outliers, not just a quiet short functional test.
+PITFALL: Treating SCHED_FIFO priority alone as sufficient for a real-time guarantee, while leaving malloc() calls, unbounded locks, or unpinned affinity in the same hot path -- priority is necessary but not remotely sufficient on its own.
+
+@@ 11.18 | Principal | Debug | tags=diagnosis,latency,irregular,tooling
+Q: A validation harness intermittently misses its IOPS deadline under load, but only rarely and unpredictably. How do you diagnose it?
+SHORT: Check in order: (1) is the thread still under its intended policy/priority right now (chrt -p), not just at startup; (2) is it taking page faults on the hot path (minor/major fault counters, should be flat once warmed up); (3) is it blocked on a lock a lower-priority thread holds (priority inversion, 11.12); (4) does the miss correlate with system-wide load or real-time throttling (11.09) rather than this process alone.
+DEEP:
+1. Confirm scheduling identity first, cheaply: a thread that silently lost its intended SCHED_FIFO/RR policy (e.g. due to a fork() resetting inherited scheduling attributes, or a library call resetting them) will show up immediately in `chrt -p <tid>` -- rule this out before looking anywhere more complex.
+2. Page faults: `/proc/<pid>/stat` minor/major fault fields (or `getrusage()`'s ru_minflt/ru_majflt from inside the process) should be essentially flat during steady-state hot-path execution if mlockall() and pre-allocation (11.13) are actually working; a nonzero trickle of minor faults under load is a real, findable cause of intermittent latency spikes.
+3. Priority inversion: correlate the exact timestamps of deadline misses against scheduler tracing (ftrace's sched events, or `perf sched record`/`perf sched latency`) to see what was actually running on that core at the moment of the miss; a lower-priority thread holding a lock the hot-path thread needed, itself preempted by something else, is the classic signature (11.12).
+4. System-wide effects: check whether misses cluster during periods of high aggregate CPU load (possibly triggering Linux real-time throttling, 11.09) or during another process's activity (a neighboring VM/container on shared hardware, a background cron job, thermal throttling) -- not everything is a bug in this specific harness's own code.
+5. Once a hypothesis is found, reproduce it under controlled synthetic contention (deliberately hold the suspected lock from a lower-priority thread, or deliberately induce a page fault) to confirm causation, not just correlation, before calling it fixed.
+FOLLOW:
+- Which single tool would you reach for first on a live, hard-to-reproduce case? => `perf sched latency` (or ftrace sched events) correlated with your own CLOCK_MONOTONIC-based per-operation latency log, since it directly shows what else the scheduler was doing at the exact moments of the misses.
+- What if none of the above shows anything unusual, but misses still occur? => Suspect hardware/firmware-level jitter outside the OS scheduler's visibility entirely (e.g. SMI/NMI handling, thermal/power management events, or the device under test itself), and instrument at that layer next.
+PITFALL: Jumping straight to "the scheduler is broken" or adding more real-time priority as a first response to an intermittent deadline miss, before checking the concrete, checkable causes above (lost policy, page faults, priority inversion, system-wide load).
+
+@@ 11.19 | Principal | Cross-layer | tags=cfs,vruntime,linux,internals
+Q: An interviewer asks you to explain how Linux's CFS scheduler decides which SCHED_OTHER thread runs next. How do you answer, and how do you scope what you actually know for certain?
+SHORT: CFS tracks each runnable thread's "virtual runtime" (CPU time consumed, scaled inversely by its nice-derived weight, 11.07) in a red-black tree, and always picks the smallest virtual runtime to run next; running a thread advances its value, pushing it back in the tree so others get a turn -- an approximately fair scheme with no fixed time slice. This is Linux-specific, not something POSIX specifies, so label it as such.
+DEEP:
+- The key structural facts worth stating precisely: virtual runtime only advances while a thread is actually running (not while blocked or ready-and-waiting), it advances more slowly for higher-weight (lower nice) threads, and the scheduler's "pick next" decision is simply "smallest virtual runtime among runnable threads" -- the red-black tree exists purely to make that pick and the corresponding insert/remove efficient.
+- What to explicitly *not* overstate: exact target-latency constants, exact minimum granularity values, and newer scheduler class details (Linux has introduced further refinements and even alternative schedulers like EEVDF in newer kernels) all change across kernel versions; state the conceptual model confidently and flag specific numeric constants as version-dependent and worth verifying against the actual running kernel rather than quoted from memory.
+- The Principal-level framing an interviewer is actually listening for: knowing where the POSIX-standard boundary ends (policy/priority API, 11.02/11.04) and Linux-specific implementation begins (CFS internals here), and being willing to say "that specific constant I'd verify against the running kernel version" rather than inventing a confident-sounding number.
+- This distinction matters concretely for firmware validation work: code that depends on the POSIX-standard scheduling API (sched_setscheduler, priorities) is portable across POSIX systems; code or tuning that depends on CFS internals (exact nice-to-weight ratios, target latency constants) is Linux-version-specific and should be documented as such.
+FOLLOW:
+- Would you expect this exact algorithm on a non-Linux POSIX system? => No; POSIX only requires *some* implementation-defined default time-sharing policy behind SCHED_OTHER, with nice/setpriority influencing it in some implementation-defined way -- another POSIX-conformant OS is free to implement its default policy completely differently.
+- What would make you say "I'm not certain" rather than guess in an interview on this topic? => Any specific numeric constant (target latency, minimum granularity, exact nice-to-weight multiplier) I have not verified against the specific kernel version in question -- the conceptual model (virtual runtime, weight, smallest-vruntime-next) is safe to state confidently; the exact numbers are not.
+PITFALL: Presenting Linux CFS internals as if they were part of the POSIX standard, or quoting specific scheduler constants from memory as if they were guaranteed to hold across kernel versions.
+VERIFY: Linux kernel scheduler internals (CFS virtual runtime, weight table, red-black tree pick-next) -- not part of the POSIX.1 sched_setscheduler.3p/sched_get_priority_max.3p pages fetched for this module; explicitly Linux-implementation knowledge.
+
+@@ 11.20 | Principal | Numeric | tags=iops,jitter,budget,reasoning
+Q: Reasoning about an IOPS budget: if a hot path must complete in 10 microseconds on average to sustain a target IOPS rate, how much scheduling jitter can it tolerate?
+SHORT: As a hedged reasoning exercise, not a spec figure: if the per-op budget is 10us and a scheduling delay can cost roughly 1-10us when it happens (11.10), even a rare (1-in-1000) delay of that size drags down a tight average, and a tail-latency requirement (e.g. p99.9) is far more sensitive to this than the average -- the average can look fine while rare context switches or page faults blow out the tail.
+DEEP:
+- The core reasoning move: separate "average throughput" from "tail latency" requirements explicitly, because they are sensitive to jitter very differently -- an average can absorb rare outliers almost invisibly, while a percentile-based SLA (common in storage validation, e.g. "99.99% of ops under X us") can be violated by outliers that barely move the average at all.
+- A back-of-envelope way to reason about it: if the target IOPS rate implies a 10us average budget, and you can (hedged, per 11.10) estimate a scheduling-jitter event at roughly 1-10us when one occurs, then the *frequency* of jitter events, not just their size, determines whether the average budget survives -- one jitter event per 100 operations is a very different story from one per 100,000.
+- The practical next step from this reasoning, not just the arithmetic: instrument actual per-operation latency (11.14/11.18) and look at the full distribution (histogram, percentiles), rather than trying to reason your way to a pass/fail conclusion from context-switch cost estimates alone -- the estimates are for building intuition about where to look, not for certifying compliance.
+- This whole line of reasoning is exactly why 11.17's design (pinning, mlockall, lock-free hot path) exists: each element specifically removes one class of jitter source (core contention, page faults, lock contention) that would otherwise eat into this budget unpredictably.
+FOLLOW:
+- Why does tail latency matter more than average latency for a real deadline-sensitive workload? => Because a single missed deadline can be a correctness/compliance failure in a real-time context even if 99.9% of operations were comfortably within budget; averages hide exactly the outliers that matter most.
+- What would you tell a manager who says "the average latency looks fine, ship it"? => That average latency and worst-case/tail latency are different questions, and a real-time or deadline-sensitive workload needs the tail measured and bounded explicitly, not inferred from the average.
+PITFALL: Certifying a real-time or IOPS-deadline requirement by looking only at average latency. A comfortable average can coexist with a tail that violates the actual requirement; always check the percentile/worst-case numbers that the requirement is actually stated in terms of.
+VERIFY: no formal spec source (workload- and hardware-dependent reasoning exercise); treat all numeric figures here as hedged, illustrative estimates, not measured facts about any specific system.

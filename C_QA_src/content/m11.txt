@@ -1,0 +1,530 @@
+# Module 11: Bit Manipulation & Numeric Representation
+
+@@ 11.01 | Basic | Concept | tags=twos-complement,subtraction,representation
+Q: What is two's complement, and why does it let a CPU implement subtraction with the same hardware as addition?
+SHORT: Two's complement is one of three signed-integer representations C11 6.2.6.2p2 permits (the others are ones' complement and sign-magnitude); in it, the sign bit contributes -(2^M) rather than being a separate sign flag. Negating a value is "invert the bits and add one," so `a - b` becomes `a + (~b + 1)`, meaning a single binary adder circuit handles both addition and subtraction with no separate subtractor and no special-cased sign logic.
+DEEP:
+- **The representation, precisely (6.2.6.2p2):** for an M-value-bit signed type, if the sign bit is 1, "the sign bit has the value -(2^M)" under two's complement, versus "the corresponding value with sign bit 0 is negated" for sign-magnitude, or "-(2^M - 1)" for ones' complement. Which one an implementation uses is implementation-defined in C11, though every mainstream target (and C23, normatively) uses two's complement.
+- **Why subtraction "is free":** `a - b == a + (-b)`, and `-b` in two's complement is `~b + 1` (flip every bit, add one). Since the hardware already has an adder for `+`, subtraction reuses it by first complementing and incrementing `b`, which is a cheap bitwise operation, rather than needing a distinct subtractor circuit.
+- **The one asymmetry two's complement introduces:** there is one more negative value than positive value (`INT_MIN` has no positive counterpart in range), because `0` "uses up" one of the sign-bit-1 patterns that sign-magnitude would otherwise spend on negative zero. This is why `-INT_MIN` and `abs(INT_MIN)` cannot be represented and are undefined behavior (7.22.6.1p2, footnote 304: "the absolute value of the most negative number cannot be represented in two's complement").
+- **Worked example, 8-bit for readability:** `5 - 3` as two's complement: `3 = 00000011`, `-3 = ~00000011 + 1 = 11111101`, `5 + (-3) = 00000101 + 11111101 = 00000010 = 2` (the carry out of the top bit is discarded), which matches the expected result using only addition.
+FOLLOW:
+- Is `abs(INT_MIN)` a crash, or just a wrong answer? => Neither is guaranteed; 7.22.6.1p2 makes it undefined behavior outright, so a real toolchain might return `INT_MIN` unchanged, trap, or do anything else, and none of those outcomes is more "correct" than another per the standard.
+- Does unsigned arithmetic care which signed representation is in use? => No, 6.2.6.2p1's unsigned rule (pure binary, value bits only) is independent of the signed-representation choice entirely, which is part of why unsigned wraparound is portable while signed overflow is not (Module 10).
+PITFALL: Writing `-x` or `abs(x)` on a signed value that might be `INT_MIN` without checking first. It is undefined behavior, not merely "returns INT_MIN".
+VERIFY: C11 6.2.6.2p2 (the three permitted signed representations) and 7.22.6.1p2 with footnote 304 (abs of INT_MIN).
+
+@@ 11.02 | Basic | Concept | fig=bitops | tags=and-or-xor-shift,bitwise,worked-example
+Q: What do AND, OR, XOR, and the shift operators actually compute, bit by bit, on a real byte value?
+SHORT: AND (`&`) keeps only the bits set in both operands, OR (`|`) keeps bits set in either, XOR (`^`) keeps bits set in exactly one, and `<<`/`>>` slide the bit pattern left or right, filling vacated positions with zero (left, and for unsigned/nonnegative right) or an implementation-defined bit (negative signed right shift, Module 10). Each is a fixed, position-by-position truth-table operation with no carrying or borrowing between bit positions, unlike ordinary addition.
+DEEP:
+```c
+#include <stdio.h>
+int main(void) {
+    unsigned char a = 0xB4;
+    unsigned char b = 0x2F;
+    printf("a & b = 0x%02X\n", (unsigned char)(a & b));
+    printf("a | b = 0x%02X\n", (unsigned char)(a | b));
+    printf("a ^ b = 0x%02X\n", (unsigned char)(a ^ b));
+    printf("a << 2 = 0x%02X\n", (unsigned char)(a << 2));
+    printf("a >> 2 = 0x%02X\n", (unsigned char)(a >> 2));
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra`, this prints `a & b = 0x24`, `a | b = 0xBF`, `a ^ b = 0x9B`, `a << 2 = 0xD0`, `a >> 2 = 0x2D`.
+
+| Position (MSB to LSB) | a=0xB4 | b=0x2F | a&b | a\|b | a^b |
+|---|---|---|---|---|---|
+| bits | 1011 0100 | 0010 1111 | 0010 0100 | 1011 1111 | 1001 1011 |
+| hex | 0xB4 | 0x2F | 0x24 | 0xBF | 0x9B |
+
+- **Each column is independent:** bit 7 of the result depends only on bit 7 of `a` and bit 7 of `b`; there is no interaction between adjacent bit positions the way there is in addition's carry chain. That independence is exactly why these operators are the tool of choice for masks, flags, and packing (Module 6's bit-fields do the same thing at the language level).
+- **Shift is a position operation, not arithmetic:** `a << 2` moves every bit two positions toward the high end and fills the low two positions with `0`, per 6.5.7p4; `unsigned char` results are promoted to `int` for the shift (integer promotions) and then implicitly narrowed back by the cast in this code, which is why the cast to `(unsigned char)` before printing matters, otherwise `%02X` with an `int` argument on a promoted value would still print the right bits here, but relying on that without the cast is fragile.
+- **`a >> 2` here is `0x2D`** because `unsigned char` promotes to a nonnegative `int` for the shift, so 6.5.7p5's "quotient of E1 / 2^E2" branch applies: `0xB4 = 180`, `180 / 4 = 45 = 0x2D`, a pure logical shift with no sign extension.
+FOLLOW:
+- Would `a >> 2` differ if `a` were declared `signed char` holding the same bit pattern? => Only in how the value is interpreted before promotion; `(signed char)0xB4` is a negative value on a two's-complement implementation, and after integer promotion to `int` it stays negative, so the shift becomes 6.5.7p5's other branch, implementation-defined for a negative operand (Module 10).
+- Is `a ^ b` the same as `(a | b) & ~(a & b)`? => Yes, that identity always holds for XOR (bits set in exactly one operand equal bits set in either operand but not both), and it is a common way interviewers ask you to derive XOR from AND/OR/NOT if you forget the direct truth table.
+PITFALL: Forgetting that `unsigned char` and `short` operands promote to `int` before any bitwise or shift operator runs, so intermediate results can be wider than the source type until narrowed back explicitly.
+VERIFY: C11 6.5.7p4-5 (shift semantics) and 6.5.10 to 6.5.12 (AND, XOR, OR semantics).
+
+@@ 11.03 | Basic | Numeric | tags=sizeof,char-bit,int-limits,worked-calculation
+Q: Work out CHAR_BIT, sizeof(int), and INT_MIN/INT_MAX for a typical 64-bit Linux target, and explain the relationship between them.
+SHORT: On this gcc/x86-64 target, `CHAR_BIT` is 8, `sizeof(int)` is 4, so `int` has 32 value-carrying bits; with one bit reserved as the sign bit in two's complement, the range is -2^31 to 2^31 - 1, which is exactly `INT_MIN = -2147483648` and `INT_MAX = 2147483647`, confirmed by compiling and printing `<limits.h>`'s macros directly.
+DEEP:
+```c
+#include <stdio.h>
+#include <limits.h>
+int main(void) {
+    printf("CHAR_BIT=%d sizeof(int)=%zu sizeof(long)=%zu\n", CHAR_BIT, sizeof(int), sizeof(long));
+    printf("INT_MIN=%d INT_MAX=%d\n", INT_MIN, INT_MAX);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra`, prints `CHAR_BIT=8 sizeof(int)=4 sizeof(long)=8` and `INT_MIN=-2147483648 INT_MAX=2147483647`.
+1. **Total bits in `int`** = `CHAR_BIT * sizeof(int)` = `8 * 4 = 32`.
+2. **Two's complement split**: 1 sign bit + 31 value bits (assuming no padding bits, which is true for `int` on this target).
+3. **Range from 31 value bits**: values `0` to `2^31 - 1 = 2147483647` are representable with the sign bit clear; with the sign bit set, two's complement adds the range down to `-2^31 = -2147483648` (6.2.6.2p2's "the sign bit has the value -(2^M)" with M=31).
+4. **`long`'s 8 bytes here (64 bits) is a target/ABI fact**, not something C11 fixes; the standard only guarantees `long` is at least 32 bits (5.2.4.2.1's minimum-range table), so `sizeof(long)` legitimately differs across platforms (4 on 32-bit Windows, 8 on 64-bit Linux) even with the same compiler.
+- **Why this worked calculation matters for firmware:** any code that hardcodes "`int` is 32 bits" or "`long` is 64 bits" instead of using `<stdint.h>`'s exact-width types (`int32_t`, `uint64_t`) or `sizeof`/`<limits.h>` is making a platform assumption that C11 does not guarantee, even though it happens to hold on most desktop and server targets.
+FOLLOW:
+- Does C11 guarantee int is exactly 32 bits? => No; 5.2.4.2.1 only guarantees INT_MIN <= -32767 and INT_MAX >= 32767 as minimums, so a conforming `int` could in principle be 16 bits (rare in practice today) or wider than 32.
+- Why use INT_MIN/INT_MAX from <limits.h> instead of hardcoding -2147483648/2147483647? => Portability and self-documentation: the macros are correct on whatever the actual target's int width is, and the literal `-2147483648` is not even directly writable as an int constant in C (it parses as unary minus applied to `2147483648`, which does not fit in a signed int, forcing an implementation-defined type for the literal itself).
+PITFALL: Assuming `sizeof(int) == sizeof(long)` because it happens to be true, or false, on the one target you tested. Use `<stdint.h>` exact-width types for any wire format or register layout that must match across targets.
+VERIFY: C11 5.2.4.2.1 (minimum magnitude requirements for INT_MIN/INT_MAX/LONG_MIN/LONG_MAX).
+
+@@ 11.04 | Intermediate | Concept | tags=set-clear-toggle-test,bit-mask,register
+Q: What are the standard idioms to set, clear, toggle, and test a single bit in an integer, and why does each one use the operator it does?
+SHORT: Set with `x |= (1u << n)` (OR forces that bit to 1 without disturbing others), clear with `x &= ~(1u << n)` (AND with every bit 1 except position n forces it to 0), toggle with `x ^= (1u << n)` (XOR flips exactly that bit), and test with `(x >> n) & 1u` (shift the target bit to position 0, then mask off everything else). Each idiom follows directly from the bitwise truth table: OR only ever turns bits on, AND only ever turns them off (when masked with 0s), XOR always flips.
+DEEP:
+```c
+#include <stdio.h>
+int main(void) {
+    unsigned int reg = 0x00;
+    reg |= (1u << 3);
+    printf("set: 0x%02X\n", reg);
+    reg &= ~(1u << 3);
+    printf("clear: 0x%02X\n", reg);
+    reg ^= (1u << 3);
+    printf("toggle: 0x%02X\n", reg);
+    unsigned int is_set = (reg >> 3) & 1u;
+    printf("test bit3: %u\n", is_set);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra`, prints `set: 0x08`, `clear: 0x00`, `toggle: 0x08`, `test bit3: 1`.
+- **Why `1u`, not `1`:** using an unsigned literal keeps the shift and mask operations entirely in defined, wraparound-friendly unsigned arithmetic; shifting a plain `1` (an `int`) into the sign bit position (bit 31 of a 32-bit int) would attempt to produce a negative-signed-overflow result, undefined per 6.5.7p4, whereas `1u << 31` is perfectly defined unsigned arithmetic.
+- **Why clear uses `~` then `&`, not a direct assignment:** `~(1u << n)` produces a mask that is all 1s except a single 0 at position n; ANDing with it leaves every other bit unchanged (`x & 1 == x`) and forces position n to 0 (`x & 0 == 0`) regardless of its previous value, which is exactly "clear this bit, leave the rest alone."
+- **Why this pattern matters for firmware registers:** a hardware control register is almost always "read-modify-write one or two bits, leave the rest of the register untouched," because other bits may control unrelated hardware functions; a naive `reg = (1 << 3)` would zero every other bit in the register, likely disabling something else the firmware did not intend to touch.
+- **Multi-bit fields generalize the same idea:** to set a multi-bit field to a value `v` at bit offset `n` with width `w`, clear the field first with a wider mask (`x &= ~(((1u << w) - 1) << n)`), then OR in the shifted value (`x |= (v << n)`), combining the clear and set idioms.
+FOLLOW:
+- Why not just write reg = 0x08 to set bit 3? => That overwrites every other bit in `reg` to 0, which is fine only if bit 3 is the sole meaningful bit; the OR-based idiom is the one that composes safely when other bits also matter, which is the common case for real registers.
+- Does `(reg >> 3) & 1u` work the same as `reg & (1u << 3)` for testing a bit? => Both correctly test whether the bit is set (nonzero result means set), but `(reg >> 3) & 1u` always yields exactly `0` or `1`, while `reg & (1u << 3)` yields `0` or `8`; prefer the shift form when the test result itself will be used as a boolean or compared numerically to `1`.
+PITFALL: Shifting a plain `int` literal (not `1u`) up to or past the sign bit position. That specific shift is undefined behavior per 6.5.7p4, not merely "sets a negative-looking bit."
+VERIFY: C11 6.5.7p4 (left shift of a signed value that is not representable is undefined) and 6.5.10-6.5.12 (AND/XOR/OR semantics).
+
+@@ 11.05 | Intermediate | Numeric | tags=popcount,brian-kernighan,worked-example
+Q: Walk through Brian Kernighan's bit-counting trick, `n &= (n - 1)`, with an actual value, and explain why it terminates in exactly popcount(n) iterations.
+SHORT: `n - 1` flips the lowest set bit of `n` to 0 and sets every bit below it to 1 (the two's complement borrow chain); ANDing that back into `n` clears exactly the lowest set bit and leaves every other bit untouched, so each iteration removes exactly one set bit. Starting from `n = 0x0B` (`0000 1011`, three set bits), the loop runs exactly three times before `n` reaches `0`, matching `popcount(0x0B) == 3`.
+DEEP:
+```c
+#include <stdio.h>
+int popcount(unsigned int n) {
+    int count = 0;
+    while (n) {
+        n &= (n - 1);
+        count++;
+    }
+    return count;
+}
+int main(void) {
+    printf("%d\n", popcount(0xFFu));
+    printf("%d\n", popcount(0x0Bu));
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra`, prints `8` (for `0xFF`, all 8 bits set) and `3` (for `0x0B`).
+
+Trace of `popcount(0x0B)`, `0x0B = 0000 1011`:
+| Step | n before | n - 1 | n & (n-1) | count |
+|---|---|---|---|---|
+| 1 | 0000 1011 | 0000 1010 | 0000 1010 | 1 |
+| 2 | 0000 1010 | 0000 1001 | 0000 1000 | 2 |
+| 3 | 0000 1000 | 0000 0111 | 0000 0000 | 3 |
+
+1. **Why `n - 1` flips exactly the lowest set bit and everything below it:** subtracting 1 borrows from the lowest set bit (since every bit below it is 0), turning that bit to 0 and every bit below it to 1, while every bit above it is untouched.
+2. **Why the AND then clears only that one bit:** the bits above the lowest set bit are identical in `n` and `n-1` (AND leaves them unchanged); the lowest set bit is 1 in `n` and 0 in `n-1` (AND clears it); the bits below are 0 in `n` and 1 in `n-1` (AND keeps them 0, which they already were).
+3. **Loop count equals the number of set bits exactly**, since each iteration removes precisely one, and the loop exits the instant `n` becomes `0`, which is why this trick runs in O(popcount(n)) rather than O(bit width) the way a naive shift-and-test loop over every bit position would.
+- **When to prefer this over `__builtin_popcount`:** almost never on gcc/clang, since the builtin typically compiles to a single hardware `POPCNT` instruction where available and is both faster and clearer; this trick remains worth knowing because it is a standard interview question and because it is portable to toolchains or embedded targets with no such builtin.
+FOLLOW:
+- What does this trick compute for n = 0? => The `while (n)` loop body never executes, so it correctly returns `0` immediately, with no special-casing needed.
+- Is n &= (n - 1) safe for signed n? => It works bit-for-bit the same way on a two's-complement representation, but mixing signed arithmetic (`n - 1` on a signed type) into a bit-twiddling loop invites the overflow risk from Module 10 if `n` can be `INT_MIN`; prefer an unsigned parameter type, as this code does.
+PITFALL: Assuming this trick requires knowing the integer's bit width in advance. It does not; it only ever does as many iterations as there are set bits, regardless of the type's width.
+VERIFY: This is a well-known algorithmic identity rather than a spec-cited rule; the underlying two's-complement borrow behavior is grounded in C11 6.2.6.2p2.
+
+@@ 11.06 | Intermediate | Concept | tags=power-of-two,bit-trick,edge-case
+Q: Why does `n != 0 && (n & (n - 1)) == 0` correctly test whether an unsigned value is a power of two, and why is the `n != 0` check required?
+SHORT: A power of two has exactly one bit set, so `n - 1` flips that bit to 0 and sets every lower bit to 1, making `n` and `n - 1` share no set bits, so `n & (n - 1) == 0`. A value with two or more set bits fails this, since `n - 1` clears only the lowest one. The explicit `n != 0` guard is required because `0 - 1` wraps to all-1-bits for unsigned, making `0 & (0 - 1) == 0` true by accident, and 0 is not a power of two.
+DEEP:
+```c
+#include <stdio.h>
+#include <stdbool.h>
+bool is_pow2(unsigned int n) {
+    return n != 0 && (n & (n - 1)) == 0;
+}
+int main(void) {
+    printf("%d %d %d %d\n", is_pow2(0), is_pow2(1), is_pow2(64), is_pow2(65));
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra`, prints `0 1 1 0`, matching: `0` is not a power of two, `1 = 2^0` is, `64 = 2^6` is, `65 = 64 + 1` (two set bits) is not.
+- **Short-circuit order matters, not just correctness:** `&&` guarantees the `n != 0` check runs first and, if false, the right-hand side is never evaluated at all (6.5.13p4's short-circuit rule), so there is no risk of a hypothetical issue from evaluating `n - 1` on `n == 0`; that subtraction is itself perfectly well-defined unsigned wraparound (Module 10), so this particular guard is about logical correctness, not about avoiding undefined behavior.
+- **The bit picture for n = 64:** `64 = 0100 0000`, `63 = 0011 1111`, and the AND of those two is `0000 0000`, no overlap, confirming the power-of-two case. For `n = 65 = 0100 0001`, `64 = 0100 0000`, AND gives `0100 0000`, nonzero, correctly rejecting it.
+- **A related, frequently confused idiom:** `n & (n + 1) == 0`... is not a power-of-two test; that shape instead identifies a value that is one less than a power of two (all low bits set, like `0x0F` or `0x7F`), which shows up in mask construction, not power-of-two checks. Keep the two straight.
+- **Firmware use case:** power-of-two checks gate ring-buffer and DMA-alignment code (Module 18's ring buffer is sized to a power of two specifically so index wraparound can use a cheap `& (size - 1)` mask instead of a modulo operation).
+FOLLOW:
+- Would this function misclassify n == UINT_MAX? => No; UINT_MAX has every bit set, so n & (n-1) clears only the lowest bit and leaves the rest set, giving a nonzero result and correctly reporting "not a power of two."
+- Can the same idiom be written as (n & -n) == n for a signed type? => That form relies on `-n` in two's complement isolating the lowest set bit the same way `n - 1`'s complement does, but doing it with a signed type reintroduces the INT_MIN negation problem from the first question in this module; the unsigned version shown here avoids that entirely.
+PITFALL: Dropping the `n != 0` guard because "0 isn't usually passed in." Any function meant to be a general-purpose predicate should handle its documented domain correctly, including the edge value.
+
+@@ 11.07 | Intermediate | Trap | tags=xor-swap,aliasing,no-temp
+Q: The classic "swap two variables without a temporary" trick uses three XORs. What is the trap that makes it dangerous in real code, not just a curiosity?
+SHORT: `*a ^= *b; *b ^= *a; *a ^= *b;` correctly swaps two distinct integers using only XOR's self-inverse property, but if `a` and `b` point to the same object (or the same array element passed twice), the first line computes `*a ^= *a`, which zeroes the value, and the swap silently destroys the data instead of leaving it unchanged the way a temporary-based swap naturally would. A real implementation must guard the aliasing case explicitly.
+DEEP:
+```c
+#include <stdio.h>
+void xor_swap(int *a, int *b) {
+    if (a == b) return;
+    *a ^= *b;
+    *b ^= *a;
+    *a ^= *b;
+}
+int main(void) {
+    int x = 5, y = 9;
+    xor_swap(&x, &y);
+    printf("%d %d\n", x, y);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra`, prints `9 5`, confirming the swap worked for the ordinary, non-aliased case.
+1. **Why the three-XOR sequence works when a != b:** let the original values be `A` and `B`. After line 1, `*a = A^B`. After line 2, `*b = B ^ (A^B) = A`. After line 3, `*a = (A^B) ^ A = B`. The result is `*a = B, *b = A`, a correct swap, using only XOR's properties `x^x=0` and `x^0=x`.
+2. **Why aliasing breaks it:** if `a == b`, line 1 computes `*a ^= *a`, and `x ^ x` is always `0` regardless of `x`'s value (6.5p6-7's rules about accessing the same object twice in one full expression are not even the issue here; this is XOR's own algebra doing exactly what it always does), so the value is zeroed before the "swap" even gets to the second line. This is a plain logic bug, not undefined behavior, which makes it worse in one sense: no sanitizer will ever flag it.
+3. **Where aliasing sneaks in in real code:** calling `xor_swap(&arr[i], &arr[j])` inside a sort routine where `i` and `j` can be equal on some iteration (a common off-by-one in partition logic) is the realistic version of this bug, not two obviously-identical variables.
+4. **Why the guard belongs inside the function, not at every call site:** relying on every caller to remember "never call this with equal pointers" is exactly the kind of contract that erodes over time as new call sites are added; the one-line `if (a == b) return;` makes the function correct for its entire domain unconditionally.
+- **Practical verdict:** this trick has no real performance advantage on any modern compiler (a plain temporary-based swap compiles to the same or better code, since the compiler already has spare registers), so treat it as an interview-knowledge item and a code-review red flag rather than something to actually reach for.
+FOLLOW:
+- Does using a temporary variable have the same aliasing problem? => No: `int t = *a; *a = *b; *b = t;` produces `*a == *b == original value` (a correct no-op) when `a == b`, since it never relies on an operation that is destructive to the value in place, which is exactly why the temporary-based swap is the one to use in production code.
+- Is the XOR trick ever the right choice for firmware? => Rarely; a handful of odd niches (swapping without spilling a register in extremely tight hand-written assembly) motivated it historically, but for C source compiled by a modern optimizer it offers no benefit and carries this real risk.
+PITFALL: Presenting the XOR swap in an interview without immediately naming the aliasing failure. Interviewers specifically probe for whether a candidate knows this trick has a sharp edge, not just that it exists.
+
+@@ 11.08 | Intermediate | Concept | tags=reverse-bits,byte,loop
+Q: Write and verify a function that reverses the bits within a single byte.
+SHORT: Peel off the source byte's bits from the low end one at a time with `b & 1`, and build the result from the high end by shifting the accumulator left and OR-ing in each peeled bit before shifting the source right, so the first (originally lowest) bit ends up at the top of the result and the last (originally highest) bit ends up at the bottom. For `0xB4` (`1011 0100`), reversing the bit order gives `0x2D` (`0010 1101`).
+DEEP:
+```c
+#include <stdio.h>
+#include <stdint.h>
+uint8_t reverse_bits(uint8_t b) {
+    uint8_t r = 0;
+    for (int i = 0; i < 8; i++) {
+        r = (uint8_t)((r << 1) | (b & 1));
+        b >>= 1;
+    }
+    return r;
+}
+int main(void) {
+    printf("0x%02X\n", reverse_bits(0xB4));
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra`, prints `0x2D`.
+1. **Bit by bit trace:** `b = 1011 0100`. Iteration 1 takes bit 0 of `b` (`0`), shifts `r` left (still `0`) and ORs in `0`, giving `r = 0`; then `b >>= 1` gives `0101 1010`. This repeats, each time moving the next-lowest bit of the (shrinking) `b` into the bottom of `r` after shifting `r` left, so bits arrive into `r` in the same order they left `b`, but end up read in reverse relative to `b`'s original layout.
+2. **Why the cast `(uint8_t)(...)` is needed on every assignment to r:** `r << 1` and the `|` promote to `int` (integer promotions), so without the explicit narrowing cast back to `uint8_t`, `-Wextra`/`-Wconversion`-style tooling would flag an implicit narrowing, and more importantly, relying on the implicit truncation without stating it invites exactly the kind of "did the width really come out right" review question this cast pre-empts.
+3. **Generalizing to a full word instead of a byte:** the identical loop structure works for any fixed width by changing the loop bound to the type's bit count (`sizeof(x) * CHAR_BIT` iterations) and widening the types; a byte-sized reversal is the version worth memorizing because it also underlies bit-reversed addressing used in FFT implementations and some peripheral register layouts.
+- **A faster, no-loop alternative for exactly 8 bits** is a 256-entry lookup table indexed by the input byte, trading code size (256 bytes of table) for O(1) time; that trade-off (loop vs. table) is a legitimate thing to discuss when asked to optimize this in an interview.
+FOLLOW:
+- Would this loop work unmodified for a 16-bit input if the type were changed to uint16_t and the bound to 16? => Yes, the same bit-peeling structure generalizes directly to any fixed width by widening the accumulator type and the loop bound to match.
+- Why use uint8_t from <stdint.h> instead of unsigned char here? => Both are typically the same object representation on ordinary platforms, but `uint8_t` states the intent (exactly 8 bits, no more) explicitly, which matters for wire-format and register-width code even though the two types are frequently interchangeable in practice.
+PITFALL: Off-by-one in the loop bound (7 instead of 8, or starting the shift before the first OR), which silently drops or duplicates the extreme bits instead of producing an obviously wrong, easy-to-spot result.
+
+@@ 11.09 | Intermediate | Concept | fig=endian | tags=endianness,runtime-check,byte-order
+Q: How do you determine at runtime whether the current platform is little-endian or big-endian, using only well-defined C?
+SHORT: Store a known multi-byte value into an object, take its address as an `unsigned char *` (permitted by 6.5p7's character-type exception to strict aliasing, unlike a same-size non-character pointer cast), and inspect the first byte: if it holds the least-significant byte of the value, the platform is little-endian, and if it holds the most-significant byte, it is big-endian. 6.2.6.1p2 leaves byte order implementation-defined, so this must be checked, not assumed.
+DEEP:
+```c
+#include <stdio.h>
+#include <stdint.h>
+int main(void) {
+    uint32_t x = 0x01020304u;
+    unsigned char *p = (unsigned char *)&x;
+    printf("bytes: %02X %02X %02X %02X\n", p[0], p[1], p[2], p[3]);
+    if (p[0] == 0x04) printf("little-endian\n");
+    else if (p[0] == 0x01) printf("big-endian\n");
+    else printf("unknown\n");
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra` on this x86-64 host, prints `bytes: 04 03 02 01` and `little-endian`: the least-significant byte (`0x04`) is stored first, at the lowest address.
+- **Why accessing through unsigned char * is not a strict-aliasing violation but casting to another int * would be:** 6.5p7 lists "a character type" as one of the always-allowed lvalue types for accessing any object's stored value, precisely so byte-level inspection code like this is well-defined; casting the same pointer to `uint16_t *` instead and dereferencing it would hit the exact violation covered in Module 10.
+- **Why this must be a runtime check, not a compile-time assumption:** 6.2.6.1p2 states byte order is either explicitly specified (it is not, for ordinary object types) or implementation-defined, so portable code that must know the host's byte order (rather than simply avoiding the question by using explicit shifts, per the next question) has to ask the platform, not hardcode an assumption that happens to hold on the one machine being tested.
+- **The common preprocessor-only alternative** is checking predefined macros such as `__BYTE_ORDER__` and `__ORDER_LITTLE_ENDIAN__` (gcc/clang extensions, not standardized by C11), which resolves this at compile time instead of runtime; the code above is the portable-C11 way to get the same answer without depending on a specific toolchain's macros.
+- **C23 note:** C23 adds `<stdbit.h>` types and, separately, a standardized way to query byte order is still not part of core C23 either; endianness detection remains a "check it yourself" problem in standard C even in the newest revision, which is why this runtime idiom stays relevant.
+FOLLOW:
+- Would this check work the same way for a struct instead of a scalar? => The same character-pointer technique works for inspecting any object's raw bytes, but a struct additionally has unspecified padding bytes between members (Module 6), so byte-by-byte inspection of a struct mixes real data bytes with padding bytes that carry no defined value.
+- Is casting &x to (unsigned char *) itself well-defined? => Yes; 6.3.2.3p7 explicitly covers converting a pointer to an object type into a pointer to a character type, and 6.5p7 then permits accessing the object through it, which together is exactly why this pattern, and not a same-size integer-pointer cast, is the standard-conforming choice.
+PITFALL: Assuming "little-endian" because the development machine is x86 and shipping that assumption into wire-format or cross-platform serialization code without an actual runtime or explicit-shift-based check.
+VERIFY: C11 6.2.6.1p2 (byte order is implementation-defined) and 6.5p7 (character-type access exception).
+
+@@ 11.10 | Advanced | Concept | tags=ieee754,float-bits,sign-exponent-mantissa
+Q: Decode the sign, exponent, and mantissa fields out of a 32-bit IEEE-754 float's bit pattern, using well-defined C.
+SHORT: Copy the float's bytes into a same-sized `uint32_t` with `memcpy` (standard-conforming, unlike a pointer cast), then extract bit 31 as the sign, bits 30 to 23 as the biased 8-bit exponent, and bits 22 to 0 as the mantissa; subtracting the bias of 127 from the exponent field gives the actual power of two. `-6.5f` decodes to sign 1, biased exponent 129 (unbiased 2, so 2^2=4), and a mantissa encoding significand 1.625.
+DEEP:
+```c
+#include <stdio.h>
+#include <string.h>
+#include <stdint.h>
+int main(void) {
+    float f = -6.5f;
+    uint32_t bits;
+    memcpy(&bits, &f, sizeof bits);
+    unsigned sign = (bits >> 31) & 1u;
+    unsigned exp = (bits >> 23) & 0xFFu;
+    unsigned mant = bits & 0x7FFFFFu;
+    printf("sign=%u exp=%u (unbiased %d) mantissa=0x%06X\n", sign, exp, (int)exp - 127, mant);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra`, prints `sign=1 exp=129 (unbiased 2) mantissa=0x500000`.
+1. **Why `memcpy`, not a pointer cast:** reinterpreting a `float`'s bytes as a `uint32_t` through a pointer cast is exactly the strict-aliasing violation covered in Module 10; `memcpy` between two same-sized objects of different types has no such problem, since it operates through `unsigned char` internally (conceptually) and every mainstream compiler compiles a small, fixed-size `memcpy` like this one down to the same load/store a cast would have produced, at no runtime cost.
+2. **Reconstructing the value from the fields:** IEEE-754 single precision is `(-1)^sign * 1.mantissa * 2^(exp - 127)` for a normal number (leading `1.` implicit and not stored). Here, sign=1 (negative), unbiased exponent 2 (`2^2 = 4`), and mantissa `0x500000 = 0b101_0000...0` over 23 bits represents `0.625` when interpreted as `mantissa / 2^23`, giving significand `1.625`; `-1 * 1.625 * 4 = -6.5`, matching the original value.
+3. **Annex F is C11's IEEE-754 binding**, and this module treats it as the assumed floating-point model since essentially every modern target implements it that way, though C11 itself does not require IEEE-754 outside of Annex F's optional conformance; `__STDC_IEC_559__` being defined is the standard way to check whether Annex F applies on a given implementation.
+- **Why interviewers ask this:** it tests whether the representation is understood as an engineered trade-off (range from the exponent, precision from the mantissa) rather than memorized trivia, and it is directly relevant to firmware that must interpret raw floating-point telemetry or protocol fields byte-for-byte.
+FOLLOW:
+- What would exp == 0 and exp == 255 mean instead of an ordinary value like 129? => exp == 0 signals a denormal (or exact zero if the mantissa is also 0), and exp == 255 signals infinity (mantissa 0) or NaN (nonzero mantissa), both special cases Module 11's later question on denormals and NaN covers.
+- Does this decoding change for a negative zero versus positive zero? => Yes, both have exp=0 and mantissa=0, differing only in the sign bit, and this is exactly the "negative zero" case that compares equal to positive zero under == but has a different bit pattern, worth remembering when doing byte-level comparisons instead of numeric ones.
+PITFALL: Reinterpreting float bits with a pointer cast instead of memcpy. It compiles and often "just works" at -O0, which is exactly the strict-aliasing trap covered in Module 10.
+VERIFY: C11 Annex F (IEC 60559 floating-point binding) and whether __STDC_IEC_559__ is defined on the target toolchain.
+
+@@ 11.11 | Advanced | Numeric | tags=float-epsilon,comparison,rounding
+Q: Why does accumulating 0.1f ten times not equal 1.0f exactly, and how should the comparison be written instead of `==`?
+SHORT: `0.1f` has no exact finite binary representation (0.1 in base 2 is a repeating fraction), so each addition carries a small rounding error, and ten accumulated roundings do not cancel back to exactly `1.0f`; on this toolchain the sum came out `1.000000119`, off from `1.0f` by exactly one `FLT_EPSILON`. The fix is comparing within a tolerance, `fabsf(a - b) < epsilon`, never `a == b`.
+DEEP:
+```c
+#include <stdio.h>
+#include <float.h>
+#include <math.h>
+int main(void) {
+    float sum = 0.0f;
+    for (int i = 0; i < 10; i++) sum += 0.1f;
+    float one = 1.0f;
+    printf("sum=%.9f one=%.9f equal=%d\n", sum, one, sum == one);
+    printf("diff=%.9f FLT_EPSILON=%.9f\n", fabsf(sum - one), FLT_EPSILON);
+    printf("close=%d\n", fabsf(sum - one) < 1e-6f);
+    return 0;
+}
+```
+Compiled and linked with `gcc -std=c11 -Wall -Wextra -o q11b q11b.c -lm`, prints `sum=1.000000119 one=1.000000000 equal=0`, `diff=0.000000119 FLT_EPSILON=0.000000119`, `close=1`.
+1. **Why 0.1f is inexact:** IEEE-754 binary floating point represents values as a sum of powers of two; `0.1` in base 2 is the repeating fraction `0.0001100110011...`, which cannot terminate in any finite number of mantissa bits, so the stored value is already the nearest representable float to 0.1, not 0.1 itself.
+2. **Why the error is exactly one FLT_EPSILON here:** `FLT_EPSILON` (7.19 no, actually `<float.h>`, C11 5.2.4.2.2) is defined as the difference between 1 and the next representable float greater than 1; accumulating ten roundings of a value near 0.1 happened, on this toolchain and rounding mode, to land exactly one representable step above `1.0f`, which is a plausible, though not standard-guaranteed, outcome of repeated rounding.
+3. **Why == is the wrong tool:** floating-point equality only holds when the bit patterns are identical, and after any chain of arithmetic involving non-exactly-representable values, expecting bit-for-bit equality with a separately-computed value is almost always the wrong expectation; the standard tolerance-based comparison (`fabsf(a - b) < some_epsilon`) is the idiom for this reason.
+4. **Choosing the tolerance is context-dependent:** `1e-6f` worked here because the error was on the order of `FLT_EPSILON` itself; a computation involving larger magnitudes or more accumulated operations needs a tolerance scaled to the magnitude of the values involved (relative error), not a single fixed absolute constant everywhere.
+- **Firmware relevance:** sensor fusion, calibration, and control-loop code that compares floating-point thresholds needs this tolerance discipline; a `==` comparison that "happened to work" in unit tests can fail intermittently once compiler, optimization level, or FPU rounding mode changes the exact accumulated error.
+FOLLOW:
+- Would using double instead of float make the sum exactly 1.0? => It would reduce the error's magnitude by many orders of magnitude (doubles carry far more mantissa bits) but not eliminate it in general, since 0.1 is still not exactly representable in binary at any finite precision.
+- Is FLT_EPSILON itself always the right tolerance to use? => Only as a rough starting point; it is the gap right at 1.0, and the appropriate tolerance for values far from 1.0 should generally scale with the magnitude of the operands (relative epsilon), not stay fixed at FLT_EPSILON.
+PITFALL: Comparing accumulated floating-point sums with == in test assertions. It works by accident on some builds and breaks on the next compiler or optimization-level change.
+VERIFY: C11 5.2.4.2.2 (FLT_EPSILON definition) and Annex F for the IEEE-754 rounding model assumed here.
+
+@@ 11.12 | Advanced | Debug | tags=shift-ub,bounds-check,fix
+Q: A code reviewer flags `unsigned int bad_mask(int n) { return 1u << n; }`. What exactly is wrong, and how do you fix it?
+SHORT: C11 6.5.7p3 says that if the shift count is negative or is greater than or equal to the width of the promoted left operand, the behavior is undefined; `bad_mask` never checks `n` against that range, so any caller passing `n < 0` or `n >= 32` (for a 32-bit `unsigned int`) triggers undefined behavior at the shift itself, not merely a wrong answer. The fix is an explicit range check before the shift, returning a defined sentinel (here, `0`) for out-of-range input.
+DEEP:
+```c
+#include <stdio.h>
+unsigned int bad_mask(int n) {
+    return 1u << n;
+}
+unsigned int fixed_mask(int n) {
+    if (n < 0 || n >= 32) return 0;
+    return 1u << n;
+}
+int main(void) {
+    printf("%u\n", bad_mask(5));
+    printf("%u\n", fixed_mask(31));
+    printf("%u\n", fixed_mask(32));
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra`, prints `32`, `2147483648`, `0`: `bad_mask(5)` happens to look correct for an in-range argument, `fixed_mask(31)` correctly returns the top bit set, and `fixed_mask(32)` correctly returns `0` instead of invoking the undefined shift `bad_mask(32)` would have performed.
+1. **The exact standard text:** 6.5.7p3, "If the value of the right operand is negative or is greater than or equal to the width of the promoted left operand, the behavior is undefined." Width here means the full bit width of the type after integer promotion (32 for `unsigned int` on this target), not the precision or any smaller "meaningful bits" notion.
+2. **Why this bug is easy to miss in review:** `bad_mask(5)` (a typical in-range call) looks completely correct, and the function will keep looking correct through however many test cases happen to stay in range; the bug only manifests for a caller that passes a computed, possibly attacker- or configuration-influenced index that reaches 32 or higher, or a negative value from an unchecked subtraction.
+3. **Why 32, not 31, is the boundary:** shifting by exactly the type's bit width (32 for a 32-bit `unsigned int`) is undefined, matching "greater than or equal to"; shifting by 31 is the maximum defined shift amount, moving the single set bit into the sign-bit position of the underlying representation, which is fine since the type is unsigned.
+4. **The general defensive pattern**, useful anywhere a bit position or shift count is derived from external input (a protocol field width, a configuration value, a loop bound): validate the count against `[0, bit_width)` before shifting, exactly as `fixed_mask` does, rather than trusting the caller.
+FOLLOW:
+- Would gcc -fsanitize=undefined have caught a call to bad_mask(32) at runtime? => Yes; shift-exponent range checking is one of the specific checks bundled in gcc's -fsanitize=undefined, and it would report a runtime error naming the exact operator and operand values, the same style of report seen for signed overflow in Module 10.
+- Is 1u << 31 itself defined? => Yes, 31 is one less than the 32-bit width, satisfying 6.5.7p3's bound exactly, and since the left operand is unsigned, there is no additional signed-overflow concern the way there would be for 1 << 31 on a signed int.
+PITFALL: Testing only with small, obviously in-range shift counts and concluding the function is correct. The bug is invisible until an out-of-range count is actually exercised.
+VERIFY: C11 6.5.7p3 (shift count range) confirmed against this target's 32-bit unsigned int width.
+
+@@ 11.13 | Advanced | Concept | tags=arithmetic-shift,logical-shift,signed-vs-unsigned
+Q: For the identical underlying bit pattern, why does a signed right shift give a different numeric result than an unsigned right shift?
+SHORT: `-16` and `0xFFFFFFF0` are the same 32-bit pattern on a two's-complement target, but 6.5.7p5 gives them different shift semantics: shifting the unsigned value right is defined as the integer quotient `E1 / 2^E2` (a logical shift, filling with zeros), while shifting a negative signed value right is implementation-defined, and on this gcc/x86-64 toolchain it sign-extends (fills with ones), giving `-4` for the signed case versus `1073741820` for the unsigned case on the same bits.
+DEEP:
+```c
+#include <stdio.h>
+int main(void) {
+    int s = -16;
+    unsigned int u = 0xFFFFFFF0u;
+    printf("signed >>2 = %d\n", s >> 2);
+    printf("unsigned >>2 = %u\n", u >> 2);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra`, prints `signed >>2 = -4` and `unsigned >>2 = 1073741820`.
+1. **Same bits, different rule applied:** both `s` and `u` hold the identical 32-bit pattern `1111 1111 1111 1111 1111 1111 1111 0000` on a two's-complement implementation; which shift rule (6.5.7p5's defined quotient, or its implementation-defined negative-value branch) applies is determined purely by the operand's declared type, not by the bit pattern itself.
+2. **The unsigned result, checked arithmetically:** `0xFFFFFFF0 = 4294967280`, and `4294967280 / 4 = 1073741820`, matching 6.5.7p5's "integral part of the quotient of E1 / 2^E2" exactly, with zeros filling the vacated high bits, a pure logical shift.
+3. **The signed result is this compiler's documented choice, not a universal rule:** gcc and clang both document (and essentially every mainstream target implements) an arithmetic right shift for negative signed values, filling with copies of the sign bit, which is why `-16 >> 2` gives `-4` (mathematically, `-16 / 4 = -4` exactly, though the standard does not phrase it as division for the negative case precisely because rounding direction on division and shifting can differ for values that do not divide evenly).
+4. **Why this distinction is a favorite interview probe:** it tests whether a candidate treats "shift" as one operation, or correctly separates it into "logical shift" (unsigned, or nonnegative signed, zero-fill) versus "arithmetic shift" (negative signed, implementation-defined fill), which is exactly the kind of type-driven semantic split C11 encodes throughout its bitwise-operator clauses.
+- **Practical guidance:** if a right shift must behave identically across every conforming compiler, perform it on an unsigned type; if a signed arithmetic shift's rounding-toward-negative-infinity behavior is specifically wanted, document the implementation-defined dependency explicitly rather than assuming it silently.
+FOLLOW:
+- Does casting the signed value to unsigned before shifting make the result portable? => Yes; (unsigned int)s >> 2 forces 6.5.7p5's defined quotient branch regardless of the original sign, at the cost of losing the sign-extension behavior if that was actually wanted.
+- Is left shift affected by the same signed/unsigned split? => Left shift has its own asymmetry (6.5.7p4): unsigned left shift is always defined as reduction modulo 2^width, while signed left shift is undefined the moment the mathematical result would not fit in the type, which is a stricter condition than simply "shifting a negative value," covered in Module 10's overflow discussion.
+PITFALL: Assuming a right shift is "just" a fast divide by a power of two for signed values. It rounds toward negative infinity for negative operands under arithmetic shift, while integer division by a power of two truncates toward zero, so the two differ by one for negative, non-multiple dividends.
+VERIFY: C11 6.5.7p5 (shift semantics for signed and unsigned operands) as implemented (arithmetic shift) by gcc/clang on x86-64.
+
+@@ 11.14 | Advanced | Cross-layer | tags=byte-order,wire-format,portable-encoding
+Q: How do you encode and decode a multi-byte integer for a wire protocol in a way that is correct regardless of the host's endianness?
+SHORT: Never rely on the host's in-memory byte order for anything that crosses a wire or file boundary; instead, explicitly shift and mask each byte into or out of position, which is defined arithmetic (6.5.7, 6.5.10-6.5.12) and gives identical results on a little-endian, big-endian, or unusual-endian host alike. This is the standard-C alternative to POSIX's `htonl`/`ntohl` (out of scope here, see VERIFY), and the technique real firmware protocol parsers use.
+DEEP:
+```c
+#include <stdio.h>
+#include <stdint.h>
+void put_be32(unsigned char *buf, uint32_t v) {
+    buf[0] = (unsigned char)(v >> 24);
+    buf[1] = (unsigned char)(v >> 16);
+    buf[2] = (unsigned char)(v >> 8);
+    buf[3] = (unsigned char)(v);
+}
+uint32_t get_be32(const unsigned char *buf) {
+    return ((uint32_t)buf[0] << 24) | ((uint32_t)buf[1] << 16) |
+           ((uint32_t)buf[2] << 8) | (uint32_t)buf[3];
+}
+int main(void) {
+    unsigned char wire[4];
+    put_be32(wire, 0x01020304u);
+    printf("%02X %02X %02X %02X\n", wire[0], wire[1], wire[2], wire[3]);
+    printf("%08X\n", get_be32(wire));
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra`, prints `01 02 03 04` (the value's bytes laid out most-significant-first, "big-endian on the wire," regardless of host order) and `01020304` (the round-tripped value), on this little-endian x86-64 host.
+1. **Why this is host-order-independent:** `put_be32` never reads or writes the multi-byte `v` as a single memory object; it computes each output byte purely by shifting and masking a value in a register, so the function produces the identical four wire bytes whether run on a little-endian or big-endian machine, because arithmetic shift and mask semantics (6.5.7, 6.5.10-6.5.12) do not depend on memory byte order at all.
+2. **Contrast with the naive approach** of `*(uint32_t *)wire = v;` (casting the buffer to a `uint32_t *` and storing directly), which both violates strict aliasing (Module 10) and bakes in whatever the host's memory byte order happens to be, producing wire bytes that differ between little- and big-endian hosts for the identical protocol value, exactly the bug demonstrated in the Principal question later in this module.
+3. **Why not just use htonl/ntohl:** those are POSIX/BSD sockets-API functions (`<arpa/inet.h>`), not part of ISO C; they do the same job on POSIX systems, but a firmware target without a POSIX sockets stack needs the portable-C version shown here regardless, so it is worth knowing the underlying technique rather than only the POSIX shortcut.
+4. **This scales to any field width:** the same shift-and-mask pattern generalizes to 16-bit, 64-bit, or non-power-of-two bit-field widths (Module 6), and is the standard technique behind any protocol header parser that must produce identical results on every target it ships to.
+FOLLOW:
+- Does this approach need any compile-time endianness detection at all? => No, that is precisely its advantage over the memory-cast approach: it needs no `#if` on byte order and no runtime check, since the shifts and masks are endianness-agnostic by construction.
+- Would a get_le32 (little-endian wire format) function look different? => Yes, only the byte-to-shift-amount mapping changes (buf[0] pairs with the lowest shift, buf[3] with the highest), while the technique (explicit shifts and masks, never a memory cast) stays identical.
+PITFALL: Believing a portable-looking `struct` laid directly over wire bytes via a pointer cast is "basically the same thing." It reintroduces both the strict-aliasing violation and the host-endianness dependency this technique specifically avoids.
+VERIFY: htonl/ntohl and <arpa/inet.h> are POSIX.1-2017, not ISO C11; treat any question needing them as belonging on the C Advanced page, referenced here only for contrast.
+
+@@ 11.15 | Advanced | Scenario | tags=popcount-builtin,firmware-register,performance
+Q: A firmware routine counts set bits in a status register on every interrupt using a naive bit-by-bit loop, and profiling shows it is hot. What are the realistic options, and how do you validate the replacement is correct?
+SHORT: Replace the naive 32-iteration bit-test loop with either Brian Kernighan's masking trick (iterations equal to the number of set bits) or, on gcc/clang, `__builtin_popcount`, which typically lowers to a single hardware `POPCNT` instruction where available and falls back to an efficient sequence otherwise. Validate by comparing both against the same test values, including the register's real observed extremes, not just small hand-picked numbers.
+DEEP:
+```c
+#include <stdio.h>
+int main(void) {
+    unsigned int reg = 0xDEADBEEFu;
+    int loop_count = 0;
+    unsigned int tmp = reg;
+    while (tmp) { tmp &= tmp - 1; loop_count++; }
+    int builtin_count = __builtin_popcount(reg);
+    printf("loop=%d builtin=%d\n", loop_count, builtin_count);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra`, prints `loop=24 builtin=24`, confirming both approaches agree on this real bit pattern.
+1. **Why "naive bit-by-bit" is slow specifically:** testing each of 32 bit positions unconditionally (`for (i = 0; i < 32; i++) if (reg & (1u << i)) count++;`) always runs 32 iterations regardless of how many bits are actually set, while Kernighan's trick runs only as many iterations as there are set bits (Module 11's earlier question), which matters on an ISR path that must return quickly.
+2. **Why `__builtin_popcount` is usually the better production choice over hand-written Kernighan:** it is a gcc/clang extension (not standard C11, hence not portable to every compiler without a fallback), but where available it typically compiles directly to the target's native population-count instruction, which is both faster and shorter than any C-level loop; C23 does add a standard `stdc_count_ones` family in `<stdbit.h>`, which is the portable, standardized equivalent once C23 is available.
+3. **Validating the replacement, concretely:** run both the old loop and the new implementation over the same input set inside a host-side unit test (not just eyeballing a couple of hand-picked hex constants), specifically including `0`, `UINT_MAX` (all bits set, worth confirming both give 32), single-bit values at the extremes (bit 0 and bit 31), and a batch of values actually captured from the real hardware register during bring-up, since real register bit patterns are rarely as clean as the textbook examples.
+4. **ISR-specific consideration beyond raw speed:** an interrupt handler should avoid anything with non-constant-time behavior if the ISR has a hard timing budget; Kernighan's trick's iteration count depends on the data (varies with popcount), while the fixed 32-iteration naive loop or a hardware `POPCNT` instruction both have constant time regardless of the bit pattern, which can matter more than average-case speed in a timing-critical ISR.
+- **Cross-reference:** ISR-safety constraints in general (what a handler must never do) belong to Module 17's fuller treatment; this question is scoped to the bit-counting choice itself.
+FOLLOW:
+- Is __builtin_popcount guaranteed to use a hardware instruction? => No, only when the target and compiler flags (for example -mpopcnt or an appropriate -march on x86) enable it; without that, gcc still generates a correct, reasonably efficient software fallback, so functional correctness never depends on the hardware feature, only performance does.
+- Does switching to __builtin_popcount change the function's behavior for reg == 0? => No, both approaches correctly return 0 for an all-clear register, which is exactly one of the boundary values the validation step above calls out explicitly.
+PITFALL: Swapping in a "faster" bit-counting implementation without re-running it against the actual range of values the hardware register produces in practice, not just clean textbook constants.
+
+@@ 11.16 | Principal | Debug | tags=endianness-bug,wire-format,root-cause
+Q: A field decoded from a received buffer as `direct = *(uint32_t *)wire;` reads back wildly wrong on some builds but fine on others, even though the buffer bytes are correct on the wire. Root-cause it.
+SHORT: The buffer holds a big-endian-encoded field, but `*(uint32_t *)wire` reinterprets those bytes using the host's native memory order, correct only on a big-endian host; on this little-endian machine it reads the bytes in reverse significance, giving a value unrelated to the intended one. The fix decodes with explicit shifts (`get_be32`) that never depend on host byte order, and the same line is also a strict-aliasing violation, independent of the endianness bug.
+DEEP:
+```c
+#include <stdio.h>
+#include <stdint.h>
+uint32_t get_be32(const unsigned char *buf) {
+    return ((uint32_t)buf[0] << 24) | ((uint32_t)buf[1] << 16) |
+           ((uint32_t)buf[2] << 8) | (uint32_t)buf[3];
+}
+int main(void) {
+    unsigned char wire[4] = {0x00, 0x00, 0x01, 0x2C};
+    uint32_t direct = *(uint32_t *)wire;
+    uint32_t portable = get_be32(wire);
+    printf("direct=%u portable=%u\n", direct, portable);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra` on this little-endian x86-64 host, prints `direct=738263040 portable=300`. The wire bytes `00 00 01 2C` encode the big-endian value `300` (`0x0000012C`), which `get_be32` correctly decodes; `direct` instead reads the same four bytes as a little-endian native `uint32_t`, giving `0x2C010000 = 738263040`, unrelated to the intended value.
+1. **Two separate bugs stacked in one line:** `*(uint32_t *)wire` both violates strict aliasing (the array's effective type is `unsigned char[4]`, accessed here through a `uint32_t` lvalue, none of 6.5p7's allowed cases) and bakes in host byte order, since dereferencing a multi-byte integer pointer reads the bytes in whatever order the host's memory representation uses, not the wire protocol's declared order.
+2. **Why this reproduces inconsistently across "builds"**: on a big-endian host the memory-order read would coincidentally match the wire's big-endian field order, masking the bug entirely there; the aliasing violation could also, separately, behave differently across optimization levels the way Module 10's aliasing question demonstrated, so "works on build A, breaks on build B" is consistent with either or both root causes being present.
+3. **The fix removes both problems at once:** `get_be32` reads through `unsigned char *` (the always-permitted character-type access, 6.5p7) and reconstructs the value with explicit shifts, which has one defined meaning ("interpret these four bytes as big-endian") regardless of host byte order or aliasing rules, since no non-character-typed reinterpretation of the buffer ever happens.
+4. **Triage checklist for "endianness bug" reports in general:** find every place a multi-byte field is read or written as a single pointer-cast memory access rather than explicit byte-by-byte shifts; each one is a candidate, and each is also worth checking for strict-aliasing exposure, since the two issues travel together in exactly this pattern.
+- **This is the same class of mistake** as Module 10's type-punning question, wearing an endianness costume: a pointer cast that reinterprets an object's type across a boundary (there, `float`/`int`; here, a byte buffer/`uint32_t`) is undefined regardless of whether an endianness mismatch happens to also be present.
+FOLLOW:
+- Would using memcpy instead of a pointer cast fix the endianness half of the bug? => No; memcpy(&direct, wire, 4) removes the strict-aliasing violation but still copies the bytes in memory order, so it would still misinterpret a big-endian wire field on a little-endian host; only the explicit shift-based decode fixes the endianness half.
+- Is this bug possible to catch with -fsanitize=undefined? => The strict-aliasing half generally is not, per Module 10's discussion of gcc's UBSan gaps; the wrong-value symptom itself would only surface as a functional test failure comparing the decoded value against the expected one.
+PITFALL: Fixing only the strict-aliasing violation (switching to memcpy) and declaring the bug resolved, while the actual wrong-value symptom, the endianness mismatch, is still present.
+
+@@ 11.17 | Principal | Numeric | tags=bitfield-packing,protocol-header,worked-design
+Q: Design and verify a packed 32-bit protocol header holding a 4-bit opcode, a 12-bit length, and a 16-bit CRC, using explicit bit operations rather than a compiler bit-field.
+SHORT: Lay the fields out explicitly, opcode in bits 31-28, length in bits 27-16, CRC in bits 15-0, pack with shifts and masks into one `uint32_t`, and unpack the same way; for opcode `0x5`, length `0x123`, CRC `0xBEEF`, this gives word `0x5123BEEF`, and unpacking recovers all three exactly. Explicit shifts, not a struct bit-field, sidestep the implementation-defined allocation order Module 6 covers.
+DEEP:
+```c
+#include <stdio.h>
+#include <stdint.h>
+uint32_t pack_header(unsigned opcode4, unsigned length12, unsigned crc16) {
+    return ((uint32_t)(opcode4 & 0xFu) << 28) |
+           ((uint32_t)(length12 & 0xFFFu) << 16) |
+           (uint32_t)(crc16 & 0xFFFFu);
+}
+void unpack_header(uint32_t word, unsigned *opcode4, unsigned *length12, unsigned *crc16) {
+    *opcode4 = (word >> 28) & 0xFu;
+    *length12 = (word >> 16) & 0xFFFu;
+    *crc16 = word & 0xFFFFu;
+}
+int main(void) {
+    uint32_t w = pack_header(0x5, 0x123, 0xBEEF);
+    unsigned op, len, crc;
+    unpack_header(w, &op, &len, &crc);
+    printf("word=0x%08X opcode=0x%X length=0x%X crc=0x%X\n", w, op, len, crc);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra`, prints `word=0x5123BEEF opcode=0x5 length=0x123 crc=0xBEEF`, confirming the round trip.
+1. **Bit budget check first:** 4 + 12 + 16 = 32 bits, exactly one `uint32_t`, with no slack, so any future field addition needs either a wider word or a narrower existing field, decided deliberately rather than discovered by an overflow.
+2. **Masking before shifting matters:** `(opcode4 & 0xFu)` clamps a caller-supplied value to 4 bits before it is placed into the top nibble, so a caller accidentally passing an opcode value wider than 4 bits gets silently truncated to fit rather than corrupting the adjacent length field; whether silent truncation or an assertion is the right response is a design choice, but the mask at least guarantees the layout invariant holds.
+3. **Why not a compiler bit-field (`unsigned opcode : 4;` etc.) instead:** C11 leaves the allocation order of bit-fields within a storage unit, and whether they can straddle a boundary, implementation-defined (Module 6), so a `struct` bit-field's in-memory layout is not guaranteed to match this exact 4/12/16 wire order across compilers; explicit shifts and masks have exactly one meaning on every conforming implementation, which is the whole reason to prefer them for a field with a mandated wire layout.
+4. **Numeric sanity check on the packed word:** `opcode4=0x5` at bit offset 28 contributes `0x5 << 28 = 0x50000000`; `length12=0x123` at offset 16 contributes `0x123 << 16 = 0x01230000`; `crc16=0xBEEF` at offset 0 contributes `0x0000BEEF`; OR-ing the three gives `0x50000000 | 0x01230000 | 0x0000BEEF = 0x5123BEEF`, matching the program's output exactly.
+- **Where this generalizes:** any fixed wire or register layout with sub-byte or non-byte-aligned fields (command opcodes, NVMe-style status fields, flag-plus-length headers) uses this identical shift-mask-OR pattern; only the field widths and offsets change.
+FOLLOW:
+- What happens if length12 is called with a value like 0x1234 (13 bits)? => The & 0xFFFu mask silently truncates it to 0x234 before packing, which prevents corrupting the opcode field but also silently hides a caller bug; a design that must catch this instead of truncating it should assert or return an error before masking.
+- Would this layout be portable to a big-endian target without changes? => The bit-level packing inside the uint32_t word is unaffected by host endianness, since it is built and read with shifts and masks (Module 11's earlier question); only serializing that uint32_t word to bytes on the wire needs an explicit byte-order choice, exactly like the put_be32/get_be32 functions shown earlier in this module.
+PITFALL: Reaching for a compiler bit-field to define a wire-format header instead of explicit shifts and masks. The layout that results is implementation-defined, not the fixed layout the wire protocol requires.
+VERIFY: C11 6.7.2.1 (bit-field allocation order and unit-straddling are implementation-defined), cross-referenced against Module 6's fuller bit-field treatment.
+
+@@ 11.18 | Principal | Concept | tags=nan-inf-denormal,ieee754,firmware-float
+Q: What must firmware that processes floating-point telemetry actively guard against regarding NaN, infinity, and denormals?
+SHORT: Unlike integer division by zero (undefined per 6.5.5), IEEE-754 float division by zero is defined and produces signed infinity or NaN (`0.0f/0.0f`); code that propagates a NaN or Inf through further arithmetic keeps producing NaN or Inf silently, since NaN compares unequal to everything including itself, so a plain `==` "did this go bad" check never fires. Denormals near zero can also degrade precision or trigger a slow path on some hardware. Check `isnan`/`isinf` explicitly at trust boundaries.
+DEEP:
+```c
+#include <stdio.h>
+#include <math.h>
+int main(void) {
+    float zero = 0.0f;
+    float a = 1.0f / zero;
+    float b = zero / zero;
+    printf("a=%f isinf=%d\n", a, isinf(a));
+    printf("b=%f isnan=%d\n", b, isnan(b));
+    return 0;
+}
+```
+Compiled and linked with `gcc -std=c11 -Wall -Wextra -o q18 q18.c -lm`, prints `a=inf isinf=1` and `b=-nan isnan=1`.
+1. **Why float division by zero is not undefined behavior:** 6.5.5's constraints on `/` require only that the operands have arithmetic type; unlike integer division by zero (an exceptional condition per 6.5p5, undefined), Annex F's IEEE-754 binding defines division by zero for floating types to produce a correctly signed infinity, or NaN specifically for `0.0/0.0`, so this is defined, standard floating-point behavior on an Annex-F-conforming implementation, not an error condition to avoid triggering.
+2. **Why `==` cannot detect a NaN:** IEEE-754 defines NaN as unordered with respect to every value, including itself, so `b == b` is false for the NaN produced above; the only standard-conforming way to test for NaN is `isnan()` (7.12.3.4) or, historically, the `x != x` idiom that relies on the same unordered property, not a direct comparison against a sentinel value.
+3. **Why silent propagation is the real danger, not the initial NaN/Inf itself:** once a NaN enters a computation, essentially every further arithmetic operation on it also produces NaN, so a control loop or filter that does not check for NaN at its input boundary can run for an arbitrarily long time producing NaN outputs with no crash and no obviously wrong-looking single value, only a persistently "stuck" or nonsensical result.
+4. **Denormals (subnormal numbers, exponent field 0 with nonzero mantissa)** represent values closer to zero than the smallest normal float can, at reduced precision; on some hardware (certain embedded FPUs, or x86 without flush-to-zero enabled) arithmetic on denormals runs significantly slower than normal-range arithmetic, which matters for a control loop with a timing budget, and is a reason to zero out tiny near-zero results explicitly rather than let them decay into the denormal range.
+- **A concrete guard pattern for a telemetry boundary:** validate every externally sourced float with `isnan(x) || isinf(x)` immediately at ingestion (before it enters any filter, average, or control computation) and reject or substitute a safe default, rather than trusting downstream arithmetic to somehow reveal the bad value later.
+FOLLOW:
+- Does isinf(x) distinguish +infinity from -infinity? => Not by itself (it returns nonzero for either sign); combine it with a sign check (x > 0 or signbit(x)) if the direction matters to the caller.
+- Is 1.0f / 0.0f guaranteed to be +infinity on every conforming implementation? => Only on one that conforms to Annex F (checkable via __STDC_IEC_559__); C11 itself does not mandate IEEE-754 floating point, so an implementation without Annex F conformance could define this differently, though essentially every mainstream target does conform.
+PITFALL: Checking for a "bad" floating-point value with x == some_nan_constant or x != x written without isnan, without realizing NaN's defining property (unordered against everything) is exactly the mechanism that makes such comparisons fail. Prefer isnan/isinf explicitly.
+VERIFY: C11 Annex F (IEEE-754 binding, division-by-zero and NaN semantics) and 7.12.3.3/7.12.3.4 (isinf/isnan), and whether __STDC_IEC_559__ is defined on the target.

@@ -1,0 +1,11 @@
+{
+ "title": "C Advanced — OS, Threads & Concurrency",
+ "kicker": "C ADVANCED · OS & CONCURRENCY",
+ "crumb": "C Advanced",
+ "lskey": "cadvqa.v1",
+ "appid": "cadvqa",
+ "exportpfx": "c-advanced-qa",
+ "out_file": "C_Advanced_QA_Study_Guide.html",
+ "hero_h": "C Advanced: OS Concepts, Threads & Concurrency",
+ "hero_p": "Processes, POSIX threads, synchronization, the memory model, and the classic concurrency problems, with real pthreads code and Principal-level design scenarios."
+}

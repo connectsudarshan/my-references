@@ -1,0 +1,582 @@
+# Module 1: Processes vs Threads & Process Memory Layout
+
+@@ 1.01 | Basic | Concept | tags=process,thread,ownership
+Q: What is the fundamental difference between a process and a thread in terms of what each owns?
+SHORT: A process owns a virtual address space, a file descriptor table, and signal dispositions; a thread is a schedulable unit of execution that lives inside a process and owns only its own stack, register state (including the program counter), thread ID, signal mask, and thread-local storage. Every thread in a process shares that process's single address space, fd table, and signal handlers.
+DEEP:
+- Creating a process (fork(), covered in module 2) gets you a whole new address space, a copy of the fd table, and independent everything; creating a thread (pthread_create(), module 3) gets you a new stack and register set inside the SAME address space as every other thread in that process.
+- This is why threads are called "lightweight": no new page tables, no copying of the heap or data segments, just a new stack and some bookkeeping.
+- The single-thread version of this question (what text/data/BSS/heap/stack are, and where they sit) is the C Language page's job; see the C Language page, module 8, question 8.06, for that address-space picture. This module only adds what changes once a process has more than one thread.
+FOLLOW:
+- Does the OS even distinguish threads from processes at the kernel level? => On Linux, no: both are `task_struct` entries created via `clone()`; what differs is which resources the flags tell the kernel to share (see 1.12).
+- Is a single-threaded process's "thread" the same as a POSIX thread? => Yes; every process has at least one thread (sometimes called the initial or main thread), created implicitly at process start-up.
+PITFALL: Describing threads as "mini-processes" without saying what they share. The whole interview-relevant point is the shared address space; that is also the source of most concurrency bugs.
+
+@@ 1.02 | Basic | Concept | tags=fd-table,shared,process-wide
+Q: What does a process own that every one of its threads shares, and what does that mean in practice?
+SHORT: The virtual address space (text/data/BSS/heap and all thread stacks live inside it), the open file descriptor table, signal dispositions (handlers), the current working directory, and user/group IDs are all process-wide. In practice this means one thread closing a file descriptor, changing directory, or installing a signal handler affects every other thread immediately, with no notification.
+DEEP:
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <string.h>
+
+static int fd;
+
+void *closer(void *arg) {
+    (void)arg;
+    close(fd);
+    printf("thread: closed fd %d\n", fd);
+    return NULL;
+}
+
+int main(void) {
+    fd = open("/tmp/m01_02_shared.txt", O_CREAT | O_WRONLY, 0644);
+    pthread_t t;
+    pthread_create(&t, NULL, closer, NULL);
+    pthread_join(t, NULL);
+    ssize_t n = write(fd, "hi", 2);
+    printf("main: write on fd %d after thread closed it returned %zd\n", fd, n);
+    if (n < 0) printf("main: errno=%d (%s)\n", errno, strerror(errno));
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run, this printed `main: write on fd %d after thread closed it returned -1` and `main: errno=9 (Bad file descriptor)` -- the second thread's close() reached into the SAME fd table main was using; there is no per-thread copy to protect main from it.
+- Same reasoning applies to `chdir()` (process-wide cwd), `umask()`, and `sigaction()`.
+FOLLOW:
+- Does `open()` in one thread give a different fd table entry to another thread? => No; the fd table is a single process-wide array of entries, and any thread can pass any valid fd number to any syscall.
+- Would `dup()`-ing the fd in each thread fix this? => It would give each thread its own fd number referring to the same underlying open file description, protecting against the wrong fd being closed, but the two fds would still share the same file offset and status flags.
+PITFALL: Assuming "thread-local" applies to file descriptors, signal handlers, or the working directory. None of those are thread-local; only the stack, registers, thread ID, signal mask, and TLS are.
+
+@@ 1.03 | Basic | Concept | tags=stack,tid,per-thread
+Q: What is actually private to each thread, as opposed to shared across the whole process?
+SHORT: Per POSIX, each thread has its own stack, its own register set and program counter, its own thread ID, its own signal mask, its own errno, and (with __thread/_Thread_local, module 3) its own thread-local storage. Everything else -- address space, fd table, signal handlers, cwd, uid/gid -- is process-wide.
+DEEP:
+```c
+#include <stdio.h>
+#include <pthread.h>
+
+void *worker(void *arg) {
+    int local = 0;
+    long id = (long)arg;
+    printf("thread %ld: tid=%lu &local=%p\n", id, (unsigned long)pthread_self(), (void *)&local);
+    return NULL;
+}
+
+int main(void) {
+    int local = 0;
+    pthread_t t1, t2;
+    printf("main:     tid=%lu &local=%p\n", (unsigned long)pthread_self(), (void *)&local);
+    pthread_create(&t1, NULL, worker, (void *)1);
+    pthread_create(&t2, NULL, worker, (void *)2);
+    pthread_join(t1, NULL);
+    pthread_join(t2, NULL);
+    return 0;
+}
+```
+Compiled and run, this printed three distinct `tid` values and three distinct `&local` addresses (main's near `0x7ffe...`, the two worker threads' near `0x7f09...` but a few hundred bytes apart) -- three separate stacks, three separate thread IDs, one process.
+FOLLOW:
+- Is errno really per-thread even though it looks like a global variable? => Yes; POSIX requires errno to behave as if thread-local (glibc implements it as a macro expanding to a per-thread storage lookup), specifically so one thread's failing call cannot corrupt another thread's error code.
+- Does pthread_self() return the same kind of value across different OSes? => No; pthread_t is an opaque type, not guaranteed to be an integer, so portable code should only compare it with pthread_equal(), not print or compare it directly (done here only for illustration).
+PITFALL: Treating pthread_t as a small integer you can safely print, hash, or compare with `==`. It is opaque; use pthread_equal() for comparisons.
+
+@@ 1.04 | Intermediate | Concept | fig=procmem | tags=address-space,thread-stacks,layout
+Q: Where do additional thread stacks actually live in a multithreaded process's address space, relative to the main thread's stack, the heap, and the data segment?
+SHORT: The initial thread's stack still sits near the top of the process's virtual address space, growing downward, exactly as in the single-thread picture; every thread pthread_create() adds afterward gets a separate stack that the implementation mmaps into the space between the heap and the main stack (the "mmap region" on Linux), not carved out of the main stack. All of them coexist inside the one address space every thread shares.
+DEEP:
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <pthread.h>
+
+int global_data = 1;
+
+void *worker(void *arg) {
+    int local = 0;
+    printf("thread %ld stack local: %p\n", (long)arg, (void *)&local);
+    return NULL;
+}
+
+int main(void) {
+    int main_local = 0;
+    int *heap_ptr = malloc(sizeof(int));
+    pthread_t t1, t2;
+    printf("text (main):       %p\n", (void *)main);
+    printf("data (global):     %p\n", (void *)&global_data);
+    printf("heap:              %p\n", (void *)heap_ptr);
+    printf("main stack local:  %p\n", (void *)&main_local);
+    pthread_create(&t1, NULL, worker, (void *)1);
+    pthread_join(t1, NULL);
+    pthread_create(&t2, NULL, worker, (void *)2);
+    pthread_join(t2, NULL);
+    free(heap_ptr);
+    return 0;
+}
+```
+Compiled and run, one observed ordering (addresses are ASLR-randomized per run, but the relative ordering is consistent) was: text `0x5583e2397249` < data `0x5583e239a010` < heap `0x5583e93b62a0`, then a large gap up to the thread stacks near `0x7ff476dfeeb4`, then main's own stack local at `0x7ffcebbc0acc` -- higher than the thread stacks, consistent with the thread-stack region sitting below the main stack and above the heap. Both worker threads landed at the same address because thread 1 was joined (and its stack freed) before thread 2 was created.
+- This is exactly module 1's addition to the C page's single-thread picture (module 8, 8.06): the same text/data/heap/stack regions exist, but now there can be many stacks, one per live thread, all still inside the one shared address space.
+FOLLOW:
+- Do thread stacks grow toward each other and risk colliding? => Each thread's stack has a fixed size (default 8 MB on typical 64-bit Linux, module 3) plus a guard page below it; the implementation places new stacks with enough room to avoid collision, and a guard-page hit turns an overflow into a SIGSEGV rather than silent corruption into a neighboring stack.
+- Why did both worker threads get the same stack address here? => Because thread 1 was joined before thread 2 was created, its stack region was freed and immediately reused; two threads alive at the same time would get distinct, non-overlapping stack regions.
+PITFALL: Assuming a new thread's stack is carved out of the main thread's stack space. It is a separate mapping the implementation allocates elsewhere in the address space, not a sub-range of the initial stack.
+VERIFY: The exact placement (mmap region below the main stack) is a Linux/glibc implementation detail, not a POSIX guarantee; POSIX only guarantees each thread has its own stack storage.
+
+@@ 1.05 | Intermediate | Numeric | tags=fork,pthread_create,cost
+Q: Roughly how much more expensive is creating a process with fork() than creating a thread with pthread_create(), and why?
+SHORT: On a quick same-machine timing loop, fork()+waitpid() cost about 0.11 ms/iteration versus about 0.02 ms/iteration for pthread_create()+pthread_join() -- roughly 4-5x, though the real-world gap is usually cited as 10-100x and grows with process size, since fork() must set up new page tables and (lazily, via copy-on-write) duplicate address-space bookkeeping that pthread_create() never touches.
+DEEP:
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <pthread.h>
+#include <time.h>
+
+#define N 2000
+void *noop(void *arg) { (void)arg; return NULL; }
+static double now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
+
+int main(void) {
+    double t0 = now_ms();
+    for (int i = 0; i < N; i++) {
+        pid_t pid = fork();
+        if (pid == 0) { _exit(0); }
+        waitpid(pid, NULL, 0);
+    }
+    double t1 = now_ms();
+    for (int i = 0; i < N; i++) {
+        pthread_t t;
+        pthread_create(&t, NULL, noop, NULL);
+        pthread_join(t, NULL);
+    }
+    double t2 = now_ms();
+    printf("fork+waitpid:         %.4f ms/iter (N=%d)\n", (t1 - t0) / N, N);
+    printf("pthread_create+join:  %.4f ms/iter (N=%d)\n", (t2 - t1) / N, N);
+    return 0;
+}
+```
+Compiled and run, this printed `fork+waitpid: 0.1109 ms/iter` and `pthread_create+join: 0.0235 ms/iter` on this machine, for N=2000 each -- about 4.7x. This is a near-empty process (nothing to copy-on-write fault on), so the gap is at its smallest; a process with a large heap or many mappings pays more for page-table setup even though COW defers the actual data copy.
+FOLLOW:
+- Why doesn't COW make fork() just as cheap as thread creation? => COW avoids copying page CONTENTS, but the kernel still has to create and populate new page-table structures referencing the parent's physical pages, which pthread_create() never has to do since threads already share one set of page tables.
+- Would exec() right after fork() change this comparison? => It would add more cost (loading a new binary, module 2, 2.05), but that is a different operation being measured; this timing is fork() alone versus pthread_create() alone.
+PITFALL: Quoting a single fork-vs-thread ratio as a universal constant. The gap depends heavily on process size (mapped memory, open fds) and the kernel/allocator in use; treat any specific number, including the one measured here, as an order-of-magnitude guide, not a spec.
+VERIFY: These are wall-clock numbers from one run on one machine, not a portable benchmark; POSIX makes no performance guarantees for either call.
+
+@@ 1.06 | Intermediate | Trap | tags=errno,thread-local,concurrent
+Q: Is it safe for two threads to both trigger a failing system call and read errno concurrently?
+SHORT: Yes -- POSIX requires errno to behave as a per-thread value, so one thread's failure setting errno never corrupts or is overwritten by another thread's unrelated success or failure. This is precisely why the plain-C errno mechanism (a single global in a single-threaded program) still works correctly once a program becomes multithreaded.
+DEEP:
+```c
+#include <stdio.h>
+#include <pthread.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <string.h>
+#include <unistd.h>
+#include <time.h>
+
+static void nap(long ms) {
+    struct timespec ts = { .tv_sec = ms / 1000, .tv_nsec = (ms % 1000) * 1000000L };
+    nanosleep(&ts, NULL);
+}
+
+void *fail_thread(void *arg) {
+    (void)arg;
+    errno = 0;
+    open("/definitely/does/not/exist/m01_06", O_RDONLY);
+    nap(50);
+    printf("fail thread: errno=%d (%s)\n", errno, strerror(errno));
+    return NULL;
+}
+
+void *ok_thread(void *arg) {
+    (void)arg;
+    nap(10);
+    errno = 0;
+    int fd = open("/tmp", O_RDONLY);
+    if (fd >= 0) close(fd);
+    printf("ok thread:   errno=%d after its own successful open (own copy, unaffected by the other thread's failure)\n", errno);
+    return NULL;
+}
+
+int main(void) {
+    pthread_t t1, t2;
+    pthread_create(&t1, NULL, fail_thread, NULL);
+    pthread_create(&t2, NULL, ok_thread, NULL);
+    pthread_join(t1, NULL);
+    pthread_join(t2, NULL);
+    return 0;
+}
+```
+Compiled and run, this printed `ok thread: errno=0` and `fail thread: errno=2 (No such file or directory)` -- each thread's errno reflects only its own last call, even though both ran concurrently and one deliberately failed while the other succeeded.
+FOLLOW:
+- Does this mean errno is declared as `_Thread_local` in the headers? => Not necessarily by that exact keyword; POSIX just requires thread-local behavior, and glibc implements it as a macro that resolves to a per-thread storage lookup at the call site.
+- Was errno always thread-safe like this? => No; this is a POSIX threads requirement layered onto a mechanism originally designed for single-threaded C, which is why old code that squirrels away a plain `int saved_errno = errno` for later use across a context switch to another thread is unsafe.
+PITFALL: Reading errno from a DIFFERENT thread than the one that made the failing call (e.g., a monitoring thread peeking at another thread's "last error"). errno only reflects the calling thread's own last call; there is no cross-thread errno.
+
+@@ 1.07 | Intermediate | Scenario | tags=fd,shared,interleaving
+Q: If two threads both write() to the same shared file descriptor, what actually happens to the file offset and the resulting file contents?
+SHORT: The file descriptor's underlying open file description, including its current file offset, is shared process-wide, so the two threads' writes both advance the SAME offset and their bytes land back-to-back in whatever order the kernel happens to schedule the two write() calls -- no interleaving of file content within a single write() call (each write is atomic for a single call on a regular file), but no ordering guarantee between separate calls from separate threads either.
+DEEP:
+```c
+#include <stdio.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <fcntl.h>
+
+static int fd;
+
+void *writer(void *arg) {
+    char c = *(char *)arg;
+    for (int i = 0; i < 5; i++) {
+        write(fd, &c, 1);
+    }
+    return NULL;
+}
+
+int main(void) {
+    fd = open("/tmp/m01_07_interleave.txt", O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    char a = 'A', b = 'B';
+    pthread_t t1, t2;
+    pthread_create(&t1, NULL, writer, &a);
+    pthread_create(&t2, NULL, writer, &b);
+    pthread_join(t1, NULL);
+    pthread_join(t2, NULL);
+    close(fd);
+    FILE *f = fopen("/tmp/m01_07_interleave.txt", "r");
+    char buf[64] = {0};
+    fgets(buf, sizeof(buf), f);
+    printf("both threads wrote through the same fd (shared file offset), result: %s\n", buf);
+    fclose(f);
+    return 0;
+}
+```
+Compiled and run, this printed `result: AAAAABBBBB` on this run -- all 10 bytes landed with no overlap or loss (each single-byte write() is atomic), but the grouping (all A's then all B's here, rather than interleaved) is a scheduling accident, not a guarantee; a different run could legitimately interleave them as `ABABAB...` or any other ordering.
+FOLLOW:
+- Would each thread opening its OWN fd on the same path avoid this? => It would give each its own file offset (no shared-offset races), but the two fds' writes to overlapping byte ranges could still race for what ends up at a given file position; O_APPEND per fd is the usual fix for append-only logging from multiple writers.
+- Is this the same sharing that causes the fd-closed-from-another-thread bug in 1.02? => Yes, same root cause: the fd table and the file offset it references are process-wide, not per-thread.
+PITFALL: Assuming "atomic write() call" means "deterministic ordering across threads." Each write() call is atomic with respect to its own bytes landing together, but the RELATIVE order of two threads' separate write() calls is unspecified.
+
+@@ 1.08 | Intermediate | Debug | tags=race,shared-globals,data,bss
+Q: If a global counter lives in the data segment and two threads both increment it in a loop with no synchronization, what actually happens, and why?
+SHORT: The data/BSS segment is shared by every thread, so both threads' `counter++` operations (a non-atomic read-modify-write) can interleave and clobber each other -- some increments get lost when two threads read the same old value before either writes back the new one. Running it shows a final count noticeably below the arithmetic total.
+DEEP:
+```c
+#include <stdio.h>
+#include <pthread.h>
+
+static long counter = 0;
+
+void *incer(void *arg) {
+    (void)arg;
+    for (long i = 0; i < 2000000; i++) counter++;
+    return NULL;
+}
+
+int main(void) {
+    pthread_t t1, t2;
+    pthread_create(&t1, NULL, incer, NULL);
+    pthread_create(&t2, NULL, incer, NULL);
+    pthread_join(t1, NULL);
+    pthread_join(t2, NULL);
+    printf("counter = %ld (expected 4000000 if updates were never lost)\n", counter);
+    return 0;
+}
+```
+Compiled and run, this printed `counter = 3076146 (expected 4000000...)` -- almost a quarter of the increments were lost to the race. Re-running gives a different (still short) number each time, which is itself evidence of a race rather than a deterministic bug.
+- Contrast this with fork(): a forked child gets its OWN copy of the data/BSS segment (copy-on-write, module 2), so two forked processes each incrementing "the same" global variable would NOT race -- they would be incrementing two separate memory pages with no relationship after the fork. Sharing the data segment is specifically a threads phenomenon.
+- The actual fix (a mutex or an atomic) is module 4's and module 7's job; this question only establishes that the sharing is real and process-visible.
+FOLLOW:
+- Would declaring counter `volatile` fix this? => No; volatile only stops compiler-level caching/reordering (see the C page's module 7), it adds no atomicity or synchronization at all, so the race is unaffected.
+- Does this race corrupt memory, or just lose updates? => For a simple `long` on a typical CPU, lost updates are the visible symptom; wider or misaligned shared data can also see partially-written ("torn") values, which is a separate hazard covered in module 7.
+PITFALL: Trusting a single test run that happens to print the "right" total. A race can appear to work by chance under low contention or on one platform; the correct verification is running it (or a stress variant) repeatedly and checking for variance, exactly as done above.
+
+@@ 1.09 | Advanced | Debug | tags=crash,process-wide,segfault
+Q: If one thread in a multithreaded process dereferences a NULL pointer, what happens to the OTHER threads, and to the process as a whole?
+SHORT: A memory-protection fault like SIGSEGV is delivered to the offending thread, but its default disposition (terminate the process) applies to the WHOLE process, not just that thread -- every other thread, however healthy, is torn down with it, since the address space, and therefore the process, is a single unit of failure.
+DEEP:
+```c
+#include <stdio.h>
+#include <pthread.h>
+#include <unistd.h>
+
+void *crasher(void *arg) {
+    (void)arg;
+    int *p = NULL;
+    printf("worker: about to dereference NULL\n");
+    fflush(stdout);
+    *p = 1;
+    return NULL;
+}
+
+int main(void) {
+    pthread_t t;
+    pthread_create(&t, NULL, crasher, NULL);
+    sleep(1);
+    printf("main: this line should never print\n");
+    return 0;
+}
+```
+Compiled and run, the output was exactly `worker: about to dereference NULL` followed by the shell reporting `Segmentation fault`, exit code 139 (128 + SIGSEGV's 11); the `main: this line should never print` text never appeared, confirming the crash took the whole process, including the otherwise-idle main thread mid-sleep, with it.
+- This is the flip side of 1.01's "shared address space" fact: one thread's fatal memory error is not contained to that thread, because there is only one address space and one set of default signal dispositions to fault against.
+FOLLOW:
+- Could a signal handler for SIGSEGV in another thread "save" the process? => A handler could run (signal handlers are process-wide, module 1.10/module 2), but the faulting thread's context is already corrupted; the usual outcome of trying to continue after SIGSEGV is another fault, so in practice the process should still be considered dead, just possibly after logging.
+- Does this mean multi-process designs are always "safer" than multithreaded ones? => For fault isolation specifically, yes -- a crash in one process does not directly kill an unrelated process; see 1.14/1.18 for when that tradeoff is worth the extra cost from 1.05.
+PITFALL: Assuming a crash in a "background worker thread" is contained the way a crashed helper subprocess would be. There is no such containment for threads; a fatal signal in any thread ends the entire process.
+
+@@ 1.10 | Advanced | Cross-layer | tags=signal,handler,mask,per-thread
+Q: sigaction() installs one handler for the whole process. How, then, can two threads see a signal differently?
+SHORT: The signal's disposition (handler vs default vs ignore) is process-wide, but each thread has its OWN signal mask (pthread_sigmask()), and the kernel only delivers a process-directed signal to a thread that does not currently have it blocked. A thread that blocks a signal simply never becomes the one that runs the shared handler for it, even though the handler itself is the same function for every thread.
+DEEP:
+```c
+#include <stdio.h>
+#include <pthread.h>
+#include <signal.h>
+#include <unistd.h>
+#include <string.h>
+#include <time.h>
+
+static volatile sig_atomic_t got = 0;
+static volatile unsigned long handler_ran_on_tid = 0;
+
+static void nap(long ms) {
+    struct timespec ts = { .tv_sec = ms / 1000, .tv_nsec = (ms % 1000) * 1000000L };
+    nanosleep(&ts, NULL);
+}
+
+void handler(int sig) {
+    (void)sig;
+    got = 1;
+    handler_ran_on_tid = (unsigned long)pthread_self();
+}
+
+void *blocker(void *arg) {
+    (void)arg;
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGUSR1);
+    pthread_sigmask(SIG_BLOCK, &set, NULL);
+    nap(300);
+    printf("blocker thread (tid=%lu): still never ran the handler; got=%d\n",
+           (unsigned long)pthread_self(), got);
+    return NULL;
+}
+
+int main(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = handler;
+    sigaction(SIGUSR1, &sa, NULL);
+    pthread_t t;
+    pthread_create(&t, NULL, blocker, NULL);
+    nap(100);
+    kill(getpid(), SIGUSR1); /* process-directed: kernel picks any thread with it unblocked */
+    pthread_join(t, NULL);
+    printf("main (tid=%lu): got=%d, handler actually ran on tid=%lu -- "
+           "one sigaction() installs the handler for the whole process, "
+           "but each thread's own mask decides who is eligible to run it\n",
+           (unsigned long)pthread_self(), got, handler_ran_on_tid);
+    return 0;
+}
+```
+Compiled and run, this printed `blocker thread (...): still never ran the handler; got=1` and `main (...): got=1, handler actually ran on tid=<main's own tid>` -- the SAME handler function, but the kernel routed the process-directed signal to main specifically because blocker had blocked it, exactly as the mechanism predicts.
+FOLLOW:
+- What if BOTH threads had SIGUSR1 unblocked? => Which thread actually receives a given process-directed signal is then unspecified; the kernel picks one eligible thread, not necessarily any particular one, and not both.
+- Is pthread_kill() different from kill()+a process-wide handler? => pthread_kill() targets one specific thread directly (bypassing the "any eligible thread" selection); it still respects that target thread's own mask, and if that thread has the signal blocked, it becomes pending for that thread specifically rather than being redirected elsewhere.
+PITFALL: Assuming pthread_sigmask() in one thread blocks a signal for the whole process. It only changes that calling thread's eligibility; the process-wide disposition set by sigaction() is unaffected, and other threads remain eligible to receive and handle the signal.
+
+@@ 1.11 | Advanced | Scenario | tags=stack-overflow,corruption,diagnosis
+Q: A crash report shows corrupted-looking data in a global structure right after a deep recursive function ran on a worker thread with a small stack. How would you confirm a stack overflow, rather than a heap bug, caused it?
+SHORT: Check whether the corrupted memory sits immediately adjacent to (in practice, just past the low end of) that thread's stack region in `/proc/<pid>/maps`, and whether the thread's stack size was set unusually small (module 3's stacksize attribute); a stack overflow into an adjacent mapping is far more likely than heap corruption when the trigger was specifically deep recursion on one thread.
+DEEP:
+- Method: (1) get the crash's core dump or `/proc/<pid>/maps` at crash time and find the specific worker thread's stack VMA (a `[stack]`-tagged or anonymous region matching that thread's `tid`); (2) check whether the corrupted global sits in a mapping directly bordering that stack region, which is only possible if the stack's guard page (module 3, 3.11) was undersized, absent, or already consumed by an earlier overflow; (3) reproduce with a much larger `pthread_attr_setstacksize()` for that thread and confirm the corruption disappears -- if it does, the stack was the cause, not a genuine heap bug.
+- Why this happens at all: thread stacks are placed in the mmap region between the heap and the main stack (1.04), with a small guard page below each one; a small guard page or a stack that grows fast enough (e.g., large local arrays plus deep recursion) can, on some configurations, corrupt an adjacent mapping's first few pages before the guard page itself faults, especially if the guard page is smaller than the size of a single stack frame's overshoot.
+- This is why module 1's "everything sharing one address space" fact matters for debugging: a memory-safety symptom in one region does not mean the bug is IN that region; it can be a neighboring region's overflow bleeding across a boundary.
+FOLLOW:
+- Would AddressSanitizer catch this reliably? => Yes for many cases; ASan instruments stack redzones and typically turns a stack overflow into an immediate, clearly-labeled fault rather than silent corruption, which is why module 15 recommends sanitizers over post-mortem guessing whenever the bug is reproducible under test.
+- Is the guard page itself part of the addressable stack? => No; it is deliberately unmapped (or mapped with no permissions) specifically so that touching it faults instead of silently writing into whatever mapping happens to sit there.
+PITFALL: Jumping straight to "heap corruption" because the corrupted variable is a heap or global object. The write that corrupted it can originate from an overflowing stack in a completely different region; check adjacency before assuming the bug is local to the corrupted object's own allocator.
+
+@@ 1.12 | Advanced | Cross-layer | tags=linux,clone,kernel
+Q: Under Linux, what does the kernel actually create differently for fork() versus pthread_create(), given that POSIX itself does not mandate any particular kernel mechanism?
+SHORT: Linux: both fork() and pthread_create() are implemented on top of the same clone() system call, which takes flags describing what to SHARE with the new task; fork() passes flags that share almost nothing (new address space, fd table, signal handlers copied-but-independent), while pthread_create() passes CLONE_VM, CLONE_FS, CLONE_FILES, and CLONE_SIGHAND, sharing the address space, filesystem info, fd table, and signal handlers with the caller.
+DEEP:
+- pthread_create() does not call clone() directly; the C library's thread implementation (glibc's NPTL) does so on its behalf, which is what actually passes those flags.
+- Linux: from the kernel's point of view, a "process" and a "thread" are both `task_struct` entries; the distinction interview candidates draw at the API level (fork vs pthread_create) is really a distinction in which `clone()` flags were passed, not in the kind of kernel object created.
+- This is exactly why 1.01's ownership table works out the way it does: CLONE_VM is what makes the address space (and everything living in it: heap, mappings, thread stacks) shared, and CLONE_FILES is what makes the fd table shared (1.02); fork() omits both, which is why a forked child gets its own address space and, per module 2, copy-on-write pages of the parent's.
+- POSIX itself makes no reference to clone() or task_struct; it only specifies the observable contract (shared vs private resources) that 1.01-1.03 describe. The clone()-based mechanism is how one implementation (Linux/glibc) satisfies that contract.
+FOLLOW:
+- Does every POSIX-conformant OS use something like clone()? => No; POSIX deliberately says nothing about the mechanism, only the observable behavior, so other systems can and do implement threads and processes with different underlying kernel primitives.
+- If threads and processes are both task_struct entries, why does `ps` normally hide threads? => `ps` filters to one row per process (thread group) by default; `ps -T` or `ps -eLf` on Linux shows every individual task, including threads.
+PITFALL: Treating "clone() flags" as a POSIX concept to cite in an interview answer without the "Linux:" qualifier. It is real and useful, but it is implementation detail, not something POSIX.1 specifies.
+
+@@ 1.13 | Advanced | Trap | tags=exit,pthread_exit,termination
+Q: What's the difference between a secondary thread calling exit() and calling pthread_exit(), and why does it matter?
+SHORT: exit() (and returning from main()) terminates the ENTIRE process, tearing down every thread immediately, no matter which thread called it; pthread_exit() (or returning from the thread's start routine) terminates only the calling thread, leaving every other thread, including main, running. Calling exit() from what was meant to be "just one worker finishing" is a common way to accidentally kill an entire multithreaded program.
+DEEP:
+```c
+#include <stdio.h>
+#include <pthread.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <time.h>
+
+static void nap(long ms) {
+    struct timespec ts = { .tv_sec = ms / 1000, .tv_nsec = (ms % 1000) * 1000000L };
+    nanosleep(&ts, NULL);
+}
+
+void *worker_exit(void *arg) {
+    (void)arg;
+    printf("worker: calling exit(0)\n");
+    fflush(stdout);
+    exit(0);
+}
+
+void *worker_pthread_exit(void *arg) {
+    (void)arg;
+    printf("worker: calling pthread_exit()\n");
+    pthread_exit(NULL);
+}
+
+int main(int argc, char **argv) {
+    pthread_t t;
+    int use_exit = (argc > 1 && argv[1][0] == 'e');
+    if (use_exit)
+        pthread_create(&t, NULL, worker_exit, NULL);
+    else
+        pthread_create(&t, NULL, worker_pthread_exit, NULL);
+    nap(200);
+    printf("main: still alive after worker thread finished (mode=%s)\n", use_exit ? "exit" : "pthread_exit");
+    pthread_join(t, NULL);
+    printf("main: joined, exiting normally\n");
+    return 0;
+}
+```
+Compiled and run with no argument (pthread_exit path), the output included `main: still alive after worker thread finished (mode=pthread_exit)` and `main: joined, exiting normally` -- main ran to completion. Run again with `e` as the argument (exit path), the output was only `worker: calling exit(0)`, with an observed exit code of 0 -- main's "still alive" line never printed, because the whole process was already gone.
+FOLLOW:
+- Is returning from a thread's start routine the same as calling pthread_exit()? => Yes; POSIX defines an implicit pthread_exit() call using the return value as the exit status when a thread's start routine returns normally.
+- What about returning from main() itself? => That is equivalent to calling exit() with main's return value, per POSIX -- it always ends the whole process, regardless of how many other threads are still running.
+PITFALL: Calling exit() (or letting a library function you did not write call it) from inside what you intended as an isolated worker thread. Only pthread_exit() or a plain return from that thread's start routine ends just that thread.
+
+@@ 1.14 | Advanced | Scenario | tags=isolation,design,tradeoff
+Q: A teammate wants to replace two cooperating processes in a validation harness with two threads in one process, purely to "make communication easier." What do you check before agreeing?
+SHORT: Whether the two components' current isolation is load-bearing -- if either one can crash, leak memory, or corrupt its own state independently today (module 2, module 8's mmap module) without taking the other down, merging them into threads throws that isolation away, since a fault in either thread now kills both (1.09) and any memory corruption in one is now visible to the other (1.01-1.03) because they share one address space.
+DEEP:
+- Questions to ask: (1) Does either component currently crash or get restarted independently in production or in test, and is that recovery behavior relied upon? (2) Does either component use a library that is not thread-safe (module 10) or that installs its own signal handlers that would now apply process-wide (1.10)? (3) Is the "easier communication" actually about avoiding IPC plumbing (module 12), which shared memory (module 1's shared address space) does simplify, or is it about avoiding the fork()/exec() cost (1.05), which is a real but usually much smaller concern?
+- If the isolation is load-bearing, keep the processes and simplify the IPC instead (a pipe or a small shared-memory region, module 12) rather than removing the process boundary; if the isolation was never actually used (both components already fail the whole harness together), threads are a reasonable simplification.
+- For firmware/SSD validation harnesses specifically, a common real reason to keep components as separate processes is that a device-under-test hang or protocol violation can hang the calling thread indefinitely (blocked in a syscall talking to the device); a stuck thread with no clean cancellation path can be worked around at the process level (kill and restart) far more simply than at the thread level.
+FOLLOW:
+- Does using multiple processes cost much more than threads for this kind of harness? => Usually not decisively; 1.05's numbers show fork() itself as microseconds-to-low-milliseconds, which is negligible next to typical device I/O latencies in an SSD validation workload.
+- Is there a middle ground? => Yes -- one process per test campaign (isolating truly independent, restartable units of work) with multiple threads inside each process for the actual parallel I/O, which is exactly the shape most production test harnesses converge on.
+PITFALL: Choosing threads over processes purely for "communication ease" without checking whether the current process boundary is silently providing crash isolation that the team has come to depend on.
+
+@@ 1.15 | Principal | Scenario | tags=design,harness,shared-state
+Q: You are reviewing the design of a new multithreaded SSD validation harness before any code is written. What do you ask about shared state specifically, given everything modules 1-3 establish about what threads share?
+SHORT: For every piece of data more than one thread will touch -- device handles/fds, result buffers, counters, log files -- ask who writes it, whether writes can interleave (1.08), and what protects it, because the answer "nothing yet, we'll add locks later" is exactly how a shared address space (1.01) turns into an unreproducible race once the harness scales past a couple of threads.
+DEEP:
+- Concretely: (1) list every global/static variable and every heap object reachable from more than one worker thread; (2) for each, decide up front whether it is read-only after setup (no protection needed), owned by exactly one thread at a time with explicit handoff (needs a clear handoff mechanism, not "usually only touched by thread X"), or actually concurrently read/written (needs a mutex, atomic, or lock-free structure -- module 4/6/7/10's job, not this module's); (3) for fds and device handles specifically, decide whether each worker gets its own (avoiding 1.02/1.07's fd-sharing surprises) or a small number are deliberately shared with explicit synchronization.
+- The review output should be a short table (object, owner/access pattern, protection mechanism) reviewed BEFORE writing the concurrent code, not a debugging exercise after a flaky test appears; this is the same principle 1.08's race demo makes concrete: unsynchronized shared mutable state fails silently and often only under load.
+- This review complements, rather than duplicates, module 15's Principal-level debugging content: this module's contribution is the up-front design question ("what is shared and how"), given that modules 1-3 establish precisely what a thread automatically shares just by existing in the same process.
+FOLLOW:
+- Should every shared object default to being protected by a mutex "to be safe"? => No; over-locking read-only or single-owner data adds needless contention and complexity, so the sharing-pattern classification above should drive the choice, not a blanket rule.
+- How does this review change if some "threads" are actually separate processes instead? => Far less state is implicitly shared (module 2), so the review shifts to explicit IPC channels (module 12) instead of implicit shared globals, which is often exactly why a design chooses processes for the riskiest shared state and threads for the rest.
+PITFALL: Deferring the "what's shared and how is it protected" conversation until after the harness is written and a flaky failure shows up. Reviewing shared state ownership before writing the concurrent code is far cheaper than reverse-engineering it from a race that only reproduces one run in a hundred.
+
+@@ 1.16 | Principal | Debug | tags=stack-size,thread-limits,method
+Q: A validation harness that used to run fine with 50 worker threads starts failing intermittently once it is scaled to run thousands of short-lived worker threads. What is your method for finding out whether thread stack memory is the bottleneck, and what did an actual test of thousands of default-sized threads show?
+SHORT: Compute the address-space budget (thread count times per-thread stack size, default 8 MB on 64-bit Linux) and compare it to the process's virtual memory limits; a test creating 4000 threads with explicit 8 MB stacks succeeded (created=4000, failed_at=-1), because stack pages are only committed lazily as touched -- so the actual bottleneck at thousands of threads is far more often {PTHREAD_THREADS_MAX}/RLIMIT_NPROC or scheduler contention than raw address-space exhaustion.
+DEEP:
+```c
+#include <stdio.h>
+#include <pthread.h>
+#include <errno.h>
+#include <string.h>
+#include <stdlib.h>
+
+#define NTHREADS 4000
+void *noop(void *arg) { (void)arg; return NULL; }
+
+int main(void) {
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 8 * 1024 * 1024);
+    int created = 0, failed_at = -1, rc = 0;
+    pthread_t *threads = malloc(sizeof(pthread_t) * NTHREADS);
+    for (int i = 0; i < NTHREADS; i++) {
+        rc = pthread_create(&threads[i], &attr, noop, NULL);
+        if (rc != 0) { failed_at = i; break; }
+        created++;
+    }
+    printf("created=%d failed_at=%d\n", created, failed_at);
+    if (failed_at >= 0) printf("pthread_create failed at %d: %s\n", failed_at, strerror(rc));
+    for (int i = 0; i < created; i++) pthread_join(threads[i], NULL);
+    pthread_attr_destroy(&attr);
+    free(threads);
+    return 0;
+}
+```
+Compiled and run, this printed `created=4000 failed_at=-1` -- 4000 * 8 MB = 32 GB of VIRTUAL reservation succeeded easily against a 64-bit address space (module 13 covers why lazy paging makes this cheap), which rules out raw stack-size exhaustion as the cause of an intermittent failure at "thousands" of threads on this kind of system.
+- The actual method for the reported symptom: (1) reproduce while capturing pthread_create()'s return code (not just checking for a crash) -- module 3's 3.14 shows the same technique catching a genuine EAGAIN once virtual memory really is constrained (there, deliberately, via a small RLIMIT_AS); (2) check `ulimit -u` / RLIMIT_NPROC and `/proc/sys/kernel/threads-max` for a real per-user or per-system thread-count ceiling being hit at scale, rather than assuming stack memory; (3) only after ruling those out, suspect scheduler contention or resource limits from something else the workload does per thread (e.g., opening a device fd per thread hitting an fd-count limit, module 12).
+FOLLOW:
+- If stacks were the real problem, what would the fix be? => Lower each thread's stacksize attribute (most worker threads do not need 8 MB) or cap concurrency with a bounded thread pool (module 15) instead of one thread per unit of work.
+- Is {PTHREAD_THREADS_MAX} something you can query directly? => Not portably at runtime in general; the practical approach is to test pthread_create()'s actual return code at the scale you care about, exactly as this demo does, rather than relying on a compile-time or documented constant that may not reflect the live system's configuration.
+PITFALL: Assuming "thousands of threads" automatically implies a stack-memory problem and reaching for smaller stacks before actually measuring where pthread_create() fails (or whether it fails at all) at the scale in question.
+
+@@ 1.17 | Principal | Concept | tags=tls,thread-local-storage,layout
+Q: Where does thread-local storage (__thread / _Thread_local) actually live in the address-space picture from 1.04, and what makes it different from an ordinary global?
+SHORT: An ordinary global lives once, in the shared data/BSS segment every thread sees the same copy of; a __thread/_Thread_local variable is still allocated once per THREAD, in a per-thread TLS block the implementation sets up at thread-creation time (commonly reached via a per-thread control block near or referenced from that thread's stack), so each thread reads and writes its own independent copy through the same source-level variable name.
+DEEP:
+```c
+#include <stdio.h>
+#include <pthread.h>
+
+__thread int tls_counter = 0;
+
+void *worker(void *arg) {
+    long id = (long)arg;
+    for (int i = 0; i < 3; i++) tls_counter++;
+    printf("thread %ld: tls_counter=%d (own copy)\n", id, tls_counter);
+    return NULL;
+}
+
+int main(void) {
+    tls_counter = 100;
+    pthread_t t1, t2;
+    pthread_create(&t1, NULL, worker, (void *)1);
+    pthread_create(&t2, NULL, worker, (void *)2);
+    pthread_join(t1, NULL);
+    pthread_join(t2, NULL);
+    printf("main: tls_counter=%d (untouched by either thread)\n", tls_counter);
+    return 0;
+}
+```
+Compiled and run, this printed `thread 1: tls_counter=3`, `thread 2: tls_counter=3`, and `main: tls_counter=100 (untouched by either thread)` -- both worker threads started their own copy at the default-initialized 0 (not main's 100), incremented it 3 times independently, and main's own copy was never touched by either.
+- Module 3 covers the full attribute/API story (__thread vs the C11 keyword _Thread_local, and the older pthread_key_create()-based thread-specific-data API); this module's point is only where TLS sits conceptually in the address-space picture: neither in the shared data segment nor on any one thread's stack, but in a separate per-thread region the runtime manages alongside each thread's other per-thread state.
+FOLLOW:
+- Is a TLS variable's address the same across threads? => No; `&tls_counter` evaluated in two different threads yields two different addresses, since each thread has its own storage for it -- this is a useful sanity check when debugging a TLS-related bug.
+- Does TLS use any more memory if a thread never touches the variable? => Implementations vary; some allocate the whole TLS block eagerly at thread creation, others lazily on first access, but either way the accounting is per-thread, unlike a global which is allocated exactly once for the whole process.
+PITFALL: Assuming a `static` (file-scope) variable declared inside a function or module is automatically thread-safe because "each thread only touches its own logical state." Without __thread/_Thread_local (or explicit synchronization), a plain static or global is the SAME shared storage 1.08 demonstrates racing, no matter how the code is organized.
+VERIFY: The exact mechanism (which per-thread structure holds the TLS block, and how it is reached) is an ABI/implementation detail, not something POSIX or C11 specifies; C11 (7.17-adjacent clause on storage-class specifiers, and the _Thread_local keyword itself) only guarantees the observable per-thread-copy behavior.
+
+@@ 1.18 | Principal | Scenario | tags=processes-vs-threads,tradeoff,decision
+Q: Given everything this module establishes about what threads share automatically, when would a Principal-level engineer actually choose multiple processes over multiple threads for new validation-harness work?
+SHORT: Choose processes when fault isolation is worth more than the (usually modest, per 1.05) extra cost of fork()/exec() -- specifically when a component can hang or crash independently of the others and that independence needs to be preserved (1.09, 1.14), or when the components are written against libraries with process-wide global state (signal handlers, cwd, environment) that would otherwise collide if merged into one process (1.02, 1.10).
+DEEP:
+- Favor threads when: the work is CPU- or I/O-bound and wants to share large read-mostly data (avoiding IPC/copying overhead) and the components are known to be safe to run in one fault domain together.
+- Favor processes when: one component talks to unreliable external state (a device under test that can hang the calling thread indefinitely, module 12's motivation), the components use libraries that are not safely combinable in one address space (conflicting signal handlers, non-reentrant globals, module 10), or independent crash/restart is a design requirement rather than an inconvenience.
+- A common production pattern for SSD validation harnesses specifically: one supervising process per test campaign (isolating catastrophic, hang-prone failures at the process level, module 2's supervisor pattern) with a pool of worker THREADS inside each process for the actual parallel I/O against the device -- getting cheap parallelism from threads while keeping the outermost fault boundary at the process level.
+- This module's entire contribution to that decision is the ownership table from 1.01-1.03: everything a thread shares automatically is exactly what you give up isolating when you choose threads over processes for a given pair of components.
+FOLLOW:
+- Is this decision usually made once for a whole harness, or per-component? => Per-component in mature harnesses; the supervisor-plus-thread-pool pattern above is exactly a per-component decision (isolate at the campaign/process level, parallelize at the thread level within a campaign).
+- Does choosing processes over threads eliminate the need for synchronization entirely? => No; shared files, shared memory regions, or a shared device under test can still race across processes (module 12), just via different, more explicit mechanisms than the implicit sharing threads give you for free.
+PITFALL: Treating "threads vs processes" as a single global architectural choice for an entire system, rather than a per-component decision driven by which components actually need fault isolation from each other.

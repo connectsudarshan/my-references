@@ -1,0 +1,430 @@
+# Module 9: The Preprocessor & Macros
+
+@@ 9.01 | Basic | Concept | tags=object-like,function-like,macro-basics
+Q: What is the difference between an object-like and a function-like macro?
+SHORT: `#define TABSIZE 100` is object-like: every subsequent occurrence of TABSIZE is replaced by its replacement list, no parentheses involved. `#define max(a,b) ((a)>(b)?(a):(b))` is function-like: it only expands when followed immediately by `(`, and its parameters are substituted with the actual arguments before the replacement list is used (C11 6.10.3p9-10).
+DEEP:
+- Syntactic trigger: a function-like macro's name must be immediately followed by `(` as the *next preprocessing token* to trigger expansion; `max` alone (no parens) is left untouched, only `max(...)` expands.
+- "There shall be white-space between the identifier and the replacement list in the definition of an object-like macro" (6.10.3p3) -- this is what distinguishes `#define F(x)` (function-like, no space before the paren) from `#define F (x)` (object-like, replacement list is literally `(x)`).
+- Both forms are rescanned for further macro names after substitution (6.10.3.4) -- expansion is not a single textual pass, it recurses until no more macro names are found (subject to the self-reference rule, 9.10).
+- A macro definition lasts until `#undef` or end of the translation unit (6.10.3.5p1), independent of block/scope structure -- unlike a C variable, a macro has no block scope at all.
+FOLLOW:
+- Can a function-like macro be called without any arguments, e.g. `FOO()`? => Yes, if it is declared with an empty parameter list `#define FOO() ...`; the invocation must still supply the matching `)`  and the correct argument count, per 6.10.3p4.
+- Does whitespace after the macro name but before `(` in a *call* (not the definition) still trigger function-like expansion? => Yes -- 6.10.3p10 treats intervening whitespace/newline as normal whitespace within an invocation; only the definition's space-before-paren rule (6.10.3p3) distinguishes the two macro kinds.
+PITFALL: Adding a space between a function-like macro's name and its `(` in the #define line, which silently turns it into an object-like macro whose replacement text starts with a literal `(`.
+VERIFY: C11 6.10.3p3, p9-10 (object-like vs. function-like macro definitions).
+
+@@ 9.02 | Basic | Concept | tags=stringize,hash-operator
+Q: What does the # (stringize) operator do to a macro argument?
+SHORT: In a function-like macro's replacement list, `#` immediately followed by a parameter turns that parameter into a string literal containing the spelling of the argument's actual tokens, with internal whitespace collapsed to single spaces and leading/trailing whitespace removed (C11 6.10.3.2). `#define mkstr(a) #a` turns `mkstr(hello)` into `"hello"`.
+DEEP:
+- "Each # preprocessing token in the replacement list for a function-like macro shall be followed by a parameter as the next preprocessing token" (6.10.3.2p1) -- # only makes sense directly before a parameter name, not before arbitrary text.
+- Special escaping: a `\` is inserted before every `"` and `\` that came from a character constant or string literal inside the argument, so the result is itself a valid string literal (6.10.3.2p2) -- e.g. stringizing an argument containing `"abc"` yields the escaped text `\"abc\"` inside the outer quotes.
+- The stringized result of an empty argument is `""` (6.10.3.2p2, last sentence before the unspecified-order note).
+- # only stringizes the literal argument tokens as written at the call site, *not* their macro-expanded form -- if the argument is itself a macro name, you get the macro's name as text, not its expansion (see 9.14 for the indirection trick that gets around this).
+FOLLOW:
+- What happens if #x produces something that is not a valid string literal, e.g. an unterminated quote in the argument? => "If the replacement that results is not a valid character string literal, the behavior is undefined" (6.10.3.2p2).
+- Is there whitespace normalization inside the string? => Yes -- "each occurrence of white space between the argument's preprocessing tokens becomes a single space character," and leading/trailing whitespace is dropped entirely (6.10.3.2p2).
+PITFALL: Expecting `#x` to stringize the macro-expanded value of x when x is itself a macro name; it stringizes the raw argument text, unexpanded.
+VERIFY: C11 6.10.3.2 (the # operator), full clause.
+
+@@ 9.03 | Basic | Concept | tags=token-paste,concatenation,double-hash
+Q: What does the ## (token paste) operator do, and what are its two hard constraints?
+SHORT: `##` glues the preprocessing token before it to the preprocessing token after it into a single new token, which is then available for further macro rescanning (C11 6.10.3.3). Its two constraints: it must not appear at the very beginning or end of a replacement list (6.10.3.3p1), and if pasting produces something that is not a valid preprocessing token at all, the behavior is undefined (6.10.3.3p3).
+DEEP:
+- `#define glue(a,b) a##b` -- `glue(x,y)` pastes the tokens `x` and `y` into the single token `xy`; if `xy` happens to be a defined macro name, it is then eligible for further expansion during rescanning.
+- Placemarkers: if an argument being pasted is empty, it is replaced by a "placemarker" token instead of nothing; concatenating two placemarkers gives one placemarker, and concatenating a placemarker with a real token just gives that real token (6.10.3.3p3) -- this is how `t(,4,5)` in the standard's own EXAMPLE 5 (`#define t(x,y,z) x##y##z`) correctly produces `45` rather than erroring on the missing first argument.
+- "The order of evaluation of ## operators is unspecified" (6.10.3.3p3, last sentence) -- when a replacement list has multiple `##` operators, do not assume left-to-right evaluation matters observably; write macros so the order cannot change the result.
+- A truly invalid paste (e.g. pasting `+` and `+` to try to form `++` is fine since `++` is a real token, but pasting `/` and `*` would try to form `/*`, not a valid single preprocessing token) is undefined behavior, not a guaranteed compile error.
+FOLLOW:
+- Can ## be used to build an identifier from a macro parameter and literal text, e.g. a generated function name? => Yes, this is exactly the mechanism X-macros and generated-name patterns rely on (9.11); `#define MK(name) name##_impl` turns `MK(foo)` into `foo_impl`.
+- Does ## expand its operands' macros first? => No -- like #, ## operates on the raw argument tokens, not their macro-expanded form; the combined token is what gets rescanned afterward (6.10.3.3p3).
+PITFALL: Trying to paste two tokens whose concatenation is not itself a valid single token (e.g. pasting a digit and a following operator in a way that doesn't form a valid number or punctuator) and assuming the preprocessor will "figure it out" -- it is undefined behavior, not graceful splitting.
+VERIFY: C11 6.10.3.3 (the ## operator), including its EXAMPLE and footnote 173 on placemarkers.
+
+@@ 9.04 | Intermediate | Trap | tags=parenthesize,macro-args,precedence-bug
+Q: Why must every macro parameter, and the whole replacement expression, be wrapped in parentheses?
+SHORT: A function-like macro is pure textual substitution before any operator precedence is considered by the macro itself, so an unparenthesized parameter or result can silently bind to the wrong operators at the call site -- `#define SQUARE_BAD(x) x * x` expands `SQUARE_BAD(1+2)` to `1 + 2 * 1 + 2`, which is 5, not the intended 9.
+DEEP:
+```c
+#include <stdio.h>
+#define SQUARE_BAD(x) x * x
+#define SQUARE_GOOD(x) ((x) * (x))
+
+int main(void) {
+    printf("SQUARE_BAD(1+2)  = %d\n", SQUARE_BAD(1 + 2));
+    printf("SQUARE_GOOD(1+2) = %d\n", SQUARE_GOOD(1 + 2));
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra` and run, this prints `SQUARE_BAD(1+2)  = 5` and `SQUARE_GOOD(1+2) = 9` -- the unparenthesized version expands to `1 + 2 * 1 + 2` (ordinary operator precedence applies to the *expanded* text, giving 1+2+2=5), while the parenthesized version expands to `((1+2) * (1+2))`, correctly 9.
+- The rule has two layers: parenthesize each parameter's use (`(x)` not `x`) so the argument's own operators cannot interact with surrounding tokens in the replacement list, and parenthesize the whole replacement expression (the outer `(...)`) so the macro's result cannot interact badly with whatever surrounds the macro call itself (e.g. `2 * SQUARE_GOOD(1+2)` needs the outer parens too, or a `*` right before it could bind wrongly if the macro body started with something like `x+x`).
+- C11's own example for this exact pattern is `#define max(a, b) ((a) > (b) ? (a) : (b))` (6.10.3 EXAMPLE 2) -- note every parameter *and* the whole ternary is parenthesized.
+FOLLOW:
+- Does this matter for a macro whose replacement is a single token, e.g. `#define TABSIZE 100`? => No real risk there since there is nothing for surrounding operators to bind wrongly to, but the discipline of "always parenthesize" avoids having to reason about it case by case as macros evolve.
+- Would a real function catch this the way a macro doesn't? => Yes -- a real function's arguments are evaluated to values before the call, so operator precedence inside the caller's expression can never leak into the function body; this class of bug is specific to textual macro substitution.
+PITFALL: Writing `#define SQUARE(x) x*x` and calling it with any argument that is itself an expression rather than a single identifier or literal.
+VERIFY: C11 6.10.3 EXAMPLE 2 (the parenthesization pattern) -- the standard does not mandate parenthesization; it is a defensive coding discipline the examples model, not a constraint the preprocessor enforces.
+
+@@ 9.05 | Intermediate | Trap | tags=multiple-evaluation,side-effects,max-macro
+Q: Why does MAX(x++, y) increment x twice, and what does the standard say about this?
+SHORT: A macro parameter used more than once in the replacement list causes the argument's tokens (side effects included) to be evaluated once per use; `#define MAX(a,b) ((a)>(b)?(a):(b))` uses `a` twice, so `MAX(x++, y)` can increment x twice. C11's own `max` example names this exact "disadvantage... of evaluating one or the other of its arguments a second time" (6.10.3 EXAMPLE 2).
+DEEP:
+```c
+#include <stdio.h>
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+
+int main(void) {
+    int x = 5, y = 3;
+    int result = MAX(x++, y);
+    printf("result=%d x=%d (x was incremented %s)\n",
+           result, x, (x == 6) ? "once" : "twice");
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra` and run, this prints `result=6 x=7 (x was incremented twice)` -- `x++` is evaluated once for the `>` comparison (x becomes 6, compares 5>3 true using the pre-increment... actually the comparison uses the post-increment expression itself which yields 5, then a second `x++` for the true branch's result increments again to 7) -- the concrete, observed number that matters here is that x ends up at 7, not 6, confirming two increments occurred, not one.
+- This is a real function-vs-macro difference: a real `int max(int a, int b)` function call evaluates `x++` exactly once, passes the resulting value, and never re-evaluates the expression -- macros cannot offer that guarantee because there is no function-call machinery, only text substitution.
+- The general rule: never call a macro whose parameter appears more than once in the replacement list with an argument that has side effects (`++`, `--`, assignment, or a function call with side effects) unless the macro's documentation explicitly guarantees single evaluation.
+FOLLOW:
+- Does wrapping the macro call's argument in extra parentheses fix this? => No -- the multiple-evaluation problem is about how many times the *parameter* appears in the replacement list, not about the argument's own parenthesization; only rewriting the macro (or using a real function/inline function instead) fixes it.
+- Would an inline function have this problem? => No -- `static inline int max(int a, int b) { return a > b ? a : b; }` evaluates each argument exactly once, just like any ordinary function call, because it uses real function-call semantics rather than text substitution.
+PITFALL: Passing an expression with side effects (i++, a mutating function call) to any macro without first checking whether that macro's parameter is used more than once.
+VERIFY: C11 6.10.3 EXAMPLE 2, the explicit "disadvantages" sentence about re-evaluating an argument including its side effects.
+
+@@ 9.06 | Intermediate | Concept | tags=variadic,va-args,ellipsis
+Q: How do variadic macros work, and what is the rule about how many arguments they need?
+SHORT: `#define LOG(fmt, ...) printf(fmt, __VA_ARGS__)` declares a trailing `...` parameter; every argument beyond the named ones (fmt here) is merged into __VA_ARGS__ and substituted wherever that identifier appears in the replacement list (C11 6.10.3p12, 6.10.3.1p2). Standard C11 requires strictly more arguments in the call than named parameters in the definition -- so a call supplying *zero* variadic arguments is a constraint violation, not just an empty __VA_ARGS__.
+DEEP:
+```c
+#include <stdio.h>
+#define LOG(fmt, ...) printf("[LOG %s:%d] " fmt "\n", __FILE__, __LINE__, __VA_ARGS__)
+
+int main(void) {
+    int code = 42;
+    LOG("error code %d, retry %d", code, 3);
+    LOG("value=%d", 7);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra` and run, this prints `[LOG test_m9_variadic.c:9] error code 42, retry 3` and `[LOG test_m9_variadic.c:10] value=7` -- both calls supply at least one variadic argument, satisfying C11's "more arguments... than parameters" rule (6.10.3p4).
+- "The identifier __VA_ARGS__ shall occur only in the replacement-list of a function-like macro that uses the ellipsis notation" (6.10.3p5) -- using it in a non-variadic macro is a constraint violation.
+- Trying to call LOG with only the fmt argument and nothing else (`LOG("starting up")`) fails to compile under strict C11, because it leaves zero tokens for the mandatory variadic part, and the trailing comma before an empty __VA_ARGS__ becomes a syntax error in the expanded call.
+- The common (non-standard) fix for the zero-argument case is GNU's `##__VA_ARGS__` extension, which deletes the preceding comma when __VA_ARGS__ is empty (9.13 covers this trade-off); C23 adds the standard `__VA_OPT__` for the same purpose.
+FOLLOW:
+- Does the C11 standard's own EXAMPLE 7 (6.10.3) show a zero-variadic-argument call? => No -- every example call there (`debug("Flag")`, `showlist(...)`, etc.) still supplies at least the required minimum after the named parameters; C11 does not show, and does not support, a strictly zero-argument variadic call.
+- What replaces __VA_ARGS__ if you pass three extra arguments? => All three, comma-separated, exactly as written at the call site -- __VA_ARGS__ is "the variable arguments" as a single merged unit, not a single token (6.10.3.1p2).
+PITFALL: Calling a variadic macro with nothing after the required named parameters, expecting __VA_ARGS__ to just become empty under standard C11 -- it is a constraint violation, not a silently-empty substitution.
+VERIFY: C11 6.10.3p4-5, p12 (variadic macro constraints and semantics) and 6.10.3.1p2 (__VA_ARGS__ substitution).
+
+@@ 9.07 | Intermediate | Scenario | tags=do-while-0,statement-macro,semicolon
+Q: Why wrap a multi-statement macro body in do { ... } while (0), and what breaks without it?
+SHORT: do{...}while(0) makes the macro's expansion a single statement syntactically, so it behaves exactly like a function call would inside an if/else, a for-loop body, or before a trailing semicolon; a bare `{ ...; ... }` block, or worse, unbraced multiple statements, can silently detach part of the macro's body from the if/else it was meant to belong to.
+DEEP:
+```c
+#include <stdio.h>
+#define LOG_AND_INC(counter) do { \
+    printf("incrementing\n"); \
+    (counter)++; \
+} while (0)
+
+int main(void) {
+    int n = 0;
+    int cond = 1;
+    if (cond)
+        LOG_AND_INC(n);   /* single statement -- binds correctly to this if */
+    else
+        n = -1;
+    printf("n=%d\n", n);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra` and run, this prints `incrementing` then `n=1` -- the whole macro body, plus the trailing semicolon the caller wrote, forms exactly one statement, so the `if`/`else` binds correctly and the call site reads exactly like an ordinary function call.
+- Without do-while(0), and specifically without even braces, `#define LOG_AND_INC_BAD(counter) printf("incrementing\n"); (counter)++;` expands to **two** statements. `if (cond) LOG_AND_INC_BAD(n)` puts only the `printf` inside the if; the `(n)++;` always runs regardless of cond, and a following `else` on the next line is then a compile error, since the `if` has already been "closed" by the first statement.
+- do-while(0) specifically (over a bare brace block) also correctly requires and consumes the caller's trailing semicolon as part of the same statement, which a bare `{ ... }` followed by a semicolon would leave as an extra empty statement -- usually harmless, but do-while(0) is the idiom that handles both problems (statement-count and stray semicolon) at once.
+FOLLOW:
+- Would a bare `{ ... }` block (no do-while) fix the dangling-else problem? => Mostly, but a block followed by the caller's semicolon leaves a stray empty statement after it; that is usually harmless but is exactly why do-while(0) became the standard idiom over a bare block.
+- Does this matter for a macro whose body is truly a single expression? => No -- a single-expression macro (like `SQUARE_GOOD` in 9.04) is already one statement once terminated by the caller's semicolon; do-while(0) is specifically for macros whose body is multiple statements.
+PITFALL: Defining a multi-statement macro without either braces or do-while(0), which lets `if`/`else` silently bind to only the first statement of the macro's body.
+VERIFY: This idiom is not itself named or mandated anywhere in C11; it follows from ordinary C statement/selection-statement grammar (6.8.4 selection-statements: an if-statement's substatement is exactly one statement) combined with how macro expansion is purely textual (6.10.3).
+
+@@ 9.08 | Intermediate | Concept | tags=include-guards,pragma-once,header
+Q: What do #ifndef/#define include guards do, and how does #pragma once differ?
+SHORT: An include guard wraps a header in `#ifndef GUARD_NAME` / `#define GUARD_NAME` / `#endif`, so a second textual inclusion in the same translation unit finds GUARD_NAME already defined and skips the body -- pure standard C11 (6.10.1). `#pragma once` gets the same effect by having the implementation itself track "already included this file," but it is not part of the C standard; it is a widely supported extension.
+DEEP:
+```c
+/* config.h */
+#ifndef CONFIG_H
+#define CONFIG_H
+#define MAX_BUF 64
+typedef struct { int id; } config_t;
+#endif /* CONFIG_H */
+```
+```c
+/* main.c */
+#include <stdio.h>
+#include "config.h"
+#include "config.h"   /* included twice; the guard makes this a no-op the second time */
+
+int main(void) {
+    config_t c = { .id = 7 };
+    printf("MAX_BUF=%d id=%d\n", MAX_BUF, c.id);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra -I.` and run, this prints `MAX_BUF=64 id=7` with no redefinition errors, even though config.h was `#include`d twice -- the second inclusion expands to nothing because CONFIG_H is already defined by then.
+- Include guards are built entirely from standard directives: `#ifndef`/`#define`/`#endif` (6.10.1, 6.10.3.5) -- they work on any C11-conforming preprocessor with zero portability risk.
+- `#pragma once`'s practical benefit is speed (the implementation can skip even opening/re-lexing the file on a later `#include`, versus a guard which still requires re-lexing down to the `#ifndef` check) and avoiding guard-name collisions between headers; its cost is that it is a non-standard pragma -- 6.10.6's `#pragma` directive is explicitly for "implementation-defined" behavior, so relying on `#pragma once` ties you to compilers that support it (which is most modern ones, but it is a compatibility choice, not a language guarantee).
+FOLLOW:
+- Can a header safely use both an include guard and #pragma once together? => Yes, this is common in practice -- #pragma once for speed on compilers that support it, with the guard as a portable fallback and a safety net if the pragma is ever unsupported or ignored.
+- What happens if two different headers accidentally use the same guard macro name? => The second header's contents are silently skipped entirely, exactly as if it had already been included -- a real, seen-in-practice bug, which is why guard names are conventionally derived from the full header path to minimize collisions.
+PITFALL: Choosing a short, generic include-guard name (like `_H` or `UTILS_H`) that collides with another header in a large codebase, silently dropping that header's declarations.
+VERIFY: C11 6.10.1 (conditional inclusion) and 6.10.6 (the #pragma directive, which is where "#pragma once" would fall if it were standard -- it is not listed among the standard pragmas in 6.10.6, e.g. STDC FP_CONTRACT).
+
+@@ 9.09 | Intermediate | Numeric | tags=expansion-order,rescanning,worked-trace
+Q: Trace exactly how join(x, y) expands to the string "x ## y" -- what actually happens at each rescanning step?
+SHORT: With `hash_hash = # ## #`, `mkstr(a) = #a`, `in_between(a) = mkstr(a)`, `join(c,d) = in_between(c hash_hash d)`, expanding hash_hash first produces a *new* token made of two adjacent `#` characters -- not the ## operator, since that only fires while literally unexpanded in a replacement list. By the time in_between's argument is stringized, it is just two `#` characters as text, giving "x ## y". This is C11's own worked example (6.10.3.3).
+DEEP:
+```c
+#include <stdio.h>
+#define hash_hash # ## #
+#define mkstr(a) # a
+#define in_between(a) mkstr(a)
+#define join(c, d) in_between(c hash_hash d)
+
+int main(void) {
+    char p[] = join(x, y);  /* equivalent to: char p[] = "x ## y"; */
+    printf("p=\"%s\"\n", p);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra` and run, this prints `p="x ## y"`, exactly matching the standard's stated result.
+- Step by step, per the standard's own trace: `join(x, y)` -> `in_between(x hash_hash y)` (c and d substituted into join's body) -> `in_between(x ## y)` (hash_hash itself expands to a token built from `#` `##` `#`, which pastes to a single two-character `##`-looking token, but again: this is a *new* token, not the operator) -> `mkstr(x ## y)` (in_between's body calls mkstr on its now-expanded argument) -> `"x ## y"` (mkstr stringizes the argument tokens `x`, `##`, `y` as plain text).
+- The point of the example, in the standard's own words: "expanding hash_hash produces a new token, consisting of two adjacent sharp signs, but this new token is not the ## operator" -- ## only has operator behavior when it appears literally, unexpanded, in the replacement list being scanned for that purpose; one produced *by* expansion is just an ordinary (if unusual-looking) token afterward.
+FOLLOW:
+- Would removing the indirection layer (in_between) change the result? => Yes -- calling mkstr(x hash_hash y) directly would stringize the *unexpanded* argument, including the still-macro-name hash_hash, giving "x hash_hash y" instead; the extra layer of function-like macro call is what forces hash_hash to expand before stringizing, exactly the same indirection trick used in 9.14.
+- Is the order of # and ## processing within one replacement list specified? => No -- "the order of evaluation of # and ## operators is unspecified" (6.10.3.2p2, last sentence), so a macro relying on one specific order between multiple # / ## uses in the same list is not portable.
+PITFALL: Assuming a token produced by macro expansion (like hash_hash's two adjacent '#' characters) automatically behaves as an operator later in the same or a different macro. Operator status is purely about literal, unexpanded presence in a replacement list.
+VERIFY: C11 6.10.3.3, the full worked EXAMPLE (hash_hash/mkstr/in_between/join) reproduced verbatim from the standard text.
+
+@@ 9.10 | Advanced | Debug | tags=self-reference,rescanning,blue-paint
+Q: If #define A A + 1 is legal, why doesn't expanding A recurse forever?
+SHORT: C11's rescanning rule stops it explicitly: "if the name of the macro being replaced is found during this scan of the replacement list... it is not replaced. Furthermore, if any nested replacements encounter the name of the macro being replaced, it is not replaced" (6.10.3.4p2). So A expands to the literal text "A + 1" -- the second A, inside its own replacement, is permanently ineligible for further expansion, not re-scanned into "A + 1 + 1 + ...".
+DEEP:
+```c
+#include <stdio.h>
+#define STR(x) #x
+#define XSTR(x) STR(x)      /* forces x to be macro-expanded before stringizing */
+#define A A + 1
+#define f(a) a * f
+#define g f
+
+int main(void) {
+    printf("XSTR(A)    = \"%s\"\n", XSTR(A));
+    printf("XSTR(g(2)) = \"%s\"\n", XSTR(g(2)));
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra` and run, this prints `XSTR(A)    = "A + 1"` and `XSTR(g(2)) = "2 * f"` -- both confirm the self-reference rule: A's own name inside its expansion is left as plain text, and g expands to f, then f(2) expands to `2 * f`, where the trailing f (the macro's own name reappearing via g's expansion) is likewise not re-expanded even though f is still a defined macro.
+- This is precisely why the standard's own EXAMPLE 3 (6.10.3, the long `f(x*(a))`/`g`/`z`/`h`/`m`/`w` example) can redefine x partway through and still produce a fully determined result -- the "not replaced again" rule, not ambiguity, is what makes recursive-looking macros terminate.
+- The rule also explains the "may expand to either" ambiguity the standard calls out for `f(2)(9)` given `#define f(a) a*g` and `#define g(a) f(a)` (6.10.3.4 EXAMPLE): whether the inner `f` is considered "the same macro being replaced" depends on implementation-specific rescanning boundaries in that particular mutually-recursive case, which the standard explicitly leaves unspecified.
+FOLLOW:
+- Once a macro name is marked "not replaceable" during one rescan, is it permanently unusable in the rest of the file? => No -- the restriction is scoped to that one expansion's rescan; a later, separate use of A (or f, or g) as a macro invocation still expands normally each time it is newly encountered in the source.
+- Why does XSTR need the extra indirection layer over STR? => Because #/## operate on unexpanded argument text (9.02, 9.09); XSTR(x) calls STR(x) as an *argument*, which forces x to be fully macro-expanded (per 6.10.3.1p1's argument-substitution rule) before STR ever stringizes it.
+PITFALL: Assuming a self-referential macro definition is either a compile error or an infinite loop. It is neither -- it is well-defined, bounded text substitution, just not the substitution people often expect at first glance.
+VERIFY: C11 6.10.3.4p1-2 (rescanning and the "not replaced" rule) and its own EXAMPLE for the f(2)(9) ambiguity.
+
+@@ 9.11 | Advanced | Scenario | tags=x-macro,generated-table,single-source-of-truth
+Q: How does an X-macro generate an enum and a matching string table from one list, and why is that valuable?
+SHORT: Define the data once as a list of X(...) invocations, then #define X differently before each place you want a different piece of generated code (an enum tag list, a string array, a size, etc.), #include-ing (or just re-expanding) the same list macro each time -- adding one new row to the single X-list automatically keeps the enum and its string table in sync, eliminating the classic bug of updating one table but forgetting the other.
+DEEP:
+```c
+#include <stdio.h>
+#define ERROR_LIST \
+    X(ERR_OK,        "ok") \
+    X(ERR_TIMEOUT,   "timeout") \
+    X(ERR_CRC,       "crc mismatch")
+
+#define X(tag, str) tag,
+typedef enum { ERROR_LIST } error_t;
+#undef X
+
+#define X(tag, str) str,
+static const char *error_strings[] = { ERROR_LIST };
+#undef X
+
+int main(void) {
+    error_t e = ERR_CRC;
+    printf("code=%d name=%s\n", e, error_strings[e]);
+    printf("table has %zu entries\n", sizeof(error_strings) / sizeof(error_strings[0]));
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra` and run, this prints `code=2 name=crc mismatch` and `table has 3 entries` -- the enum values and the string table were generated from the exact same three-row list, so ERR_CRC's numeric value (2) correctly indexes into error_strings to get "crc mismatch".
+- The pattern: redefine X (with `#undef X` between uses, since a macro cannot be redefined with a different replacement list without first undefining it, 6.10.3p2) to project the same row data into whatever shape the current generated artifact needs -- an enum tag, a string, a struct initializer, a switch case, and so on.
+- Real firmware use: error code tables, register/field descriptor tables, and protocol opcode tables are common X-macro candidates, specifically because they need to stay synchronized across multiple generated representations (an enum for code, a string table for logging, sometimes a size/count for validation) with zero chance of drifting apart.
+FOLLOW:
+- Does the X-macro pattern require the list to be in a separate header? => Not necessarily for a small table like this one, but for larger or multi-file-shared tables, putting just the `X(...) X(...) ...` list (without any #define X) in its own header, included by each generator site after that site's own `#define X`, is the more common real-world layout.
+- What is the main readability cost? => The generated code (the enum, the array) is not visible as ordinary declarations in the source you are reading; a reader unfamiliar with the pattern has to mentally re-expand the macros, which is the trade-off against the single-source-of-truth benefit.
+PITFALL: Forgetting `#undef X` between two different `#define X(...)` uses of the same list, which is a redefinition constraint violation (6.10.3p2) since the two X definitions have different replacement lists.
+VERIFY: C11 6.10.3p2 (macro redefinition constraints, which is exactly why #undef is required between different X definitions).
+
+@@ 9.12 | Advanced | Cross-layer | tags=macro-vs-enum,type-safety,debugger
+Q: For a firmware constant like a retry limit, why might you prefer an enum constant over an object-like macro?
+SHORT: An enum constant has an actual type (an int-compatible type the compiler tracks) and typically survives into the debugger's symbol information, while an object-like macro is pure text substitution with no type and, because it never survives past translation phase 4 (6.10.3.5p1), is invisible to a debugger inspecting the compiled binary -- you cannot set a breakpoint on it or watch it, because it never existed as a symbol at all.
+DEEP:
+```c
+#include <stdio.h>
+#define MAX_RETRIES_MACRO 3
+enum { MAX_RETRIES_ENUM = 3 };
+
+int main(void) {
+    printf("sizeof macro const = %zu\n", sizeof(MAX_RETRIES_MACRO));
+    printf("sizeof enum const  = %zu\n", sizeof(MAX_RETRIES_ENUM));
+    printf("macro==enum: %d\n", MAX_RETRIES_MACRO == MAX_RETRIES_ENUM);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra` and run, this prints `sizeof macro const = 4`, `sizeof enum const  = 4`, `macro==enum: 1` -- both behave identically as int-sized constant expressions here; the difference is not in the arithmetic, it is in what the compiler and debugger know about the name.
+- Macros have no scope at all (they are not subject to C's block/file scope rules, 6.10.3.5p1) -- a macro named the same as a local variable in some other part of the file will silently substitute there too, whereas an enum constant follows ordinary scope and can be shadowed/scoped predictably.
+- `const int` is a third option with its own trade-off: it has a real type and address (usable where a compile-time constant expression is not required, e.g. as an array bound only in C99+ VLA contexts or never as a case label), but unlike an enum constant it is not usable as a case label or other integer-constant-expression context, because a const object is not itself a constant expression in C.
+- For firmware specifically: prefer enum (or const, where a real object is wanted) for anything you might ever want to inspect live in a debugger or that participates in switch/case; reserve macros for things that are truly textual (conditional compilation guards, generated code via X-macros, or values that must work in contexts requiring true preprocessor-time constants like #if).
+FOLLOW:
+- Can an enum constant be used in a #if directive? => No -- #if only evaluates preprocessor-time constant expressions, and enum constants do not exist yet at preprocessing time (they are a compiler-level construct); only object-like macros (or literal integers) work in #if.
+- Does this mean macros for constants are always the wrong choice? => No -- for a value that must be visible to #if/#ifdef conditional compilation, a macro is the only option; the enum-vs-macro choice is specifically about ordinary in-code integer constants, not preprocessor-time ones.
+PITFALL: Defining every firmware constant as a macro out of habit, including ones that are only ever used as ordinary in-code values and would benefit from a real type and debugger visibility as an enum constant instead.
+VERIFY: C11 6.10.3.5p1 (macro definitions have no significance -- and by extension no scope -- after translation phase 4); enum constant typing is 6.7.2.2.
+
+@@ 9.13 | Advanced | Trap | tags=variadic,gnu-extension,zero-args
+Q: LOG(fmt, ...) using printf(fmt, __VA_ARGS__) fails to compile when called with zero extra arguments -- what is the standard-conforming fix versus the common non-standard one?
+SHORT: Standard C11 requires the call to supply strictly more arguments than the named parameters (6.10.3p4), so `LOG("starting up")` with nothing after fmt is a constraint violation, not a silently-empty __VA_ARGS__. The common fix is GNU's `##__VA_ARGS__` extension, which deletes the preceding comma specifically when __VA_ARGS__ is empty -- widely supported by GCC/Clang but not part of ISO C11.
+DEEP:
+```c
+#include <stdio.h>
+#define LOG(fmt, ...) printf("[LOG] " fmt "\n", ##__VA_ARGS__)
+
+int main(void) {
+    LOG("starting up");           /* zero variadic arguments */
+    LOG("error code %d", 42);     /* one variadic argument */
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra` and run, this prints `[LOG] starting up` and `[LOG] error code 42` -- both the zero-argument and one-argument calls compile and run correctly, because `##__VA_ARGS__` removes the otherwise-dangling comma exactly when there is nothing to paste it to.
+- Since `##__VA_ARGS__` is a GNU extension (not in C11's own 6.10.3), code that must be strictly portable across every standard-conforming preprocessor cannot rely on it; the alternatives are always passing at least one variadic argument (9.06), or restructuring the macro to avoid the leading-comma pattern entirely (e.g. two macros, one for zero args and one for one-plus).
+- C23 standardizes `__VA_OPT__` for exactly this use case (a token sequence that vanishes when __VA_ARGS__ is empty) -- a portable, standard-blessed replacement for the GNU trick, but only from C23 onward; C11/C17 code has no standard solution.
+- Because this is a GCC/Clang extension rather than a `-std=c11` conformance issue per se, `-std=c11 -Wall -Wextra` does not warn about using it; `-std=c11 -pedantic` would flag it as a non-standard extension.
+FOLLOW:
+- Would this compile under `-std=c11 -pedantic`? => It would produce a pedantic warning about the GNU extension, since `##__VA_ARGS__`'s comma-deletion behavior is not part of ISO C11; -Wall -Wextra alone does not include -pedantic's strict conformance warnings.
+- Is __VA_OPT__ usable if the codebase must stay on C11? => No -- __VA_OPT__ is a C23 feature; a C11/C17-only codebase has to choose between the GNU extension, always requiring one variadic argument, or a macro-overload-by-argument-count workaround.
+PITFALL: Relying on `##__VA_ARGS__` in code that claims strict C11 portability, without checking whether the target toolchain actually treats it as a supported extension rather than a hard error.
+VERIFY: C11 6.10.3p4-5 (the strict "more arguments than parameters" requirement) -- ##__VA_ARGS__ itself is documented only in GCC/Clang's own manuals, not in C11. C17/C23: __VA_OPT__ is new in C23.
+
+@@ 9.14 | Advanced | Concept | tags=stringize,indirection,double-expansion
+Q: Why does stringizing a macro argument sometimes need an extra layer of indirection?
+SHORT: # stringizes the argument's raw, unexpanded tokens (6.10.3.2), so if the argument is itself a macro name, #arg gives you the macro's *name* as literal text, not its expanded value. Wrapping it in a second function-like macro that just forwards to a #-based one forces the outer call's argument-substitution step (which *does* fully macro-expand arguments before substitution, 6.10.3.1p1) to run first, so by the time the inner macro stringizes, it is stringizing the already-expanded text.
+DEEP:
+```c
+#include <stdio.h>
+#define VERSION 42
+#define DIRECT_STR(x) #x
+#define INDIRECT_STR(x) DIRECT_STR(x)
+
+int main(void) {
+    printf("DIRECT_STR(VERSION)   = \"%s\"\n", DIRECT_STR(VERSION));
+    printf("INDIRECT_STR(VERSION) = \"%s\"\n", INDIRECT_STR(VERSION));
+    return 0;
+}
+```
+This is the same xstr/str pattern as C11's own 6.10.3.3 EXAMPLE (`str`/`xstr`) and 6.10.3.2's `xstr(INCFILE(2))` illustration; the mechanism: `DIRECT_STR(VERSION)` substitutes the parameter x with the literal, unexpanded token `VERSION` (since x is directly preceded by #, argument substitution skips macro-expanding it, per 6.10.3.1p1's "unless preceded by a # or ## ... is replaced by the corresponding argument after all macros contained therein have been expanded" -- the preceding-# case is exactly the exception), giving `"VERSION"`. `INDIRECT_STR(VERSION)` first substitutes x with VERSION as an ordinary (non-#-adjacent) argument to INDIRECT_STR -- which *does* get macro-expanded first, becoming 42 -- and only then calls DIRECT_STR(42), which stringizes 42, giving `"42"`.
+- This exact two-layer pattern (str/xstr, mkstr/in_between) appears twice in the standard's own preprocessor examples (6.10.3.2 and 6.10.3.3) precisely because it is the standard idiom for "I want the expanded value as a string," not the macro name.
+- Practical use: turning a version number macro, a build-configured constant, or any #define'd value into a string literal for a log message or a `#pragma message`-style diagnostic requires exactly this indirection.
+FOLLOW:
+- Does the same indirection trick work for ##, not just #? => Yes, in the analogous sense -- if you need an argument macro-expanded *before* pasting rather than pasted as its literal name, you need an extra layer that receives the argument as an ordinary (non-##-adjacent) parameter first.
+- Why does 6.10.3.1p1 make # and ## the exception to "always expand arguments first"? => Because # and ## are specifically about capturing the literal, as-written text (a token's spelling, or gluing exact tokens) -- if they auto-expanded their operand first, you could never stringize or paste a macro's own name, only its expansion, which would remove a capability the operators are partly there to provide.
+PITFALL: Calling a #-based macro directly on an argument that is itself a macro name, expecting the stringized result to be the macro's value rather than its bare name.
+VERIFY: C11 6.10.3.1p1 (argument substitution's #/## exception) and the worked xstr/str example under 6.10.3.2-6.10.3.3.
+
+@@ 9.15 | Advanced | Concept | tags=predefined-macros,file-line-func,logging
+Q: What do __FILE__, __LINE__ and __func__ give you, and which of them is technically not a macro at all?
+SHORT: __FILE__ expands to the current source file name as a string literal, and __LINE__ to the current source line number as a decimal constant -- both are true predefined macros (C11 6.10.8.1). __func__, by contrast, is not a macro; it is an implicitly-declared, implementation-provided string variable with the current function's name, valid only inside a function body (6.4.2.2) -- it cannot be used, redefined, or stringized the way a real macro can outside function scope.
+DEEP:
+```c
+#include <stdio.h>
+#define LOG_HERE() printf("[%s:%d in %s]\n", __FILE__, __LINE__, __func__)
+
+void driver_init(void) { LOG_HERE(); }
+
+int main(void) {
+    LOG_HERE();
+    driver_init();
+    printf("__STDC_VERSION__=%ldL\n", (long)__STDC_VERSION__);
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra` and run, this prints two `[filename:line in funcname]` lines (one for main, one for driver_init, each with the correct line number at its own LOG_HERE() call site) followed by `__STDC_VERSION__=201112L`, confirming C11 mode.
+- __LINE__ and __FILE__ can be changed mid-file by a `#line` directive (6.10.4) -- generated code (e.g. from a code generator or yacc/bison-style tool) commonly uses this to make error messages point back at the *original* source rather than the generated file.
+- __STDC_VERSION__ is one of the "mandatory macros" (6.10.8.1) every conforming implementation must predefine; its value (201112L for C11) is the standard, portable way to detect which C standard revision is active at preprocessing time, distinct from a compiler-specific version macro.
+- __func__ being a variable, not a macro, has a real consequence: `#ifdef __func__` does not reliably detect its presence the way `#ifdef __FILE__` would for a true macro, since implementations are not required to also define it as a macro (some do, as an extension, but that is not guaranteed).
+FOLLOW:
+- Can you use __LINE__ inside another macro to capture the caller's line number reliably? => Yes -- when __LINE__ appears in a macro's replacement list, it expands using the line of the *invocation* (where the macro call's closing token completes), which is exactly why wrapping it in LOG_HERE() above still reports each call site's own line correctly.
+- Is __func__ available in C89/ANSI C? => No -- __func__ is a C99 addition (and continues into C11); C89-only code commonly used a compiler-specific extension like GNU's __FUNCTION__ instead.
+PITFALL: Treating __func__ as an ordinary macro (e.g. trying to `#undef __func__` or use it outside any function), when it is a predeclared variable scoped to the enclosing function body.
+VERIFY: C11 6.10.8.1 (mandatory predefined macros, including __FILE__, __LINE__, __STDC_VERSION__) and 6.4.2.2 (the __func__ predefined identifier, explicitly described as "as if" a static const char array were declared, not a macro).
+
+@@ 9.16 | Principal | Scenario | tags=static-assert,compile-time,pre-c11-trick
+Q: Design a compile-time assertion for a firmware header, covering both C11's _Static_assert and the pre-C11 trick it replaced.
+SHORT: In C11, `_Static_assert(constant-expression, "message")` is a declaration that fails translation with your message if the expression is false -- no runtime cost, no library support needed. Before C11, the idiom was to force the same failure through a constraint violation, usually `typedef char name[(COND) ? 1 : -1];`, which fails to compile exactly when COND is false.
+DEEP:
+```c
+#include <stdio.h>
+#include <stddef.h>
+
+_Static_assert(sizeof(int) >= 4, "int must be at least 32 bits");
+_Static_assert(sizeof(void *) == sizeof(size_t), "pointer/size_t width mismatch");
+
+#define COMPILE_TIME_ASSERT(COND, name) typedef char name[(COND) ? 1 : -1]
+COMPILE_TIME_ASSERT(sizeof(long) >= sizeof(int), long_not_smaller_than_int);
+
+int main(void) {
+    printf("all static asserts passed at compile time\n");
+    return 0;
+}
+```
+Compiled with `gcc -std=c11 -Wall -Wextra` and run, this prints `all static asserts passed at compile time` -- both `_Static_assert` lines and the pre-C11-style macro-based check compiled cleanly, because every condition checked is actually true on this platform; changing any condition to false would turn each into a genuine compile-time failure, not a runtime one.
+- The pre-C11 trick's failure mode is a real but sometimes confusing compiler error (something like "array size is negative"), which is exactly *why* C11 added `_Static_assert`: it lets you supply your own diagnostic message directly, rather than relying on programmers recognizing what a stray "-1 array size" error at some header line actually means.
+- Design guidance for a firmware header: use `_Static_assert` liberally for structural invariants that must hold for the target build -- struct sizes and offsets (tying into module 6's offsetof), pointer/size_t width assumptions, endianness assumptions if the code is not written to be endian-agnostic -- so a porting mistake fails the build immediately with a clear message, instead of shipping and failing at runtime or in the field.
+- `_Static_assert` can appear at file scope or inside a block (C11 6.7.10), so it works equally well for "this struct must be exactly N bytes" (file scope, right after the struct definition) and "this local buffer must be big enough" (block scope, right where the buffer is declared) style checks.
+FOLLOW:
+- Can _Static_assert's condition depend on sizeof or offsetof? => Yes -- both are integer constant expressions suitable for _Static_assert's first argument, which is exactly why it is the right tool for struct-layout invariants (module 6) as well as simple numeric ones.
+- Does the pre-C11 trick have any downside beyond the confusing error message? => It also introduces an unused typedef name into the surrounding scope (harmless but slightly noisy), and if two such assertions in the same scope generate the same typedef name, you get a spurious redefinition error unrelated to the actual check -- __LINE__ or ## token-pasting into the name is a common way to make each generated name unique.
+PITFALL: Relying only on the pre-C11 array-size trick in new C11 code out of habit, when _Static_assert gives a clearer message and does not risk a name-collision between two assertions in the same scope.
+VERIFY: C11 6.7.10 (_Static_assert), full clause including its file-scope and block-scope placement rules.
+
+@@ 9.17 | Principal | Trap | tags=macro-review,legacy-header,checklist
+Q: You are handed a legacy firmware header full of macros with no tests. What do you check, in order, before trusting any of them?
+SHORT: Work through the failure classes this module demonstrated, in order of how silently each fails: unparenthesized parameters/results (9.04, wrong answer, no warning), parameters used more than once with side-effecting call sites (9.05, wrong answer, no warning), multi-statement macros without do-while(0) (9.07, bad control-flow binding), and only then style issues like non-standard ##__VA_ARGS__ (9.13) or macros that should be enums (9.12).
+DEEP:
+1. **Grep for unparenthesized parameters.** For every function-like macro, check that each parameter appears as `(param)` everywhere in the body, and that the whole replacement expression is itself wrapped in parens -- this is a five-minute mechanical check that catches 9.04-class bugs before they ever run.
+2. **Check for repeated-parameter side-effect risk.** Any parameter used more than once in the body is a latent 9.05-class bug at every call site that ever passes an expression with side effects; either verify no call site does that (audit all callers), or rewrite the macro's logic to use the parameter exactly once, or replace it with an inline function that evaluates arguments exactly once by construction.
+3. **Check every multi-statement macro for do-while(0) or braces.** A macro whose body has more than one statement and lacks do-while(0) wrapping is a 9.07-class time bomb waiting for someone to call it inside an if without braces.
+4. **Only then, look at style/portability.** Non-standard extensions (##__VA_ARGS__), macros used for things an enum or inline function would serve better (9.12), and cosmetic issues are real but lower-severity than the first three classes, which can silently produce *wrong answers* rather than just being awkward.
+- The Principal-level point for an interview: naming "check for missing parens" is table stakes; demonstrating you know *why* each check matters (by reference to a concrete failure mode with a concrete wrong output, as this module has shown for each one) is what separates a checklist recital from real understanding.
+- A legacy header audit like this should end with either a short written list of specific bugs found (cite the macro name, the exact failure class, and a minimal repro) or a statement that all four checks passed -- not a vague "looks okay."
+FOLLOW:
+- Should you rewrite every risky macro to an inline function on sight? => Not necessarily immediately -- for widely-used legacy macros, first quantify actual risk (are any call sites currently passing side-effecting arguments, or relying on multi-statement expansion inside an unbraced if) before triggering a larger, riskier refactor; fix what is actually broken or actually risky first.
+- What is the fastest way to find every call site of a suspect macro across a large codebase? => A text/regex search for the macro name followed by `(` is a reasonable first pass, but remember function-like macros only trigger on `(` immediately following (9.01) -- a plain grep can both over- and under-match if the macro name is also used as an ordinary identifier elsewhere.
+PITFALL: Auditing a legacy macro header for style issues (naming, formatting) before checking for the correctness-affecting classes (unparenthesized parameters, multiple evaluation, missing do-while(0)) that can silently produce wrong answers.
+VERIFY: Each failure class cited here traces to a specific clause already grounded in this module: 6.10.3 EXAMPLE 2 (parenthesization), 6.10.3 EXAMPLE 2's own "disadvantages" note (multiple evaluation), and ordinary statement grammar interacting with textual substitution (do-while(0), 9.07) -- there is no single "macro safety" clause; the risk comes from combining several individually well-defined preprocessor rules.
+
+@@ 9.18 | Principal | Concept | tags=macro-vs-alternative,design-tradeoff,x-macro-review
+Q: A driver needs a table of ten register descriptors (name, offset, width) used to generate both an enum and a debug-print table. Do you reach for an X-macro, or push back for a different design -- and how do you justify the call in review?
+SHORT: An X-macro is the right call specifically when the same row data must project into two or more truly different generated artifacts (an enum here, a string/print table there) that must never drift apart -- which is exactly this case. If there were only one generated artifact (just the enum, say), a plain enum plus a separate hand-written table would be simpler and more readable, and the X-macro's indirection cost would not be buying you anything.
+DEEP:
+- Decision framework from this module: reach for a macro only when plain C cannot express what you need (generating multiple synchronized artifacts from one list -- 9.11; a value that must be usable in #if -- 9.12's FOLLOW; forcing a real compile-time failure with a message -- 9.16); prefer enum/const/inline function whenever the need is just "a named integer constant" or "avoid re-evaluating an argument" (9.05, 9.12), because those get real types, real scope, and debugger visibility that macros do not.
+- For the ten-register case specifically: the X-macro buys synchronization (adding an eleventh register updates the enum and the debug table from one edit, with no way to update one and forget the other) at the cost of readability for someone unfamiliar with the pattern (9.11's FOLLOW) -- for exactly two generated artifacts from one ten-row list, that trade is usually worth it; for a truly large, multi-consumer table (register access code, a debug table, a validation table, a serialization table -- four or more consumers), the case gets even stronger.
+- What you should push back on in review is not the X-macro pattern itself but sloppy use of it: verify `#undef X` appears between every redefinition (9.11's pitfall, a real redefinition-constraint violation if missed), verify the row macro's parameters are used consistently (each X(...) invocation supplying the same shape of arguments), and verify at least one _Static_assert (9.16) checks something structurally important derived from the table, such as the total register count matching an expected hardware constant.
+- The Principal-level answer names the actual trade-off (synchronization benefit versus readability cost) with the concrete numbers of this case (two consumers, ten rows), rather than either reflexively reaching for the "clever" X-macro pattern or reflexively rejecting all macros as unsafe.
+FOLLOW:
+- What if a future third consumer (e.g. a runtime validation table) gets added later? => That is exactly the scenario where the X-macro's benefit compounds -- a third `#define X` / use-list / `#undef X` block reuses the same ten-row source with no risk of the new table drifting from the other two, which is the whole point of centralizing the data once.
+- Is there a lighter-weight alternative that gets some of the same benefit? => A single array of a small `{const char *name; unsigned offset, width;}` struct, initialized once and then both indexed for the "enum-like" lookups and iterated for the debug table, avoids macros entirely at the cost of losing compile-time enum-style named constants usable as case labels -- a reasonable alternative when case-label usage is not actually needed.
+PITFALL: Introducing an X-macro for a table with only one real consumer, or rejecting a truly two-or-more-consumer synchronized table design as "too clever" without weighing the real synchronization risk of maintaining two hand-written tables by hand.
+VERIFY: No single C11 clause governs this design trade-off; the individual mechanisms it combines (6.10.3p2 redefinition rules, 6.10.3.3 token pasting, 6.7.10 _Static_assert) are each grounded in earlier questions in this module.
