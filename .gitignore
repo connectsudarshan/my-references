@@ -1,0 +1,14 @@
+# Build output: each *_src/build step writes the page to out/ before it is copied to the repo root
+out/
+
+# Python bytecode caches from running the build and apply scripts
+__pycache__/
+*.pyc
+
+# Temporary files from compile checks and editors
+_c*.js
+ccheck_*/
+*.tmp
+~$*
+.DS_Store
+Thumbs.db
