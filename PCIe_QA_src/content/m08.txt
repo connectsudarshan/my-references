@@ -12,9 +12,8 @@ DEEP:
 - **Cost:** receivers spend buffer memory, and the credit window has to cover the round trip or the link idles (sizing is in the Numeric question below).
 FOLLOW:
 - Who decides how many credits a port advertises? => The receiving port's designer, from its buffer sizes. Software cannot change it, though some switches expose buffer profiles.
-- What happens if a transmitter sends without credits? => The receiver may detect a Receiver Overflow, an uncorrectable and normally fatal error, and it can no longer trust the link.
+- What happens if a transmitter sends without credits? => The receiver may detect a Receiver Overflow (AER uncorrectable bit 17, fatal by default) and can no longer trust the link. A malformed credit advertisement or update is a Flow Control Protocol Error (bit 13, also fatal by default).
 PITFALL: Treating flow control as end to end. It is strictly per link, and the two directions have independent credits.
-VERIFY: AER bit assignments and default severity for Receiver Overflow and Flow Control Protocol Error.
 
 @@ 8.02 | Basic | Concept | tags=credits,ph,pd,nph,npd,cplh,cpld,units
 Q: What are the six credit types, and how many credits does a given TLP consume?
@@ -40,7 +39,7 @@ FOLLOW:
 - Why is a read request cheap in credits but its completion is not? => The MRd has no payload, so it uses one NPH credit. The returning data uses CplH and CplD credits at the requester's receiver.
 - How many credits does a 4 KiB write as 16 TLPs of 256 B use in total? => 16 PH and 256 PD.
 PITFALL: Counting bytes instead of credits. Tiny TLPs such as doorbells and CQEs waste data credits and burn one header credit each.
-VERIFY: How prefixes and the digest are counted in a header credit, and the exact credit cost of AtomicOps.
+VERIFY: How TLP prefixes are counted against a header credit in non-flit mode.
 
 @@ 8.03 | Basic | Concept | fig=fc | tags=credit-loop,credits-consumed,credit-limit,credits-allocated,updatefc
 Q: How does the credit loop work: what are CREDITS_CONSUMED, CREDIT_LIMIT and CREDITS_ALLOCATED?
@@ -59,7 +58,6 @@ FOLLOW:
 - Does an Ack return credits? => No. Ack and Nak belong to the Data Link Layer's reliability, and credits belong to the Transaction Layer's buffer management.
 - Why are the values totals rather than deltas? => A delta lost with a corrupted DLLP would leak credits forever. A total is repaired by the next update.
 PITFALL: Picturing CREDIT_LIMIT as a remaining balance. It is an absolute cumulative limit compared against a cumulative consumed count, which is why wraparound arithmetic matters.
-VERIFY: Which counters are mandatory (CREDITS_RECEIVED is used for the optional overflow check) and the initial values in the Base Specification Flow Control chapter.
 
 @@ 8.04 | Intermediate | Numeric | tags=modulo,wraparound,gating,credit-check,counter-width
 Q: How does the transmitter check credits with modulo counters? Work an example that wraps.
@@ -75,6 +73,7 @@ Header counters (N = 8, half range 128):
 
 Data counters (N = 12, half range 2048): CL = 32, CC = 4090, P = 16 (one 256 B write). CC + P = 4106, which wraps to 10. (32 - 4106) mod 4096 = 22, which is at most 2048, so it may send.
 
+- **The exact check:** the spec's gating rule is (CREDIT_LIMIT - (CREDITS_CONSUMED + CUMULATIVE_CREDITS_REQUIRED)) mod 2^N <= 2^N / 2, with N = 8 for header and 12 for data counters, which is the expression used above.
 - **Why "at most half the range":** same argument as the sequence number in Module 6. If the granted window is always below half the modulus, "ahead" and "behind" cannot alias. That limits the largest advertised value to 127 header credits and 2047 data credits (32 KB) per type and VC.
 - **Two checks per TLP:** header and data counters are checked separately, and the TLP needs both to pass. A TLP with 16 PD needed and only 15 left must wait, even with PH free.
 - **How fast counters wrap:** the header counter wraps after 256 header credits, which is 256 doorbell-size posted TLPs. The data counter wraps after 4096 credits, or 64 KiB of payload. Wraparound happens constantly in real traffic.
@@ -83,7 +82,6 @@ FOLLOW:
 - What breaks if hardware compares CC + P <= CL with plain integers? => It works until the first wrap, then either stalls forever or sends without credit. It appears after 256 header credits or 64 KiB of posted data.
 - Why do wrap bugs hide in testing? => They show only when limit and consumed straddle the wrap point, which needs tight credits or a specific traffic amount. A test has to aim at that case.
 PITFALL: Writing the check as CL >= CC + P with unbounded integers in a model. The model passes and the hardware, with its narrow counters, does not.
-VERIFY: The exact gating expression, the 8-bit and 12-bit field widths, and the maximum initial credit values in the Base Specification (Flow Control Rules).
 
 @@ 8.05 | Intermediate | Concept | tags=initfc,updatefc,infinite-credit,timing,loop-time
 Q: How do infinite credits and UpdateFC timing fit together, and why does a late UpdateFC cost throughput?
@@ -99,23 +97,23 @@ FOLLOW:
 - What does a receiver cost if it sends an UpdateFC for every freed credit? => DLLP bandwidth and processing. Implementations batch, which stretches the loop slightly.
 - Does the credit state survive a link retrain? => Yes. Flow control state is kept through Recovery and low-power exits. Only a link down and a new InitFC exchange reset it.
 PITFALL: Assuming a credit returns when the TLP is received. It returns when the receiving Transaction Layer has drained it.
-VERIFY: The UpdateFC maximum interval (30 microseconds is the commonly cited value), the latency limit tables, and which types may be advertised as infinite.
+VERIFY: Which completion credit types Root Ports and endpoints are required (not just allowed) to advertise as infinite.
 
 @@ 8.06 | Intermediate | Concept | tags=scaled-flow-control,hdrscale,datascale,gen4,dl-feature
 Q: What is Scaled Flow Control and why was it added?
 SHORT: The original credit fields are 8 bits for headers and 12 bits for data, so the window per type is at most 127 header credits and 2047 data credits, which is 32 KB of data. That is too small for fast, wide links with long round trips. Scaled Flow Control, introduced with PCIe 4.0, adds HdrScale and DataScale fields to InitFC and UpdateFC that multiply the credit values, up to 16 times. Both link partners must support it and agree during Data Link Feature exchange.
 DEEP:
-- **Mechanism:** each InitFC and UpdateFC carries a scale field beside the header and data values. The advertised credit value is multiplied by the scale factor (1, 4 or 16), so the effective window grows.
+- **Mechanism:** each InitFC and UpdateFC carries a 2-bit scale field beside the header and data values: 00b means scaling is not in use, 01b x1, 10b x4, 11b x16. The advertised credit value is multiplied by the scale factor, so at x16 the window can reach about 2032 header credits and about 32,752 data credits (roughly 512 KB).
 - **Negotiation:** the Data Link Feature exchange in DL_Feature (Module 6) reports support. If either side lacks it, the link uses unscaled flow control.
-- **Why needed:** the Numeric question below shows Gen5 x16 with a 1 microsecond loop needs about 3500 data credits, above the 2047 limit.
-- **Who needs it:** an M.2 Gen4 x4 SSD moving about 7.15 GB/s of payload with a 1 microsecond loop needs about 450 data credits (7.9 GB/s of raw link rate would need about 490), well inside the unscaled range. It matters for x16 Gen5 and Gen6 devices such as GPUs, NICs and CXL cards.
+- **Why needed:** the Numeric question below shows Gen5 x16 with a 1 microsecond loop needs about 3600 data credits, above the 2047 limit.
+- **Who needs it:** an M.2 Gen4 x4 SSD moving about 7.2 GB/s of payload with a 1 microsecond loop needs about 450 data credits (7.9 GB/s of raw link rate would need about 490), well inside the unscaled range. It matters for x16 Gen5 and Gen6 devices such as GPUs, NICs and CXL cards.
 - **Gen6:** FLIT mode changes how credits are advertised and updated (in shared credit pools carried in flits). That is outside this module.
 - **Validation:** test with scaling on and off, and against a partner that lacks it, and check counter wraparound at the larger windows.
 FOLLOW:
 - Who chooses the scale factor? => Each receiver chooses what it advertises, provided both ends support the feature.
 - How would you see it on a trace? => The InitFC DLLPs carry the scale fields, and analyzers decode HdrScale and DataScale.
 PITFALL: Assuming a Gen4 or faster link always uses scaled flow control. Both ends must support and agree on it.
-VERIFY: HdrScale and DataScale encodings and effective maxima, whether support is mandatory at 16 GT/s and above, and the Data Link Feature capability fields.
+VERIFY: Whether Scaled Flow Control support is mandatory for ports that support 16 GT/s and above, and the exact maxima per scale factor.
 
 @@ 8.07 | Intermediate | Concept | tags=virtual-channel,traffic-class,vc0,arbitration,tc-vc-mapping
 Q: What are traffic classes and virtual channels, and why do most SSD systems use only VC0?
@@ -141,49 +139,48 @@ May the later TLP (row) pass an earlier TLP (column)?
 
 | Later TLP | Earlier posted | Earlier non-posted | Earlier completion |
 |---|---|---|---|
-| Posted | No (unless RO or IDO) | Yes, required | Yes, must be able to (deadlock avoidance) |
-| Non-posted | No | No requirement | No requirement |
+| Posted | No (unless RO or IDO) | Yes, required | Permitted, not required (required only in PCIe-to-PCI bridges) |
+| Non-posted | No (unless IDO, for a different requester) | No requirement | No requirement |
 | Completion | No (unless RO or IDO) | Yes, required | Yes, except completions with the same Transaction ID keep their order |
 
 - **Producer/consumer:** the producer writes data, then a flag. A consumer that sees the flag must see the data. That needs posted-after-posted order.
 - **Reads flush writes:** a non-posted request cannot pass an earlier posted write. That is why a read from a device forces its earlier writes to complete (Module 2).
 - **Completions after writes:** if a consumer reads a flag from a device, the completion carrying it must not pass earlier posted data from that device.
-- **Deadlock avoidance:** if a non-posted queue is blocked, posted writes and completions behind it must be allowed to bypass. Otherwise two devices, each waiting for the other to accept, can block forever.
+- **Deadlock avoidance:** if a non-posted queue is blocked, posted writes and completions behind it must be allowed to bypass. Otherwise two devices, each waiting for the other to accept, can block forever. These are the only two mandatory "must pass" entries in native PCIe.
 - **In practice:** switches keep separate posted, non-posted and completion queues per VC, in order within each, plus the mandatory bypasses.
 - **Different VCs:** no ordering relationship.
 FOLLOW:
 - Why do posted, non-posted and completion traffic have separate buffers and credits? => The bypass rules need separate queues, and separate credits stop one class from consuming another's buffer.
 - Which rule makes the flush read trick work? => A non-posted request cannot pass earlier posted writes, so the read's completion implies those writes have been done.
 PITFALL: Remembering the table as "everything stays in order". The key rules are the "must be able to pass" exceptions, which exist to prevent deadlock.
-VERIFY: Every cell of the Transaction Ordering table in the Base Specification, especially entries that depend on Relaxed Ordering and ID-Based Ordering, and the posted-passes-completion entry.
+VERIFY: The remaining Y/N cells of the Transaction Ordering table (non-posted versus non-posted and completions) in your spec revision.
 
 @@ 8.09 | Advanced | Numeric | tags=credit-sizing,bdp,gen5,line-rate,scaled-fc
 Q: How many credits does a Gen5 x4 link need to sustain line rate, and what happens with a longer loop or a wider link?
-SHORT: Credits needed are the payload rate times the credit loop time. Gen5 x4 carries 15.75 GB/s raw, about 14.3 GB/s of payload at 256 B TLPs. With an assumed 1 microsecond loop that is 14.3 KB in flight, about 894 data credits (16 B each) and 56 header credits. Gen5 x16 needs about 3575 data credits, above the 2047 unscaled maximum, so it needs Scaled Flow Control or a shorter loop.
+SHORT: Credits needed are the payload rate times the credit loop time. Gen5 x4 carries 15.75 GB/s raw, about 14.4 GB/s of payload at 256 B TLPs. With an assumed 1 microsecond loop that is 14.4 KB in flight, about 900 data credits (16 B each) and 56 header credits. Gen5 x16 needs about 3600 data credits, above the 2047 unscaled maximum, so it needs Scaled Flow Control or a shorter loop.
 DEEP:
-Assumptions: 128b/130b, per-TLP overhead 26 B (4DW header), loop time 1 microsecond (TLP transit, receiver drain, UpdateFC scheduling, return). Recompute with your loop time.
+Assumptions: 128b/130b, per-TLP overhead 24 B (4 B STP token with the sequence number, 16 B header, 4 B LCRC), loop time 1 microsecond (TLP transit, receiver drain, UpdateFC scheduling, return). Recompute with your loop time.
 
 1. Raw rate, Gen5 x4: 32 GT/s x 4 x 128/130 / 8 = 15.75 GB/s.
-2. Payload rate at 256 B TLPs: 15.75 x 256 / 282 = 14.30 GB/s.
-3. Bytes in flight = 14.30 GB/s x 1 microsecond = 14.3 KB.
-4. PD credits = 14.3 KB / 16 B = 894. PH credits = 14.3 KB / 256 B = 56.
+2. Payload rate at 256 B TLPs: 15.75 x 256 / 280 = 14.40 GB/s.
+3. Bytes in flight = 14.40 GB/s x 1 microsecond = 14.4 KB.
+4. PD credits = 14.4 KB / 16 B = 900. PH credits = 14.4 KB / 256 B = 56.
 
 | Link | Payload rate (256 B) | Loop | PD credits | PH credits |
 |---|---|---|---|---|
-| Gen4 x4 | 7.15 GB/s | 1 us | 447 | 28 |
-| Gen5 x4 | 14.30 GB/s | 0.5 us | 447 | 28 |
-| Gen5 x4 | 14.30 GB/s | 1 us | 894 | 56 |
-| Gen5 x4, 128 B TLPs | 13.09 GB/s | 1 us | 818 | 102 |
-| Gen5 x16 | 57.2 GB/s | 1 us | 3575 | 223 |
+| Gen4 x4 | 7.20 GB/s | 1 us | 450 | 28 |
+| Gen5 x4 | 14.40 GB/s | 0.5 us | 450 | 28 |
+| Gen5 x4 | 14.40 GB/s | 1 us | 900 | 56 |
+| Gen5 x4, 128 B TLPs | 13.27 GB/s | 1 us | 829 | 104 |
+| Gen5 x16 | 57.6 GB/s | 1 us | 3600 | 225 |
 
-- **PH grows for small TLPs:** at 128 B the header need doubles to 102, close to the 127 maximum.
+- **PH grows for small TLPs:** at 128 B the header need nearly doubles to 104, close to the 127 maximum.
 - **Late updates:** window / loop is the throughput cap. A receiver with 256 PD (4 KB) and a 1 microsecond loop caps at 4.1 GB/s. If UpdateFC arrives 0.5 microsecond later, the cap falls to 2.7 GB/s.
 - **Scaled Flow Control:** it lifts the 2047 limit for x16 links.
 FOLLOW:
 - Which binds first, PH or PD? => The smaller of PH times TLP payload and PD x 16 B. Big TLPs burn data credits, small ones burn header credits.
 - Why do real x4 endpoints reach line rate with modest credits? => Their loops are short in direct-attach systems and receivers over-provision. Verify from InitFC values on a trace, do not assume.
 PITFALL: Sizing to raw link rate instead of payload rate, or forgetting that every TLP costs at least one header credit.
-VERIFY: The maximum advertised credit values, and the actual credits advertised by your Root Port and switch (read them from InitFC on a trace).
 
 @@ 8.10 | Advanced | Concept | tags=relaxed-ordering,ido,no-snoop,attributes,device-control
 Q: What do Relaxed Ordering, ID-Based Ordering and No Snoop do, and who is allowed to set them?
@@ -193,14 +190,15 @@ DEEP:
 - **RO in practice:** bulk data writes to memory where order among the pieces does not matter. A completion inherits RO from its request and can then pass posted writes.
 - **IDO:** producer/consumer ordering concerns a single producer, so TLPs from different Requester IDs need no order. It reduces head-of-line blocking between endpoints.
 - **NS:** it skips the coherency snoop. It is safe only if software handles cache state, and it has no effect on PCIe ordering.
-- **Enables:** Device Control has Enable Relaxed Ordering and Enable No Snoop. Device Control 2 has IDO Request Enable and IDO Completion Enable.
+- **Where the bits are:** in the TLP header NS is Attr[0] (byte 2 bit 4), RO is Attr[1] (byte 2 bit 5) and IDO is Attr[2] (byte 1 bit 2).
+- **Enables:** Device Control bit 4 is Enable Relaxed Ordering and bit 11 Enable No Snoop. Device Control 2 bit 8 is IDO Request Enable and bit 9 IDO Completion Enable.
 - **Platform quirks:** Linux clears Enable Relaxed Ordering on devices below Root Ports on a quirk list, because those ports mishandled RO.
 - **Overlapping writes:** RO writes to overlapping addresses can swap. Do not set it where a later write must overwrite an earlier one.
 FOLLOW:
 - Is No Snoop about ordering? => No. It concerns cache coherency at the Root Complex. RO and IDO concern ordering.
 - Who chooses whether a TLP carries RO? => The device, per TLP, once Enable Relaxed Ordering is set. Software cannot tag individual TLPs.
 PITFALL: Setting RO on the flag, CQE or interrupt write for speed. That write is the one that must stay behind the data.
-VERIFY: Attribute bit positions, the Device Control and Device Control 2 enable bits, the RO and IDO entries in the ordering table, and which Root Ports Linux quirks.
+VERIFY: Which Root Ports your kernel's quirk list marks as not handling Relaxed Ordering (PCI_DEV_FLAGS_NO_RELAXED_ORDERING on Linux).
 
 @@ 8.11 | Advanced | Scenario | tags=nvme,ordering,cqe,msix,producer-consumer,ro
 Q: An NVMe controller writes read data, then the CQE, then an MSI-X, all posted on the same TC. Why does the interrupt imply the data is visible, and what breaks it?
@@ -249,7 +247,7 @@ FOLLOW:
 - Can a completer be blocked by credits? => Yes, by the requester's CplH and CplD credits. Requesters normally advertise infinite completion credits, so it is rare.
 - Do posted writes use tags? => The Tag field is present but nothing matches on it, and the write still needs PH and PD.
 PITFALL: Fixing a credit stall by raising the tag limit, or the reverse. First find which limit is binding.
-VERIFY: Whether tag values for posted requests have any uniqueness requirement with 10-bit tags.
+VERIFY: Tag field rules for posted requests when 10-bit tags are enabled.
 
 @@ 8.13 | Advanced | Debug | tags=credit-stall,analyzer,nph,idle-link,counters
 Q: The link is up and clean but all I/O has stopped. How do you prove the transmitter is blocked on NPH credits, from an analyzer trace and from device counters?
@@ -275,7 +273,7 @@ VERIFY: Which analyzer models compute credit state, and the debug counter names 
 Q: How does a flow control stall or a hung completer turn into a completion timeout, and what happens to the NVMe command?
 SHORT: The requester runs a completion timer for each non-posted request. If no completion arrives in the programmed range, it logs a Completion Timeout, frees the tag, and reports the failure upward. A credit stall in a switch or Root Complex, or a hung completer, only becomes an error when it lasts longer than the timer. For an SSD reading host memory, the DMA fails, and the command either completes with an error or times out at the host, which resets the controller.
 DEEP:
-- **Timer:** the Completion Timeout Value in Device Control 2 selects a range, from 50 microseconds up to 64 seconds across the ranges. Default is 50 microseconds to 50 milliseconds. Register details are in Module 12.
+- **Timer:** the Completion Timeout Value in Device Control 2 selects a range, from 50 microseconds up to 64 seconds across the ranges. Default is 50 microseconds to 50 milliseconds (Module 2 has the encoding table). The timer starts when the request is transmitted and stops when its last completion arrives.
 - **Where the wait counts:** time waiting to be transmitted for lack of credits at the requester's own port is before the request goes out. Time spent queued in a switch or Root Complex, or in the completer, is inside the timeout window.
 - **Stall types:**
   - Requester's own port out of NPH: no request is sent, so no timeout, but the device makes no progress and the host eventually times out its command.
@@ -289,14 +287,14 @@ FOLLOW:
 - Should you shorten the timeout to catch stalls faster? => Only carefully. Real paths with IOMMU walks, switches and L1 exits add delay and cause false positives. Disabling it hides hung paths.
 - How does DPC relate? => DPC contains an uncorrectable error at the downstream port by disabling the link, so the host recovers the device with a driver-level reset.
 PITFALL: Treating "no timeout logged" as "no stall". A stall shorter than the timer is invisible in AER but still a latency problem.
-VERIFY: When the completion timer starts, the range and default values, late-completion and tag reuse rules, and NVMe behavior on failed host memory accesses.
+VERIFY: Late-completion and tag-reuse rules after a completion timeout, and your NVMe controller's behavior on failed host memory accesses.
 
 @@ 8.15 | Principal | Scenario | tags=credit-limited,switch,throughput,triage,quantify
 Q: A Gen4 x4 SSD behind a switch tops out at 5.6 GB/s sequential read with a clean link. How do you show it is credit-limited, and what would you change?
 SHORT: The SSD sends read data as posted writes, so its ceiling is credit window / loop time at the switch's downstream port. Capture the link from reset to get InitFC, read the posted credits the switch advertised, and measure the loop time between a TLP and the UpdateFC that returns its credits. If window / loop time matches the measured throughput, credits are the limit. The fix is on the switch side, or removing the hop.
 DEEP:
 Illustrative numbers (read your own from the trace):
-1. **Link is clean:** no replays, no Recovery, 256 B TLPs, link idle about 22% of the time (5.6 GB/s of payload is about 6.2 GB/s on the wire, against 7.88 GB/s).
+1. **Link is clean:** no replays, no Recovery, 256 B TLPs, link idle about 22% of the time (5.6 GB/s of payload is about 6.1 GB/s on the wire, against 7.88 GB/s).
 2. **InitFC from the switch downstream port:** PH = 32, PD = 256.
 3. **Windows:** PH: 32 x 256 B = 8192 B. PD: 256 x 16 B = 4096 B. PD binds.
 4. **Loop time:** on the trace, the time from a TLP to the UpdateFC covering it is about 0.73 microsecond.

@@ -5,7 +5,7 @@ Q: How does a PCIe device raise an interrupt, given that there are no interrupt 
 SHORT: PCIe has no sideband interrupt wires, so interrupts travel in-band as TLPs. MSI and MSI-X interrupts are simply posted memory writes: the device writes a small data value to an address the host pre-programmed, and the interrupt controller decodes that write into a CPU interrupt. Legacy INTx is emulated with Assert_INTx and Deassert_INTx message TLPs that mimic a level-sensitive wire.
 DEEP:
 - **MSI and MSI-X:** the driver programs an address and data into the device. To interrupt, the device sends a one-dword memory write TLP to that address with that data. On x86 the address range 0xFEExxxxx is claimed by the interrupt controller, not by memory.
-- **INTx emulation:** the device sends Assert_INTA (or B, C, D) when its internal interrupt goes active and Deassert_INTx when it clears. Messages are consumed at the next port and re-issued upstream, and the root complex maps them onto a system interrupt.
+- **INTx emulation:** the device sends Assert_INTA (or B, C, D; message codes 20h to 23h) when its internal interrupt goes active and Deassert_INTx (24h to 27h) when it clears. Messages are consumed at the next port and re-issued upstream, and the root complex maps them onto a system interrupt.
 - **Why in-band is good:** the interrupt is ordered with the device's data writes in the same posted stream. If the completion queue entry was written first, the interrupt cannot pass it (subject to ordering rules, see below).
 - **Why it matters for SSDs:** a modern NVMe SSD uses MSI-X, with one vector per completion queue, so completions land on the CPU that issued the command.
 - **Who asks for what:** a device reports which mechanisms it supports through capabilities (MSI 05h, MSI-X 11h), and the OS chooses, normally MSI-X, then MSI, then INTx.
@@ -13,7 +13,7 @@ FOLLOW:
 - Is a device required to support INTx? => Native PCIe endpoints that generate interrupts must support MSI or MSI-X. INTx is legacy compatibility and is optional for many.
 - What about PME and hot-plug events? => They use the same in-band mechanisms, usually MSI or MSI-X, with the vector identified in the PCI Express Capabilities register.
 PITFALL: Imagining the interrupt as a signal separate from data. It is a memory write in the same stream, and the ordering of the two is the whole point.
-VERIFY: Whether native PCIe endpoints are required to support INTx, and the Message code values for Assert_INTx and Deassert_INTx.
+VERIFY: Whether native PCIe endpoints that support MSI or MSI-X are still required to implement INTx in your spec revision.
 
 @@ 10.02 | Basic | Concept | tags=intx,assert,deassert,swizzle,interrupt-pin
 Q: How does INTx emulation work over PCIe, and how does the INTx-to-pin mapping change through bridges?
@@ -21,7 +21,7 @@ SHORT: The device sends Assert_INTx when its interrupt goes active and Deassert_
 DEEP:
 - **Interrupt Pin (3Dh):** 00h means no INTx, 01h to 04h mean INTA to INTD. Most single-function devices use INTA. The Interrupt Line register (3Ch) is a scratch byte for firmware to record the IRQ.
 - **Per-wire state in bridges:** a bridge or switch tracks each virtual wire as if wired-OR. It sends Assert upstream when the first source asserts and Deassert only when the last source deasserts.
-- **Swizzling:** upstream wire = (child wire + device number of the downstream port) mod 4.
+- **Swizzling:** upstream wire = (child wire + device number of the downstream port) mod 4. The rotation happens where a bus has several device numbers, such as a switch's internal bus. Below a downstream port the only device is device 0, so that hop does not rotate.
 
 | Port device number | Child INTA | INTB | INTC | INTD |
 |---|---|---|---|---|
@@ -37,7 +37,6 @@ FOLLOW:
 - Are Assert and Deassert messages routed to a memory address? => No. They are message requests routed to the local receiver only, consumed and regenerated at each bridge.
 - Why swizzle at all? => PCI had four shared lines, and rotating by slot number balanced the load. PCIe keeps the rule so old software and firmware maps still work.
 PITFALL: Expecting each device to have its own interrupt line. INTx wires are shared by many functions, so the handler must find out who actually raised it.
-VERIFY: The port device number rule and the mapping table in the Base Specification (INTx virtual wire mapping), and the Message code values.
 
 @@ 10.03 | Basic | Concept | tags=intx,sharing,level,disable,interrupt-status,latency
 Q: What are the problems with INTx, and what do the INTx Disable and Interrupt Status bits do?
@@ -55,30 +54,28 @@ FOLLOW:
 - Why do drivers read a register back after clearing the interrupt cause? => The read forces the earlier posted write to reach the device before the CPU signals end of interrupt, so the level is really gone.
 - When would you deliberately test INTx on an SSD? => For legacy compatibility (boot environments, old BIOS, virtualized hosts without MSI), and to verify pin-based behavior with INTMS and INTMC.
 PITFALL: Believing Interrupt Disable turns off all interrupts. It only affects INTx, and a device using MSI-X keeps interrupting.
-VERIFY: Bit positions of Interrupt Disable (Command bit 10) and Interrupt Status (Status bit 3) in the Base Specification.
 
 @@ 10.04 | Intermediate | Concept | tags=msi,capability,multiple-message,per-vector-mask,64-bit
 Q: How is the MSI capability structured, and how does a device generate up to 32 vectors from one address?
 SHORT: The MSI capability (ID 05h) holds Message Control, a Message Address (32 or 64 bit), a 16-bit Message Data, and optionally per-vector Mask and Pending registers. Multiple Message Capable says how many vectors the device wants, as a power of two up to 32, and Multiple Message Enable says how many software granted. The device makes vector n by replacing the low bits of Message Data with n, so all vectors share one address.
 DEEP:
-- **Message Control bits:** MSI Enable (bit 0), Multiple Message Capable (3:1), Multiple Message Enable (6:4), 64-bit Address Capable (7), Per-Vector Masking Capable (8).
+- **Message Control bits:** MSI Enable (bit 0), Multiple Message Capable (3:1), Multiple Message Enable (6:4), 64-bit Address Capable (7), Per-Vector Masking Capable (8), and in newer revisions Extended Message Data Capable (9) and Enable (10), which add a second 16 bits of data.
 - **Layout, 64-bit variant:** Message Address at +4, Upper Address at +8, Message Data at +0Ch, Mask Bits at +10h, Pending Bits at +14h. The 32-bit variant has Data at +8, then Mask at +0Ch and Pending at +10h.
 - **Vector encoding:** the field 2^(MMC) is the requested count: 000b is 1, 001b is 2, 010b is 4, 011b is 8, 100b is 16, 101b is 32. Software programs a base Message Data with the low log2(N) bits zero, and the device ORs vector number n into them.
 - **One address, one CPU:** on x86 the destination CPU is in the message address, so without interrupt remapping every vector of an MSI function lands on the same CPU. That, plus the 32-vector limit and contiguous allocation, is why MSI does not suit multi-queue devices.
 - **Masking:** with per-vector masking, a masked vector that fires sets its Pending bit and is delivered on unmask. Without it, the OS cannot mask at the device.
-- **Enable rule:** software enables MSI or MSI-X on a function, not both. Linux disables MSI before it enables MSI-X.
+- **Enable rule:** software enables MSI or MSI-X on a function, not both; behavior with both enabled is undefined. Linux disables MSI before it enables MSI-X.
 FOLLOW:
 - Can an NVMe SSD use MSI with more than one vector? => Yes, multi-message MSI is allowed, and the NVMe specification lists it as an option. In practice SSDs use MSI-X and MSI is a fallback.
 - What does the OS do if it grants fewer vectors than requested? => Multiple Message Enable is set lower, and the device must fold its interrupt sources onto the granted vectors.
 PITFALL: Assuming vectors in MSI can be steered to different CPUs independently. They share one address, so unless the interrupt controller remaps, they go to the same place.
-VERIFY: Message Control bit positions and the Mask and Pending register offsets for 32-bit and 64-bit variants, what the specification says when MSI and MSI-X are both enabled, and any Extended Message Data bits added in recent revisions.
 
 @@ 10.05 | Intermediate | Concept | fig=msix | tags=msi-x,table,pba,bir,vector-control,function-mask
 Q: How is MSI-X structured, and how do the table, the PBA and the mask bits work?
 SHORT: The MSI-X capability (ID 11h) points to two structures in device BARs. The MSI-X Table holds up to 2048 sixteen-byte entries of Message Address (low and high), Message Data and Vector Control, and the Pending Bit Array (PBA) holds one bit per vector. Each entry has its own address and data, so each vector can target a different CPU. Vector Control bit 0 masks one vector, and Function Mask in Message Control masks all of them.
 DEEP:
 - **Capability fields:** Message Control has Table Size (bits 10:0, N-1 encoded), Function Mask (bit 14) and MSI-X Enable (bit 15). The Table Offset/BIR register (at +4) and PBA Offset/BIR (at +8) each hold a BAR indicator in bits 2:0 (0 to 5 for BAR0 to BAR5) and a QWORD-aligned offset in bits 31:3.
-- **Table entry (16 bytes):** Message Address Lower (+0), Upper (+4), Message Data (+8), Vector Control (+0Ch, bit 0 is Mask).
+- **Table entry (16 bytes):** Message Address Lower (+0), Upper (+4), Message Data (+8), Vector Control (+0Ch, bit 0 is Mask; bits 31:16 can carry a TPH Steering Tag when the ST table lives in the MSI-X table).
 - **PBA:** one bit per vector packed into 64-bit words. It is read-only to software.
 - **Masking flow:**
   1. A masked vector (or one under Function Mask) that wants to fire sets its PBA bit instead.
@@ -91,7 +88,7 @@ FOLLOW:
 - Can the MSI-X table share a BAR with device registers? => Yes, but the specification wants registers not to share a 4 KB page with the table or the PBA, so that a hypervisor can trap them separately.
 - What does MSI-X Enable with Function Mask do? => Nothing is sent, and events accumulate in the PBA until the function mask is cleared.
 PITFALL: Rewriting a live vector's address and data without masking it first. A message in flight can go to the old CPU with the new data, or the other way around.
-VERIFY: Bit positions in Message Control, Table Size encoding, the QWORD alignment of table and PBA offsets, and the page-sharing rule in the MSI-X section of the Base Specification.
+VERIFY: Whether the page-sharing rule for the MSI-X table and PBA is a requirement or a recommendation in your spec revision.
 
 @@ 10.06 | Intermediate | Numeric | tags=msi-x,table-size,pba,bar-footprint,worked-example
 Q: How big are the MSI-X table and PBA for N vectors, and what BAR footprint results?
@@ -117,7 +114,6 @@ FOLLOW:
 - Why is the PBA measured in 64-bit words? => Its offset and access are QWORD aligned, so it is an array of 8-byte words.
 - Does the SSD need to use all vectors the table offers? => No. Table Size is what the function can expose, and software enables as many as it allocates.
 PITFALL: Computing PBA as N / 8 bytes. For non-multiples of 64 vectors, the array is rounded up to whole 64-bit words.
-VERIFY: The PBA rounding rule (QWORD units) and the maximum table size in the MSI-X section of the Base Specification.
 
 @@ 10.07 | Intermediate | Concept | tags=x86,apic,fee00000,interrupt-remapping,iommu
 Q: What is the memory write of an MSI or MSI-X interrupt on x86, and where does interrupt remapping fit in?
@@ -133,7 +129,7 @@ FOLLOW:
 - Does the interrupt write go through the DMA address translation? => Interrupt requests are recognized separately and handled by interrupt remapping, not by the DMA page tables.
 - Why might a VM guest's interrupts fail after enabling passthrough? => The remapping entry or requester ID check is wrong or missing, which shows up as an IOMMU interrupt fault.
 PITFALL: Describing the interrupt write as memory traffic that lands in DRAM. It is decoded as an interrupt by the platform, and it is the reason for special address ranges.
-VERIFY: Address and data field layouts for the compatibility and remappable formats in the Intel SDM and VT-d specification (and the AMD IOMMU and Arm GIC equivalents), and the exact fault message text on your kernel.
+VERIFY: Remappable-format field layouts in the Intel VT-d specification (and the AMD IOMMU and Arm GIC ITS equivalents), and the exact fault message text on your kernel.
 
 @@ 10.08 | Intermediate | Debug | tags=proc-interrupts,lspci,sysfs,windows,perfmon,tools
 Q: How do you inspect an NVMe SSD's interrupts on Linux and Windows?
@@ -188,16 +184,16 @@ DEEP:
 - **Fallback:** if the OS obtains fewer vectors than queues, queues share vectors. If it gets only MSI or INTx, the device still works, on vector 0.
 - **Queue count versus vector count:** Set Features Number of Queues (FID 07h) sets the number of queues and does not by itself allocate vectors.
 FOLLOW:
-- Does coalescing apply to the admin queue? => Do not assume. Check the specification wording for vector 0 and test it on your controller.
+- Does coalescing apply to the admin queue? => No. Interrupt Coalescing applies only to I/O completion queues, so vector 0 for the Admin CQ is never delayed. The spec also recommends not coalescing completions that report errors.
 - How do you read the current setting? => `nvme get-feature /dev/nvme0 -f 8 -H` (and `-f 9 -c <vector>` for the per-vector setting).
 PITFALL: Using INTMS/INTMC to mask an MSI-X vector. The registers are not defined for MSI-X, so the mask has no effect.
-VERIFY: FID 08h and 09h field layout (THR, TIME, IV, CD), the Create I/O CQ CDW11 fields, coalescing behavior on the admin vector, and INTMS/INTMC applicability, in the NVMe Base Specification 2.x and the NVMe over PCIe Transport Specification.
+VERIFY: Create I/O CQ CDW11 field positions and INTMS/INTMC applicability in the NVMe Base Specification 2.x and the NVMe over PCIe Transport Specification.
 
 @@ 10.11 | Advanced | Numeric | tags=interrupt-rate,coalescing,iops,cpu-cost,latency
 Q: At 1 million IOPS, how many interrupts per second result with and without coalescing, and what does it cost in latency?
 SHORT: With one interrupt per completion, 1M IOPS is 1M interrupts per second. On 64 vectors that is 15.6K per vector, one every 64 microseconds. At an assumed 1.5 microseconds of CPU per interrupt that costs 1.5 cores. With aggregation threshold 8 and time 100 microseconds, 64 vectors drop to about 390K per second (2.6 times fewer), and 8 vectors drop to 125K per second (8 times fewer). The price is added completion latency.
 DEEP:
-Assumptions: 4 KB random IO, completions spread evenly, 1.5 microseconds of fixed CPU cost per interrupt (entry, handler, exit), and a controller that signals on threshold reached or time expired, starting the timer at the first pending completion.
+Assumptions: 4 KB random IO, completions spread evenly, 1.5 microseconds of fixed CPU cost per interrupt (entry, handler, exit), and a controller that signals on threshold reached or time expired, starting the timer at the first pending completion. (The NVMe spec lets a controller restart the time or count when the host writes that vector's CQ head doorbell, so real behavior can differ; measure it.)
 1. **No coalescing, 64 vectors:** 1,000,000 / 64 = 15,625 per vector per second, so one completion every 64 microseconds. Total 1M interrupts per second. CPU = 1,000,000 x 1.5 us = 1.5 cores of interrupt overhead.
 2. **THR = 8, TIME = 100 us, 64 vectors:** eight completions would take 8 x 64 = 512 us to accumulate, so the 100 us timer fires first. A cycle is about 100 us plus about 64 us of average wait for the next completion, so 164 us. That is 6,098 interrupts per vector, or about 390K per second. Each interrupt carries 100/64 + 1 = about 2.6 completions. CPU falls to about 0.59 core. Added latency is up to 100 us.
 3. **THR = 8, TIME = 100 us, 8 vectors:** each vector sees 125,000 per second, one every 8 us, so the threshold hits after 64 us. That is 15,625 per second per vector, 125K total. CPU is about 0.19 core, with added latency up to about 56 us for the first completion in a batch.
@@ -209,7 +205,7 @@ FOLLOW:
 - Why do most Linux systems leave coalescing off? => Per-CPU queues with managed affinity, and a large enough queue count, keep the interrupt rate per vector modest, and added latency is unwelcome.
 - What is the alternative for very high IOPS? => Polling queues, or software adaptive schemes, which trade CPU for latency, covered next.
 PITFALL: Applying a coalescing setting to a test that runs QD1 and calling the extra latency a firmware regression.
-VERIFY: Whether the controller starts the coalescing timer at the first pending completion, the units of TIME and the 0's based THR in the NVMe Base Specification.
+VERIFY: When your controller starts and restarts the coalescing timer (first pending completion, or CQ head doorbell writes).
 
 @@ 10.12 | Advanced | Concept | tags=polling,hybrid-polling,io-uring,poll-queues,latency
 Q: When does polling beat interrupts for NVMe, and how do poll queues and hybrid polling work?

@@ -25,7 +25,6 @@ FOLLOW:
 - Can the legacy CF8h/CFCh mechanism read an extended capability? => No. It reaches only 256 bytes, so extended capabilities need ECAM or an equivalent memory-mapped mechanism.
 - How does software know which header layout to parse? => Read Header Type at 0Eh and mask bit 7 (the multi-function flag). 00h is Type 0, 01h is Type 1.
 PITFALL: Treating the 4 KB as one space per device. It is per function, and each function can have a different capability chain.
-VERIFY: Type 1 field offsets against the header figure in the PCIe Base Specification (or PCI-to-PCI Bridge Architecture Specification).
 
 @@ 9.02 | Basic | Concept | tags=vendor-id,device-id,class-code,header-type,multifunction,nvme
 Q: Which config space fields identify a function, and what is the Class Code of an NVMe SSD?
@@ -41,7 +40,7 @@ FOLLOW:
 - What do SR-IOV virtual functions return for Vendor ID? => FFFFh. Their identity comes from the physical function's SR-IOV capability (VF Device ID), and the OS treats them specially.
 - Why is Vendor ID read first during enumeration? => It is the cheapest presence test. Anything except a valid ID means no function there (or not ready yet, see Configuration Request Retry Status).
 PITFALL: Matching on Device ID alone in a test script. The same Device ID can ship with different firmware and Subsystem IDs, and behavior can differ per OEM model.
-VERIFY: Programming interface values for NVMe (02h NVM Express, 01h NVMHCI, and any newer value for administrative controllers) in the PCI-SIG class code list and the NVMe over PCIe Transport specification.
+VERIFY: Any programming interface value beyond 01h (NVMHCI) and 02h (NVM Express), such as one for NVMe administrative controllers, in the PCI-SIG class code list.
 
 @@ 9.03 | Basic | Concept | tags=command,status,mse,bme,intx,write-1-to-clear
 Q: What do the Command and Status registers control, and which bits matter for an NVMe SSD?
@@ -65,7 +64,6 @@ FOLLOW:
 - Who sets Bus Master Enable, the BIOS or the OS driver? => Usually the OS, via `pci_set_master()` in Linux, when the driver enables the device. Firmware sets it only when it uses the device, for example to boot from it.
 - Does Interrupt Disable stop MSI-X? => No. It only masks INTx. Drivers often set it anyway when they enable MSI-X.
 PITFALL: A 32-bit read-modify-write to offset 04h writes back the Status half. Any error bit that was read as 1 is written as 1 and cleared, so you lose evidence. Use 16-bit accesses (`setpci ... COMMAND=...`).
-VERIFY: Bit positions against the Command and Status register figures in the Base Specification.
 
 @@ 9.04 | Intermediate | Concept | tags=bar,prefetchable,64-bit,io-space
 Q: Explain Base Address Registers: memory versus I/O, 32-bit versus 64-bit, and the prefetchable bit.
@@ -106,20 +104,20 @@ DEEP:
 
 - **Edge case:** for a BAR of 4 GB or more the low dword reads back as only the type bits (for example 0000000Ch). 32-bit arithmetic would overflow, so always use 64-bit math on 64-bit BARs.
 - **Alignment:** the lowest writable address bit equals the size, so the base must be a multiple of the size. A 256 MB BAR sits on a 256 MB boundary.
+- **Smallest sizes:** the encoding allows memory BARs as small as 16 bytes and I/O BARs as small as 4 bytes, but memory BARs are recommended to be at least 4 KB so each can be mapped into its own page (for user-space or VM pass-through).
 FOLLOW:
 - What does a BAR that reads back 0 after the all-ones write mean? => It is not implemented (hardwired to zero), so skip it.
 - What if the readback is FFFFFFFFh in full? => That is not a 4 GB BAR. It means nothing answered (device gone or link down), so treat it as an error and re-read the Vendor ID.
 PITFALL: Sizing a live device without disabling decode. The temporary all-ones base can overlap other resources, and if the sequence is interrupted the BAR is left at a bogus address.
-VERIFY: Minimum BAR sizes that the Base Specification allows for memory and I/O BARs.
 
 @@ 9.06 | Intermediate | Concept | tags=bridge,bus-number,windows,routing,type1
 Q: What do bus numbers and the memory, prefetchable and I/O windows in a Type 1 header do?
 SHORT: Every bridge, root port and switch port describes what lies beneath it. Primary, Secondary and Subordinate Bus Number give the bus range that ID-routed TLPs, such as configuration requests and completions, are forwarded into. The I/O, Memory and Prefetchable Base/Limit pairs give the address ranges that address-routed TLPs are forwarded into. Anything else that arrives from below goes upstream.
 DEEP:
 - **Bus numbers (18h to 1Ah):** Primary is the bus on the upstream side, Secondary is the bus directly below, Subordinate is the highest bus number anywhere below. A request for bus B goes down if Secondary <= B <= Subordinate.
-- **Memory window (20h/22h):** 16-bit Base and Limit hold address bits 31:20, so granularity is 1 MB, 32-bit, non-prefetchable.
-- **Prefetchable window (24h/26h):** same 1 MB granularity, with upper 32 bits at 28h and 2Ch, so 64-bit capable.
-- **I/O window (1Ch/1Dh):** 4 KB granularity, upper 16 bits at 30h and 32h. Most PCIe endpoints need none.
+- **Memory window (20h/22h):** bits 15:4 of the 16-bit Base and Limit hold address bits 31:20 (bits 3:0 are reserved), so granularity is 1 MB, 32-bit, non-prefetchable.
+- **Prefetchable window (24h/26h):** same 1 MB granularity, with upper 32 bits at 28h and 2Ch, so 64-bit capable. Bits 3:0 read 0h for a 32-bit or 1h for a 64-bit window.
+- **I/O window (1Ch/1Dh):** bits 7:4 of the 8-bit Base and Limit hold I/O address bits 15:12, so 4 KB granularity, with upper 16 bits at 30h and 32h when bits 3:0 read 1h (32-bit I/O). Most PCIe endpoints need none.
 - **Closed window:** Base above Limit disables it.
 - **Direction:** a TLP whose address falls inside a window goes downstream. A TLP that does not, such as DMA to host memory or an MSI write, is forwarded upstream if the bridge's Bus Master Enable is set. Address ranges of sibling ports allow peer-to-peer inside a switch, unless ACS redirects it.
 
@@ -128,7 +126,6 @@ FOLLOW:
 - Why is the smallest window 1 MB even for a 16 KB BAR? => The Base/Limit registers only hold bits 31:20, so software rounds up, and bridge windows waste address space.
 - What does Secondary Bus Reset (Bridge Control) do? => It drives a hot reset on the link below, resetting everything downstream without a power cycle.
 PITFALL: Forgetting that Bus Master Enable on a bridge controls upstream forwarding. An SSD can be perfectly configured while a bridge above it with BME clear silently blocks its DMA and MSI writes.
-VERIFY: Granularity and register offsets for the I/O window and the reserved bits in the Base/Limit registers.
 
 @@ 9.07 | Intermediate | Concept | tags=capabilities,linked-list,pm,msi,msix,pcie-cap
 Q: How does the capability linked list work, and which capabilities does an NVMe SSD expose?
@@ -155,7 +152,6 @@ FOLLOW:
 - Does the same list logic apply to the Type 1 header? => Yes. The pointer is at 34h in both headers.
 - What does `lspci` print for the chain? => `Capabilities: [40] Power Management version 3`, `[50] MSI: ...`, `[70] Express ...`, `[b0] MSI-X: ...`. The number in brackets is the offset.
 PITFALL: Assuming a capability sits at a fixed offset. Offsets differ per vendor and per firmware version, so always walk the list.
-VERIFY: Capability ID values (01h, 05h, 09h, 10h, 11h) and the bit position of Status.Capabilities List against the PCI Code and ID Assignment Specification and the Base Specification.
 
 @@ 9.08 | Intermediate | Concept | tags=extended-capabilities,aer,sriov,ats,dsn,l1-substates
 Q: How is the extended capability list organized, and which extended capabilities matter for SSD validation?
@@ -178,12 +174,13 @@ DEEP:
 | 0026h | Physical Layer 16.0 GT/s | Gen4 eq status |
 | 0027h | Lane Margining at the Receiver | Margin tests |
 
+Others you will meet: 000Dh ACS, 001Dh DPC, 001Fh PTM, 0023h DVSEC, 002Ah Physical Layer 32.0 GT/s, 002Eh DOE, 0030h IDE and 0031h Physical Layer 64.0 GT/s.
+
 - **Where they go:** register-level details for errors, power and virtualization are in later modules. Here the point is to find them.
 FOLLOW:
 - How do you find a specific extended capability? => Walk the chain from 100h comparing IDs, as `setpci ECAP_AER` and `lspci -vvv` do.
 - What about the Vendor-Specific Extended Capability and DVSEC? => Both give vendors their own structures with a standard header. The DVSEC carries a vendor ID and a DVSEC ID, and is how CXL exposes its structures.
 PITFALL: Copying the ID table from memory into a tool. Verify against the spec revision and handle unknown IDs by skipping them, not by aborting the walk.
-VERIFY: All extended capability ID values and versions in this table against the PCI Code and ID Assignment Specification and the Base Specification, including the IDs added after 5.0.
 
 @@ 9.09 | Intermediate | Debug | tags=lspci,setpci,linux,windows,tools,sysfs
 Q: How do you read and interpret config space in practice on Linux and Windows? Interpret this `lspci` snippet.
@@ -212,7 +209,7 @@ FOLLOW:
 - Why does `lspci` show `<access denied>` for capability details? => Non-root users can read only the first 64 bytes through sysfs. Run as root.
 - Is it safe to run `setpci` writes on a live SSD? => Only on registers you understand. Writing Command or Link Control while the driver runs can hang the device or the link.
 PITFALL: Reading LnkSta as if it described the whole path. Each end reports its own, and downgraded compares only against that device's own LnkCap.
-VERIFY: `setpci` symbolic names such as `CAP_EXP` and `ECAP_AER` for your pciutils version, and the WinDbg `!pci` flags for your debugger version.
+VERIFY: The WinDbg `!pci` flags for your debugger version.
 
 @@ 9.10 | Advanced | Concept | tags=pcie-capability,mps,mrrs,device-control,link-control
 Q: What is in the PCI Express capability structure, and which registers must enumeration software program?
@@ -224,9 +221,11 @@ DEEP:
 | 04h, 08h, 0Ah | Device Capabilities, Control, Status |
 | 0Ch, 10h, 12h | Link Capabilities, Control, Status |
 | 24h, 28h, 2Ah | Device Capabilities 2, Control 2, Status 2 |
+| 14h, 18h, 1Ah | Slot Capabilities, Control, Status (ports with a slot) |
+| 1Ch, 1Eh, 20h | Root Control, Root Capabilities, Root Status (Root Ports) |
 | 2Ch, 30h, 32h | Link Capabilities 2, Control 2, Status 2 |
 
-- **Device Control:** Max Payload Size (bits 7:5), Enable Relaxed Ordering (bit 4), Extended Tag Field Enable (bit 8), Max Read Request Size (bits 14:12), error reporting enables, Initiate FLR.
+- **Device Control:** error reporting enables (bits 3:0), Enable Relaxed Ordering (bit 4), Max Payload Size (bits 7:5), Extended Tag Field Enable (bit 8), Enable No Snoop (bit 11), Max Read Request Size (bits 14:12), Initiate FLR (bit 15, endpoints).
 - **MPS encoding:** 000b is 128 B, 001b 256 B, then 512 B, 1024 B, 2048 B, 4096 B. A TLP payload above the receiver's MPS is a Malformed TLP.
 - **MRRS:** limits the size of read requests a device issues. An NVMe SSD reads host memory for commands, PRP lists and write data, so its MRRS affects write performance.
 - **Link registers:** Link Capabilities gives max speed and width and ASPM support, Link Control holds ASPM Control, Retrain Link and Common Clock Configuration, and Link Status holds Current Link Speed, Negotiated Link Width, Link Training and Data Link Layer Link Active. Details were covered in the LTSSM and equalization modules.
@@ -236,7 +235,6 @@ FOLLOW:
 - Who decides the MPS for a path? => Enumeration software, which sets each device's MPS to at most what every device it may talk to accepts, usually the minimum along the path.
 - Where do you see Relaxed Ordering used? => The device sets an attribute bit in memory write TLPs if Enable Relaxed Ordering is on. Its effect is covered in the ordering module.
 PITFALL: Assuming a larger MPS on the SSD than on the root complex is harmless. Its writes exceed the receiver's limit and are dropped as Malformed TLPs, which can look like a data corruption bug.
-VERIFY: Register offsets and bit positions within Device Capabilities, Control and Control 2 against the PCI Express Capability Structure figure in the Base Specification.
 
 @@ 9.11 | Advanced | Numeric | tags=ecam,mcfg,addressing,ari
 Q: How does ECAM map bus, device, function and register into a memory address, and how large is it?
@@ -259,7 +257,7 @@ FOLLOW:
 - What does ECAM cost in address space? => Up to 256 MB of address space for a full 256-bus segment (usually placed below 4 GB, though the MCFG base can be higher), which is why firmware trims the bus range on some platforms.
 - What if the ECAM region is not mapped or wrong? => Reads return all ones, extended capabilities vanish while the first 256 bytes may still work through CF8h/CFCh.
 PITFALL: Forgetting the segment. Two devices on different segments can have the same bus/device/function, so a tool must key on the full domain:bus:device.function.
-VERIFY: MCFG table format and the requirement for the uncached mapping in the ACPI and PCI Firmware specifications.
+VERIFY: The MCFG table format and mapping requirements in the ACPI and PCI Firmware specifications.
 
 @@ 9.12 | Advanced | Concept | tags=cfgrd,cfgwr,type0,type1,ari,routing
 Q: What are Type 0 and Type 1 configuration requests, how does a bridge convert one into the other, and what does ARI change?
@@ -270,7 +268,7 @@ DEEP:
 - **Bridge decision on receiving Type 1 from upstream:**
   1. Bus equals Secondary: convert to Type 0 and send down.
   2. Bus in Secondary+1 to Subordinate: forward as Type 1.
-  3. Otherwise: not for this port, complete with UR (or ignore).
+  3. Otherwise: not for this port, so the bridge completes it with Unsupported Request.
 - **Type 0 arriving at a bridge:** it is for the bridge's own config space.
 - **One device per link:** a PCIe downstream port forwards only device 0 to the link partner, so a non-ARI enumerator scanning devices 1 to 31 below a root or switch port gets UR. Bus 0 and the internal bus of a switch do hold several devices.
 - **ARI (Alternative Routing-ID Interpretation):** the 8 bits of device and function form a function number, so one device can have up to 256 functions. A downstream port needs ARI Forwarding Enabled in Device Control 2. Functions are found by following the ARI capability's Next Function Number chain. SR-IOV uses it for many virtual functions.
@@ -278,7 +276,6 @@ FOLLOW:
 - Which config request does the root complex use for a device directly below a root port? => Type 0 if the bus equals the root port's Secondary bus, Type 1 if the target is deeper.
 - Why is ARI needed for SR-IOV SSDs? => Eight functions are too few for many virtual functions, so ARI provides up to 256 per bus without extra bus numbers.
 PITFALL: Assuming a Type 1 request changes at each hop. It stays Type 1 until the bridge whose Secondary bus is the target.
-VERIFY: Fmt/Type encodings, the UR versus drop behavior for out-of-range Type 1 requests, and the device-number handling with ARI Forwarding in the Base Specification.
 
 @@ 9.13 | Principal | Scenario | tags=enumeration,depth-first,bus-numbers,windows,mps,hotplug
 Q: Walk through how software enumerates a root port, a switch and two NVMe SSDs, including the bus numbers and windows it programs.
@@ -301,17 +298,16 @@ FOLLOW:
 - Which MPS do you choose? => The largest value every device on the path supports, so no receiver sees an oversize payload. Linux offers `pci=pcie_bus_safe` and `pcie_bus_perf`.
 - Who does this, BIOS or OS? => Usually both. The BIOS enumerates to boot, and the OS either trusts it or reassigns (`pci=realloc`).
 PITFALL: Setting Subordinate to the current bus before scanning below. Type 1 requests to devices deeper in the tree are never forwarded, and downstream devices look missing.
-VERIFY: Linux boot parameter names (`hpbussize`, `hpmemsize`, `realloc`, `pcie_bus_safe`, `pcie_bus_perf`) for your kernel version.
 
 @@ 9.14 | Advanced | Trap | tags=crs,reset,readiness,100ms,vendor-id
 Q: You read the Vendor ID 20 ms after reset and get FFFFh or 0001h. Is the SSD dead?
 SHORT: Not necessarily. After a reset a device may not be ready, so it answers configuration requests with Configuration Request Retry Status (CRS). If CRS Software Visibility is enabled, the root complex returns 0001h for a Vendor ID read to say retry later. FFFFh means nobody answered, which can mean a dead link. Software should wait at least 100 ms after reset, then retry, and only after about 1 s of failure treat it as broken.
 DEEP:
-- **CRS:** a completion status a device returns for a configuration request while it is initializing. Without software visibility, the root complex retries in hardware. With CRS Software Visibility Enable in Root Control, a read of the 2-byte Vendor ID returns 0001h and software polls.
+- **CRS:** a completion status a device returns for a configuration request while it is initializing (PCIe 6.0 renamed it Request Retry Status, RRS, which newer tools use). Without software visibility, the root complex retries in hardware. With CRS Software Visibility Enable (Root Control bit 4, supported when Root Capabilities bit 0 is set), a read of the 2-byte Vendor ID returns 0001h and software polls.
 - **Timing rules (spec-sensitive):**
-  - Software waits 100 ms after a reset before the first configuration request. For links above 5 GT/s it counts from link-up (Data Link Layer Link Active), not from the end of reset.
-  - A device must be able to finish a first configuration request with success or CRS within about 1 s.
-  - Functional Level Reset has a similar 100 ms budget.
+  - Software waits 100 ms after a Conventional Reset before the first configuration request. For ports that support more than 5 GT/s it counts from link training completing (Data Link Layer Link Active), not from the end of reset.
+  - Software must allow at least 1 s of CRS completions before deciding the device is broken.
+  - An FLR must complete within 100 ms; software waits that long before touching the function again.
 - **Read what came back:** 0001h from a Vendor ID read means CRS. FFFFh means UR or no response: no device, link down or a broken route.
 - **Three readiness levels for NVMe:** the link is up, then config space answers, then MMIO registers and CSTS.RDY come ready. CSTS.RDY has its own timeout (CAP.TO), independent of the PCIe rules.
 - **Why SSDs matter:** an SSD firmware boot after an unsafe power loss can rebuild metadata, taking much longer than a clean boot. Firmware that returns nothing instead of CRS, or a BIOS that gives up early, shows up as a missing drive that a later rescan finds.
@@ -320,11 +316,10 @@ FOLLOW:
 - Does the endpoint have to return CRS? => It is allowed to while not ready. A device that returns neither CRS nor completions within the limit is out of spec.
 - Can you rescan later? => Yes: `echo 1 > /sys/bus/pci/rescan`. If the device appears, the fault is readiness timing rather than link or hardware.
 PITFALL: Declaring failure at the first FFFFh. The right test distinguishes CRS, UR and link-down using the completion status, the root port link status and a deadline.
-VERIFY: The 100 ms and 1 s values, the Data Link Layer Link Active based timing for greater than 5 GT/s, the FLR timing and the CRS Software Visibility bits in the Base Specification.
 
 @@ 9.15 | Advanced | Cross-layer | tags=nvme,bar0,cmb,capabilities,doorbell,msix
 Q: How do NVMe controller registers map onto PCIe BAR0, what capabilities does an NVMe SSD expose, and how does a CMB affect BAR sizing?
-SHORT: NVMe controller registers (CAP, VS, INTMS, INTMC, CC, CSTS, AQA, ASQ, ACQ and more) are memory-mapped from the start of a 64-bit non-prefetchable BAR0, with doorbells at offset 1000h. Its size is the register block plus the doorbells, rounded up to a power of two and at least 16 KB. A CMB adds a separate memory region in a BAR named by its Base Indicator Register, which can force a large prefetchable BAR and Above 4G Decoding.
+SHORT: NVMe controller registers (CAP, VS, INTMS, INTMC, CC, CSTS, AQA, ASQ, ACQ and more) are memory-mapped from the start of a 64-bit non-prefetchable BAR0, with doorbells at offset 1000h. Its size is registers plus doorbells rounded up to a power of two, and at least 16 KB (the transport puts the base in BAR0 bits 31:14). A CMB adds a separate memory region in a BAR named by its Base Indicator Register, which can force a large prefetchable BAR and Above 4G Decoding.
 DEEP:
 | BAR0 offset | Register |
 |---|---|
@@ -346,7 +341,7 @@ FOLLOW:
 - Why do doorbells start at 1000h? => The specification places the doorbell array right after the 4 KB controller register block, so it starts at 1000h and grows with the number of queues.
 - Where do you see BAR0 in `lspci`? => `Region 0: Memory at ... (64-bit, non-prefetchable) [size=16K]`.
 PITFALL: Assuming the BAR0 size shows the number of queues. It only bounds the doorbell area, and the actual queue count comes from CAP, Set Features, and the interrupt vectors available.
-VERIFY: CMBLOC and CMBSZ fields (the Base Indicator Register and whether a CMB may share BAR0), the doorbell stride formula, the 16 KB minimum, and the location of PCIe-specific requirements in the NVMe over PCIe Transport specification versus the Base Specification 2.x.
+VERIFY: Whether a CMB may share BAR0 on your controller (CMBLOC Base Indicator Register), and the MSI-X table and PBA placement rules in the NVMe over PCIe Transport Specification.
 
 @@ 9.16 | Advanced | Debug | tags=all-ones,ffffffff,bar,mmio,link-down,nvme
 Q: An MMIO read of a BAR, or a config read, returns FFFFFFFFh. What can that mean and how do you narrow it down?
@@ -373,7 +368,7 @@ FOLLOW:
 - Why does the CPU get all ones instead of an error? => On x86 the host bridge completes a failed read with all ones and, unless configured to report, no exception is raised. Look at AER and platform error logs.
 - How do you tell a link drop from a controller crash? => Link down shows Data Link Layer Link Active clear and config reads fail. A controller crash leaves config alive with the NVMe controller fatal status set.
 PITFALL: Stopping at "device gone". A device with a valid Vendor ID and MMIO all ones is alive at the PCIe level, and the root cause is usually decode, reset or power state, not the link.
-VERIFY: The exact Linux nvme driver message text on your kernel, and how your platform reports failed MMIO reads.
+VERIFY: How your platform reports failed MMIO reads (all ones, machine check or a firmware-first error record).
 
 @@ 9.17 | Principal | Scenario | tags=cold-boot,missing-device,crs,perst,triage,reliability
 Q: An SSD sometimes does not appear after a cold boot, about one boot in 200. How do you find the cause?
