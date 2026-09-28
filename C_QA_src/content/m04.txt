@@ -133,11 +133,11 @@ Compiled with `gcc -std=c11 -Wall -Wextra` and run: the caller printed `40` (ten
 
 A common helper macro is `#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))`; it silently gives wrong results on pointers, so the Linux kernel's version adds a compile-time check that the argument really is an array.
 
+**C11 reference (checked against N1570):** 6.7.6.3 on function parameter adjustment for array types.
 FOLLOW:
 - Does writing `int arr[10]` instead of `int *arr` as the parameter change anything? => No; C11 footnote 103 to 6.5.3.4 says the parameter is adjusted to the pointer type regardless of which spelling you use, so `sizeof` behaves identically either way.
 - How do you get the real element count into the function then? => Pass it explicitly as a second parameter, computed in the caller with `sizeof(arr) / sizeof(arr[0])` while the array type is still visible.
 PITFALL: Writing a helper that takes an array parameter and tries to compute its length internally with `sizeof`.
-VERIFY: C11 6.7.6.3 on function parameter adjustment for array types.
 
 @@ 4.06 | Intermediate | Scenario | fig=ptrmodel | tags=arrays,decay,multidim
 Q: What is the difference between `int (*p)[4]` and `int *p[4]`, and when do you need the first one?
@@ -277,11 +277,11 @@ Compiled and run: `p < q` printed `1`, `p == r` printed `0`, and `p < r` printed
 
 **When you really need an ordering** (e.g. lock ordering by address to avoid deadlocks, or checking whether a pointer lies inside a buffer), convert to `uintptr_t` first: `(uintptr_t)p < (uintptr_t)q`. The result is implementation-defined rather than undefined, and it behaves as expected on flat-memory targets. For an "is `p` inside `buf`?" check, compare the integer forms against `buf` and `buf + len`.
 
+**C11 reference (checked against N1570):** 6.5.8p5 (relational operators) versus 6.5.9p6 (equality operators).
 FOLLOW:
 - Why single out relational operators and not `==`? => 6.5.9p6 defines equality purely in terms of "same object or both one-past-the-end", which needs no notion of address ordering; `<` inherently claims one address is numerically before another, which the standard only promises within one array.
 - Does this matter for real code? => Yes: sorting a list of unrelated heap pointers by comparing them with `<` is a common but technically nonportable pattern, even though it works on every mainstream flat-address-space target.
 PITFALL: Using pointer `<` comparisons to order pointers from unrelated allocations and assuming that is guaranteed portable.
-VERIFY: C11 6.5.8p5 (relational operators) versus 6.5.9p6 (equality operators).
 
 @@ 4.11 | Advanced | Scenario | tags=2darray,parameters
 Q: How do you write a function that takes a fixed-width 2D array and correctly indexes its rows?
@@ -476,11 +476,12 @@ DEEP:
 - Two allocations from separate `malloc` calls can legitimately receive the exact same bit pattern if the first was freed first; the standard's concern is about pointer *provenance* (which allocation a value is entitled to refer to), not just the numeric address.
 - This matters for optimizing compilers: because using a stale pointer value is undefined, the compiler is free to assume it never happens, and reorder or eliminate code accordingly; it is not merely a "hope the hardware does not fault" situation.
 - Module 10 covers the full undefined/unspecified/implementation-defined taxonomy this falls under; module 8 covers the allocator side (`malloc`/`free`/`realloc`) that creates and ends these lifetimes.
+
+**C11 reference (checked against N1570):** 6.2.4 on storage durations and the end of an object's lifetime.
 FOLLOW:
 - Does this mean you can never store a pointer after freeing its target? => You can store the bits (e.g. in a log), but the standard does not guarantee that stored value is usable as a pointer again; treat it as opaque data, not as an address.
 - Is this the same issue as a dangling pointer from 4.09? => Closely related: a dangling pointer is the everyday name for exactly this, an old pointer value whose target's lifetime has ended.
 PITFALL: Assuming that because an address "looks the same" after a free, comparing or logging that pointer value is automatically harmless.
-VERIFY: C11 6.2.4 on storage durations and the end of an object's lifetime.
 
 @@ 4.18 | Principal | Numeric | tags=ptrdiff,arithmetic
 Q: Given `int arr[10]`, `p = &arr[2]`, and `q = &arr[7]`, what does `q - p` evaluate to, and in what type?

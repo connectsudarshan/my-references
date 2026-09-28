@@ -24,11 +24,11 @@ Compiled with `-Wall -Wextra`: gcc flags this exact shape with `warning: suggest
 
 To make the outer `if` own the `else`, braces are the only tool: `if (a) { if (b) x(); } else y();`. GCC's `-Wmisleading-indentation` (in `-Wall`) complements `-Wdangling-else` by flagging statements indented as if they belonged to an unbraced body.
 
+**C11 reference (checked against N1570):** 6.8.4.1p3
 FOLLOW:
 - Does adding braces change the binding, or just make it visible? => It actually changes which `if` the `else` binds to, if you place the braces to enclose the inner `if` alone; braces make the (already-fixed) rule match your visual intent instead of fighting it.
 - Is this ambiguous in the grammar itself? => No; the grammar plus 6.8.4.1p3's rule fully disambiguates it. It only "looks" ambiguous to a human reading indentation.
 PITFALL: Relying on an auto-formatter or personal indentation style instead of braces for any `if` containing a nested `if` without its own `else`.
-VERIFY: 6.8.4.1p3
 
 @@ 3.02 | Basic | Concept | tags=switch,break
 Q: How does a `switch` statement decide where control jumps, and what happens if you omit `break`?
@@ -57,11 +57,11 @@ There may be at most one `default` label (6.8.4.2p3), and it does not have to be
 
 Rules worth knowing: case labels must be integer constant expressions and unique; you cannot switch on strings or floating values. Declaring a variable right after a `case` label needs a block (`case 1: { int t = ...; break; }`), and a jump past an initialized declaration into its scope leaves it uninitialized. For `enum` switches, omit `default` so `-Wswitch` (in `-Wall`) warns when a new enumerator is not handled.
 
+**C11 reference (checked against N1570):** 6.8.4.2p3, p5, 6.8.6.3
 FOLLOW:
 - Must every case end in break? => No; intentional fall-through (module 3's later Duff's-device and fall-through questions) is legal C, just easy to get wrong by accident.
 - What type must the controlling expression have? => Integer type (6.8.4.2p1); a `switch` on a `float` or pointer is a constraint violation.
 PITFALL: Forgetting `break` at the end of a case is the single most common `switch` bug; `-Wimplicit-fallthrough` (not in default `-Wall`/`-Wextra` on all gcc versions, but available and worth enabling) flags unmarked fall-through.
-VERIFY: 6.8.4.2p3, p5, 6.8.6.3
 
 @@ 3.03 | Basic | Concept | tags=loops,invariant
 Q: What is the actual behavioral difference between `while`, `do-while`, and `for`, beyond syntax?
@@ -90,11 +90,12 @@ int main(void)
 }
 ```
 Compiled and run: `for: 0 1 2`, `while: 0 1 2`, `do-while: 0 1 2`, then `for with n=0 runs: (none)`. Setting `n = 0` before the last loop demonstrates the zero-iteration case that `for`/`while` support and `do-while` cannot.
+
+**C11 reference (checked against N1570):** 6.8.5.1p1, 6.8.5.2p1, 6.8.5.3p1
 FOLLOW:
 - When is `do-while` the natural choice? => When the loop body must run at least once regardless of the condition, such as a menu-driven input loop or a retry-once-then-check pattern.
 - Which loop is a "loop invariant" easiest to reason about with? => `for`, because its three clauses put the initialization, condition, and progress step in one place, making the invariant ("this holds true before every condition check") easier to state and verify.
 PITFALL: Using `do-while` when the body should not run on a false initial condition; this is a common off-by-one-iteration bug when translating a `while` loop into `do-while` for style reasons alone.
-VERIFY: 6.8.5.1p1, 6.8.5.2p1, 6.8.5.3p1
 
 @@ 3.04 | Intermediate | Scenario | tags=switch,fallthrough
 Q: Show a real, legitimate use of intentional switch fall-through (not a bug).
@@ -139,11 +140,11 @@ default:
 
 GCC's `-Wimplicit-fallthrough` (in `-Wextra`) warns on unmarked fall-through past code; a `/* fall through */` comment or `__attribute__((fallthrough));` silences it, and C23 standardizes `[[fallthrough]];`. Stacked labels with no code between them, as in `is_vowel`, never warn.
 
+**C11 reference (checked against N1570):** 6.8.4.2p3
 FOLLOW:
 - Is this different from Duff's device style fall-through? => Yes; here, labels with no statements between them just group alternatives. Duff's device (this module, advanced section) falls through *past executable statements*, which is a much sharper tool used deliberately for loop unrolling.
 - Does `-Wimplicit-fallthrough` warn about this pattern? => No; gcc specifically recognizes empty-label-to-label fall-through (no statements in between) as safe and does not warn on it.
 PITFALL: Adding a statement "temporarily" between two stacked case labels for debugging, then forgetting to remove it, turning a safe grouping into an unintended fall-through bug.
-VERIFY: 6.8.4.2p3
 
 @@ 3.05 | Intermediate | Concept | tags=goto,cleanup
 Q: What is the "goto for cleanup" pattern, and why is it still considered legitimate, idiomatic C rather than a code smell?
@@ -184,11 +185,12 @@ int main(void)
 }
 ```
 Compiled and run: `fail_at=2 -> rc=-1`, `fail_at=0 -> rc=0`. `free(NULL)` is well-defined and a no-op (7.22.3.3), which is exactly why the single shared `cleanup:` label can safely `free()` all three pointers regardless of how far acquisition actually got.
+
+**C11 reference (checked against N1570):** 6.8.6.1p2-p3, 7.22.3.3
 FOLLOW:
 - Why not just nest the ifs instead of using goto? => With more than two or three resources, nested ifs indent one level per resource and duplicate (or badly complicate) the cleanup logic at every failure branch; the goto version keeps cleanup in exactly one place.
 - Is jumping backward with goto ever legitimate too? => Yes, for state-machine-style dispatch or restart logic (6.8.6.1's own example jumps into a loop's reinitialization code), though that is a less common pattern than forward cleanup jumps.
 PITFALL: Forgetting to initialize each pointer to NULL before the acquisition sequence; without that, a cleanup path reached before a given `malloc` runs would `free()` an indeterminate (not NULL) pointer, which is undefined behavior.
-VERIFY: 6.8.6.1p2-p3, 7.22.3.3
 
 @@ 3.06 | Intermediate | Numeric | tags=off-by-one,bounds
 Q: An array `int a[5]` is looped over with `for (int i = 0; i <= n; i++)` where `n = sizeof(a)/sizeof(a[0])`. Work out exactly what goes wrong and what the fix is.
@@ -211,11 +213,12 @@ int main(void)
 }
 ```
 Compiled and run: `correct sum (i < n) = 150`, `bounds check: last valid index is 4, n is 5`. The worked numbers: `n = sizeof(a)/sizeof(a[0]) = 20/4 = 5` on a platform with 4-byte `int`; valid indices are `0..4`; `i <= n` would let `i` reach `5`, one past the last valid index, which this file deliberately does not execute since an out-of-bounds read has no defined value to show.
+
+**C11 reference (checked against N1570):** 6.5.6 (pointer/array bound reasoning); accessing `a[5]` of a 5-element array is outside the object per 6.5.6p8's "one past the end" rule, which permits computing but not dereferencing that address
 FOLLOW:
 - Why is `<` idiomatic and `<=` almost always wrong for zero-based array bounds? => Because C array indices are zero-based and half-open ranges (`[0, n)`) are exactly what `<` expresses; `<=` describes a closed range `[0, n]`, which has one too many elements for a zero-based array of size `n`.
 - Does this crash immediately? => Not necessarily and not reliably; reading one past a stack or heap array often reads adjacent memory silently (appearing to "work"), which is what makes this bug dangerous rather than merely annoying.
 PITFALL: Using `<=` "by habit" when translating a 1-based mathematical description ("process elements 1 through n") directly into 0-based C indices without adjusting the comparison.
-VERIFY: 6.5.6 (pointer/array bound reasoning); accessing `a[5]` of a 5-element array is outside the object per 6.5.6p8's "one past the end" rule, which permits computing but not dereferencing that address
 
 @@ 3.07 | Intermediate | Scenario | tags=recursion,factorial
 Q: Write both a recursive and an iterative factorial, and identify which calls in the recursive version are (and are not) tail calls.
@@ -266,11 +269,11 @@ The declaration-part restriction (6.8.5.3p2 in this module's earlier for-stateme
 - Declarations in the `for` header are a C99 feature; strict C89 compilers (`-std=c89`, some old embedded toolchains) reject them.
 - A loop body that is a compound statement is a separate, nested block: `for (int i = 0; ...) { int i = 5; }` is legal and shadows the loop variable, which `-Wshadow` flags.
 
+**C11 reference (checked against N1570):** 6.8.5.3p1-p2, 6.8.5p5, 6.2.1p4
 FOLLOW:
 - Does each iteration get a fresh `i`, or the same object reinitialized? => The same object; `i`'s declaration runs once, before the first condition check, not once per iteration -- only the increment expression re-touches it thereafter.
 - Can you shadow an outer `i` with the for-loop's `i`? => Yes; the for-loop's `i` is in a nested (inner) scope and hides an outer `i` of the same name for the loop's duration, per the general shadowing rule (6.2.1p4).
 PITFALL: Writing two adjacent `for (int i = ...)` loops at the same nesting level and assuming they share one `i`; each loop's `int i` is a fresh declaration in its own scope, not a re-use of a prior loop's variable.
-VERIFY: 6.8.5.3p1-p2, 6.8.5p5, 6.2.1p4
 
 @@ 3.09 | Intermediate | Concept | tags=continue,for-vs-while
 Q: Does `continue` behave identically in a `for` loop and a `while` loop?
@@ -298,11 +301,12 @@ int main(void)
 }
 ```
 Compiled and run: `for: 0 1 3 4`, `while (correct):  0 1 3 4`. The `while` version only matches because the increment was manually duplicated onto the `continue` branch; omitting that duplication (`if (i == 2) continue;` with the `i++;` left only at the bottom of the loop body) would skip the increment entirely on that iteration and loop forever at `i == 2`.
+
+**C11 reference (checked against N1570):** 6.8.6.2p2, 6.8.5.3p1
 FOLLOW:
 - Is this exactly the 6.8.6.2p2 rule? => Yes: the standard spells out that `continue` in a `for` is equivalent to `goto` to a point just before the loop's re-test, which in a `for` statement is defined to include running expression-3 first (6.8.5.3p1).
 - Is this a good argument for preferring `for` over `while` when a manual increment is involved? => Generally yes; `for`'s structure makes the "increment always happens, even after continue" guarantee automatic instead of something you must remember to duplicate at every early-exit branch.
 PITFALL: Converting a `for` loop with a `continue` into a `while` loop by moving the increment to the bottom of the body without also duplicating it before every `continue`.
-VERIFY: 6.8.6.2p2, 6.8.5.3p1
 
 @@ 3.10 | Advanced | Trap | tags=duffs-device,fallthrough
 Q: Explain Duff's device: how does a `switch` end up nested inside a `do-while` loop, and how does it actually unroll a copy loop?
@@ -338,11 +342,12 @@ int main(void)
 }
 ```
 Compiled with `-Wall -Wextra`: gcc emits a `warning: this statement may fall through [-Wimplicit-fallthrough=]` at every stacked case, which is the entire mechanism being demonstrated, not a defect (per this page's guidance, a warning that is the point of the question is explained, not silenced). Run output: `1 2 3 4 5 6 7 8 9 10 11 12 13` -- all 13 elements copied correctly. `13 % 8 = 5`, so the switch jumps to `case 5`, executing the remaining 5 copies (elements 1-5) to finish the first partial group, then falls out of the switch into `while (--n > 0)`, and every subsequent loop iteration (n was `(13+7)/8 = 2`, so one more full pass) executes all 8 case labels from `case 0`'s `do` downward.
+
+**C11 reference (checked against N1570):** 6.8.4.2p4, 6.8.1p1
 FOLLOW:
 - Is Duff's device something you should write in real firmware code today? => Almost never; modern compilers' own loop unrolling (`-O2`/`-O3`) typically matches or beats hand-rolled Duff's device, and the technique is notoriously hard to review correctly. It is asked about as a "do you understand fall-through and switch/loop composition deeply" question, not as production advice.
 - Does the `case 0:` label's position (attached to the `do`) matter? => Critically: it is what makes `count % 8 == 0` (a full multiple of 8) enter at the very top of the unrolled block instead of some other point.
 PITFALL: Miscounting which `case` should handle the "count is an exact multiple of 8" remainder (`0`); it must be the one attached to the `do`, executing the full 8-copy body on every iteration including a possible first one.
-VERIFY: 6.8.4.2p4, 6.8.1p1
 
 @@ 3.11 | Advanced | Debug | tags=goto,vla,compile-error
 Q: `goto lab3;` jumps forward into a block containing a variable-length array `double a[n];`, with `lab3:` positioned after the VLA's declaration. Why does this fail to compile, and what does the standard say about it directly?
@@ -370,11 +375,11 @@ Compiled with `gcc -std=c11 -Wall -Wextra`: this is a genuine compile error, not
 
 This interacts with the classic C error-handling idiom: `goto cleanup;` to a single exit label is widely used in drivers (the Linux kernel uses it everywhere), and it breaks as soon as someone adds a VLA between the `goto` and the label. Many firmware coding standards ban VLAs outright (MISRA C:2012 Rule 18.8) because their stack usage is unbounded, which also avoids this problem.
 
+**C11 reference (checked against N1570):** 6.8.6.1p1, p4 (Example 2)
 FOLLOW:
 - Would a jump *within* the VLA's scope (after its declaration) be legal? => Yes; the standard's own example 2 (6.8.6.1p4) shows `goto lab4;` jumping from inside the VLA's scope to another label still inside that same scope as valid.
 - Why does a VLA specifically trigger this, but a fixed-size array does not? => A VLA's size is computed at runtime from `n`; if you skip its declaration statement, the runtime bookkeeping needed to know `a`'s size and where it lives on the stack never happens, so there is nothing well-defined for later code to index into. A fixed-size array needs no such runtime step, so jumping past its declaration (leaving it uninitialized) is legal, if unwise.
 PITFALL: Assuming this is merely a style warning like the dangling-else case; unlike that case, this is a hard constraint violation and gcc refuses to produce a binary at all.
-VERIFY: 6.8.6.1p1, p4 (Example 2)
 
 @@ 3.12 | Advanced | Cross-layer | tags=branches,codegen
 Q: At the machine level, what does an `if` or a loop's controlling expression actually compile down to, and why does this matter for embedded code reviewing branch-heavy hot paths?
@@ -396,11 +401,12 @@ DEEP:
 This absence is worth stating precisely for an interview: unlike languages such as Scheme (whose standard *mandates* proper tail calls), C's standard defines no special treatment for a call in tail position. 6.5.2.2p11 permits recursive calls "both directly and indirectly," but permitting recursion is not the same as guaranteeing bounded stack usage for it.
 
 Practical consequence for firmware: never rely on deep recursion (tail-shaped or not) staying within a small, fixed embedded stack budget unless you have specifically verified, for your target compiler and optimization flags, that the recursion in question is actually being converted to iteration -- and even then, a compiler upgrade or flag change can silently remove that optimization, since it was never a guarantee to begin with. The safe default for firmware is to write the loop directly, or to bound recursion depth explicitly with an assertion, rather than trust an unspecified compiler behavior for a resource (stack) that is often only a few kilobytes.
+
+**C11 reference (checked against N1570):** 6.5.2.2p11 (recursion permitted); the standard has no clause governing tail-call elimination, which is itself the fact this question tests
 FOLLOW:
 - Is this the same standard-compliance point as `next_id()`'s static counter surviving calls (module 1)? => Different topic (storage duration vs. optimization guarantees) but the same interview instinct applies: separate "what the standard promises" from "what my one compiler happens to do today."
 - How would you actually verify whether your compiler eliminated a tail call? => Inspect the generated assembly (`-S`) for the function and check whether the recursive call became a jump back to the function's own entry with no growing stack usage, or profile actual stack depth at runtime with a known-large input.
 PITFALL: Treating "GCC optimizes simple tail recursion at -O2 in my testing" as a language guarantee; it is an optimization your specific compiler happened to apply today, not something C11 obligates any conforming implementation to do.
-VERIFY: 6.5.2.2p11 (recursion permitted); the standard has no clause governing tail-call elimination, which is itself the fact this question tests
 
 @@ 3.14 | Advanced | Trap | tags=switch,enum
 Q: You `switch` on an `enum` with 4 enumerators but only write 3 `case` labels, no `default`. What warns you, and what happens for the unhandled value at runtime?
@@ -429,11 +435,12 @@ int main(void)
 }
 ```
 Compiled with `-Wall -Wextra`: gcc emits `warning: enumeration value 'STATE_DONE' not handled in switch [-Wswitch]` pointing exactly at the missing case. Run output: `run`, then `unknown` (the fallback `return "unknown";` after the switch catches the unhandled case here, because this particular function was written defensively). Had that trailing `return` not existed, and had the function's return type made "falling off the end" itself UB (6.9.1p12, "if the } that terminates a function is reached, and the value of the function call is used by the caller, the behavior is undefined"), an unhandled enumerator would be a much sharper bug.
+
+**C11 reference (checked against N1570):** 6.8.4.2p5, 6.9.1p12
 FOLLOW:
 - Does adding a `default` label silence -Wswitch even if a real enumerator is still missing? => Yes, which is exactly why some teams deliberately omit `default` on enum-controlled switches: they want the compiler to keep flagging every new enumerator added later that is not yet handled.
 - Is this specific to `enum`, or does plain-`int` switch get the same warning? => Specific to enum; `-Wswitch` only tracks enumerator coverage, since a plain `int`'s value space is not enumerable the same way.
 PITFALL: Adding a new enumerator to an existing `enum` used widely in `switch` statements without recompiling everything with `-Wswitch` enabled; it is precisely the tool that catches every now-incomplete switch across the codebase.
-VERIFY: 6.8.4.2p5, 6.9.1p12
 
 @@ 3.15 | Principal | Scenario | tags=review,switch,firmware
 Q: You are reviewing an interrupt-driven event dispatcher: a `switch` on an `event_t` inside the ISR, with several cases and one `default`. State your review checklist for this specific shape of code.
@@ -448,11 +455,12 @@ A concrete checklist, each item tied to a mechanism covered in this module:
 5. **Controlling expression has no observable side effects** (a call to a function that mutates shared state) -- if it must, that state needs the same care given to any interrupt-shared object (a forward reference to `volatile` in module 7).
 
 The Principal-level habit this question is really testing: reviewing control flow in a safety- or timing-critical context means reviewing the *shape* (coverage, fall-through discipline, blocking calls) systematically, not just reading each case for correctness in isolation.
+
+**C11 reference (checked against N1570):** 6.8.4.2p5, 6.8.4.2p3
 FOLLOW:
 - Which single compiler flag catches the most of this automatically? => `-Wswitch` for enumerator coverage and `-Wimplicit-fallthrough` for unmarked fall-through; neither catches blocking-call or reentrancy issues, which need manual review or specialized static analysis.
 - Should ISR dispatch tables prefer switch or a function-pointer array? => Both are legitimate (module 12 covers function-pointer dispatch tables); a `switch` is often clearer for a small, fixed set of cases, while a dispatch table scales better for a large or dynamically extensible event set and avoids the enumerator-coverage question entirely by construction.
 PITFALL: Suppressing a real `-Wswitch` warning with a blanket `default: break;` added purely to silence the compiler, without checking whether the newly-added enumerator actually needed handling.
-VERIFY: 6.8.4.2p5, 6.8.4.2p3
 
 @@ 3.16 | Principal | Debug | tags=switch,missing-break,firmware
 Q: A firmware event loop's RX-event counter is mysteriously always equal to (RX count + TX count) instead of just RX count. Root-cause it from this description alone, then confirm with code.
@@ -503,11 +511,12 @@ int main(void)
 Compiled with `-Wall -Wextra`: gcc flags the exact fall-through with `warning: this statement may fall through [-Wimplicit-fallthrough=]` right at the `EVT_RX` case -- in a real codebase, this warning alone would have caught the bug before it ever shipped. Run output confirms the diagnosis: `buggy:  RX=1 TX=1 ERR=0 (RX incorrectly bumps TX too)`, `fixed:  RX=1 TX=0 ERR=0`.
 
 Root-cause method demonstrated here: (1) match the symptom's exact shape ("counter A always includes counter B's increments") to the known fall-through signature rather than guessing broadly; (2) locate the suspect switch and check every case for a `break` immediately before assuming a more complex bug; (3) confirm by compiling with `-Wimplicit-fallthrough` (part of `-Wall`) rather than only reading the code, since the warning is authoritative and immediate.
+
+**C11 reference (checked against N1570):** 6.8.4.2p5, 6.8.6.3p2
 FOLLOW:
 - Would this bug survive a code review that only reads the diff for the changed case? => Very plausibly; the missing `break` is invisible unless the reviewer explicitly checks that every case in the whole switch, not just the changed one, still terminates correctly.
 - Is `-Wimplicit-fallthrough` on by default with `-Wall`? => Yes, in modern gcc versions (it was added to `-Wextra` initially and later folded into `-Wall`'s effective set on many distributions); always verify with your specific toolchain rather than assuming.
 PITFALL: Fixing this kind of bug by adding a `break` and moving on without also auditing every other case in the same switch for the identical missing-break pattern; these bugs cluster.
-VERIFY: 6.8.4.2p5, 6.8.6.3p2
 
 @@ 3.17 | Principal | Numeric | tags=recursion,stack,firmware
 Q: A firmware target has an 8 KB task stack, and a recursive parser function's stack frame is roughly 48 bytes. Roughly how deep can it recurse before overflowing the stack, and how would you get real numbers instead of guessing?

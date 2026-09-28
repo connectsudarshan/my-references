@@ -32,11 +32,11 @@ The practical rule: when mixing bitwise operators (`& ^ |`) with equality/relati
 
 Associativity matters too: most binary operators group left to right, but assignment and `?:` group right to left, so `a = b = 0` assigns `b` first. Precedence says how an expression is grouped, not the order its operands are evaluated in (see 2.12). `-Wall` enables `-Wparentheses`, which catches the first two.
 
+**C11 reference (checked against N1570):** 6.5 (Annex A grammar defines the precedence via nested grammar productions in the C11 standard)
 FOLLOW:
 - Which operators are right-associative? => Unary operators, assignment operators, and `?:` (the ternary's third operand associates right-to-left for chained ternaries).
 - Do casts have higher precedence than binary operators? => Yes, `(int)x + y` casts only `x`, not `x + y`.
 PITFALL: Writing `a & b == c` intending `(a & b) == c`; `==` binds tighter, so this actually means `a & (b == c)`.
-VERIFY: 6.5 (Annex A grammar defines the precedence via nested grammar productions in the C11 standard)
 
 @@ 2.02 | Basic | Concept | tags=short-circuit
 Q: What does "short-circuit evaluation" mean for `&&` and `||`, and is it guaranteed by the standard?
@@ -75,11 +75,11 @@ Compiled and run: `side_effect()` is never printed; both messages report `0` cal
 
 Because the right operand of `&&`/`||` may be skipped, never put a required side effect there: `if (ok && write_reg(REG, v))` silently skips the write when `ok` is 0. The bitwise `&` and `|` operators do NOT short-circuit and have no sequence point, so `if (p != NULL & p->len)` dereferences NULL. Both `&&` and `||` also always yield `int` 0 or 1.
 
+**C11 reference (checked against N1570):** 6.5.13p4, 6.5.14p4
 FOLLOW:
 - Is this different from `&` and `|`? => Completely: `&` and `|` are bitwise operators that always evaluate both operands, with unspecified order between them and no short-circuiting at all.
 - Why does this matter for null-pointer checks? => It is why `if (p != NULL && p->field)` is safe while `if (p->field && p != NULL)` is not; the left operand is fully evaluated (and its sequence point passed) before the right is even considered.
 PITFALL: Writing `if (p->field && p)` when you meant to guard against a null `p`; order inside `&&` matters.
-VERIFY: 6.5.13p4, 6.5.14p4
 
 @@ 2.03 | Basic | Concept | tags=comma-operator
 Q: What does the comma operator do, and where can it not be used?
@@ -105,11 +105,12 @@ int main(void)
 Compiled and run: prints `0 1 0 3 4` (index 2 never written) then `result = 5`.
 
 The classic gotcha from the standard's own example (6.5.17p3): in `f(a, (t=3, t+2), c)`, the function is called with exactly three arguments; the middle one, `(t=3, t+2)`, needs its own parentheses because the outer commas are argument separators, not comma operators.
+
+**C11 reference (checked against N1570):** 6.5.17p2-p3
 FOLLOW:
 - Is `for (i = 0, j = 4; ...)` using the comma operator or just separated statements? => It is the genuine comma operator; a `for` clause is a single expression slot, and comma lets you pack two initializations into it.
 - Does the comma operator's left operand's side effects happen before the right operand's? => Yes, guaranteed, unlike most other binary operators.
 PITFALL: `printf("%d", (x, y))` compiles and prints `y`'s value, discarding `x`'s value entirely (but not its side effects) -- easy to write by accident and hard to spot in review.
-VERIFY: 6.5.17p2-p3
 
 @@ 2.04 | Intermediate | Numeric | tags=promotion,conversions
 Q: Given `char a = 10; short b = 20; unsigned long c = 5UL;`, what is the type and value of `a + b - c`?
@@ -138,11 +139,11 @@ Compiled and run: `a+b-c = 25`, `x + y = 0`. The second line is the sharper less
 
 The rule of thumb: when a signed and an unsigned operand of equal or higher rank meet, the signed one is converted to unsigned. Keep sizes and counts in one signedness, compare `i + 1 < len` instead of `i < len - 1`, and enable `-Wsign-compare` (in `-Wextra`) and `-Wsign-conversion` to find mixed expressions.
 
+**C11 reference (checked against N1570):** 6.3.1.1, 6.3.1.8
 FOLLOW:
 - What is the general rank-based rule? => Convert both operands to the type of whichever operand has the greater integer conversion rank (6.3.1.1); if ranks are equal but one is unsigned, the signed one converts to unsigned.
 - Why is this dangerous in loop bounds like `for (int i = n - 1; ...)` with `size_t n`? => If `n` is `size_t` (unsigned) and you write `n - 1` where `n` could be `0`, the subtraction happens in `size_t` and wraps to `SIZE_MAX`, not `-1`.
 PITFALL: Mixing a signed loop counter with an unsigned array-size type (`size_t`) in the same comparison; the signed value silently converts to unsigned.
-VERIFY: 6.3.1.1, 6.3.1.8
 
 @@ 2.05 | Intermediate | Trap | tags=precedence,bitwise
 Q: Why does `if (flags & mask == 0x02)` almost never do what it looks like it does?
@@ -169,11 +170,12 @@ int main(void)
 }
 ```
 Compiled with `-Wall -Wextra`: gcc emits `warning: suggest parentheses around comparison in operand of '&' [-Wparentheses]` at exactly that line -- this warning existing at all is evidence of how common the mistake is. Run output: the trap branch prints `false` (because `mask == 0x02` is `1`, and `flags & 1` is `0x06 & 0x01 = 0`), while the parenthesized version correctly prints `true`.
+
+**C11 reference (checked against N1570):** 6.5.10, 6.5.9 (bitwise AND and equality-operator subclauses, whose relative order in the grammar's subclause sequence sets their precedence per 6.5 footnote 85)
 FOLLOW:
 - Does the same trap apply to `|`? => Yes, identically; `flags | mask == 0` has the same misparse.
 - Is there a simple habit that prevents this entirely? => Always parenthesize any expression that mixes a bitwise operator with a relational or equality operator, with no exceptions, even when you are sure of the precedence.
 PITFALL: This bug frequently still compiles clean and "looks" correct at a glance in code review; only `-Wparentheses` (included in `-Wall`) or careful manual precedence-checking catches it.
-VERIFY: 6.5.10, 6.5.9 (bitwise AND and equality-operator subclauses, whose relative order in the grammar's subclause sequence sets their precedence per 6.5 footnote 85)
 
 @@ 2.06 | Intermediate | Concept | tags=ternary,conversions
 Q: What is the result type of `cond ? i : f` when `i` is `int` and `f` is `float`?
@@ -193,11 +195,12 @@ int main(void)
 }
 ```
 Compiled and run: `5.000000`, then `sizeof(1 ? i : f) = 4 (float), sizeof(i) = 4 (int)` (both 4 bytes on this platform, but the types differ: the `sizeof` expression's *type* is `float` even though its numeric size happens to match `int` here). Passing an `int` result of `?:` straight to `printf("%d", ...)` when the compiler silently picked `float` due to the other branch is a classic source of `-Wformat` warnings and wrong output.
+
+**C11 reference (checked against N1570):** 6.5.15p5
 FOLLOW:
 - What if one branch were a pointer and the other `NULL`/`0`? => Different rule set (6.5.15p6) applies for pointer operands: compatible pointer types unify, and a null pointer constant converts to the other operand's pointer type.
 - Does the *unevaluated* branch still affect the result's type? => Yes; the conversion rule looks at both operands' types regardless of which one is actually evaluated at runtime.
 PITFALL: `printf("%d\n", cond ? int_val : float_val)` silently promotes the whole ternary to `float`/`double`, and `%d` then reads the wrong bytes, typically undefined behavior from a mismatched format specifier.
-VERIFY: 6.5.15p5
 
 @@ 2.07 | Intermediate | Scenario | tags=comma,for-loop
 Q: Beyond `for` loop clauses, where is the comma operator legitimately useful, versus where it is a code smell?
@@ -212,11 +215,12 @@ for (i = 0, j = 4; i < j; i++, j--) { /* ... */ }
 Outside that context, if you can write two separate statements instead, you almost always should; a comma-joined chain like `x = 1, y = 2, z = x + y;` compiles and runs fine but reads worse than three separate statements and gains nothing (each sub-expression's side effects are still fully sequenced left to right, so there is no performance reason either).
 
 One more legitimate spot: inside a macro that must expand to a single expression (not a statement), `#define LOG_AND_RETURN(v) (log_value(v), (v))` uses the comma operator to sequence a side effect and still yield a value usable in a larger expression -- module 9 covers the do-while(0) idiom for the statement-like case instead.
+
+**C11 reference (checked against N1570):** 6.5.17
 FOLLOW:
 - Can the comma operator appear inside a function call's argument list directly? => No without parentheses; `f(a, b)` is two arguments, but `f((a, b))` is one argument whose value is `b`.
 - Does `-Wall` warn about comma-chained statements? => Not generally; there is no standard warning for "too many commas," which is exactly why it is a style discipline, not a compiler-enforced rule.
 PITFALL: Confusing "the comma operator" with "the comma used as a list separator" -- they look identical but have entirely different sequencing rules; only the operator form guarantees a sequence point between its two operands.
-VERIFY: 6.5.17
 
 @@ 2.08 | Intermediate | Concept | tags=sequence-points,c11
 Q: What is a "sequence point," and how did C11's wording change from earlier standards?
@@ -230,11 +234,12 @@ Places where sequencing is still guaranteed in C11 (Annex C lists them explicitl
 - Between the value computation and side effect of an operator's operands, and the value computation of the result (6.5p1: "the value computations of the operands of an operator are sequenced before the value computation of the result").
 
 What did *not* change in practice: `i++ + i++` and `i = i++ + 1` are undefined behavior under both models. What changed is the framing: instead of "there must be a sequence point separating these," C11 says "if a side effect on a scalar object is unsequenced relative to another side effect on the same object, or a value computation using that object, the behavior is undefined" (6.5p2), which is a strictly more general statement that also lets the standard describe truly concurrent/interleaved evaluation possibilities that "sequence point" language handled awkwardly.
+
+**C11 reference (checked against N1570):** 6.5p1-p3, Annex C
 FOLLOW:
 - Does function-call argument evaluation order relate to sequence points? => The arguments' evaluations are indeterminately sequenced relative to each other (order unspecified, module 1's 1.13), but each individual argument's own evaluation is internally sequenced; there is also a sequence point between all argument evaluations and the actual call (6.5.2.2).
 - Where can I read the definitive list for C11? => Annex C ("Sequence points"), which is informative but cross-references the normative subclauses.
 PITFALL: Assuming C11 "removed" sequence points and therefore loosened the classic UB rules; it only changed the descriptive mechanism, not the actual guarantees or prohibitions.
-VERIFY: 6.5p1-p3, Annex C
 
 @@ 2.09 | Intermediate | Concept | tags=sequence-points,for-loop
 Q: In `for (clause1; expr2; expr3) body`, exactly when is `expr3` evaluated relative to `body` and the next check of `expr2`?
@@ -248,11 +253,11 @@ This ordering is exactly what makes `for` and a hand-written `while` differ subt
 
 **`continue` jumps to `expr3`, not to the condition.** In a `for` loop, `continue` still runs the increment. The "equivalent" `while` loop with `i++` at the bottom of the body skips that increment on `continue` and can loop forever, which is the classic difference module 3 expands on. All three clauses are optional: `for (;;)` is the idiomatic infinite loop (an omitted `expr2` counts as nonzero).
 
+**C11 reference (checked against N1570):** 6.8.5.3p1-p2
 FOLLOW:
 - Can `expr2` be omitted? => Yes; an omitted controlling expression is replaced by a nonzero constant (6.8.5.3p2), making `for (;;)` an infinite loop by definition.
 - Does `clause1` run once, or once per iteration? => Exactly once, before the loop starts; only `expr2` and `expr3` repeat per iteration.
 PITFALL: Believing `expr3` runs *before* the body on the first iteration; it never does, on any iteration -- it always runs strictly after the body.
-VERIFY: 6.8.5.3p1-p2
 
 @@ 2.10 | Advanced | Trap | tags=undefined-behavior,sequence
 Q: Why is `i = i++ + 1;` undefined behavior, and what did you actually observe when you compiled it?
@@ -270,11 +275,12 @@ int main(void)
 }
 ```
 Compiled with `-Wall -Wextra`: gcc detects and flags this exact pattern with `warning: operation on 'i' may be undefined [-Wsequence-point]`, which is precisely the point of this question (the warning is informative, not a defect to silence). Run output on this build: `i = 6`. This is one specific compiler's one specific answer today; the standard permits a conforming implementation to produce `5`, `6`, `7`, or something else entirely, and even this same compiler could legally produce a different answer at a different optimization level or after an unrelated code change nearby.
+
+**C11 reference (checked against N1570):** 6.5p2, footnote 84
 FOLLOW:
 - Is `i = i + 1;` (no `++`) fine? => Yes, completely well-defined: it has one side effect (the outer assignment) and no unsequenced competing side effect on `i`.
 - Does `-fsanitize=undefined` catch this? => Not always automatically for pure `-Wsequence-point`-style cases (UBSan focuses on a different category of checks like signed overflow and misaligned access; gcc's `-Wsequence-point` warning, part of `-Wall`, is actually the more reliable static catch for this specific pattern), covered further in module 10.
 PITFALL: Treating "it consistently prints 6 on my machine every time I run it" as proof the behavior is well-defined; consistency under one compiler and one set of flags is not a standard guarantee.
-VERIFY: 6.5p2, footnote 84
 
 @@ 2.11 | Advanced | Trap | tags=undefined-behavior,arrays
 Q: Is `a[i++] = i;` well-defined? What does the standard say directly about this exact expression?
@@ -298,11 +304,11 @@ Compiled with `-Wall -Wextra`: gcc again catches it with `warning: operation on 
 
 **The fix is always to split the statement** so each modification sits in its own full expression: `a[i] = i + 1; i++;` (or whatever you meant). The end of a full expression is a sequence point. Don't reason from one compiler's output: the next version, another optimization level, or a different target can choose differently, and GCC's `-Wsequence-point` (in `-Wall`) catches the common cases for you.
 
+**C11 reference (checked against N1570):** 6.5p2, footnote 84
 FOLLOW:
 - Why does the standard bother naming this exact example in a footnote? => Because it is exactly the kind of expression that looks "obviously" like it should write the post-increment value at the post-increment index, but the language provides no such guarantee, making it a canonical teaching example.
 - What is the safe rewrite? => Split it: `a[i] = i + 1; i++;` (or `i++; a[i-1] = i;`), whichever ordering you actually intend, with the increment on its own statement.
 PITFALL: "Fixing" this by adding parentheses (`a[(i++)] = i;`); parentheses only affect grouping, not sequencing, and do nothing here.
-VERIFY: 6.5p2, footnote 84
 
 @@ 2.12 | Advanced | Debug | tags=argument-order,unspecified
 Q: A test asserts `printf("%d %d %d\n", tag(1), tag(2), tag(3))` prints "1 2 3" in that order because "arguments evaluate left to right." Debug the assumption, not the code.
@@ -333,11 +339,11 @@ Compiled with gcc 13 (`-std=c11 -Wall -Wextra -O2`) on x86-64 Linux and run: the
 
 **How to debug this kind of assumption:** make the side effects visible (log inside the argument functions as in 1.13), build with a second compiler or target (`clang`, `-m32`, an ARM cross-compiler), and look for arguments that touch shared state. The real fix is in the code, not the test: move order-dependent calls into separate statements so the test checks behavior the language actually guarantees.
 
+**C11 reference (checked against N1570):** 6.5.2.2, Annex J.1
 FOLLOW:
 - How should this actually be tested? => Assert on the *set* of values produced and the final result, not on the order argument-evaluation side effects were observed in; or restructure the code under test so it does not depend on evaluation order at all.
 - Is this the same category of bug as `i = i++ + 1`? => Related but distinct: this is *unspecified* behavior (one of several defined outcomes, compiler's choice, no diagnostic required or typically given) rather than *undefined* behavior (no defined outcome at all); see module 10 for the full three-way split.
 PITFALL: Shipping logging/telemetry code whose correctness (not just its printed order, but computed values) depends on argument evaluation order; refactor any such side-effecting expression into separate statements first.
-VERIFY: 6.5.2.2, Annex J.1
 
 @@ 2.13 | Advanced | Numeric | tags=division,modulo
 Q: What are `-5 / 2`, `-5 % 2`, `5 / -2`, and `5 % -2` in C11, and what rule guarantees those values?
@@ -363,11 +369,11 @@ Truncation toward zero means `-5 / 2` rounds -2.5 toward 0, giving -2 (not -3, w
 
 A mathematical (always non-negative) modulo for signed values is `((a % n) + n) % n`. Also note that `INT_MIN / -1` and `INT_MIN % -1` are undefined because the true quotient does not fit in `int`; on x86 the division traps with SIGFPE.
 
+**C11 reference (checked against N1570):** 6.5.5p6
 FOLLOW:
 - Was this always true in C? => No; C89 left the rounding direction for negative operands implementation-defined. C99 (carried into C11) is the version that mandated truncation toward zero specifically.
 - What if either operand is 0? => Division by zero and `%` with a zero right operand are both undefined behavior (6.5.5p5), regardless of sign.
 PITFALL: Porting code from a language that rounds toward negative infinity (Python's `//` and `%`) and assuming C's `/` and `%` behave the same way for negative operands; they do not.
-VERIFY: 6.5.5p6
 
 @@ 2.14 | Advanced | Cross-layer | tags=optimization,unsequenced
 Q: Why does the "unsequenced side effects are undefined" rule (6.5p2) actually matter to a compiler's optimizer, beyond just "it's confusing to read"?
@@ -376,11 +382,12 @@ DEEP:
 The unsequenced-evaluation rule is not primarily about penalizing bad code; it exists to give the compiler transformation freedom. If the standard required, say, strict left-to-right evaluation of every subexpression, many everyday optimizations (reordering independent loads across a loop body for vectorization, hoisting a common subexpression, scheduling instructions to hide memory latency on an out-of-order or pipelined CPU) would become observably incorrect for any code containing side effects, forcing the compiler to prove far more before optimizing.
 
 By instead saying "if your code's subexpressions have unsequenced side effects on the same object, that program's behavior is undefined," the standard shifts the burden onto the programmer to avoid writing such expressions, and grants the compiler broad license for well-defined programs. This is the same underlying philosophy behind signed-overflow UB (module 10) and strict aliasing: each pushes a correctness obligation onto the programmer specifically so that the optimizer does not have to defensively preserve a specific, possibly slow, evaluation order.
+
+**C11 reference (checked against N1570):** 6.5p2
 FOLLOW:
 - Does this mean `-O0` and `-O2` can legitimately produce different results for `i = i++ + 1`? => Yes, legitimately, precisely because the behavior is undefined; in practice, on this gcc build both `-O0` and `-O2` happened to produce the same result for this particular expression, but that agreement is not something the standard promises.
 - Is this the same reasoning as why an "infinite loop" with no side effects can be assumed to terminate (module 3, 6.8.5p6)? => Yes, same family of rule: giving the optimizer permission to assume the absence of certain problematic constructs in exchange for programmer discipline.
 PITFALL: Debugging a "why did -O2 change my program's output" issue by assuming a compiler bug, before first checking the code for undefined behavior; the vast majority of these reports turn out to be exactly this category.
-VERIFY: 6.5p2
 
 @@ 2.15 | Advanced | Trap | tags=macro,multiple-evaluation,forward-reference
 Q: `#define MAX(a, b) ((a) > (b) ? (a) : (b))`, called as `MAX(x++, y)`. What actually happens to `x`, and why?
@@ -402,11 +409,12 @@ int main(void)
 Compiled and run: `r = 6, x = 7`. Tracing the expansion: `MAX(x++, y)` becomes `((x++) > (y) ? (x++) : (y))`. The comparison evaluates `x++` once (using the original value 5, then incrementing `x` to 6), the comparison is true (5 > 3), so the `?:`'s second operand `(x++)` runs too, using the now-6 value as the ternary's result and incrementing `x` again to 7.
 
 This is unambiguously well-defined per the standard's evaluation rules (each `x++` is its own fully sequenced expression, and `?:` guarantees a sequence point before whichever branch runs); the bug is entirely at the text-substitution level, specific to how the macro was written, not a sequencing violation.
+
+**C11 reference (checked against N1570):** 6.10.3 (macro replacement is textual, prior to expression evaluation)
 FOLLOW:
 - Does a `static inline` function have this problem? => No; a real function evaluates its arguments exactly once each, which is precisely why "prefer inline functions over macros when arguments might have side effects" is standard advice (module 9 elaborates).
 - Is there a macro-only fix? => Not a complete one for arbitrary expressions; GNU C's statement-expression extension can capture the argument once, but that is a compiler extension, not portable C11.
 PITFALL: Assuming a macro that "looks like a function call" evaluates its arguments like a function does; only genuine functions evaluate each argument exactly once, guaranteed.
-VERIFY: 6.10.3 (macro replacement is textual, prior to expression evaluation)
 
 @@ 2.16 | Principal | Debug | tags=optimization,unsequenced,root-cause
 Q: A regression only reproduces in the `-O2` release build, never in the `-O0` debug build, and the changed line is `buf[idx++] = idx;`-shaped. What is your root-cause method, and what would you actually expect to find?
@@ -420,11 +428,12 @@ Method, in order:
 4. Fix by splitting the expression: decide which value (pre- or post-increment) was actually intended, and write it as two ordinary statements with the increment isolated.
 
 Concretely, for `buf[idx++] = idx;`: if the intent was "store the pre-increment index, then advance," write `buf[idx] = idx; idx++;`... but check the requirement again -- more often the intent was "store the index that was just used," i.e. `buf[idx] = idx; idx++;` is usually correct as written unless the requirement actually wants the post-increment value stored, in which case `idx++; buf[idx-1] = idx;` or simply reordering the increment to a separate prior/following line makes the intent unambiguous and removes the UB either way.
+
+**C11 reference (checked against N1570):** 6.5p2
 FOLLOW:
 - Why does `-O0` often "look fine" while `-O2` breaks? => `-O0` frequently (not guaranteedly) evaluates subexpressions in a simple, consistent left-to-right-ish order matching direct codegen, while `-O2`'s instruction scheduling, common-subexpression elimination, and register allocation are more likely to reorder or restructure the unsequenced pieces differently.
 - Is `-fsanitize=undefined` a substitute for step 2's `-Wsequence-point`? => No; UBSan's runtime checks target a different set of UB categories (signed overflow, null/misaligned pointer access, etc.); the `-Wsequence-point` compile-time warning is the more reliable tool specifically for this pattern.
 PITFALL: "It works if I just add `-O0` to the release build" is not a fix; it hides the same latent UB, which can resurface with a different compiler version, a different `-O` level, or unrelated code changes nearby that affect the optimizer's choices.
-VERIFY: 6.5p2
 
 @@ 2.17 | Principal | Concept | tags=undefined,unspecified,three-way-split
 Q: Explain, with the operators covered in this module, the practical difference between "undefined behavior" and "unspecified behavior," using one example of each.
@@ -436,8 +445,9 @@ The distinction matters most in what you are allowed to conclude from an observa
 - If you observe `tag(1) + tag(2) + tag(3)` evaluate left-to-right on your build, you have learned a real fact about *that build's* choice among the standard's permitted alternatives, but not a fact about the *language*: the standard permits (does not forbid) a different, equally conforming compiler to choose the opposite order, with zero required diagnostic in either case.
 
 A third category this module also touches, though its home is module 10, is implementation-defined behavior: like unspecified, one of several outcomes is chosen, but unlike unspecified, the implementation *must* document and consistently apply its choice (plain `char`'s signedness in module 1 is the canonical example). Interviewers frequently want you to place a given behavior into the correct one of these three buckets and justify it with the mechanism (sequencing rules for UB, "implementation picks silently" for unspecified, "implementation picks and documents" for implementation-defined), not just recite the definitions.
+
+**C11 reference (checked against N1570):** 6.5p2, 6.5.2.2, Annex J.1, 3.4.1, 3.4.3, 3.4.4 (definitions of implementation-defined, undefined, and unspecified behavior)
 FOLLOW:
 - Which bucket does signed integer overflow fall into? => Undefined (module 10 covers this and strict aliasing as the two most consequential UB categories for real bugs).
 - Which bucket does the number of significant initial characters in an identifier beyond a certain length fall into? => Implementation-defined (a translation limit the standard requires the implementation to document, distinct from both of the above).
 PITFALL: Using "unspecified" and "undefined" interchangeably in an interview; they carry materially different guarantees, and conflating them is a fast way to lose credibility on a topic the standard is very precise about.
-VERIFY: 6.5p2, 6.5.2.2, Annex J.1, 3.4.1, 3.4.3, 3.4.4 (definitions of implementation-defined, undefined, and unspecified behavior)

@@ -199,11 +199,12 @@ int main(void) {
 }
 ```
 Compiled with `gcc -std=c11 -Wall -Wextra -pthread`, the compiler itself flagged the bug at compile time: `warning: function returns address of local variable [-Wreturn-local-addr]`. Run anyway, it printed `joiner received pointer (nil)` -- the pointer value observed by the joiner was NULL, not `local`'s original address, apparently already overwritten by the thread-teardown machinery reusing that stack memory -- and then crashed with a segmentation fault on the following dereference (exit code 139), confirming this is actually unsafe memory, not merely "risky-looking but fine."
+
+**C11 reference (checked against N1570):** The specific observed value (NULL, then a crash) is this run's behavior on this compiler/libc/platform, not a portable guarantee; C11 gives no defined semantics at all for accessing an object outside its lifetime (6.2.4), which is the underlying rule that makes any outcome here equally "correct" from the standard's point of view.
 FOLLOW:
 - Why didn't it just print `12345` or obvious garbage instead of exactly NULL? => Undefined behavior means the standard makes no promise about WHICH of these outcomes occurs; here, the C library's own thread-exit bookkeeping happened to write a NULL-like value into that same stack location before the joiner read it -- a different libc, platform, or optimization level could show 12345, other garbage, or crash immediately instead.
 - Does the -Wreturn-local-addr warning always fire for this bug? => It is a good, real signal here, but it is a heuristic (best-effort static analysis), not a guarantee; more indirect versions of the same bug (returning a pointer stored inside a struct that itself is stack-allocated, for instance) can easily slip past it.
 PITFALL: Treating a compiler warning like -Wreturn-local-addr as optional noise on legacy code, rather than as exactly the class of bug this question demonstrates being caught before it ever reaches a joiner.
-VERIFY: The specific observed value (NULL, then a crash) is this run's behavior on this compiler/libc/platform, not a portable guarantee; C11 gives no defined semantics at all for accessing an object outside its lifetime (6.2.4), which is the underlying rule that makes any outcome here equally "correct" from the standard's point of view.
 
 @@ 3.07 | Intermediate | Concept | tags=pthread_attr_t,detachstate,stacksize
 Q: What can you configure via pthread_attr_t before creating a thread, and how does setting detachstate up front compare to calling pthread_detach() afterward?

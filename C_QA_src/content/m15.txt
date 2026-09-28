@@ -25,11 +25,12 @@ void free_list(Node *head) {
     while (head) { Node *next = head->next; free(head); head = next; }
 }
 ```
+
+**C11 reference (checked against N1570):** 6.7.2.1 paragraph 3
 FOLLOW:
 - Why does push_front take and return a Node* rather than modifying a global head variable? => It keeps the function pure and reusable for any list, including a local one in main, and makes the caller's control over the head pointer explicit rather than hidden as a side effect.
 - What is the equivalent O(1) operation at the tail instead of the head? => None, for a plain singly linked list with only a head pointer; appending at the tail requires either walking to the end (O(n)) or maintaining a separate tail pointer alongside head, as the queue implementation in 15.03 does.
 PITFALL: Forgetting that a freshly malloc'd node's next field is uninitialized garbage until explicitly set; every insert function must set next itself rather than assuming a fresh node starts as NULL.
-VERIFY: C11 6.7.2.1 paragraph 3
 
 @@ 15.02 | Basic | Concept | tags=stack,arraybacked,listbacked
 Q: What are the trade-offs between an array-backed stack and a list-backed stack, and how do you implement each?
@@ -155,11 +156,12 @@ Tracing the pointer state at each iteration on a short 3-node list `A -> B -> C 
 After step 3, `cur` is NULL so the loop ends, and `prev` (C) is returned as the new head: the list is now `C -> B -> A -> NULL`, exactly the reverse of the original, and no node was ever allocated or freed; only the `next` pointers were rewired.
 
 This is the operation the assigned figure illustrates: the node/next pointer structure, and this exact link-by-link rewiring as the list is walked once.
+
+**C11 reference (checked against N1570):** self-referential struct via pointer member, C11 6.7.2.1 paragraph 3
 FOLLOW:
 - Why must next be saved before overwriting cur->next? => Because cur->next = prev immediately destroys the only remaining reference to the rest of the original list; without saving it first, the traversal would lose the rest of the list right after reversing the first link.
 - What is the time and space complexity? => O(n) time (one pass, one pointer rewrite per node) and O(1) extra space (three pointer variables regardless of list length), which is the benchmark a recursive version (15.06) is compared against.
 PITFALL: Returning cur instead of prev at the end of the loop; cur is NULL by the time the loop exits, so returning it gives a reversed list whose head pointer is lost, not the actual new head.
-VERIFY: self-referential struct via pointer member, C11 6.7.2.1 paragraph 3
 
 @@ 15.06 | Intermediate | Concept | tags=reverse,recursive,stackdepth
 Q: Reverse a singly linked list recursively. How does its resource cost compare to the iterative version?
@@ -513,11 +515,12 @@ Actual output: `device id=1 name=nand0` then `device id=2 name=nand1`, confirmin
 `offsetof(type, member)` (stddef.h, C11 7.19) gives the exact byte distance from the start of `type` to `member`; since `link` is a plain, fixed-layout member (no padding surprises beyond what module 6 already covers for ordinary struct layout), subtracting that constant offset from the address of the embedded `ListNode` recovers the address of the struct that contains it, with zero runtime search and no extra pointer stored anywhere.
 
 Why this earns its place as a Principal-level design question: the same list-linking machinery (`ListNode`, and the traversal logic) works completely generically for *any* struct that embeds a `ListNode`, with zero heap allocation dedicated to list bookkeeping (unlike every other list in this module, which allocates a separate wrapper node per element); this is exactly the technique the Linux kernel's own `struct list_head` uses throughout, and it is a natural fit for firmware contexts (module 17's territory) where a fixed set of long-lived driver/device structs need to be linked and relinked without ever calling an allocator.
+
+**C11 reference (checked against N1570):** offsetof is defined in C11 7.19 (stddef.h); the container_of pattern itself is a widely used idiom (notably in the Linux kernel), not something C11 names or specifies directly.
 FOLLOW:
 - What is the main risk of this technique compared to a wrapper-node list? => Every struct type that wants to participate in this kind of list must dedicate a member to the embedded link, and a struct can only be a member of as many such lists as it has distinct embedded link members, unlike a wrapper-node list which can link any existing struct without modifying its definition.
 - Does container_of perform any runtime check that ptr actually points at the named member of a real type instance? => No, none at all; it is pure pointer arithmetic based on a compile-time offset, so passing it a pointer that is not actually a member of that member at that struct type produces silently wrong, out-of-bounds pointers rather than any kind of detectable error.
 PITFALL: Using container_of on a pointer that does not actually point at the named member (a typo'd member name compiles fine as long as the type matches accidentally, or a stray pointer entirely); there is no runtime check, so the result is a garbage pointer used with full confidence.
-VERIFY: offsetof is defined in C11 7.19 (stddef.h); the container_of pattern itself is a widely used idiom (notably in the Linux kernel), not something C11 names or specifies directly.
 
 @@ 15.17 | Principal | Concept | tags=embedded,fixedcapacity,noalloc
 Q: For an embedded system where malloc is disallowed after initialization, how do you provide stack/queue behavior with no per-operation dynamic allocation?
@@ -584,8 +587,9 @@ The design case for this over the two alternatives, stated the way an interviewe
 - The sorted-array approach is also directly checkable at compile time or by a simple startup assertion (the array must actually be sorted for binary search's precondition to hold, exactly module 14's bsearch precondition), whereas a hand-built BST's correctness depends on runtime insertion logic executing correctly every time the program starts.
 
 The general design principle worth stating unprompted: reach for a pointer-based dynamic structure (BST, hash table, linked list) when the data set's membership actually changes at runtime; when it does not, a flat, sorted, statically-declared array is very often both simpler and objectively more efficient in exactly the ways that matter for firmware (flash placement, zero heap use, cache locality).
+
+**C11 reference (checked against N1570):** 6.9.2 paragraph 2 (a static const array without an explicit runtime-computed initializer is placed by the toolchain in read-only storage; the exact section name (.rodata) is a toolchain/ABI convention, not ISO C terminology)
 FOLLOW:
 - Would you change this answer if the config table had thousands of entries instead of 4? => The core argument (fixed key set known at compile time) does not change, but at a much larger scale a hash table's O(1) lookup, or a perfect hash computed once offline for this exact known key set, would start to matter more than it does for a handful of entries, where binary search's few comparisons are already effectively free.
 - What standard library function could replace the hand-written binary search loop here? => bsearch (module 14), with a comparator that calls strcmp on the key field, provided the array element size and layout still match bsearch's void*-based contract; writing the loop by hand here was for clarity, not because bsearch would not work.
 PITFALL: Defaulting to "a hash table is always faster" without checking whether the actual key set size and its compile-time-fixed nature make that speed advantage irrelevant next to the real costs (allocation, hash-function correctness, memory layout) a hash table brings for a small, static table.
-VERIFY: C11 6.9.2 paragraph 2 (a static const array without an explicit runtime-computed initializer is placed by the toolchain in read-only storage; the exact section name (.rodata) is a toolchain/ABI convention, not ISO C terminology)

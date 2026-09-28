@@ -8,11 +8,12 @@ DEEP:
 - The standard's core tool is "happens before": a relation built from `sequenced before` (order within one thread) and `synchronizes with` (a release paired with an acquire that observes it), and it says a non-atomic read's value is only well-defined if there is a unique "visible" prior write ordered before it by happens-before.
 - "The execution of a program contains a data race if it contains two conflicting actions in different threads, at least one of which is not atomic, and neither happens before the other. Any such data race results in undefined behavior" -- this is the sharpest sentence in the whole clause: not "unspecified," undefined.
 - This module's job is the multi-threaded angle only; a single thread's own memory layout and the `volatile` qualifier are the C Language page's territory (see the C Language page, module 7) -- `volatile` says nothing about what another thread may observe.
+
+**C11 reference (checked against N1570):** (ISO/IEC 9899:2011), 5.1.2.4 Multi-threaded executions and data races, paragraphs 5-6 and 25.
 FOLLOW:
 - Does this mean two threads can never touch the same variable without atomics or a lock? => They can, but only if something else (a mutex, a already-joined thread, a barrier) establishes happens-before between the touches; stdatomic.h and pthread synchronization calls are exactly the library operations 5.1.2.4 names as the things that create synchronizes-with edges.
 - Is this model specific to C11, or does POSIX have its own separate one? => POSIX's own memory-ordering guarantees for pthread calls (module 4's "mutex acquisition reads the value written by the last mutex release") are consistent with, and were one of the motivating examples for, this same happens-before framework; they are not a competing model.
 PITFALL: Assuming that because a race "usually looks fine" when tested, it is fine. 5.1.2.4 defines it as undefined behavior outright, not as an unlikely bug; a compiler is free to optimize a racy program in ways that make the race's effects far worse on a different build or platform.
-VERIFY: C11 (ISO/IEC 9899:2011), 5.1.2.4 Multi-threaded executions and data races, paragraphs 5-6 and 25.
 
 @@ 7.02 | Basic | Concept | tags=data-race,atomic-vs-nonatomic,ub
 Q: What exactly makes an access "atomic" versus "non-atomic" in C11, and why does that distinction decide whether a race is even possible?
@@ -22,11 +23,12 @@ DEEP:
 - Relaxed atomic operations are explicitly still safe from a race-detection standpoint: "We do not include relaxed atomic operations as synchronization operations although, like synchronization operations, they cannot contribute to data races" -- relaxed buys no ordering, but it does buy indivisibility (module 7.04 demonstrates this concretely).
 - Mutex lock/unlock counts as a synchronization operation too (7.26.4 in the full standard, POSIX's pthread_mutex_* in practice): "a call that acquires a mutex will perform an acquire operation... a call that releases the same mutex will perform a release operation" -- this is why a plain, non-atomic shared variable protected correctly by a mutex is not a data race, even though the variable itself is never atomic.
 - This is the precise reason 4.02 (module 4) says `counter++` on a plain int is not atomic: it is two or three separate non-atomic memory accesses (load, add, store) with nothing making the whole sequence indivisible or ordered against another thread's concurrent access to the same object.
+
+**C11 reference (checked against N1570):** 5.1.2.4 paragraphs 4-6 and 25 (conflict, synchronization operations, and the data-race definition).
 FOLLOW:
 - If a variable is only ever read by other threads, never written, is that a data race? => No -- "conflict" requires at least one side to modify the location; multiple concurrent reads of the same object, with no writes overlapping, never conflict regardless of atomicity.
 - Does making every shared variable `_Atomic` eliminate all data races in a program? => It eliminates plain-memory data races on those specific objects, but composite operations across multiple atomics (check-then-act sequences) can still be logically wrong (module 7.17's ABA problem is exactly this: individually-atomic operations, still an application-level bug).
 PITFALL: Treating "atomic" as a property of an operation done to any variable ("I'll just be careful with this int") rather than a property of the variable's declared type. Only `_Atomic`-qualified objects (or `atomic_*` typedefs) get the no-data-race guarantee; wrapping ordinary accesses in careful-looking code does not.
-VERIFY: C11, 5.1.2.4 paragraphs 4-6 and 25 (conflict, synchronization operations, and the data-race definition).
 
 @@ 7.03 | Basic | Concept | tags=stdatomic,atomic-types,declaring
 Q: What does stdatomic.h actually provide, and how do you declare and use one of its atomic types?
@@ -49,11 +51,12 @@ Compiled with `gcc -std=c11 -Wall -Wextra` and run, this printed `seen=5 prev=5 
 - The functions not ending in `_explicit` (`atomic_load`, `atomic_store`, `atomic_fetch_add`, ...) are shorthand for the `_explicit` form with `memory_order_seq_cst` -- the strongest, default ordering; the `_explicit` forms (7.05-7.09) let you ask for a weaker, cheaper ordering when the algorithm allows it.
 - `ATOMIC_VAR_INIT`/`atomic_init` exist for cases where an atomic object cannot be given an ordinary initializer at its point of declaration; a static or thread-local atomic's default zero-initialization is already valid without either.
 - Every atomic integer type mirrors an ordinary one (`atomic_uint` <-> `unsigned int`, `atomic_size_t` <-> `size_t`, and so on); pick the atomic type that matches the plain type your data would otherwise have.
+
+**C11 reference (checked against N1570):** 7.17.1 Introduction, 7.17.6 Atomic integer types, and 7.17.7 Operations on atomic types.
 FOLLOW:
 - Do you need `-latomic` to compile this? => Not for ordinary integer-width atomics on a mainstream 64-bit target like this one, since the hardware has native atomic instructions for these sizes; wider (e.g. 128-bit) or unusual atomic objects can require it on some platforms, which is why the AUTHORING guidance for this page calls it out as load-bearing only when actually needed.
 - What happens if you just write `x = 5;` on an atomic_int instead of atomic_store? => It still performs an atomic store (operators on atomic types are defined to invoke the corresponding atomic operation at `memory_order_seq_cst`), so plain assignment and comparison do work correctly on these types; the explicit function forms exist mainly to access weaker orderings and the fetch/exchange/compare-exchange operations that have no natural operator syntax.
 PITFALL: Assuming an atomic type needs no memory-order thought at all because "atomic" sounds complete. Atomicity (indivisibility) and ordering (visibility timing to other threads) are two separate guarantees; the default seq_cst ordering is always correct but not always the cheapest, which is what 7.05 onward is about.
-VERIFY: C11, 7.17.1 Introduction, 7.17.6 Atomic integer types, and 7.17.7 Operations on atomic types.
 
 @@ 7.04 | Intermediate | Debug | tags=relaxed,fetch-add,atomicity-without-ordering,compiled
 Q: Show that a relaxed atomic increment is still fully atomic (no lost updates) even though memory_order_relaxed provides no ordering guarantee at all.
@@ -78,11 +81,12 @@ static void *plain_worker(void *arg) {
 ```
 Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run three times, the atomic version printed `counter=1600000 expect=1600000 OK` every time; the plain version printed `plain_counter=1240060`, `1075577`, and `1226603` on the three runs (expected 1600000 each time) -- real, varying lost updates, confirming the plain int's race actually manifests on this platform.
 - "Implementations must still guarantee that any given atomic access to a particular atomic object be indivisible with respect to all other atomic accesses to that object" (7.17.3 NOTE 2) is the exact guarantee this demonstrates: relaxed is relaxed only about ordering, never about the read-modify-write itself being whole.
+
+**C11 reference (checked against N1570):** 7.17.3 Order and consistency, paragraph 8 (NOTE 2, indivisibility of relaxed atomic access). Compiled and run: relaxed_counter.c.
 FOLLOW:
 - If relaxed gives no ordering, why would relaxed fetch_add ever be the right choice? => When the only thing that matters is the final count and no other memory needs to be made visible alongside it -- a pure statistics counter is the textbook case; the moment another thread needs to see writes that happened before the increment, acquire/release (7.06) is needed instead.
 - Could this same relaxed counter ever show a lost update on a different platform? => No -- indivisibility of a given atomic access is required by the standard on every conforming C11 implementation, unlike ordering, which is where platforms differ; the difference between platforms is what relaxed fails to order, never whether it is atomic.
 PITFALL: Reading "relaxed" as "not fully atomic" or "best-effort." Relaxed atomics are exactly as indivisible as sequentially consistent ones; the only thing relaxed gives up is the cross-thread visibility ordering of everything else.
-VERIFY: C11, 7.17.3 Order and consistency, paragraph 8 (NOTE 2, indivisibility of relaxed atomic access). Compiled and run: relaxed_counter.c.
 
 @@ 7.05 | Intermediate | Concept | tags=acquire,release,synchronizes-with
 Q: In plain terms, what do "acquire" and "release" actually order?
@@ -92,11 +96,12 @@ DEEP:
 - "Informally, performing a release operation on A forces prior side effects on other memory locations to become visible to other threads that later perform an acquire or consume operation on A" -- this is precisely the "publish" mental model: release is "I'm done writing, here's the flag," acquire is "I saw the flag, so I can trust what came before it."
 - A release/acquire pair only orders the two threads directly involved in that specific synchronizes-with edge; it says nothing about a third thread's own view unless that third thread also participates in some happens-before chain (module 7.05's memory_order_consume question and 7.14's seq_cst total order are two different ways more is guaranteed).
 - Acquire and release are directional: acquire only meaningfully applies to a load (or the load half of a read-modify-write), release only to a store (or the store half); `memory_order_acq_rel` on a read-modify-write op is both at once.
+
+**C11 reference (checked against N1570):** 5.1.2.4 paragraphs 5-6 and 11 (release/acquire, synchronizes-with) and 7.17.3 paragraphs 3-4 (which orderings apply to store vs load).
 FOLLOW:
 - Does an acquire load need to be paired with a specific release, or does it acquire against "everything before it globally"? => Specifically against the release sequence headed by the exact store it read the value from -- an acquire load that happens to read a stale or unrelated value synchronizes with nothing, which is why acquire/release code must be checked against the actual value being observed (7.06's flag pattern), not just the operation type.
 - Is release/acquire enough to build a mutex from scratch? => The synchronization piece, yes; a real mutex additionally needs a way to block instead of spin (a futex or condition variable) so a waiter is not burning CPU -- release/acquire alone gives you correctness, not the blocking/wakeup mechanism (module 4 and 5's actual pthread_mutex_t/pthread_cond_t are built on exactly this kind of primitive plus a kernel wait/wake mechanism).
 PITFALL: Assuming "acquire" and "release" are properties of a memory location rather than of a specific operation on it. The same atomic_int can be stored to with release in one place and relaxed in another; only the release-ordered store participates in a synchronizes-with edge.
-VERIFY: C11, 5.1.2.4 paragraphs 5-6 and 11 (release/acquire, synchronizes-with) and 7.17.3 paragraphs 3-4 (which orderings apply to store vs load).
 
 @@ 7.06 | Intermediate | Debug | fig=memorder | tags=acquire-release,publish-pattern,compiled
 Q: Build the canonical "publish" pattern -- one thread writes ordinary data then a release-stores a ready flag, another spins on an acquire-load of that flag before reading the data -- and confirm the reader always sees the data.
@@ -123,11 +128,12 @@ static void *reader_thread(void *arg) {
 Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run, all 50000/50000 iterations printed the confirmation with no failure: `50000/50000 runs: reader always saw payload=42 after observing ready==1`.
 - This is the figure this module's diagram illustrates: a store-then-flag-set on one thread paired with a flag-check-then-load on the other is exactly what an acquire/release pair guarantees and nothing more -- it says nothing about any third thread, or about accesses to unrelated memory locations.
 - Replacing either the store or the load with memory_order_relaxed (7.17) removes this guarantee at the language level, even though it may not visibly fail on every platform (7.17 shows the same structure, relaxed, run the same number of times, with zero observed failures on this specific x86_64 machine -- a fact about this hardware's strong memory model, not a language guarantee).
+
+**C11 reference (checked against N1570):** 5.1.2.4 paragraph 11 and 7.17.3 paragraphs 3-4. Compiled and run: memorder_pub.c (50000/50000 pass).
 FOLLOW:
 - Why does the reader spin instead of blocking? => This demo is deliberately the raw building-block version; a real design would use this exact pattern only for very short waits, or wrap the flag in a condition-variable-style wait (module 5) once blocking instead of burning CPU matters.
 - Would `atomic_thread_fence` calls work instead of the release/acquire arguments on the store/load themselves? => Yes -- 7.09 builds the identical guarantee using a relaxed store/load plus explicit `atomic_thread_fence(memory_order_release)`/`atomic_thread_fence(memory_order_acquire)` calls, and it also showed zero failures over 50000 runs.
 PITFALL: Assuming any atomic flag check ("is it non-zero yet?") gives this guarantee regardless of the memory_order arguments used. Only when the store is release (or stronger) and the load that observes it is acquire (or stronger) does the plain-memory visibility follow; relaxed on either side breaks the guarantee at the standard level.
-VERIFY: C11, 5.1.2.4 paragraph 11 and 7.17.3 paragraphs 3-4. Compiled and run: memorder_pub.c (50000/50000 pass).
 
 @@ 7.07 | Intermediate | Cross-layer | tags=compiler-reorder,cpu-reorder,cache-coherence
 Q: How do compiler reordering, CPU reordering, and cache-coherence effects each separately threaten a multi-threaded program, and how does one atomic operation address all three at once?
@@ -137,11 +143,12 @@ DEEP:
 - CPU reordering is a separate, later-stage concern: even code the compiler emits in a fixed order can be reordered by an out-of-order CPU core's own pipeline, and different architectures reorder differently (x86-64 has a comparatively strong memory model that reorders far less than ARM or POWER, which is part of why some ordering bugs only ever show up on non-x86 hardware).
 - Cache coherence (e.g. MESI-family protocols) guarantees every core eventually agrees on a value, but "eventually" is the operative word without an explicit fence: a store on one core can take some real, non-zero time to become visible via cache-coherence traffic to another core reading the same line, which is a separate, physical-latency concern from either reordering issue.
 - A correctly-used memory_order_acquire/release pair is a single language-level instruction that compiles down to whatever combination of "do not reorder this across the optimizer" plus "emit the right hardware fence/barrier instruction" a given target actually needs -- on x86-64 that can be nearly free for acquire/release (7.19 measured release stores at about 2x a relaxed store's cost) but expensive for seq_cst (about 16-18x, since it needs a full MFENCE).
+
+**C11 reference (checked against N1570):** 5.1.2.4 (happens-before, the abstract machine's guarantees) and 7.17.3 NOTE 10 (atomic-to-atomic reordering prohibition). Architecture-specific reordering behavior (x86-64 vs ARM) is general computer-architecture knowledge, not itself specified by C11 or POSIX -- treat as VERIFY against the target architecture's own memory-ordering documentation.
 FOLLOW:
 - Does this mean weakly-ordered code that "works" on x86-64 is safe to ship? => No -- correctness has to be argued from the C11 abstract machine's guarantees, not from one architecture's stronger-than-required behavior; code relying on relaxed ordering to behave like acquire/release only "happens to work" on x86-64 and can break on ARM or with a more aggressive compiler (7.17's code-review question is built around exactly this trap).
 - Is a compiler ever allowed to reorder across an atomic operation with any ordering, including relaxed? => Not for other atomic accesses to the same object (7.17.3 NOTE 10 explicitly disallows compiler reordering of atomics to a single object, "effectively making the cache coherence guarantee... available to C atomic operations"), but relaxed provides no ordering guarantee at all relative to *other* memory locations or objects.
 PITFALL: Debugging a suspected ordering bug by only checking the generated assembly on one's own machine. A bug that is a genuine C11-level data race can be invisible on x86-64's strong memory model and still be a real, standard-violating bug that manifests on a different CPU architecture or after a compiler upgrade.
-VERIFY: C11, 5.1.2.4 (happens-before, the abstract machine's guarantees) and 7.17.3 NOTE 10 (atomic-to-atomic reordering prohibition). Architecture-specific reordering behavior (x86-64 vs ARM) is general computer-architecture knowledge, not itself specified by C11 or POSIX -- treat as VERIFY against the target architecture's own memory-ordering documentation.
 
 @@ 7.08 | Intermediate | Trap | tags=volatile,not-atomic,not-a-fence
 Q: Does declaring a shared counter `volatile` fix the lost-update race from an unsynchronized `counter++`?
@@ -160,11 +167,12 @@ Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run three times, it prin
 - This is the multi-threaded angle on the C Language page's qualifier module (see the C Language page, module 7): volatile's contract is about a single thread's interaction with a value that can change outside the compiler's model of that thread (a hardware register, a signal handler), never about cross-thread visibility ordering or the indivisibility of an operation.
 - The C11 standard itself only says a stdatomic.h operation's volatile-qualified variant "preserves" volatility "when applying these operations to volatile objects" (7.17.1 NOTE) -- volatile and atomic are entirely orthogonal properties that happen to be combinable, not substitutes for each other.
 - The fix for this exact program is either `atomic_long` with `atomic_fetch_add` (7.04 showed this holds exactly, every run) or a plain long protected by a mutex (module 4.05); volatile alone accomplishes neither atomicity nor ordering.
+
+**C11 reference (checked against N1570):** 7.17.1 NOTE (volatile-qualified atomic operations preserve volatility) and 6.7.3 (volatile's own semantics, C Language page module 7's territory). Compiled and run: volatile_no_help.c.
 FOLLOW:
 - Is there any threading-related problem volatile does correctly solve? => Essentially none on its own; even the classic "flag to stop a spin loop" idiom is better served by an atomic flag with acquire/release (7.06), since volatile does not guarantee the compiler emits any hardware fence a weaker-ordered CPU might need.
 - Why does volatile even seem to help sometimes in practice? => Because it does stop the compiler from caching the variable in a register across loop iterations in that one thread, which can accidentally mask a lost-update-by-compiler-optimization bug while leaving the genuine cross-thread race (interleaved hardware read-modify-write) fully intact -- exactly what this test shows.
 PITFALL: Reaching for `volatile` as a quick fix for a shared-variable threading bug because it "sounds like" the right keyword for something that changes unexpectedly. It solves a different, single-thread-facing problem; atomics or a lock are what threading correctness actually requires.
-VERIFY: C11, 7.17.1 NOTE (volatile-qualified atomic operations preserve volatility) and 6.7.3 (volatile's own semantics, C Language page module 7's territory). Compiled and run: volatile_no_help.c.
 
 @@ 7.09 | Intermediate | Concept | tags=fences,atomic-thread-fence,barriers
 Q: What does atomic_thread_fence() do, and when would you reach for one instead of putting the ordering directly on a load or store?
@@ -192,11 +200,12 @@ Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run for 50000 fresh writ
 - "A release fence A synchronizes with an acquire fence B if there exist atomic operations X and Y... such that A is sequenced before X, X modifies M, Y is sequenced before B, and Y reads the value written by X" -- the fence's ordering power still routes through some actual atomic operation (here, the relaxed store/load on `ready`); a fence with no atomic operation anywhere nearby orders nothing observable by another thread.
 - A fence is most useful when several plain writes need to be published together around a single relaxed atomic flag flip, or when a function needs to impose ordering without owning the specific atomic variable involved (a generic "commit barrier" helper called from several call sites).
 - `atomic_signal_fence()` is the same idea restricted to a thread and a signal handler running in that same thread -- it orders compiler-visible reordering the same way, but "the hardware fence instructions that atomic_thread_fence would have inserted are not emitted," since no other core's cache needs to be involved for a same-thread signal handler.
+
+**C11 reference (checked against N1570):** 7.17.4 Fences and 7.17.4.1 The atomic_thread_fence function. Compiled and run: fence_demo.c (0/50000 failures).
 FOLLOW:
 - Is a fence ever strictly necessary, or can the same guarantee always be gotten by putting release/acquire on the atomic operation directly? => For a single load/store, putting the ordering directly on that operation (7.06) is simpler and just as correct; fences earn their keep when one release/acquire needs to cover multiple relaxed atomics or when refactoring wants the ordering decision separated from the specific atomic call site.
 - Does a relaxed atomic operation with a fence next to it cost less than just using release/acquire directly? => Not meaningfully on most platforms -- the fence still has to emit the same hardware barrier the equivalent release/acquire operation would; the benefit is structural (one fence covering several operations), not typically a raw performance win over marking each operation itself.
 PITFALL: Adding a fence "near" the relevant atomic operation without confirming it is actually sequenced-before/after the correct one in program order. A misplaced fence -- one not adjacent to the specific atomic operation that carries the cross-thread edge -- silently orders nothing.
-VERIFY: C11, 7.17.4 Fences and 7.17.4.1 The atomic_thread_fence function. Compiled and run: fence_demo.c (0/50000 failures).
 
 @@ 7.10 | Advanced | Numeric | tags=false-sharing,cache-line,benchmark,compiled
 Q: Demonstrate false sharing with a real timed benchmark: two threads each bumping their own independent atomic counter, once packed into the same cache line, once padded apart.
@@ -247,11 +256,12 @@ Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run three times with 8 p
 - The key idiom is that a failed `compare_exchange` writes the *actual current* value back into its "expected" argument, so the retry's `n->next = head` (push) or `n = head` (pop) update is free -- the loop body does not need to re-load head manually before retrying.
 - Push uses release on success (publishing the new node and its `next` link to whichever thread's acquire-pop later observes it); pop uses acquire on success (so the popped node's own prior writes, and the list structure beyond it, are visible) -- this is the same release/acquire "publish" idea from 7.06, applied to a pointer-based structure instead of a flag.
 - This program never frees a node that is still reachable and never double-frees, but it is still vulnerable to the ABA problem (7.12) in general -- this specific test does not expose it because nothing recycles a freed node's memory address back into the same stack while another thread's CAS is still in flight, which is exactly the narrow window ABA depends on.
+
+**C11 reference (checked against N1570):** 7.17.7.4 (compare_exchange semantics, weak spurious-failure NOTE and EXAMPLE). Compiled and run: cas_stack.c (400000/400000 OK, three runs).
 FOLLOW:
 - Why compare_exchange_weak here instead of _strong? => This is precisely the loop shape 7.17.7.4's own example recommends weak for -- the operation is already inside a retry loop, so an occasional spurious failure just costs one extra iteration, and weak can be measurably cheaper to implement on load-linked/store-conditional architectures.
 - What happens under contention if many threads CAS the same head simultaneously? => Exactly one succeeds per round; every other thread's CAS fails, its "expected" is refreshed to the new actual head, and it retries -- this is normal, expected lock-free contention, not a bug, and the test's exact-match totals confirm no update was ever lost despite it.
 PITFALL: Reusing freed node memory (e.g. via a custom allocator or memory pool) without a reclamation scheme (hazard pointers, epoch-based reclamation) alongside a CAS-based structure like this. That reintroduces the ABA problem in a way plain malloc/free mostly avoids by luck, not guarantee.
-VERIFY: C11, 7.17.7.4 (compare_exchange semantics, weak spurious-failure NOTE and EXAMPLE). Compiled and run: cas_stack.c (400000/400000 OK, three runs).
 
 @@ 7.12 | Advanced | Trap | tags=aba,cas,pointer-reuse
 Q: What is the ABA problem, and why doesn't a plain compare-and-swap protect against it?
@@ -288,11 +298,12 @@ Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run three times, every r
 - `atomic_flag` is specifically "the minimum hardware-implemented type needed to conform" (7.17.8) -- its operations are required to be lock-free on every conforming implementation, unlike other atomic types where lock-free-ness is only queryable, not guaranteed (7.17.5's `atomic_is_lock_free`).
 - The acquire on test-and-set and release on clear are what make this a correct mutual-exclusion primitive and not just an atomic flag flip: acquire on the winning test-and-set ensures the critical section's reads/writes happen after the lock is actually held, and release on clear ensures they are visible to the next thread that wins the lock, exactly the same publish pattern as 7.06 applied to lock hand-off instead of a one-shot flag.
 - This is a real (if minimal) alternative to a pthread_mutex_t (module 4) for a very short critical section under low-to-moderate contention; unlike a pthread mutex, a spinlock never asks the kernel to block a losing thread, which wastes CPU under high contention or a long critical section -- exactly the tradeoff module 4's own mutex-vs-spinlock comparison covers.
+
+**C11 reference (checked against N1570):** 7.17.8 Atomic flag type and operations, 7.17.8.1/7.17.8.2 (test_and_set/clear semantics). Compiled and run: flag_spinlock.c (800000/800000 OK, three runs).
 FOLLOW:
 - Why not just use a `pthread_mutex_t` instead? => For most application code, a pthread mutex is the right default (module 4); a hand-rolled atomic_flag spinlock is worth it only when the critical section is extremely short and contention is low enough that avoiding a kernel block/wake round-trip actually matters, which needs measuring, not assuming.
 - Does this spinlock guarantee any fairness about which waiting thread wins next? => No -- nothing here tracks arrival order; whichever thread's test_and_set happens to execute first after the flag clears wins, which can in principle let one thread win repeatedly under the right (or wrong) scheduling, the same fairness gap module 8 covers for mutexes generally.
 PITFALL: Using a spinlock for a critical section that can block (I/O, a further lock acquisition, anything that can sleep). A spinning thread burns CPU the entire time; if the lock holder itself gets descheduled or blocks while holding it, every spinning waiter wastes cycles for the whole delay instead of yielding the CPU productively.
-VERIFY: C11, 7.17.8 Atomic flag type and operations, 7.17.8.1/7.17.8.2 (test_and_set/clear semantics). Compiled and run: flag_spinlock.c (800000/800000 OK, three runs).
 
 @@ 7.14 | Advanced | Concept | tags=seq-cst,total-order,strongest-ordering
 Q: What extra guarantee does memory_order_seq_cst provide beyond memory_order_acq_rel, and when does that extra guarantee actually matter?
@@ -302,11 +313,12 @@ DEEP:
 - With seq_cst, that scenario cannot happen: since every seq_cst operation across every atomic object sits in one agreed-upon global order S, if thread A's store to flagA precedes thread B's load of flagA in S, B's subsequent seq_cst load of flagB is also ordered after A's own seq_cst store to flagB, closing the loophole acq_rel leaves open.
 - This is also why seq_cst is the default for the non-`_explicit` functions (`atomic_load`, `atomic_fetch_add`, plain operators on atomic types): it is always a correct (if not always cheapest) choice, since anything acq_rel or weaker permits is also permitted under seq_cst, but not vice versa.
 - The cost is real and measured on this platform (7.19): an uncontended seq_cst store cost roughly 16-18x a relaxed store's cost on x86-64 (needing a full hardware fence), while acq_rel and relaxed read-modify-write operations showed no measurable difference from each other at all, since a LOCK-prefixed instruction is already a full fence on x86-64 regardless of the ordering requested.
+
+**C11 reference (checked against N1570):** 7.17.3 paragraph 6 (the seq_cst total order S) and paragraphs 9-11 (seq_cst fences' additional guarantees).
 FOLLOW:
 - If seq_cst is always correct, why not just use it everywhere and skip the whole ordering-choice question? => It is a legitimate, common default for code where performance is not the bottleneck; the reason weaker orderings exist at all is that 7.19's measured 16-18x store overhead is real money in a hot path (a lock-free queue's per-item cost, for example), so the choice is a genuine engineering tradeoff, not merely academic.
 - Does mixing seq_cst and relaxed operations on the *same* atomic object cause any problem? => Not by itself -- the modification order of a single object is still respected regardless of which orderings touched it; the subtlety seq_cst's total order S is about is coordinating operations across *different* atomic objects that acq_rel/release/acquire alone cannot.
 PITFALL: Assuming acq_rel on two independently-flagged "who got here first" variables gives the same cross-thread agreement seq_cst does. Acq_rel's guarantee is strictly pairwise (a specific release observed by a specific acquire); only seq_cst's single total order additionally coordinates unrelated atomic objects against each other.
-VERIFY: C11, 7.17.3 paragraph 6 (the seq_cst total order S) and paragraphs 9-11 (seq_cst fences' additional guarantees).
 
 @@ 7.15 | Advanced | Debug | tags=compare-exchange,weak-vs-strong,spurious-failure,compiled
 Q: Compare the retry counts of compare_exchange_weak versus compare_exchange_strong in the same CAS-increment loop, to see whether weak's documented "spurious failure" actually costs extra retries on this platform.
@@ -330,11 +342,12 @@ Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run three times (8 threa
 - "A weak compare-and-exchange operation may fail spuriously... even when the contents of memory... are equal" -- this is a permission the standard grants implementations, specifically to support "load-locked store-conditional" (LL/SC) architectures (common on ARM/POWER) where a strong guarantee would require extra instructions the hardware does not offer directly; x86-64's native CMPXCHG instruction has no such gap to fill, so glibc's weak and strong compile to essentially the same code there.
 - This is exactly the kind of platform-dependent result flagged elsewhere in this module (7.07): the standard permits spurious failure, it does not require observable spurious failure on every platform, and this run's near-identical retry counts are a fact about x86-64, not proof that weak is "just as good as strong everywhere."
 - 7.11's Treiber stack push/pop use weak specifically because both are already inside a retry loop by construction (per 7.17.7.4's own recommendation): "when a compare-and-exchange is in a loop, the weak version will yield better performance on some platforms" -- "some," not this one, specifically.
+
+**C11 reference (checked against N1570):** 7.17.7.4 paragraphs 4-6 (spurious failure NOTE and EXAMPLE). Compiled and run: weak_vs_strong.c (three runs, ranges above); platform-specific (this glibc/x86-64 build only).
 FOLLOW:
 - So is there ever a reason to prefer weak over strong on x86-64 specifically? => Marginal to none for this platform's CMPXCHG-based implementation; the real reason to default to weak inside a loop is portability to LL/SC architectures where it can matter, not a measured win here.
 - When should strong actually be preferred? => "When a weak compare-and-exchange would require a loop and a strong one would not, the strong one is preferable" (7.17.7.4 EXAMPLE) -- a single, non-looped compare-and-swap attempt (no retry logic at all) should use strong, since a spurious failure there would incorrectly abandon an operation that should have succeeded.
 PITFALL: Assuming weak's spurious-failure permission means it is measurably worse in general. On this platform it was not measurably different from strong; the real, portable reason to choose one over the other is whether the call site is already a retry loop, not an assumed performance difference.
-VERIFY: C11, 7.17.7.4 paragraphs 4-6 (spurious failure NOTE and EXAMPLE). Compiled and run: weak_vs_strong.c (three runs, ranges above); platform-specific (this glibc/x86-64 build only).
 
 @@ 7.16 | Principal | Scenario | tags=spsc,ring-buffer,lock-free,design,compiled
 Q: Design a lock-free single-producer/single-consumer ring buffer using only atomics, and confirm it under real sustained load that every item arrives exactly once and in order.
@@ -394,11 +407,12 @@ Compiled and run 50000 times back-to-back on this x86-64 machine, the relaxed ve
 3. **Reach for the tool built to catch this, understanding its limits.** ThreadSanitizer (`-fsanitize=thread`) is the standard tool for exactly this bug class -- but compiling this same relaxed-ordering program with `-fsanitize=thread` and running it did **not** flag the race either (7.18 covers why, and what that means for how much to trust a clean TSan run here).
 4. **Ask for the ordering that matches the intent, not the weakest one that happens to pass.** If the intent is "publish this data once, then signal it's ready," that is exactly release/acquire's contract (7.06); relaxed should only be chosen when there is truly no other memory that needs to be ordered alongside the atomic operation itself (7.04's pure-counter case).
 5. **Put the reasoning in the review comment, not just the request.** "Change memory_order_relaxed to release/acquire" without explaining that CI's silence is expected-but-meaningless for this specific bug class invites the same mistake again on the next PR.
+
+**C11 reference (checked against N1570):** 5.1.2.4 (data race = undefined behavior, independent of whether it is observed). Compiled and run: memorder_relaxed_bug.c (0/50000 observed failures on this x86-64 build -- the exact non-observation the pitfall warns against over-trusting).
 FOLLOW:
 - Could the author reasonably respond "then how would I ever know if I introduced this exact bug"? => By reasoning from the code's structure against the standard's rules (does this atomic operation's ordering match what the surrounding plain memory access needs), not from running the program, which is exactly why this class of review needs the same acquire/release vocabulary this module builds, not empirical testing.
 - Is there a build-time or static-analysis tool that would have caught this instead? => TSan is the closest widely-used dynamic tool and it missed this specific case (7.18); a static analyzer aware of C11 memory-order semantics is a more targeted answer than dynamic testing for this exact bug class, though this study guide did not have one available to verify against directly.
 PITFALL: Treating "ran clean in CI/testing" as evidence of correctness for a memory-ordering bug specifically. It is strong evidence for most other bug classes; for this one, a clean run on a strong-memory-model architecture is close to uninformative.
-VERIFY: C11, 5.1.2.4 (data race = undefined behavior, independent of whether it is observed). Compiled and run: memorder_relaxed_bug.c (0/50000 observed failures on this x86-64 build -- the exact non-observation the pitfall warns against over-trusting).
 
 @@ 7.18 | Principal | Cross-layer | tags=tooling,tsan,review-method,memory-order-decision
 Q: At a Principal level, what is the actual method for deciding what memory_order a given atomic operation needs, and what should you instrument or run to catch an under-synchronized one, given that 7.17 showed ThreadSanitizer can miss this exact bug class?

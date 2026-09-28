@@ -122,11 +122,11 @@ _Static_assert(sizeof(struct cmd_header) == 12, "cmd_header size");
 
 If a later edit changes the layout, the build fails instead of the device misreading commands.
 
+**C11 reference (checked against N1570):** 7.19p3, the `offsetof` macro's contract (undefined if the named member is a bit-field).
 FOLLOW:
 - Where exactly are the padding bytes in this layout? => One byte at offset 1 (before `nsid`), and three bytes at offsets 9-11 (after `flags`, to round the struct up to a multiple of its 4-byte alignment).
 - Would reordering the members to `opcode, flags, nsid, cdw2` change the total size? => Yes, it would shrink to 8 bytes: the two `uint8_t` fields pack together first, `nsid` then needs no padding to reach 2-byte alignment at offset 2, and `cdw2` lands exactly at offset 4 with nothing wasted.
 PITFALL: Computing a struct's wire size as the sum of its field sizes instead of measuring `sizeof` (or working out alignment-driven padding by hand).
-VERIFY: C11 7.19p3, the `offsetof` macro's contract (undefined if the named member is a bit-field).
 
 @@ 6.04 | Intermediate | Concept | tags=padding,reordering
 Q: Does reordering a struct's members ever change its size, and how do you order them to minimize padding?

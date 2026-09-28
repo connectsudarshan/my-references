@@ -14,11 +14,12 @@ DEEP:
 - **3.4.4, unspecified behavior:** "use of an unspecified value, or other behavior where this International Standard provides two or more possibilities and imposes no further requirements on which is chosen." The value exists and is one of the allowed choices; the program has not left defined territory.
 - **3.4.1, implementation-defined behavior:** "unspecified behavior where each implementation documents how the choice is made." The standard's own example is the propagation of the high-order bit when a signed integer is shifted right.
 - **Why the distinction matters for review:** unspecified and implementation-defined code is still portable in the sense that it always does *something* consistent for a given implementation; undefined behavior can differ between two calls in the same binary, or be removed entirely by the optimizer.
+
+**C11 reference (checked against N1570):** Clause numbers 3.4.1, 3.4.3, 3.4.4 in the C11 draft (N1570).
 FOLLOW:
 - Is a compiler required to document undefined behavior? => No. Only implementation-defined (and locale-specific, 3.4.2) behavior must be documented; undefined behavior has no documentation obligation at all.
 - Can undefined behavior produce output that looks completely correct? => Yes, and that is what makes it dangerous. A program with UB can pass every test on one compiler and version and fail only after a toolchain or optimization-level change.
 PITFALL: Treating "the compiler didn't warn" as proof the code is well-defined. Absence of a diagnostic says nothing; a diagnostic is never required for undefined behavior.
-VERIFY: Clause numbers 3.4.1, 3.4.3, 3.4.4 in the C11 draft (N1570).
 
 @@ 10.02 | Basic | Concept | tags=warall,wextra,static-analysis,limits
 Q: Why does code full of undefined behavior often compile cleanly with -Wall -Wextra?
@@ -58,11 +59,12 @@ q03.c:4:7: warning: operation on 'i' may be undefined [-Wsequence-point]
 - **Why `i++` alone is fine but `i = i++` is not:** `i++` by itself has one side effect on `i` and no competing value computation or side effect on the same object in the same full expression. `i = i++` adds the assignment's write to the same object, and nothing in the grammar sequences the two.
 - **A related but different case:** `i = i + 1;` has no such problem, because there is exactly one write to `i` (the assignment) and the read of `i` on the right-hand side is a value computation, not a second side effect, and it is sequenced before the assignment by 6.5.16p3.
 - **-Wall caught this one because the pattern is syntactic** (an object modified and used again with no separator), which is exactly the class of UB static analysis is good at, per the previous question.
+
+**C11 reference (checked against N1570):** 6.5p2 and p3 (N1570) for the unsequenced-side-effect wording that replaced the older "sequence point" terminology.
 FOLLOW:
 - Is `a[i] = i++;` undefined for the same reason? => Yes, if `a[i]` and `i++` both touch `i` with no sequencing between the value computation used for the index and the side effect of the increment, the behavior is undefined; some concrete cases here are unspecified rather than undefined depending on exact wording, so treat any such expression as suspect and split it into statements.
 - Does splitting into two statements fix it? => Yes: `int t = i; i = t + 1;` or simply `i++;` on its own line has one full expression per side effect, which removes the ambiguity entirely.
 PITFALL: Assuming the printed value (`5` here) reveals the "real" rule. It is one observed result on one compiler and flag set, not a guarantee; a different compiler, version, or optimization level is free to print something else.
-VERIFY: C11 6.5p2 and p3 (N1570) for the unsequenced-side-effect wording that replaced the older "sequence point" terminology.
 
 @@ 10.04 | Intermediate | Numeric | tags=signed-overflow,ubsan,int-max
 Q: What actually happens when a signed int overflows, and what does -fsanitize=undefined report?
@@ -90,11 +92,12 @@ q04.c:5:9: runtime error: signed integer overflow: 2147483647 + 1 cannot be repr
 3. This is why `INT_MAX + 1` is the canonical textbook example of undefined behavior: 3.4.3's own example text names "the behavior on integer overflow."
 - **Why unsigned does not have this problem:** unsigned arithmetic is defined to wrap via 6.3.1.3p2 (modulo 2^n), covered in the next question, so there is nothing for UBSan to report there.
 - **Build cost:** `-fsanitize=undefined` adds a runtime check around arithmetic, shifts, array indexing with a statically known bound, null and misaligned-pointer use, and more; it is cheap enough to run in CI and in debug or test builds, though not typically shipped in a release firmware image due to code size and timing impact.
+
+**C11 reference (checked against N1570):** 6.5p5 (exceptional condition during expression evaluation is undefined) and 3.4.3 EXAMPLE (integer overflow named as undefined behavior).
 FOLLOW:
 - Does -fsanitize=undefined stop the program by default? => No, by default it prints the diagnostic to stderr and continues; `-fsanitize=undefined -fno-sanitize-recover=all` (or setting `UBSAN_OPTIONS=halt_on_error=1`) makes it abort on the first violation instead.
 - Would `unsigned int b = a + 1;` with `a` still an `int` at INT_MAX avoid the problem? => No, the addition `a + 1` is still performed in `int` before any conversion to `unsigned int` happens, since `1` is an `int` constant and the usual arithmetic conversions do not apply until both operands' types are compared; the overflow already occurred.
 PITFALL: Reporting the wrapped value as "the" behavior of signed overflow in a design document or test oracle. Only unsigned wraparound is a documented, reproducible contract; the signed case is not.
-VERIFY: C11 6.5p5 (exceptional condition during expression evaluation is undefined) and 3.4.3 EXAMPLE (integer overflow named as undefined behavior).
 
 @@ 10.05 | Intermediate | Concept | tags=unsigned-wraparound,modulo,defined
 Q: Why is unsigned integer overflow well-defined while signed integer overflow is undefined?
@@ -114,11 +117,12 @@ Compiled with `gcc -std=c11 -Wall -Wextra` (no warning) and run: prints `4294967
 - **Signed types have no such fallback rule.** 6.2.6.2p2 leaves the actual bit-level representation (two's complement, ones' complement, or sign-magnitude) implementation-defined, so the standard cannot also promise a specific wraparound value for overflow without picking a representation; instead it simply declines to define the outcome (6.5p5).
 - **Practical consequence for firmware counters:** a free-running unsigned tick counter or CRC accumulator that wraps is relying on defined, portable behavior. The same code written with a signed counter is relying on undefined behavior even if two's complement wraparound is what every real target does in practice.
 - **Do not use this as license to ignore unsigned wraparound:** it is defined, but a counter silently wrapping from `UINT_MAX` to `0` can still be a logic bug (for example a size or length computation going negative-then-huge); "defined" is not the same as "correct."
+
+**C11 reference (checked against N1570):** 6.3.1.3p2 (conversion to unsigned type) and 6.2.6.2p2 (implementation-defined signed representation).
 FOLLOW:
 - Does casting a signed value to unsigned before the operation make an otherwise-overflowing computation defined? => Yes, if the addition or subtraction itself happens on the unsigned operands, since then 6.3.1.3p2's wraparound rule governs the whole computation; converting only the final result back to signed afterward does not retroactively fix a signed overflow that already happened earlier.
 - Is `size_t` subtraction that goes negative the same kind of bug? => It is the same wraparound mechanism (well-defined, huge positive result) but frequently the root cause of buffer-overrun bugs, since the huge value is then used as a length or offset.
 PITFALL: Assuming "no crash and no sanitizer warning" for an unsigned computation means the logic is correct. It only means the bit pattern followed the modulo rule, not that the resulting value made sense.
-VERIFY: C11 6.3.1.3p2 (conversion to unsigned type) and 6.2.6.2p2 (implementation-defined signed representation).
 
 @@ 10.06 | Intermediate | Concept | tags=strict-aliasing,effective-type,type-punning
 Q: What is the strict aliasing rule, and why does naive type punning through a pointer cast violate it?
@@ -137,11 +141,12 @@ Compiled with `gcc -std=c11 -Wall -Wextra`: no diagnostic, prints `1069547520`, 
 - **Why the character-type exception exists:** 6.5p7 explicitly allows access through a character type, which is why `unsigned char *` is the one universally safe way to inspect an object's bytes (used for the endianness check in Module 11) without violating effective type.
 - **The standard-conforming ways to reinterpret bits:** `memcpy` into an object of the target type (copies bytes, no aliasing violation, and every real compiler optimizes a small fixed-size `memcpy` into the same load/store the pointer cast would have produced), or a `union` of the two types (C11 explicitly permits reading a different union member than was last written as an implementation-defined "extension" many implementations document; only `memcpy` is unconditionally portable).
 - **Why this bites at -O2 and not -O0:** the whole reason a compiler is allowed to assume no aliasing between differently-typed pointers is so it can keep values in registers and skip reloading from memory across such accesses; at low optimization it usually reloads from memory every time anyway, so the visible bug often appears only after turning optimization on, which is exactly backwards from where most people go looking for it.
+
+**C11 reference (checked against N1570):** 6.5p6 and p7 (effective type and the list of allowable accessing lvalue types), footnote 88.
 FOLLOW:
 - Is casting `int *` to `unsigned char *` and reading bytes also a violation? => No, that direction is explicitly permitted by 6.5p7's character-type exception; it is writing through an incompatible non-character type, or reading a non-character-typed object through such a pointer, that violates the rule.
 - Does `-fno-strict-aliasing` make this code correct? => It makes gcc stop optimizing on the aliasing assumption, so the specific miscompile risk goes away on that compiler, but the code is still not standard-conforming C, and it will not be portably safe on a different compiler or a future gcc release.
 PITFALL: "It worked when I tested it" for a type-punning cast. The failure mode is a silent miscompile under specific optimizations, not a crash, so ad hoc testing is close to useless for catching it.
-VERIFY: C11 6.5p6 and p7 (effective type and the list of allowable accessing lvalue types), footnote 88.
 
 @@ 10.07 | Intermediate | Concept | tags=pointer-arithmetic,out-of-bounds,one-past-the-end
 Q: How far can a pointer legally move past the end of an array, and where does it become undefined?
@@ -161,11 +166,12 @@ Compiled with `gcc -std=c11 -Wall -Wextra`: no warning, prints `4`. `arr + 4` is
 - **Pointer subtraction has the matching rule (6.5.6p9):** both pointers must point into the same array object (or one past its end); subtracting pointers into two unrelated arrays is undefined even if the subtraction "looks like" it produces a plausible number.
 - **Why this matters for loop idioms:** `for (int *p = arr; p != arr + n; p++)` is standard-conforming precisely because the loop never dereferences `arr + n`, only compares against it; the moment code writes `for (int *p = arr; p <= arr + n; p++) use(*p);` it dereferences one past the end on the last iteration, which is undefined.
 - **A common firmware variant:** iterating a ring buffer or descriptor table by pointer and "just going one more" to peek at the next unused slot is only safe if that slot exists as part of the same array object; going past the allocation entirely (for example reading one struct past a `malloc`'d array) is the same class of bug as this one, and neither -Wall nor -Wextra reliably detects it.
+
+**C11 reference (checked against N1570):** 6.5.6p8 (additive operators, pointer bounds) and p9 (pointer subtraction).
 FOLLOW:
 - Is `arr + 4` usable as a sentinel to compare against in a loop condition? => Yes, that is exactly the standard idiom the rule was written to support; computing and comparing the one-past-the-end pointer is well-defined, only dereferencing it is not.
 - Would `int *p = arr - 1;` ever be legal? => No, that is one before the first element, which is outside the "elements of the array object, or one past the last element" range in 6.5.6p8, so even computing it is undefined, unlike the one-past-the-end case.
 PITFALL: Assuming "the pointer arithmetic compiled and the address looked reasonable" proves it is in range. 6.5.6p8's overflow clause applies to the abstract array object, not to whatever the underlying memory layout happens to allow.
-VERIFY: C11 6.5.6p8 (additive operators, pointer bounds) and p9 (pointer subtraction).
 
 @@ 10.08 | Intermediate | Trap | tags=null-check,dead-code-elimination,dereference-before-check
 Q: Why is checking a pointer for NULL after already dereferencing it dangerous, beyond the obvious crash risk?
@@ -280,11 +286,12 @@ Running it printed `pos`. Under `-fsanitize=undefined` it also ran silently and 
 - **Two distinct standard hooks, easy to conflate:** 6.3.2.1p2 is about *never having given the object a value at all*; 6.2.6.1p5's trap representation is about the bits present (from whatever leftover memory happened to be there) not forming a valid value of the type at all, for example a `_Bool` byte holding something other than 0 or 1 on an implementation that traps on it. Ordinary `int` on common platforms has no trap representations, so the first clause, plain "unspecified-turned-undefined by use," is the one actually in play for `int x;` here; padding-heavy or `_Bool`-like types are where the second clause bites.
 - **"Indeterminate value" is the standard's term** (an unspecified value or a trap representation), and 6.3.2.1p2 is explicit that using it is undefined, not merely unspecified, precisely because it might be a trap representation.
 - **Static analysis (here, -Wuninitialized) is decent at exactly this pattern** because "declared, then read on some path with no intervening write" is a data-flow property the compiler already computes for other reasons; it is one of the more reliable UB warnings available.
+
+**C11 reference (checked against N1570):** 6.3.2.1p2 (indeterminate value on automatic storage) and 6.2.6.1p5 (trap representations).
 FOLLOW:
 - Does zero-initializing static or global variables avoid this? => Yes, objects with static storage duration are zero-initialized by default (6.7.9p10) if not explicitly initialized, so this specific issue is purely about automatic (stack) storage.
 - Would `int x = 0;` at the top instead of a later conditional assignment always be safer style? => Generally yes for exactly this reason; default-initializing removes an entire category of undefined behavior for negligible cost, at the price of occasionally masking a "forgot to set this" logic bug that a warning would otherwise have caught.
 PITFALL: Assuming an uninitialized read is merely "some garbage value" that is annoying but safe to reason about. The standard allows it to be a trap representation, which can be undefined the instant it is read, not just imprecise.
-VERIFY: C11 6.3.2.1p2 (indeterminate value on automatic storage) and 6.2.6.1p5 (trap representations).
 
 @@ 10.12 | Advanced | Scenario | tags=works-on-my-machine,portability,review
 Q: A teammate says "this pointer-arithmetic trick works fine on our target, so it is not really a bug." How do you separate a real implementation-defined guarantee from an accidental one before signing off?
@@ -325,11 +332,12 @@ Compiled with `gcc -std=c11 -Wall -Wextra` and run: `signed >>2 = -4`, `unsigned
 
 - **Why "implementation-defined" is still useful information:** unlike undefined behavior, each of these has one fixed, documented answer for a given compiler and target, so code that depends on "arithmetic right shift" is non-portable but not unsafe on a toolchain where that is the documented choice; the risk is entirely in porting to a different one, not in the current build misbehaving.
 - **C17/C23:** the core wording for these clauses is essentially unchanged from C11; C23 does add a normative requirement that signed integers be two's complement (removing the other two historical choices as conforming options going forward), which turns 6.2.6.2p2's implementation-defined list into a fixed rule for any C23-conforming implementation.
+
+**C11 reference (checked against N1570):** 6.5.7p5 (shift semantics), 6.2.6.2p2 (signed representation choices), 6.3.1.3p3 (out-of-range signed conversion).
 FOLLOW:
 - Is `-8 >> 1` guaranteed to equal `-4` on every C11 implementation? => No; it is guaranteed to be one implementation-defined value chosen and documented by that vendor, and arithmetic shift (giving `-4`) merely happens to be what essentially every mainstream implementation documents, gcc and clang included.
 - Does implementation-defined behavior ever get caught by -fsanitize=undefined? => No; by definition it is not undefined behavior, so UBSan has nothing to report there, which is exactly why the earlier question's table showed a clean UBSan run for the signed-shift line.
 PITFALL: Calling every "surprising but consistent" result implementation-defined without checking the actual clause. Some surprising-but-consistent results (like the earlier `x + 1 > x` fold) are undefined behavior that merely happened to be stable on one build, not a documented guarantee.
-VERIFY: C11 6.5.7p5 (shift semantics), 6.2.6.2p2 (signed representation choices), 6.3.1.3p3 (out-of-range signed conversion).
 
 @@ 10.14 | Advanced | Trap | tags=pointer-comparison,relational,different-objects
 Q: Is comparing two pointers into unrelated arrays with `<` well-defined, if the comparison compiles and runs without crashing?
@@ -340,11 +348,12 @@ DEEP:
 - **Why `==` is different and safe:** 6.5.9 defines pointer equality unconditionally (they compare equal exactly when they point to the same object, or are both null, or one is one-past-the-end matching the other under the rule in 6.5.6p9); there is no "unrelated objects" exception the way there is for the ordering operators.
 - **Where this actually bites in real code:** a bounds check like `if (ptr >= buffer_a && ptr < buffer_a + len)` is fine (same array), but code that tries to establish a total order between two independently allocated buffers, or between a stack variable's address and a heap pointer, to decide "which one is higher in memory" is relying on undefined behavior, not a portable layout fact.
 - **The standard-conforming alternative** when a total order across unrelated objects is actually needed (rare, and usually a sign the design should not need it) is to convert both pointers to `uintptr_t` (7.20.1.4) first; the pointer-to-integer conversion itself is implementation-defined but at least well-defined enough to compare as integers, unlike the raw pointer comparison.
+
+**C11 reference (checked against N1570):** 6.5.8p5 (relational operators, pointer comparison rules) and 6.5.9 (equality operators).
 FOLLOW:
 - Is subtracting (not comparing) two pointers into different arrays any better? => No, it is the matching undefined case in 6.5.6p9, for the same reason: the standard only defines pointer subtraction within one array object.
 - Does this affect qsort-style comparators, which receive pointers into elements of the same array being sorted? => No, that is exactly the safe case (same array object), which is why qsort comparators comparing `*(const int *)a` against `*(const int *)b` (comparing the pointed-to values, not the addresses) or even the addresses themselves within one array are both fine.
 PITFALL: Trusting that "it returned 0 or 1 consistently across many test runs" proves the comparison is defined. Consistency under one build's memory layout is not the same as a standard guarantee.
-VERIFY: C11 6.5.8p5 (relational operators, pointer comparison rules) and 6.5.9 (equality operators).
 
 @@ 10.15 | Principal | Cross-layer | tags=optimizer,overflow-assumption,x-plus-one
 Q: A junior engineer is confused that `if (x + 1 > x) return 1;` returned `1` even when called with `x == INT_MAX`, where `x + 1` overflows. Walk through why, and what it reveals about how optimizers use undefined behavior.
@@ -374,11 +383,12 @@ check:
 3. **The mental model to replace:** "the compiler will do the two's-complement thing I expect" is only true for unsigned types, which have a defined wraparound (6.3.1.3p2). For signed types, the correct mental model is "the compiler is allowed to assume this line of code, as written, never overflows," and will use that assumption anywhere it helps, including deleting the very check meant to catch the overflow.
 4. **The fix**, if overflow must be detected rather than assumed away, is to check before the addition using the type's limits (`if (x == INT_MAX) return 0; return 1;` here), or to perform the arithmetic in a wider or unsigned type and then range-check the result, never to test for overflow after the fact on the signed operation itself.
 - **Interview framing:** this example (or the closely related infinite-loop-from-overflow-assumption story) is the standard way interviewers probe whether a candidate understands that "undefined behavior" is not a synonym for "probably fine in practice," but an active license the optimizer is written to exploit.
+
+**C11 reference (checked against N1570):** 6.5p5 (undefined on overflow) and 6.3.1.3p2 (defined unsigned wraparound), to confirm the asymmetry that makes this fold legal only for the signed version.
 FOLLOW:
 - Would `unsigned int check_u(unsigned int x) { return (x + 1 > x); }` behave the same way at `x == UINT_MAX`? => No, and that is the whole point of the contrast: unsigned wraparound is defined (6.3.1.3p2), so `UINT_MAX + 1` really is `0`, `0 > UINT_MAX` is false, and the function correctly returns `0`; the compiler cannot fold this one to a constant because the false case is a real, reachable outcome.
 - Is this specific to gcc, or would clang do the same fold? => The standard permits any conforming compiler to perform this fold, since it follows directly from signed overflow being undefined; which specific compilers actually implement it, and at which point in their pipeline, is a toolchain fact, not a language one, so always verify on the actual compiler in use rather than assuming.
 PITFALL: Debugging this by staring at the "wrong" runtime value and looking for a hardware or memory-corruption explanation. The value is not wrong by any hardware fault; the whole comparison was removed at compile time.
-VERIFY: C11 6.5p5 (undefined on overflow) and 6.3.1.3p2 (defined unsigned wraparound), to confirm the asymmetry that makes this fold legal only for the signed version.
 
 @@ 10.16 | Principal | Scenario | tags=firmware-review,checklist,ub-audit
 Q: You are reviewing a firmware driver's C file for undefined behavior before a safety-relevant release. What is your concrete method, beyond "read it carefully"?

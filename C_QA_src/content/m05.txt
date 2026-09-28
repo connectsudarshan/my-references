@@ -110,11 +110,12 @@ int main(void) {
 }
 ```
 Compiled with `gcc -std=c11 -Wall -Wextra` (it accepted this without a warning, since writing through a non-`const` `char *` to a literal is legal C syntax even though it is semantically undefined). Running it: `lit1 == lit2` printed `1` on this toolchain (GCC folded the two identical literals into one object), the write to `arr` succeeded and printed `Hello`, and the write through `lit1` segfaulted immediately, because glibc places string literal data in a read-only section. The standard only promises this is undefined, not that it crashes; another toolchain could silently corrupt a shared literal instead.
+
+**C11 reference (checked against N1570):** 6.4.5p6-7 (string literal storage and sharing) and J.5.5 (writable string literals as a common extension, not standard behavior).
 FOLLOW:
 - Should you declare string literal pointers as `const char *`? => Yes; that lets the compiler reject an accidental write at compile time instead of leaving it as a silent runtime UB trap.
 - Does every C implementation share identical literals the way this one did? => No, C11 6.4.5p7 leaves that unspecified; some implementations give every literal its own storage even when the contents are identical.
 PITFALL: Passing a string literal to a function that the caller expects to modify in place (a "sanitize this buffer" style API) instead of a real writable array.
-VERIFY: C11 6.4.5p6-7 (string literal storage and sharing) and J.5.5 (writable string literals as a common extension, not standard behavior).
 
 @@ 5.05 | Intermediate | Concept | tags=null-terminator,off-by-one
 Q: `char src[] = "firmware"` is 8 characters. Why does `char dst[8]; strcpy(dst, src);` overflow `dst`?

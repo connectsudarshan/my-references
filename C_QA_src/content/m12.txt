@@ -20,11 +20,12 @@ Compiled with `gcc -std=c11 -Wall -Wextra`, prints `7` twice, confirming both ca
 - **Why `fp(3, 4)` and `(*fp)(3, 4)` are both valid:** calling through a function pointer implicitly dereferences it either way; the explicit `*` form is the more literal reading (dereference to get the function, then call it) and the bare form relies on the function-call operator accepting a function pointer directly, which C has always permitted for readability.
 - **The same decay rule explains why `&add` also works** as an initializer: `&` applied to a function designator explicitly takes its address, producing the identical pointer value that the automatic decay would have produced anyway, so `fp = &add;` and `fp = add;` are equivalent, and most style guides pick one and use it consistently.
 - **Typedef makes this far more readable in practice**, and the next question in this module introduces that idiom directly, since raw function-pointer declarator syntax gets unwieldy quickly with more parameters or a more complex return type.
+
+**C11 reference (checked against N1570):** 6.3.2.1p4 (function designator to function pointer conversion).
 FOLLOW:
 - Is int (*fp)(int, int) the same type as int (*fp)(int a, int b)? => Yes, parameter names in a function pointer's type are purely documentation and do not affect the type; only the parameter types and count (and the return type) matter for compatibility.
 - What happens if fp is called before being assigned a function? => Calling through an uninitialized function pointer is undefined behavior (it holds an indeterminate value, Module 10), which is why declaring it with an initializer, or checking against NULL before the first call, is the safer pattern shown later in this module.
 PITFALL: Writing `int *fp(int, int)` when a function pointer was intended. Without the parentheses around `*fp`, this instead declares a function returning `int *`, a easy typo with a completely different meaning.
-VERIFY: C11 6.3.2.1p4 (function designator to function pointer conversion).
 
 @@ 12.02 | Basic | Concept | tags=typedef,callback,binop
 Q: Why is a typedef almost always used for function pointer types, and how does a simple callback parameter look with one?
@@ -74,11 +75,12 @@ Compiled with `gcc -std=c11 -Wall -Wextra`, prints `sizeof(fp)=8 sizeof(dp)=8` o
 - **Where this actually differs in practice:** some Harvard-architecture microcontrollers and a few historical platforms (older segmented x86 real-mode code, for instance) have code and data living in address spaces with different widths or addressing schemes, making function and data pointers different sizes; this is rare in modern general-purpose targets but real on some embedded cores.
 - **Practical consequence for portable code:** never assume a function pointer fits where a `void *` is expected, or vice versa; POSIX's `dlsym` (covered later in this module) is the well-known case where a POSIX extension has to work around exactly this incompatibility, since ISO C itself does not define converting between function pointers and object pointers at all.
 - **`void *` specifically cannot portably hold a function pointer:** 6.3.2.3's void-pointer conversion rules are stated in terms of "any object type," and a function type is explicitly not an object type (6.2.5p2 distinguishes them), so casting a function pointer through `void *` and back is not something C11 guarantees to work, even though POSIX requires exactly this to work for its own APIs on POSIX systems.
+
+**C11 reference (checked against N1570):** 6.2.5 (object pointer types vs. function pointer types as distinct categories) and 6.3.2.3 (pointer conversions, which are stated in terms of object types for void *).
 FOLLOW:
 - Can a function pointer be safely stored in a void*? => Not portably in ISO C; POSIX systems require it to work for POSIX API compatibility, but standard C makes no such guarantee, which is exactly the caveat covered in the Advanced Trap question on dlsym later in this module.
 - Does this affect how function pointers are used in a vtable struct? => No; a struct of function-pointer members (the vtable pattern later in this module) works uniformly regardless of the exact size, since the struct layout rules apply to whatever size the platform's function pointers actually are.
 PITFALL: Assuming `sizeof(void *) == sizeof(some_func_ptr)` is a language guarantee rather than a common but non-universal platform fact.
-VERIFY: C11 6.2.5 (object pointer types vs. function pointer types as distinct categories) and 6.3.2.3 (pointer conversions, which are stated in terms of object types for void *).
 
 @@ 12.04 | Intermediate | Concept | tags=dispatch-table,array-of-function-pointers
 Q: How does an array of function pointers implement a dispatch table, and why is this the core mechanism behind most "C is not object-oriented but acts like it" tricks?
@@ -134,11 +136,12 @@ Compiled with `gcc -std=c11 -Wall -Wextra`, prints `1 2 3 5 8 9`.
 - **Why the parameters are `const void *`, not `const int *`:** qsort's own prototype (7.22.5.2) is generic over any element type, so it must accept a pointer type that can point to anything; the comparator's job is to know the real element type and cast back to it, which is exactly the same "type-erased callback" idea underlying the `void *` context parameter pattern covered later in this module.
 - **The comparator's contract, precisely:** return a value less than, equal to, or greater than zero depending on whether the first argument is considered less than, equal to, or greater than the second (7.22.5.2p2); qsort relies on this contract holding consistently for every pair it compares, and a comparator that violates it (inconsistent ordering) produces an unspecified, not merely wrong, final order.
 - **This is precisely the pattern behind signal handlers too** (`void (*)(int)`, covered in the next question): a standard library function accepts a function pointer with a fixed signature and calls back into caller-supplied code at a moment the library, not the caller, controls.
+
+**C11 reference (checked against N1570):** 7.22.5.2 (the qsort function's parameter types and comparator contract).
 FOLLOW:
 - Would cmp_int work correctly if compiled to compare doubles by just changing the cast? => No, both the cast type and the dereferenced type need to change together (const double *, and comparing double values), and mixing them (casting to double * but the array is actually int) would be undefined behavior from an incompatible-type access, the same class of bug as Module 10's strict-aliasing question.
 - Is qsort guaranteed to be stable (preserve the relative order of equal elements)? => No, C11 makes no stability guarantee for qsort; if stable sorting is required, a different algorithm implementation, or a comparator that breaks ties using a secondary stable key such as original index, is needed.
 PITFALL: Writing a comparator that returns `a - b` directly for integer or pointer-derived values. It is both potentially undefined (signed overflow) and, for pointer subtraction between unrelated objects, doubly so per Module 10.
-VERIFY: C11 7.22.5.2 (the qsort function's parameter types and comparator contract).
 
 @@ 12.06 | Intermediate | Concept | tags=signal-handler,callback,forward-reference
 Q: How is a signal handler an example of the same function-pointer callback pattern as qsort's comparator?
@@ -168,11 +171,12 @@ Compiled with `gcc -std=c11 -Wall -Wextra`, prints `got_signal=1`: `raise(SIGINT
 - **Why `got_signal` is `volatile sig_atomic_t`, not a plain `int`:** a signal handler can run at a point the compiler cannot fully predict relative to `main`'s ordinary flow, so the shared flag needs `volatile` for the same single-threaded "do not cache or reorder this access" reason Module 7 covers for hardware registers, and `sig_atomic_t` specifically because C11 guarantees reading or writing an object of that type cannot itself be interrupted into an inconsistent state by a signal.
 - **What a signal handler must never do**, briefly: call most standard library functions (only a short async-signal-safe list is permitted, 7.14.1.1p5), including `printf`, because the handler can run mid-way through library state the handler itself might reenter; this reentrancy and signal-handler-safety topic is covered fully on the C Advanced page (thread and signal-handler safety), and this module only notes the function-pointer mechanism, not the full safety rules.
 - **The forward reference from Module 7 is the same qualifier**, `volatile`, used here for a different reason than a hardware register: both cases need "every access is observable, no compiler-assumed caching," just triggered by different sources (an interrupt/signal versus a memory-mapped device).
+
+**C11 reference (checked against N1570):** 7.14.1.1 (signal function and its restrictions) and 7.14.2.1 (raise); reentrancy and async-signal-safety in depth is POSIX.1-2017 territory, covered on the C Advanced page.
 FOLLOW:
 - Could handler safely call printf from inside a real interrupt-like signal delivery? => Not safely in general; printf is not on the async-signal-safe function list, and calling it from a handler risks corrupting library state if the signal happens to arrive while the program was already inside a related library call.
 - Is raise(SIGINT) here run on a separate thread or context? => No; raise delivers the signal synchronously within the calling thread, which is why this single-threaded example can rely on got_signal being set before printf runs, without any actual concurrency involved.
 PITFALL: Writing signal-handler logic that assumes normal library functions are always safe to call, because "it worked in this simple test." Reentrancy issues are asynchronous, timing-dependent, and usually invisible until a rare, ill-timed real signal.
-VERIFY: C11 7.14.1.1 (signal function and its restrictions) and 7.14.2.1 (raise); reentrancy and async-signal-safety in depth is POSIX.1-2017 territory, covered on the C Advanced page.
 
 @@ 12.07 | Intermediate | Trap | tags=incompatible-function-pointer,ub,cast
 Q: Casting a function pointer to an incompatible function pointer type and calling through it compiled and ran without error here. Is that safe?
@@ -193,11 +197,12 @@ Compiled with `gcc -std=c11 -Wall -Wextra`, prints `7`, and separately tested wi
 - **Where this becomes a genuine bug, not just a curiosity:** calling *without* casting back correctly, for example treating any function pointer as `void (*)(void)` and invoking it directly through that type (common in a naive plugin loader that stores every callback as a generic pointer type and calls it without restoring the real signature first), is calling through an incompatible type, squarely inside 6.3.2.3p8's undefined case.
 - **Real-world consequence on some ABIs:** calling convention details (which registers or stack slots hold which arguments, how the return value is passed) are determined by the function's actual signature; calling through a pointer typed with a different signature can pass arguments in the wrong place entirely, which is why this is not merely a "type system technicality" but a genuine risk of reading garbage arguments or a garbage return value on a real target, even though this particular x86-64 example happened to work.
 - **`dlsym`'s well-known real-world version of this exact problem** (converting a `void *` returned by `dlsym` into a specific function pointer type) is covered as its own Advanced Trap question later in this module.
+
+**C11 reference (checked against N1570):** 6.3.2.3p8 (function pointer conversion and the incompatible-type call being undefined); confirmed that gcc's -fsanitize=undefined does not flag this case on this toolchain, unlike clang's separate -fsanitize=function.
 FOLLOW:
 - Would this be caught by -Wall -Wextra? => No, gcc issued no warning for this cast sequence in this build; some `-Wcast-function-type`-style warnings exist on modern gcc for certain incompatible function-pointer casts, but coverage is inconsistent across compilers and cast shapes, so do not rely on a warning to catch this category.
 - Is casting a function pointer through void * (not another function pointer type) any better? => It is a separate, additional problem: ISO C does not guarantee function pointers survive a round trip through void * at all (per the earlier sizeof question), so that path has its own undefined-behavior risk on top of the incompatible-call issue.
 PITFALL: Treating "it compiled, ran, and printed the right number" as proof this pattern is fine to use in production. Both the cast and the call are undefined behavior per 6.3.2.3p8, regardless of what one specific build happened to output.
-VERIFY: C11 6.3.2.3p8 (function pointer conversion and the incompatible-type call being undefined); confirmed that gcc's -fsanitize=undefined does not flag this case on this toolchain, unlike clang's separate -fsanitize=function.
 
 @@ 12.08 | Intermediate | Concept | fig=vtable | tags=struct-of-function-pointers,interface,vtable
 Q: How does a struct of function pointers emulate an interface or virtual method table in C, dispatching to two different implementations through the same call sites?
@@ -240,11 +245,12 @@ Compiled with `gcc -std=c11 -Wall -Wextra`, prints `mem read=42` and `log calls=
 3. **Why this is "C-style polymorphism," not just callbacks:** a single callback (Module 12's qsort example) is one function pointer for one operation; a vtable groups several related operations behind one shared interface type, which is the structural difference between "pass a callback" and "implement an interface."
 4. **Real-world instances of exactly this pattern:** a device driver framework's per-device operation table (`read`/`write`/`ioctl`), a Linux kernel `file_operations` struct, and any plugin system that hands the host program a struct of function pointers to call into, all use this identical shape.
 - **What this pattern does not give you for free**, unlike C++ virtual dispatch: no compiler-enforced type safety tying a `ctx` pointer to the vtable it is used with, and no automatic vtable selection from an object's declared type; both are the caller's discipline to maintain, which is exactly what the design-review question later in this module is about.
+
+**C11 reference (checked against N1570):** This is an idiom built entirely from ordinary C11 struct and function-pointer rules (6.7.2.1, 6.3.2.3), not a single cited clause; no additional language feature is involved.
 FOLLOW:
 - Could mem_vt.write(&log, 7) be called by mistake? => Yes, and nothing in this pattern prevents it at compile time; it would cast the log_dev_t* through mem_dev_t*'s member layout, an effective-type violation (Module 10) that a real design typically guards against with a matching type tag stored alongside ctx, checked before dispatch.
 - Is this the same technique used for qsort's comparator? => Related but simpler; qsort takes one function pointer for one operation (compare), while a vtable groups several function pointers under one struct type representing a whole interface.
 PITFALL: Passing a context pointer to the wrong vtable's functions. Nothing in the plain struct-of-function-pointers pattern catches this at compile time; it manifests as a same-class-of-bug as any other type-punned access.
-VERIFY: This is an idiom built entirely from ordinary C11 struct and function-pointer rules (6.7.2.1, 6.3.2.3), not a single cited clause; no additional language feature is involved.
 
 @@ 12.09 | Intermediate | Debug | tags=null-function-pointer,guard,crash
 Q: A dispatch table has an unused slot left as NULL, and calling code crashed. What is the correct guard, and why does it belong at the call site?

@@ -123,11 +123,12 @@ DEEP:
 - The standard's own description (C11 7.17.7.4p3) is exactly `memcmp`+`memcpy` in spirit: "if the comparison is true, replace the value pointed to by object with desired; ... if false, update expected with the value pointed to by object."
 - CAS is the universal building block for lock-free code: every lock-free counter, stack, or queue in this module is a retry loop built on CAS, because CAS is what most hardware actually gives you as a single atomic instruction (`cmpxchg` on x86, `ldrex/strex` or `cas` on ARM).
 - See 10.08 for the "weak" vs "strong" distinction and why weak CAS is used inside retry loops.
+
+**C11 reference (checked against N1570):** 7.17.7.4 (atomic_compare_exchange), paragraphs 1-3.
 FOLLOW:
 - What happens to `expected` when CAS succeeds? => It is left unchanged (still equal to the old value), since the standard only documents updating it on the false/failure branch.
 - Can CAS be used to implement a full mutex? => Yes in principle (a CAS-based spinlock is a few lines), but a real mutex also needs blocking/wake support from the kernel for the contended case, which plain CAS does not provide by itself.
 PITFALL: Treating CAS as "check, then set" as two separate steps in your own head when reasoning about correctness. The whole point is that no other thread can act between the check and the set; reason about it as one indivisible operation.
-VERIFY: C11 7.17.7.4 (atomic_compare_exchange), paragraphs 1-3.
 
 @@ 10.07 | Intermediate | Scenario | tags=dcl,broken,naive
 Q: What is wrong with the "naive" double-checked-locking pattern that uses a plain pointer with no atomics?
@@ -150,11 +151,12 @@ DEEP:
 - The standard's own example (7.17.7.4p6, EXAMPLE) is precisely the retry-loop idiom used throughout this module: `do { des = f(exp); } while (!atomic_compare_exchange_weak(&cur, &exp, des));`.
 - On x86, `cmpxchg` never fails spuriously, so weak and strong compile to the same instruction there; on LL/SC architectures (classic ARM, POWER), strong CAS is implemented as a small internal retry loop around LL/SC, so calling weak CAS from your own retry loop avoids nesting one nested retry loop inside another.
 - Rule of thumb: "am I already in a `while`/`do-while` loop that will just try again?" -> use weak. "Do I need a definitive single yes/no answer right now?" -> use strong.
+
+**C11 reference (checked against N1570):** 7.17.7.4, paragraphs 4-6 (spurious failure and the weak-CAS retry-loop example).
 FOLLOW:
 - Does a spurious weak-CAS failure update `expected`? => Yes, the same as a real failure; the standard does not distinguish the two cases for the caller, which is exactly why weak CAS only makes sense inside a loop that re-reads and retries anyway.
 - Is one extra spurious retry expensive? => Negligible compared to a real contended retry; it is just one more loop iteration, not a fallback to a slow path.
 PITFALL: Using atomic_compare_exchange_weak() in a single "try once" check with no surrounding loop. A spurious failure will make you incorrectly conclude the values differed.
-VERIFY: C11 7.17.7.4, paragraphs 4-6 (spurious failure and the weak-CAS retry-loop example).
 
 @@ 10.09 | Intermediate | Numeric | tags=cost,cas,mutex,contention
 Q: Roughly, how does the cost of an uncontended atomic increment compare to an uncontended mutex lock/unlock?
@@ -242,11 +244,12 @@ config_t *get_config_fixed(void) {
   Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run with 16 threads racing to call this on first use, every thread read back `value == 42` on every run -- 0/16 wrong on 3 separate runs.
 - The naive version (plain `config_t *g_cfg_naive` with a plain pointer store, no atomics) was compiled and run the same way, in the same test binary, and also showed 0/16 wrong on this x86-64 machine across 3 runs. This is the expected, honest result: x86-64's strong memory ordering for normal loads/stores tends to hide this exact bug in practice, which is precisely why the naive version is still undefined behavior rather than "safe because it happened to work here" -- a weaker-ordered CPU (or a sufficiently aggressive future compiler optimization) is free to reorder the plain store in a way that would surface it.
 - The lesson for an interview: correctness under the standard, not "no failure observed on my test box," is what makes code right. The fixed version is correct *by the standard's rules*, not just by luck of the target CPU.
+
+**C11 reference (checked against N1570):** 7.17.3 (memory_order semantics for acquire/release) as the basis for why the release-then-acquire pairing here is sufficient.
 FOLLOW:
 - Why use memory_order_relaxed for the second (inside-the-lock) read? => Because that read is protected by the mutex already, which provides its own synchronization; no extra atomic ordering is needed for a read that can only race with writers who are also holding the same lock.
 - Would this whole pattern be unnecessary with C11's pthread_once() or a function-local static initializer? => Largely yes for simple one-time lazy init -- pthread_once() (see the C Advanced page's threads module) already solves this exact problem correctly; double-checked locking is worth knowing because it appears in older codebases and because the reasoning generalizes to other lazily-published shared pointers.
 PITFALL: Reasoning "I ran it N times and it was fine" as proof of correctness for a memory-ordering bug. Only the C11 standard's rules (and tools like ThreadSanitizer, covered in module 15) can tell you the code is actually race-free; empirical testing on one architecture cannot.
-VERIFY: C11 7.17.3 (memory_order semantics for acquire/release) as the basis for why the release-then-acquire pairing here is sufficient.
 
 @@ 10.13 | Advanced | Debug | tags=lockfree,stack,aba,reclamation
 Q: Build a minimal lock-free stack with CAS, and explain the ABA problem it is vulnerable to.
