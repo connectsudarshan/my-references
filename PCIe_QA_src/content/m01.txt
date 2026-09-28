@@ -26,6 +26,13 @@ DEEP:
 - Data is byte-striped across the lanes at the Physical Layer and the receiver de-skews the lanes before reassembly. Each lane trains and can fail independently.
 - Slot size and link width are different things: an x4 card in an x16 slot runs x4, and an x16 slot wired for x8 only ever trains x8.
 - A port is an upstream port (facing the Root Complex) or a downstream port (facing away from it). Root ports and switch downstream ports are downstream ports.
+
+**Two related board-level features:**
+
+- **Bifurcation:** a root port configured by BIOS to split one x16 into x8x8 or x4x4x4x4. That is how a passive carrier card holds four M.2 SSDs; without bifurcation support, only the first drive enumerates.
+- **Lane reversal and polarity inversion:** lane 0 on one side may be routed to lane 3 of an x4 partner (reversal), and the P and N wires of a pair may be swapped (inversion). Training detects and corrects both, so layout can avoid crossing traces.
+
+When a link trains narrower than expected, `lspci -vv` shows it directly, for example `LnkCap: ... Width x4` against `LnkSta: ... Width x2 (downgraded)`.
 FOLLOW:
 - How is a data stream spread across lanes? => Consecutive bytes go to consecutive lanes (byte striping), and the receiver de-skews the lanes and reassembles the stream.
 - What does an x2 SSD lose compared to x4? => Half the peak sequential bandwidth. Latency is unchanged, so low-queue-depth random reads barely move.
@@ -40,6 +47,17 @@ DEEP:
 - **Endpoint:** a Type 0 function. PCIe endpoints versus legacy endpoints differ mainly in I/O space use and in required features.
 - **Bridge:** PCIe-to-PCI/PCI-X, or PCI-to-PCIe.
 - Multi-root sharing and non-transparent bridges deliberately break the single-tree assumption and are out of scope here.
+
+**What the tree looks like on a real host** (`lspci -tv`, trimmed):
+
+```
+-[0000:00]-+-00.0  Host bridge
+           +-01.0-[01]----00.0  NVMe SSD            (endpoint directly on a root port)
+           \-01.1-[02-05]----00.0-[03-05]--+-00.0-[04]----00.0  NVMe SSD
+                                           \-01.0-[05]----00.0  NVMe SSD
+```
+
+Root port `00:01.1` owns buses 02 to 05. Bus 02 holds the switch's upstream port, bus 03 is the switch's internal bus, and each switch downstream port starts its own bus (04 and 05) with one SSD behind it. The PCI Express Capability's Device/Port Type field identifies each role: 0h endpoint, 4h root port, 5h switch upstream port, 6h switch downstream port, 9h RCiEP and Ah RCEC.
 FOLLOW:
 - How does software see a switch? => As a bridge tree: one Type 1 bridge for the upstream port and one for each downstream port.
 - Can two endpoints talk directly? => Yes, peer-to-peer through a switch if ACS allows it. Through the Root Complex only if the RC supports peer-to-peer routing.
@@ -58,12 +76,11 @@ DEEP:
 | 5 | 32 | 128b/130b | 3.94 GB/s |
 | 6 | 64 | PAM4 + FLIT + FEC | about 7.4 GB/s (8 GB/s raw) |
 
-Gen3 arithmetic: 5 GT/s x 0.8 = 4 Gb/s usable at Gen2, and 8 GT/s x 128/130 = 7.88 Gb/s usable at Gen3, which is 1.97 times as much. A Gen7 specification at 128 GT/s (PAM4) has also been published.
+Gen3 arithmetic: 5 GT/s x 0.8 = 4 Gb/s usable at Gen2, and 8 GT/s x 128/130 = 7.88 Gb/s usable at Gen3, which is 1.97 times as much. PCIe 6.0 was released in January 2022, and PCIe 7.0 (128 GT/s, still PAM4 and flit mode) in June 2025.
 FOLLOW:
 - Why did Gen3 pick 8 GT/s instead of 10? => With the cheaper 128b/130b encoding, 8 GT/s already doubled usable bandwidth and stayed within what mainstream board materials and connectors could support.
 - Which generation first required receiver equalization? => Gen3. Gen1 and Gen2 use fixed de-emphasis only.
 PITFALL: Treating GT/s as Gb/s of payload. GT/s counts raw line bits including encoding.
-VERIFY: Confirm Gen6/Gen7 details and release status against the current PCI-SIG Base Specification revision.
 
 @@ 1.05 | Basic | Numeric | tags=bandwidth,math
 Q: How do you calculate the bandwidth of a Gen4 x4 link?
@@ -79,6 +96,16 @@ DEEP:
 | Gen5 x4 | 32 x 4 x 0.9846 / 8 | 15.75 |
 
 This is the ceiling before protocol overhead. The next questions cover why real SSDs land near 7 GB/s on a Gen4 x4 link.
+
+**The general formula**, per direction: `GB/s = GT/s x lanes x encoding efficiency / 8`, where efficiency is 0.8 for 8b/10b, 128/130 for 128b/130b, and about 236/256 for Gen6 flit mode.
+
+| Link | Calculation | GB/s per direction |
+|---|---|---|
+| Gen5 x16 | 32 x 16 x 0.9846 / 8 | 63.0 |
+| Gen6 x4 | 64 x 4 x 0.922 / 8 | 29.5 |
+| Gen6 x16 | 64 x 16 x 0.922 / 8 | 118 |
+
+A quick sanity check in an interview: Gen3 is about 1 GB/s per lane per direction, and every generation after it doubles that. So Gen4 x4 is about 8, Gen5 x4 about 16, Gen5 x16 about 64.
 FOLLOW:
 - Gen5 x2 versus Gen4 x4? => Identical: 32 x 2 = 16 x 4 = 64 GT/s aggregate, so 7.88 GB/s per direction.
 - Gen2 x4 versus Gen3 x2? => Gen2 x4 is 2.0 GB/s and Gen3 x2 is 1.97 GB/s, so they are effectively equal.
@@ -94,6 +121,15 @@ Three separate losses stack on top of each other:
 3. **Protocol dynamics:** reads need request TLPs one way and completions the other way, completions can be split at the read completion boundary, and outstanding-request limits (tags, credits) cap throughput when round-trip latency is high.
 
 Marketing numbers add a fourth confusion: "PCIe 4.0 x4 = 8 GB/s" is a rounded one-direction figure, and "16 GB/s" is the two directions added together.
+
+**A worked example for a Gen4 x4 SSD reading sequentially:**
+
+1. Wire rate: 16 GT/s x 4 lanes = 64 Gb/s.
+2. After 128b/130b: 64 x 128/130 / 8 = 7.88 GB/s.
+3. After TLP overhead at MPS 256 (91%): about 7.2 GB/s.
+4. After DLLPs, the read requests travelling the other way, command fetches and completion writes: roughly 7.0 GB/s, which is what fio reports for 128 KiB reads at a high queue depth on a good drive.
+
+If a benchmark lands far below step 4, the link is usually not the problem; look at queue depth, block size, CPU and interrupt affinity, or thermal throttling.
 FOLLOW:
 - Why do the specs say GT/s and not Gbps? => The physical layer bit rate includes encoding bits. Only after removing them do you get data bits, so the spec quotes the raw transfer rate.
 - Is "PCIe 4.0 x4 is 8 GB/s" correct? => Approximately, per direction (7.88 GB/s exactly). Some sources add both directions to reach 16 GB/s.
@@ -125,13 +161,26 @@ FOLLOW:
 - Can a Gen3 root port train a Gen5 SSD? => Yes, at Gen3, provided the SSD's link training logic handles the lower rate correctly.
 - Where do compatibility bugs cluster? => Speed changes and equalization, power-state transitions, and enumeration/resource allocation.
 PITFALL: Assuming backward compatibility removes the need to test each generation combination.
-VERIFY: Check the FLIT-mode negotiation rules for speeds below 64 GT/s in the current Base Specification.
+VERIFY: How flits are carried at 2.5 to 32 GT/s in flit mode (which flit fields are sent and whether FEC is applied) in the Physical Layer chapter of PCIe Base 6.x.
 
 @@ 1.09 | Intermediate | Numeric | tags=efficiency,mps,overhead
 Q: Estimate TLP efficiency for a 256-byte payload.
-SHORT: Each TLP adds about 22 to 26 bytes: framing, a 2-byte sequence number, a 12- or 16-byte header, and a 4-byte LCRC (plus 4 bytes if ECRC is used). With a 256-byte payload that is about 91% efficient, 128 bytes about 84%, 64 bytes about 73%. DLLPs and read requests cost a bit more, so 85 to 90% of the encoded rate is realistic.
+SHORT: Each TLP adds 20 or 24 bytes: 4 bytes of framing and sequence number, a 12- or 16-byte header, and a 4-byte LCRC (plus 4 bytes if ECRC is used). With a 256-byte payload that is about 91% efficient, 128 bytes about 84%, 64 bytes about 73%. DLLPs and read requests cost a bit more, so 85 to 90% of the encoded rate is realistic.
 DEEP:
-Using about 24 bytes of overhead per TLP:
+Where the bytes come from:
+
+| Item | 8b/10b (Gen1, Gen2) | 128b/130b (Gen3 to Gen5) |
+|---|---|---|
+| Start framing | STP symbol, 1 B | STP token, 4 B (carries the length and the sequence number) |
+| Sequence number | 2 B | inside the STP token |
+| Header | 12 B (3DW) or 16 B (4DW) | 12 B or 16 B |
+| LCRC | 4 B | 4 B |
+| End framing | END symbol, 1 B | none (the STP token gives the length) |
+| Total | 20 or 24 B | 20 or 24 B |
+
+Flit mode (Gen6) is different: TLPs are packed into the 236-byte TLP area of each 256-byte flit, with no per-TLP framing token or LCRC (see 1.15).
+
+Using 24 bytes of overhead per TLP (4DW header, no ECRC):
 
 | Payload | Efficiency |
 |---|---|
@@ -147,7 +196,6 @@ FOLLOW:
 - Why does raising MPS from 256 to 512 help only a little? => Efficiency moves from about 91% to about 95%, while larger MPS needs bigger buffers and is limited by the smallest MPS on the path.
 - How does MRRS interact? => A read request bigger than MPS returns as several completions. A small MRRS with too few tags limits the amount of data in flight.
 PITFALL: Forgetting that DLLPs and the request TLPs for reads also consume link time.
-VERIFY: Framing overhead differs between 8b/10b, 128b/130b, and FLIT mode. Recompute from the spec for the generation you care about.
 
 @@ 1.10 | Intermediate | Concept | tags=rc,rciep,rcec,root-port
 Q: What is a Root Complex, and how do root ports, RCiEPs and RCECs fit in?
@@ -157,6 +205,10 @@ DEEP:
 - Each root port starts its own downstream bus range and has its own link, capabilities and AER registers.
 - RCiEPs (an integrated NIC or chipset controller, for example) have no PCIe link, so they cannot be hot-plugged and some link-related registers do not apply.
 - An RCEC gathers AER errors from the RCiEPs so that error reporting still works for devices with no link to send messages on.
+
+**How to tell the roles apart on a live system:** `lspci -vv` prints the Device/Port Type from the PCI Express Capability, for example `Express (v2) Root Port (Slot+)`, `Express (v2) Endpoint`, `Express (v2) Root Complex Integrated Endpoint` or `Root Complex Event Collector`.
+
+Why it matters in validation: an RCiEP has no Link Capabilities or Link Status to check and no hot-plug, and its AER errors arrive through the RCEC rather than a root port. Error-injection and link-health scripts that assume every function sits below a root port need a separate path for RCiEPs.
 FOLLOW:
 - Does a root port use a Type 0 or Type 1 header? => Type 1, because it is a bridge to its secondary bus.
 - How does a CPU load reach a device? => The RC matches the address against the root port bridge windows and BARs, and issues a memory read TLP on the matching root port.
@@ -170,6 +222,10 @@ DEEP:
 - Ingress and egress buffers exist per port and per virtual channel, with arbitration between ports. Cut-through versus store-and-forward is an implementation choice.
 - Latency per hop is typically tens to a few hundred nanoseconds depending on the part and the mode. This matters for latency-sensitive NVMe workloads and for retimer and tag budgeting.
 - Backplane switches multiplex many x4 drives onto one x16 or x8 upstream link, so aggregate bandwidth is limited by the upstream port, not by the drives.
+
+**Latency in practice:** a request crosses the switch twice for a read (request down, completion up), so a switch with about 150 ns per hop adds roughly 0.3 us to a 4 KiB random read. Against a NAND read latency of 50 to 100 us that is small, but it matters for low-latency SCM drives and for tail-latency budgets.
+
+On `lspci -vv`, switch ports appear as `Upstream Port of PCI Express Switch` and `Downstream Port of PCI Express Switch`, each with its own Link Status. A down-trained link can sit between the switch and the drive rather than at the root port, so check both.
 FOLLOW:
 - How does a switch route a memory TLP? => It compares the address with each downstream port's base and limit windows. If none matches, it forwards the TLP upstream.
 - Transparent versus non-transparent? => A transparent switch presents one hierarchy. A non-transparent bridge joins two separate address domains and translates between them.
@@ -193,15 +249,18 @@ PITFALL: Mixing up the reference clock (PLL input) with the recovered data clock
 Q: Compare 8b/10b and 128b/130b encoding.
 SHORT: 8b/10b maps each byte to a 10-bit symbol (20% overhead) and provides DC balance, guaranteed transitions, and K-codes for framing. 128b/130b sends 128 payload bits per 130-bit block behind a 2-bit sync header (10b for a data block, 01b for an ordered-set block) with a scrambler, cutting overhead to about 1.5%. The trade is that block alignment, scrambler synchronization, and receiver equalization become mandatory.
 DEEP:
-- **Gen3 framing:** no K-codes. Ordered-set blocks are marked by the 01b sync header (data blocks by 10b), and TLP/DLLP framing uses tokens inside data blocks (for example STP and SDP), with an end-of-data-stream token to leave the data stream.
+- **Gen3 framing:** no K-codes. Ordered-set blocks are marked by the 01b sync header (data blocks by 10b), and TLP/DLLP framing uses tokens inside data blocks: STP (start of TLP, 4 bytes), SDP (start of DLLP, 2 bytes), IDL (logical idle), EDB (end bad, marks a nullified TLP) and EDS (end of data stream, sent before an ordered-set block).
 - **Block alignment:** learned from a unique pattern (the electrical idle exit ordered set) during training, then tracked with the sync headers.
 - **Cost:** a single bit error corrupts a whole block, which the LCRC then catches. The link also depends much more on equalization because there is no code-level guarantee of transition density.
 - **Benefit:** at the same signaling rate, usable throughput improves by about 23% over 8b/10b (0.985 versus 0.8).
+
+**Worked comparison at the same era's rates:** Gen2 at 5 GT/s with 8b/10b gives 5 x 0.8 = 4 Gb/s per lane; Gen3 at 8 GT/s with 128b/130b gives 8 x 128/130 = 7.88 Gb/s. A 60% faster line rate almost doubled usable bandwidth.
+
+**K-codes at Gen1 and Gen2** mark framing and control: COM (K28.5) starts every ordered set, STP (K27.7) and SDP (K28.2) start TLPs and DLLPs, END (K29.7) ends them, EDB (K30.7) marks a nullified TLP, and SKP (K28.0), FTS (K28.1) and IDL (K28.3) handle clock compensation, L0s exit and electrical idle entry. Gen3 replaces all of these with sync headers, tokens and ordered-set blocks.
 FOLLOW:
 - How does the receiver find block boundaries? => It detects the unique electrical-idle-exit ordered set during training to align, and then tracks sync headers.
 - What does 128b/130b give up? => Guaranteed transition density and DC balance from the code itself. The design depends on the scrambler and on receiver equalization instead.
 PITFALL: Quoting the overhead as 25% or 30%. It is 2 bits in 130, about 1.5%.
-VERIFY: Token names and the exact framing rules are in the Base Specification chapter on the Physical Layer. Check them before quoting in an interview.
 
 @@ 1.14 | Advanced | Cross-layer | tags=nvme,x4,x2,iops
 Q: Why are most NVMe SSDs x4, and when does x2 or a narrower link matter?
@@ -222,15 +281,14 @@ Q: How does Gen6 double the data rate, and what does it cost?
 SHORT: Gen6 keeps the Gen5 symbol rate of 32 GBaud but uses PAM4, which carries 2 bits per symbol, to reach 64 GT/s. The Nyquist frequency and channel loss budget stay near Gen5's. The price is three eyes each a third as tall, about 9.5 dB less SNR, so Gen6 mandates FEC and moves to fixed 256-byte FLITs with flit-level CRC and replay.
 DEEP:
 - **PAM4 penalty:** the same voltage swing is divided into three eyes, so each has one third of the amplitude, a loss of 20 x log10(3) = 9.5 dB of SNR.
-- **Error rates:** raw pre-FEC bit error rates are far worse than the 1e-12 NRZ targets, so a lightweight forward error correction stage is required.
+- **Error rates:** the Gen6 channel is designed for a first bit error rate (FBER) of about 1e-6, versus the 1e-12 BER target of the NRZ generations, so a lightweight forward error correction stage is required.
 - **FLIT:** a fixed 256-byte unit carrying TLP data, a small DLP field, CRC, and FEC parity. There is no 128b/130b sync header and no per-TLP LCRC or sequence number in FLIT mode; reliability moves to flit-level ACK/NAK and replay.
-- **Budget:** roughly 236 bytes of TLP payload area per 256-byte flit, so about 92% efficiency before other overheads.
+- **Budget:** each 256-byte flit holds 236 bytes of TLP area, 6 bytes of DLP (data link payload), 8 bytes of CRC and 6 bytes of FEC, so about 92% efficiency before other overheads.
 - **Power:** L0p lets a link shed lanes without going through Recovery.
 FOLLOW:
 - Why FLIT? => Fixed size makes FEC and CRC deterministic, removes sync-header framing, and simplifies TLP packing at very high rates.
 - What does mandatory FEC cost? => A few nanoseconds of latency and about 2% of bandwidth for parity, designed so that most errors are corrected and not replayed.
 PITFALL: Saying PAM4 makes the signal faster. The symbol rate is unchanged; only the bits per symbol doubled.
-VERIFY: Flit byte budget (about 236 payload, 6 DLP, 8 CRC, 6 FEC) and the pre-FEC error rate target. Confirm in the current Base Specification.
 
 @@ 1.16 | Principal | Scenario | tags=triage,downtrain,lnksta,nvme
 Q: A Gen4 x4 SSD delivers only 3.9 GB/s sequential read. What do you check, in what order?
@@ -248,12 +306,12 @@ LnkCap: Port #0, Speed 16GT/s, Width x4 ...
 LnkSta: Speed 8GT/s (downgraded), Width x4 (ok)
 ```
 
-On Windows the same data is available through the device's PCI link-speed and link-width properties (for example via `Get-PnpDeviceProperty`).
+On Windows the same data is available through the device properties `DEVPKEY_PciDevice_CurrentLinkSpeed`, `DEVPKEY_PciDevice_CurrentLinkWidth`, `DEVPKEY_PciDevice_MaxLinkSpeed` and `DEVPKEY_PciDevice_MaxLinkWidth` (for example via `Get-PnpDeviceProperty`).
 FOLLOW:
 - `LnkSta` says 16 GT/s x4 but you still see 5 GB/s. Now what? => The link is fine. Look at the workload (queue depth, block size), thermal throttling, chipset uplink sharing, MPS and MRRS, IOMMU overhead, and controller-internal limits.
 - Why can't one throughput number tell you which of speed or width fell? => Several combinations produce the same total, so 3.94 GB/s could be Gen3 x4, Gen4 x2, or Gen5 x1.
 PITFALL: Blaming SSD firmware before reading two registers.
-VERIFY: Property names for link speed and width in Windows (the PCI device property keys) and whether your driver stack exposes them.
+VERIFY: Whether your Windows version and bus driver populate these keys for your device (they are defined in pciprop.h).
 
 @@ 1.17 | Principal | Numeric | tags=oversubscription,switch,backplane
 Q: Eight Gen4 x4 SSDs sit behind a switch with a Gen4 x16 uplink. What aggregate read throughput can the host see?

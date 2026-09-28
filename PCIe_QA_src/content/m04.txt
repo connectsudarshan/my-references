@@ -9,6 +9,10 @@ DEEP:
 - **Low power:** L0s (fast idle, per direction), L1 (deeper, both directions, exits through Recovery), L2 (main power removed, auxiliary power on).
 - **Special states:** Hot Reset (reset the downstream side of the link), Disabled (link turned off), Loopback (test mode).
 - **Two ports, one machine each:** each port runs its own LTSSM, and they stay in step by exchanging ordered sets.
+
+**Seeing it on real hardware:** an analyzer decodes the LTSSM from the ordered sets it observes (TS1, TS2, EIOS, FTS, SKP), and most controller IPs expose the current state and a short history in vendor debug registers. A useful habit is to record the state sequence on every link-up in automated tests: a healthy Gen4 link-up reads Detect, Polling, Configuration, L0 at Gen1, then Recovery (Speed, Equalization phases) and back to L0 at Gen4.
+
+If a test logs only "link up yes or no", intermittent failures are almost impossible to explain later.
 FOLLOW:
 - Who runs the LTSSM, the MAC or the PHY? => The MAC side owns the state machine and drives the PHY through PIPE.
 - Which state do you spend all your time in? => L0, where TLPs and DLLPs flow. Everything else exists to reach L0 or leave it.
@@ -22,25 +26,31 @@ DEEP:
 - **Detect.Active:** the transmitter runs receiver detection on every lane. Lanes with a detected receiver define the candidate link width.
 - **Outcome:** any lane detected leads to Polling. No lane detected sends the LTSSM back to Detect.Quiet, so an empty slot loops here forever, which is normal.
 - **Why it matters:** an unpowered device, missing lane or damaged connector shows up here as a narrower or absent link.
+
+**Timing example:** an empty slot alternates between Detect.Quiet (up to 12 ms) and Detect.Active indefinitely, so a hot-plug insertion is noticed within about 12 ms plus the detection time.
+
+**Validation angle:** receiver detection is lane by lane, so a single lane with a missing AC-coupling capacitor or an open connector pin makes the link come up narrower (for example x2 instead of x4) with no error logged. Compare the negotiated width with the capability on every boot and power cycle.
 FOLLOW:
 - Is a partner needed for Detect to succeed? => The partner only needs its receiver termination present. It does not need to run its LTSSM.
 - Why might a populated slot loop in Detect? => Receiver terminations are missing (unpowered card, connector fault) or the lane is open or shorted.
 PITFALL: Expecting Detect to involve packets. It is a purely analog measurement.
-VERIFY: Detect.Quiet timeout value (12 ms) in the LTSSM chapter of the Base Specification.
 
 @@ 4.03 | Basic | Concept | tags=polling,ts1,ts2,bit-lock
 Q: What happens in Polling?
 SHORT: Both ports send TS1 ordered sets at 2.5 GT/s so each receiver can achieve bit lock and symbol lock, and they check for polarity inversion. After seeing enough TS1 or TS2 from the partner, they move to Polling.Configuration and send TS2 to confirm they are ready to proceed. Polling.Compliance is a side state used when a receiver is detected but the partner never sends anything.
 DEEP:
 - **Polling.Active:** transmit TS1 with PAD in the link and lane fields. Exit after receiving 8 consecutive TS1 or TS2 (or their inverted forms) and having sent at least 1024 TS1. A 24 ms timeout applies.
-- **Polling.Configuration:** transmit TS2 and exit to Configuration after receiving 8 consecutive TS2 and having sent at least 16 TS2 since the first TS2 was received.
+- **Polling.Configuration:** transmit TS2 and exit to Configuration after receiving 8 consecutive TS2 and having sent at least 16 TS2 since the first TS2 was received. A 48 ms timeout returns the LTSSM to Detect.
 - **Polling.Compliance:** entered when a receiver was detected but the partner never left electrical idle, which is how a compliance load board is recognized. The port emits a compliance pattern for scope testing.
 - **Polarity:** an inverted TS1 tells the receiver to invert that lane's polarity.
+
+**What an analyzer shows for a healthy Polling:** a burst of at least 1024 TS1 ordered sets per lane with PAD in the link and lane number fields, then TS2, then Configuration TS1 with a real link number. At 2.5 GT/s one TS1 is 16 symbols (64 ns), so 1024 TS1 take about 65 us: Polling normally finishes in well under a millisecond.
+
+A link that spends the full 24 ms in Polling.Active and drops back to Detect never received 8 consecutive good TS1 or TS2 from the partner, which points at the receiver side: clock, reset or signal integrity, not configuration.
 FOLLOW:
 - Why is Polling always at 2.5 GT/s? => Every device supports it and it needs no equalization, so it is the lowest common denominator to start negotiation.
 - What proves bit lock and symbol lock? => Receiving valid TS1 or TS2 with correct symbol boundaries, seen as a run of consecutive valid ordered sets.
 PITFALL: Calling Polling.Compliance a failure state. It is a defined test state that real hardware sometimes ends up in by accident.
-VERIFY: Exact ordered-set counts and timeouts for each Polling sub-state.
 
 @@ 4.04 | Basic | Concept | tags=configuration,lane-number,width
 Q: What is negotiated in the Configuration state?
@@ -52,6 +62,10 @@ DEEP:
 - **Complete:** both sides send TS2 and confirm the configuration.
 - **Idle:** idle data is exchanged and L0 is entered after enough idle symbols are sent and received.
 - **Width choice:** must be a supported width (x1, x2, x4, x8, x16), so a partially failed lane group falls back to a smaller width.
+
+**A worked x4 example:** the root port sends TS1 with link number 0 and lane numbers 0 to 3. If the SSD's lanes are routed in reverse, it sees them as 3, 2, 1, 0 and, if it supports reversal, maps them internally so its lane 0 is the root port's lane 0. If lane 2 failed Detect, only lanes 0 and 1 can form a legal link, and the result is x2.
+
+`lspci -vv` then shows `LnkSta: ... Width x2 (downgraded)` on both ends, and nothing is logged in AER, because a narrower width is a legal outcome of Configuration, not an error.
 FOLLOW:
 - Who proposes the link number? => The downstream port.
 - Where does lane reversal show up? => In the lane numbers: the upstream port sees them in reverse order and maps its lanes accordingly, if it supports reversal.
@@ -69,7 +83,7 @@ DEEP:
 | 3 | N_FTS: number of fast training sequences needed to exit L0s |
 | 4 | Data rate identifier: supported speeds, speed change request |
 | 5 | Training control bits |
-| 6 to 15 | TS identifier (TS1 or TS2 pattern); in Gen3 and above, the first symbols carry equalization info |
+| 6 to 15 | TS identifier (TS1 or TS2 pattern: D10.2 for TS1, D5.2 for TS2 in 8b/10b); in Gen3 and above, symbols 6 to 9 carry equalization info (EC phase, preset, and the FS, LF and coefficient values) and symbols 10 to 15 keep the identifier |
 
 - **Data rate identifier:** each bit advertises a supported rate, and a separate bit requests a speed change.
 - **Training control bits:** hot reset, disable link, loopback, disable scrambling, compliance receive.
@@ -78,7 +92,7 @@ FOLLOW:
 - What does N_FTS do? => It tells the transmitter partner how many FTS ordered sets to send when leaving L0s so this receiver can relock.
 - Why do TS1 and TS2 exist as two types? => TS1 means "I am still negotiating." TS2 means "I have accepted the current configuration and am ready to move on."
 PITFALL: Memorizing symbol positions without knowing what each field is used for during debug.
-VERIFY: Field layout and bit assignments for TS1/TS2, especially the Gen3+ equalization fields.
+VERIFY: Exact bit positions inside the Gen3+ equalization symbols (6 to 9) of TS1 and TS2.
 
 @@ 4.06 | Intermediate | Concept | fig=recovery | tags=recovery
 Q: What is Recovery, when is it entered, and what are its sub-states?
@@ -95,7 +109,6 @@ FOLLOW:
 - Does Recovery lose TLPs? => TLPs already in the replay buffer are retained and replayed as needed. Data in flight during retrain may need replay.
 - Why does every L1 exit go through Recovery? => The receiver has lost lock during idle, so it must re-lock and reconfirm parameters before resuming.
 PITFALL: Assuming Recovery only happens on errors. Speed changes and L1 exits use it routinely.
-VERIFY: The complete list of Recovery entry conditions and timeouts in the Base Specification.
 
 @@ 4.07 | Intermediate | Concept | tags=l0s,fts,aspm
 Q: How does L0s work, and why is it rarely used?
@@ -104,13 +117,15 @@ DEEP:
 - **Directional:** each direction enters and exits independently. One direction can be in L0s while the other is active.
 - **Exit:** the transmitter sends the N_FTS number of FTS ordered sets that the receiver advertised, then a SKP ordered set. If the receiver cannot relock in time, the link goes to Recovery.
 - **Latency:** the exit latency is a function of N_FTS and reference clock mode. Devices report it in Link Capabilities.
-- **Policy:** ASPM control in Link Control enables L0s and L1 separately. Many platforms enable only L1.
+- **Policy:** ASPM control in Link Control enables L0s and L1 separately. Many platforms enable only L1, and many NVMe SSDs do not advertise L0s at all.
+- **Gen6:** flit mode does not support L0s. Its replacement for fast power saving is L0p, which turns off some lanes while the link keeps running (module 14).
 - **Validation angle:** a failed L0s exit is one of the classic sources of unexpected Recovery entries and correctable errors.
+
+**How the exit latency is advertised:** Link Capabilities bits 14:12 encode the L0s exit latency (less than 64 ns up to more than 4 us) and bits 17:15 the L1 exit latency (less than 1 us up to more than 64 us). The Device Capabilities register has the matching "acceptable latency" fields, which the OS compares against the sum of exit latencies on the path before enabling ASPM. On Linux, `lspci -vv` prints both, for example `ASPM L1, Exit Latency L1 <64us`.
 FOLLOW:
 - Where does the exit latency come from? => The number of FTS the receiver needs (N_FTS) times their duration, plus fixed overheads. Slower reference clock modes need larger N_FTS.
 - Why disable it? => Power savings are small compared with L1, the exit latency is visible to workloads, and wake failures cause Recovery entries.
 PITFALL: Treating L0s as a bidirectional state like L1.
-VERIFY: How current platforms and NVMe devices treat L0s support (many do not implement it).
 
 @@ 4.08 | Intermediate | Concept | tags=l1,aspm,exit-latency
 Q: What is L1, how is it entered, and what determines its exit latency?
@@ -124,7 +139,7 @@ FOLLOW:
 - Why does L1 exit take longer than L0s? => The PHY must wake, relock, and pass through Recovery, whereas L0s only needs a short FTS burst.
 - What do L1 substates add? => Lower idle power by turning off the reference clock and more analog circuitry, with a longer exit latency.
 PITFALL: Assuming L1 loses configuration state. Configuration space and device state are preserved in L1.
-VERIFY: L1 substate timing parameters (T_POWER_ON, LTR thresholds) in the L1 PM Substates chapter.
+VERIFY: L1 substate timing parameters (T_POWER_ON, Common Mode Restore Time, LTR threshold) in the L1 PM Substates section; module 11 covers them in detail.
 
 @@ 4.09 | Intermediate | Concept | tags=l2,pme,wake,d3cold
 Q: What is L2, and how does a link enter it?
@@ -136,6 +151,10 @@ DEEP:
 4. Platform removes main power. The link is in L2 if auxiliary power remains, or L3 if everything is off.
 5. Wake: the device asserts WAKE# or sends a beacon. Main power and reference clock return, and the link retrains from Detect (L2 exits through Detect, not Recovery).
 - **State loss:** in D3cold the device loses its state and must be reinitialized by software after power returns.
+
+**Why SSD validation cares:** a system suspend (S3) or a runtime D3cold on a laptop drives the SSD through D3hot, PME_Turn_Off, PME_TO_Ack, L2/L3 Ready and power removal. The SSD must have flushed volatile data before acknowledging (the NVMe shutdown notification through CC.SHN normally happens first), and on resume it comes back from Detect with a full re-initialization.
+
+Classic bugs in this path: a drive that never sends PME_TO_Ack (the platform waits, then removes power anyway), and a drive that reports ready too early after power returns, so the first configuration reads get Unsupported Request instead of Configuration Request Retry Status.
 FOLLOW:
 - How does a device wake the system from L2? => By asserting the WAKE# sideband signal (or, for some designs, a beacon on the link).
 - Why does L2 exit through Detect? => Power was removed, so the link must retrain fully.
@@ -148,12 +167,11 @@ DEEP:
 - **Hot Reset:** software sets Secondary Bus Reset in the bridge control register of the downstream port. The port sends TS1 with the Hot Reset bit for about 2 ms, and the device resets its functions, then both sides return to Detect and retrain.
 - **Disabled:** entered with the Disable Link bit in TS1. The link stays disabled until software clears the Link Disable bit or a reset occurs.
 - **Loopback:** the master sends TS1 with the Loopback bit. The slave enters Loopback and retransmits everything it receives. It is used for receiver testing and analyzer bring-up.
-- **Reset scope:** hot reset resets function state and config space to defaults (except sticky bits) but does not remove power or drop the reference clock.
+- **Reset scope:** hot reset resets function state and config space to defaults (except sticky bits, attribute types such as RWS, ROS and RW1CS) but does not remove power or drop the reference clock. The port stays in the Hot Reset state for 2 ms after the partner starts echoing the Hot Reset bit, then returns to Detect.
 FOLLOW:
 - How does software trigger a hot reset? => It sets the Secondary Bus Reset bit in the Bridge Control register of the downstream port above the device.
 - Is a hot reset the same as PERST#? => No. PERST# is a fundamental reset that also clears sticky state and restarts everything. Hot reset resets at the link level and preserves sticky registers.
 PITFALL: Expecting hot reset to preserve BARs. Function state and config registers reset to defaults, so software must re-enumerate and reprogram.
-VERIFY: Hot reset duration and reset scope for sticky registers in the Base Specification.
 
 @@ 4.11 | Advanced | Concept | tags=speed-change,recovery,gen3
 Q: Describe how a link changes speed from Gen1 to Gen4.
@@ -186,13 +204,14 @@ DEEP:
 | Recovery.RcvrCfg | 48 ms | Detect |
 | Recovery.Idle | 2 ms | Detect |
 
+- **Speed-change failures:** if Recovery.RcvrLock times out while a speed change is in progress, the LTSSM goes to Recovery.Speed to return to the previous rate rather than to Detect, which is how a failed Gen4 attempt lands back at Gen1 or Gen3.
 - **How it helps debug:** a link that keeps cycling Polling.Active to Detect never got 8 consecutive TS1. One cycling Recovery to Detect never completed RcvrCfg.
 - **Automation implication:** test harness timeouts for "link up" should be longer than several worst-case LTSSM loops.
 FOLLOW:
 - Why do interviews ask for timeouts? => They show whether you have debugged real training failures. Each timeout tells you which handshake failed.
 - What does a repeating loop period tell you? => The sum of the timeouts in the loop identifies the states involved, so a 24 ms cycle points at Polling.Active.
 PITFALL: Quoting a timeout without knowing its destination state.
-VERIFY: Every value in this table against the LTSSM state tables in the Base Specification. Numbers vary by state and revision.
+VERIFY: Timeout destinations for every sub-state against the LTSSM state descriptions; they depend on conditions such as a speed change in progress or directed width changes.
 
 @@ 4.13 | Advanced | Concept | tags=downtrain,width,upconfigure
 Q: How does width down-training happen, and how can a link change width without a full restart?
@@ -207,7 +226,7 @@ FOLLOW:
 - Why not run three lanes? => Widths must be power-of-two groups. Three healthy lanes become x2 (with one wasted).
 - How does software learn the width dropped? => Through Link Status (negotiated width) and the link bandwidth notification bits.
 PITFALL: Treating a width reduction as always fault-driven. Power management can also reduce width intentionally.
-VERIFY: Upconfigure rules and lane assignment constraints for each width.
+VERIFY: Upconfigure rules and lane-assignment constraints for each width, and the Upconfigure Capability bit in TS2.
 
 @@ 4.14 | Advanced | Concept | tags=lnkcap,lnksta,registers,lspci
 Q: Which PCIe registers show link state, and what do you look for in each?
@@ -235,15 +254,18 @@ PITFALL: Comparing `LnkSta` to `LnkCap` of the wrong port. Check both ends of th
 Q: The LTSSM sits in Polling.Compliance. What does that mean, and what do you check?
 SHORT: The port detected a receiver on at least one lane but never saw the partner leave electrical idle, so it assumed a compliance load board and started emitting the compliance pattern. In a real system it means the partner has its receiver terminated but is not transmitting: it is held in reset, not clocked, not powered enough to run its LTSSM, or its transmitters are disabled.
 DEEP:
-- **Entry rule:** from Polling.Active, if the timeout expires with a receiver detected but no electrical idle exit ever observed, the LTSSM enters Polling.Compliance.
+- **Entry rule:** from Polling.Active, if the 24 ms timeout expires with a receiver detected but no electrical idle exit ever observed on that lane, the LTSSM enters Polling.Compliance. It also enters it deliberately when software sets Enter Compliance in Link Control 2, or when the partner sends TS1 with the Compliance Receive bit set.
 - **Common real-world causes:** PERST# still asserted, REFCLK absent or unstable at the device, device power rails not stable, a device firmware not yet running with an LTSSM enable, or an analog fault where terminations are present but the transmitter is not working.
 - **What to check:** PERST# timing, REFCLK presence and level at the device, power rails, the device's readiness, and whether the device's LTSSM is enabled in firmware or strap configuration.
 - **Exit:** the machine leaves compliance on detecting an idle exit or a reset condition.
+
+**A quick way to confirm it on the bench:** probe the PERST# pin at the SSD connector. If PERST# is still asserted, the drive's transmitters stay quiet while its receiver termination is present, which is exactly the Polling.Compliance entry condition. Release it (fix the reset GPIO or sequencing) and the root port should leave compliance and train.
+
+In automated power-cycle tests, a small percentage of runs ending in Polling.Compliance usually points at a race between the platform releasing PERST# and the SSD's controller starting its PHY, which needs a timing measurement, not a protocol trace.
 FOLLOW:
 - Why does an empty slot not go to Polling.Compliance? => No receiver is detected, so the LTSSM never leaves Detect.
 - How could firmware cause this? => An SSD whose controller has not yet enabled the PCIe PHY's LTSSM (or released it from reset) has terminations on but transmits nothing.
 PITFALL: Assuming the state means the link is broken electrically. It often means the partner is simply not ready.
-VERIFY: The exact Polling.Compliance entry conditions in the Base Specification.
 
 @@ 4.16 | Principal | Scenario | tags=triage,ltssm,logs,downtrain
 Q: A link comes up at x2 Gen1 instead of x4 Gen4. How do you use LTSSM state history to triage?
@@ -279,13 +301,13 @@ DEEP:
 | NVMe subsystem reset | NVMe subsystem, per NVMe spec | May, device dependent | Device dependent |
 
 - **Test strategy:** each reset type needs its own test loop, with link state, config space, MSI-X setup and queue state re-verified after each.
-- **Recovery time:** FLR completion time is bounded (100 ms) and hot reset and PERST# have recovery time requirements before configuration accesses.
+- **Recovery time:** an FLR must complete within 100 ms, and after a Conventional Reset software must wait 100 ms before the first configuration request (after link training completes, for ports faster than 5 GT/s), and allow up to 1 s of Configuration Request Retry Status before declaring the device broken (module 15).
 - **Common bug class:** firmware that handles CC.EN reset correctly but leaves state stale after FLR or hot reset.
 FOLLOW:
 - After a hot reset, what must software do? => Re-enumerate the function: reprogram BARs, bus master, MSI-X, and re-run NVMe controller initialization.
 - What does CC.EN not reset? => PCIe link state and PCIe configuration space, so BARs and MSI-X enables persist.
 PITFALL: Testing only CC.EN resets and assuming the others behave the same.
-VERIFY: NVMe subsystem reset behavior with respect to the link, and FLR and reset recovery times in the PCIe and NVMe specifications.
+VERIFY: How the NVMe over PCIe Transport Specification maps each PCIe reset to a Controller Level Reset or NVM Subsystem Reset, and whether your device drops the link on NSSR.
 
 @@ 4.18 | Principal | Trap | tags=recovery,detect,transitions
 Q: Which LTSSM exits go through Recovery, which go through Detect, and which go straight back to L0?

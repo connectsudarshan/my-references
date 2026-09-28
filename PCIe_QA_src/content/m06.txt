@@ -21,8 +21,19 @@ DEEP:
 - **Sequence number:** 12 bits, in a 16-bit field (4 reserved bits), placed in front of the header.
 - **LCRC:** 32-bit CRC over the sequence number and the whole TLP, so it protects the header, payload and ECRC together.
 - **Framing (8b/10b):** STP (start TLP) and END (or EDB for a nullified TLP) are control symbols.
-- **Framing (128b/130b):** an STP token at the start carries the TLP length, and the end is implied by that length.
-- **Cost per TLP:** roughly 6 bytes from the Data Link Layer plus 2 to 4 bytes framing, on top of the 12 or 16-byte header. It is why small TLPs are inefficient.
+- **Framing (128b/130b):** a 4-byte STP token at the start carries the TLP length and the 12-bit sequence number itself, and the end is implied by that length. There is no separate sequence-number field and no END.
+- **Cost per TLP:** 8 bytes of Data Link Layer and framing overhead at every generation up to Gen5 (STP 1 + sequence 2 + LCRC 4 + END 1 at 8b/10b; STP token 4 + LCRC 4 at 128b/130b), on top of the 12 or 16-byte header. It is why small TLPs are inefficient.
+
+**What it looks like on an analyzer at Gen4:**
+
+```
+STP token: Len=70 DW  Seq=0x3A7
+MWr 64-bit  Addr=0x0000_0012_3456_7000  Len=64 DW  ReqID=01:00.0  Tag=0x12
+  <256 bytes of payload>
+LCRC=0x9C41_07E2  (good)
+```
+
+(Values are illustrative.) The token's length counts every DW of the TLP from the STP token itself through the LCRC (here 1 + 4 header + 64 payload + 1 LCRC = 70), which is how the receiver finds the end without an END symbol. Next to it you would see Ack DLLPs flowing the other way, each carrying the last good sequence number.
 FOLLOW:
 - Does the LCRC get recomputed on a replay? => No. The same TLP, with the same sequence number and same LCRC, is resent from the replay buffer.
 - Are DLLPs numbered? => No. DLLPs have no sequence number and are never replayed. They are protected only by a 16-bit CRC, and lost ones are recovered by later ones.
@@ -51,7 +62,7 @@ FOLLOW:
 - Why are DLLPs never replayed? => They are periodic or self-superseding. A later Ack covers an earlier one and a later UpdateFC carries a newer cumulative total.
 - Can a DLLP pass through a switch? => No. It is consumed at the next link partner. Each link has its own.
 PITFALL: Learning the encodings as trivia. What matters is the pattern: Ack and Nak carry a sequence number, flow control DLLPs carry credit counts, and none are replayed.
-VERIFY: Type encodings for PM, Vendor-Specific, Nop and the Data Link Feature DLLP in the Base Specification.
+VERIFY: Type encodings for Vendor-Specific, Nop and the Data Link Feature DLLP in the Base Specification.
 
 @@ 6.04 | Intermediate | Concept | fig=replay | tags=ack,nak,replay,cumulative
 Q: Explain the ACK/NAK protocol and the replay buffer.
@@ -76,8 +87,8 @@ PITFALL: Imagining selective retransmit. PCIe replays everything after the first
 Q: How does the 12-bit sequence number work, and why can only 2048 TLPs be outstanding?
 SHORT: Sequence numbers count 0 to 4095 and wrap. The sender tracks NEXT_TRANSMIT_SEQ and ACKD_SEQ, the receiver tracks NEXT_RCV_SEQ. To tell a new TLP from an old duplicate after wrap, the spec limits unacknowledged TLPs to at most 2048, half the space. Numbers within 2048 behind the expected one are duplicates, and those within 2048 ahead are gaps.
 DEEP:
-- **Sender state:** NEXT_TRANSMIT_SEQ (next number to assign), ACKD_SEQ (last acknowledged).
-- **Receiver state:** NEXT_RCV_SEQ (the next number it expects).
+- **Sender state:** NEXT_TRANSMIT_SEQ (next number to assign, initialized to 0), ACKD_SEQ (last acknowledged, initialized to FFFh so that 0 is the first new number).
+- **Receiver state:** NEXT_RCV_SEQ (the next number it expects, initialized to 0). Ack and Nak DLLPs carry NEXT_RCV_SEQ minus 1 (modulo 4096), the last TLP received correctly.
 - **Why half:** modular arithmetic on a 12-bit field is only unambiguous if all live numbers sit inside a window of half the range. Then "behind" and "ahead" of the expected number never overlap.
 - **Classification at the receiver:**
 
@@ -92,7 +103,6 @@ FOLLOW:
 - Why ack a duplicate instead of ignoring it? => A duplicate usually means the sender did not see an earlier Ack. Acking it lets the sender move on.
 - What resets the counters? => Entering DL_Inactive/DL_Init (link down and back up) resets them on both sides, so they start from 0 in a fresh link.
 PITFALL: Thinking the sequence number is a global TLP ID. It is per link and per direction, and is unrelated to the requester's Tag.
-VERIFY: Initial values of NEXT_TRANSMIT_SEQ, ACKD_SEQ and NEXT_RCV_SEQ, and the exact Ack/Nak sequence number encoding (NEXT_RCV_SEQ minus 1).
 
 @@ 6.06 | Intermediate | Trap | tags=duplicate,nak-scheduled,out-of-sequence
 Q: A receiver sees TLP 10, then 12 (11 was corrupted and dropped), then 13. What does it send, and what does the sender do?
@@ -141,10 +151,10 @@ DEEP:
 - **After retrain:** the replay buffer is kept, and replay resumes when the link is back in L0. If retraining fails, DL_Down follows.
 - **Why it matters:** repeated rollover events mean the link is bad enough to keep failing, and the retrain is the hardware's last attempt before declaring the link dead.
 FOLLOW:
-- Does a Nak-triggered replay increment REPLAY_NUM? => Replays increment it and progress in acknowledgment resets it. Check the spec for the exact Nak handling, since a Nak that also frees entries counts as progress.
+- Does a Nak-triggered replay increment REPLAY_NUM? => Yes. Every replay increments it, whether a Nak or the timer triggered it, and an Ack or Nak that acknowledges new TLPs resets it to 0. A rollover therefore means four replays in a row with no forward progress.
 - What would a stuck receiver look like at the sender? => Replay Timer Timeouts, then Rollover, then Recovery, and possibly a link down if the partner never responds.
 PITFALL: Treating Replay Number Rollover as a benign counter. It means the link was one step from a forced retrain, which stalls all traffic for microseconds to milliseconds.
-VERIFY: The REPLAY_TIMER limit formula, and exactly which events (Nak, timer expiry, Ack with progress) increment or reset REPLAY_NUM.
+VERIFY: The REPLAY_TIMER limit formula and its adjustment for retimers and Extended Synch.
 
 @@ 6.09 | Intermediate | Concept | tags=lcrc,crc32,crc16,polynomial,ecrc
 Q: Which CRCs does PCIe use, and what does each protect?
@@ -156,14 +166,14 @@ DEEP:
 | ECRC | 32 | TLP header and data, end to end | Final receiver (and switches may check) |
 | DLLP CRC | 16 | The 4 bytes of the DLLP | Every receiver |
 
-- **Polynomials:** CRC-32 is x^32+x^26+x^23+x^22+x^16+x^12+x^11+x^10+x^8+x^7+x^5+x^4+x^2+x+1 (0x04C11DB7). The DLLP CRC-16 polynomial is 0x100B.
+- **Polynomials:** CRC-32 is x^32+x^26+x^23+x^22+x^16+x^12+x^11+x^10+x^8+x^7+x^5+x^4+x^2+x+1 (0x04C11DB7). The DLLP CRC-16 polynomial is 0x100B. Both are seeded with all ones (FFFFFFFFh and FFFFh) before each packet.
 - **Why both LCRC and ECRC:** LCRC catches link errors and triggers replay. ECRC catches errors introduced inside a switch or a device between the links, where LCRC is regenerated over corrupted data and appears fine.
 - **Strength:** a 32-bit CRC detects every burst error up to 32 bits long and all but about 1 in 4 billion (2^-32) of longer or random error patterns, which is strong for link error patterns.
 FOLLOW:
 - Why does the switch regenerate the LCRC? => The sequence number is per link and differs on each hop, and the LCRC covers it, so it must be recomputed.
 - What happens when ECRC fails? => The Transaction Layer reports an uncorrectable ECRC Error (AER), and the packet is treated as bad by the receiver. It is not replayed by the Data Link Layer.
 PITFALL: Assuming LCRC protects end to end. A fault inside a switch's buffers gets a fresh good LCRC on the way out.
-VERIFY: The polynomial and initial values for LCRC and DLLP CRC in the Base Specification, and the ECRC masking of variant bits.
+VERIFY: The ECRC masking of variant bits (see 2.05) and the bit ordering used when the CRC is placed on the wire.
 
 @@ 6.10 | Advanced | Concept | tags=dlcmsm,dl-init,dl-active,dl-up,dl-feature
 Q: What is the Data Link Control and Management State Machine, and how does it decide the link is up?
@@ -175,11 +185,15 @@ DEEP:
 - **DL_Active:** normal operation. Ack/Nak, replay, and UpdateFC all run here.
 - **Link down:** any loss of the Physical Layer link, or a reset, returns to DL_Inactive and the buffers and counters are cleared.
 - **What software sees:** the Data Link Layer Link Active bit in Link Status reflects DL_Active, and hot-plug software waits on it before touching a newly inserted device.
+
+**Bring-up timeline for a healthy link:** LTSSM reaches L0, DLCMSM leaves DL_Inactive, optional DL_Feature exchange, InitFC1 and InitFC2 for VC0 (usually a few microseconds), DL_Active, then the first configuration read from the root port. On an analyzer you see the Data Link Feature DLLPs (if both support them), then bursts of InitFC1-P, -NP, -Cpl, then InitFC2, then the first TLP.
+
+**Common bring-up failure:** a device whose firmware or IP holds off flow-control initialization (for example waiting for internal initialization) stays in DL_Init with the LTSSM in L0. The root port reports a trained link, but Data Link Layer Link Active stays 0 and every configuration access below it fails until the device finishes.
 FOLLOW:
 - Is the link "up" when the LTSSM reaches L0? => Physically yes, but not to the software layers. Until the DLCMSM reaches DL_Active, TLPs are not exchanged.
 - Can the DLCMSM be in DL_Init while the LTSSM is in Recovery? => The Physical Layer can retrain while the Data Link Layer keeps its state, as long as the link is not declared down. Full loss goes to DL_Inactive.
 PITFALL: Equating LTSSM L0 with a usable link. A link can sit in L0 but never reach DL_Active if flow control initialization does not complete.
-VERIFY: Whether DL_Feature applies at all rates in the spec version you target, and DLCMSM transition conditions.
+VERIFY: Data Link Feature exchange rules, including when a port may skip DL_Feature, in the Data Link Layer chapter.
 
 @@ 6.11 | Advanced | Concept | tags=flow-control,initfc1,initfc2,updatefc
 Q: Why does flow control initialization need both InitFC1 and InitFC2?
@@ -190,12 +204,12 @@ DEEP:
 - **InitFC2 round:** once InitFC1 was received for all types, send InitFC2. The reception of InitFC2 (or an UpdateFC) proves that the partner completed its InitFC1 phase.
 - **Why two rounds:** with only one, one side could finish while the other is still missing its first advertisement, since DLLPs are unacknowledged. The second round is the handshake.
 - **VC0 first:** VC0 is always initialized. Other VCs are initialized later by software enabling them.
-- **UpdateFC:** in DL_Active the receiver sends cumulative credit updates when the Transaction Layer frees buffer space, at least every 30 microseconds by the spec's timing rules (VERIFY).
+- **UpdateFC:** in DL_Active the receiver sends cumulative credit updates when the Transaction Layer frees buffer space, and at least once every 30 microseconds for each credit type that is not infinite, even with nothing new to report (120 microseconds when Extended Synch is set). The periodic update recovers from a lost UpdateFC DLLP.
 FOLLOW:
 - Can TLPs flow on VC0 before other VCs are initialized? => Yes. Only VC0 must be initialized to enter DL_Active.
 - What is infinite credit? => A value of 0 in the advertisement means the receiver has infinite credit for that type. It is used for Completion credits by endpoints and Root Complexes, which can always accept completions for requests they issued.
 PITFALL: Explaining InitFC2 as a repeat with no purpose. It is the acknowledgement of the first round in a protocol with no acknowledgements.
-VERIFY: UpdateFC timing limit, the scaled flow control field encodings, and the infinite credit rules for Completions.
+VERIFY: Scaled Flow Control field encodings (HdrScale, DataScale) and the maximum credit values; module 8 covers them.
 
 @@ 6.12 | Intermediate | Concept | tags=pm-dllp,l1,aspm,handshake
 Q: How do the power management DLLPs get a link into L1?
@@ -221,11 +235,13 @@ SHORT: Receiver Error means the Physical Layer lost sync or hit a decode or fram
 DEEP:
 | Status bit | Logged by | Meaning |
 |---|---|---|
-| Receiver Error | Receiver | PHY-level error: 8b/10b code violation, disparity, framing, or 128b/130b sync or block error |
-| Bad TLP | Receiver | LCRC failure or bad sequence number |
-| Bad DLLP | Receiver | DLLP CRC failure |
-| Replay Number Rollover | Sender | Repeated replays with no progress (2-bit counter rolls over) |
-| Replay Timer Timeout | Sender | No Ack within the timer, so it replayed |
+| Receiver Error (bit 0) | Receiver | PHY-level error: 8b/10b code violation, disparity, framing, or 128b/130b sync or block error |
+| Bad TLP (bit 6) | Receiver | LCRC failure or bad sequence number |
+| Bad DLLP (bit 7) | Receiver | DLLP CRC failure |
+| REPLAY_NUM Rollover (bit 8) | Sender | Repeated replays with no progress (2-bit counter rolls over) |
+| Replay Timer Timeout (bit 12) | Sender | No Ack within the timer, so it replayed |
+
+Bit numbers are in the AER Correctable Error Status register (offset 10h in the AER capability); the Correctable Error Mask register at offset 14h uses the same positions.
 
 - **Direction rule:** errors are logged at the receiving end. Bad TLP at the endpoint means the root-port-to-endpoint direction is damaged. Look at the root port's counters for the other direction.
 - **Nak replays set no AER bit at the sender:** a Nak-triggered replay logs nothing there, although it counts toward REPLAY_NUM. Only Replay Timer Timeout and Replay Number Rollover appear in the sender's AER.
@@ -236,7 +252,7 @@ FOLLOW:
 - Bad TLP is high on the endpoint. Which side's transmitter do you suspect? => The root port's transmitter or the channel in that direction (or the endpoint's receiver). Do not read the endpoint's own transmit direction from that counter.
 - Both ends show similar counts? => Symmetric problem: reference clock, power noise, a shared channel issue such as the connector, or the environment (temperature).
 PITFALL: Reading counters as if they described the local transmitter. They describe what the local receiver saw.
-VERIFY: Bit positions of the correctable error status register, and whether your platform masks any of them in the Correctable Error Mask register.
+VERIFY: Whether your platform firmware masks any correctable errors in the Correctable Error Mask register.
 
 @@ 6.14 | Advanced | Concept | tags=surprise-down,dl-up,data-link-protocol-error,link-active
 Q: What are Surprise Down and Data Link Protocol errors, and how does the Data Link Layer report link up and down?
@@ -244,6 +260,7 @@ SHORT: The Data Link Layer reports DL_Up when it enters DL_Active and DL_Down wh
 DEEP:
 - **DL_Up and DL_Down:** signals to the Transaction Layer. On DL_Down, pending transactions are aborted and completions will not arrive.
 - **Link Active bit:** Data Link Layer Link Active in Link Status is set when DL_Active, and ports can optionally signal changes with an interrupt (Data Link Layer State Changed).
+- **Where they are logged:** Data Link Protocol Error is bit 4 and Surprise Down Error is bit 5 of the AER Uncorrectable Error Status register; both default to fatal severity. Surprise Down reporting is only required of ports that support Surprise Down Error Reporting (advertised in Link Capabilities).
 - **Surprise Down Error:** DL_Down without a preceding intentional cause (Link Disable, hot reset, or slot power-off), logged as an uncorrectable error. Hot-plug capable slots may treat it as a normal removal.
 - **Data Link Protocol Error:** an uncorrectable error that indicates a fault inside the partner's Data Link Layer or a DLLP that refers to state that does not exist. Rare in the field.
 - **Consequence:** in-flight requests never complete, and the completion timeout on the requester handles them.
@@ -251,7 +268,7 @@ FOLLOW:
 - How does an NVMe SSD pulled from a live slot appear? => The port sees DL_Down, logs Surprise Down (unless the slot expects it), and the NVMe driver sees timeouts and a controller that reads all 1s.
 - What ends a Surprise Down state? => A link retrain that reaches DL_Active again, or removal of the device by the OS.
 PITFALL: Treating a Surprise Down on a hot-plug slot as always a failure. It is the normal signature of a surprise removal.
-VERIFY: Which uncorrectable error bits map to Surprise Down and Data Link Protocol Error, and platform hot-plug behavior for them.
+VERIFY: Platform hot-plug behavior for Surprise Down (whether pciehp or DPC handles it first) on your system.
 
 @@ 6.15 | Principal | Numeric | tags=ber,throughput,go-back-n,replay
 Q: Estimate the throughput loss caused by replays at a given BER, for a Gen4 x4 link. At what BER does it become severe?
@@ -320,4 +337,4 @@ FOLLOW:
 - How do you set a threshold? => From the baseline distribution of healthy units at the same speed and workload, and a rate that would cost a defined amount of throughput (see the BER model), not a guess.
 - Why record the firmware version? => Retimer, BIOS and SSD firmware all change link behavior, and correlation with a version is often the first clue in a regression.
 PITFALL: Alerting on the raw count. Long tests always accumulate counts, so monitor rates and changes.
-VERIFY: WHEA-Logger event IDs and fields for PCIe corrected errors on your Windows version, and sysfs counter names on your kernel version.
+VERIFY: WHEA-Logger event IDs for PCIe corrected and uncorrected errors on your Windows version (event 17 is the usual corrected-error event) and sysfs counter names on your kernel.

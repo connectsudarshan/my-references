@@ -6,42 +6,52 @@ SHORT: Each direction is a pair of complementary signals, and the receiver reads
 DEEP:
 - **Common-mode rejection:** crosstalk, ground bounce and power noise appear on both wires and cancel in the receiver.
 - **Small swing:** less voltage swing means less power, less EMI, and faster edges for the same power.
-- **AC coupling:** a series capacitor (typically in the 75 to 200 nF range on the transmit pair of a card) blocks the DC level. Each end sets its own common-mode bias.
+- **AC coupling:** a series capacitor on each transmit pair (75 to 200 nF for 2.5 and 5 GT/s designs; 176 to 265 nF, typically 220 nF, from 8 GT/s in the CEM specification) blocks the DC level. Each end sets its own common-mode bias.
 - **Consequence for coding:** the AC-coupled channel high-pass filters the signal, so the line code must not contain long low-frequency content. 8b/10b guarantees DC balance. 128b/130b relies on scrambling and a receiver that tolerates baseline wander.
+
+**Worked example of why the pair helps:** a 10 mV noise spike coupling onto both wires of a pair shifts both D+ and D- by 10 mV, so D+ minus D- is unchanged. On a single-ended line it would eat directly into a noise margin that, at Gen5 receivers, is only tens of millivolts after the channel's loss.
+
+**Validation angle:** a missing, wrong-value or cracked AC-coupling capacitor on one lane often still trains at Gen1 but fails or down-trains at higher speeds, and shows up as one lane with much worse margin than its neighbors in lane margining.
 FOLLOW:
 - What does AC coupling let you do at the connector? => Connect two devices with different supply voltages or a card that powers up later, without a DC path or a large surge.
 - What breaks if DC balance is poor? => The coupling capacitor charges, the baseline drifts, and the eye closes for long runs of ones or zeros.
 PITFALL: Calling the two wires "TX and RX." A pair is one direction; a lane has one pair each way.
-VERIFY: The capacitor value range and placement rules in the CEM specification (they depend on form factor).
+VERIFY: Capacitor placement rules for your form factor (M.2, U.2 and EDSFF specifications may differ from CEM).
 
 @@ 3.02 | Basic | Concept | tags=refclk,pll
 Q: What is REFCLK and what does it do if the data clock is recovered from the data?
 SHORT: REFCLK is a 100 MHz differential reference clock, normally supplied by the host on the connector. Each device's PLL multiplies it to the bit rate for its transmitter, and the receiver's CDR recovers the data timing on its own. REFCLK does not sample data; it sets each side's transmit frequency within a small tolerance and keeps both ends close in frequency.
 DEEP:
 - **Tolerance:** transmit frequency must stay within about plus or minus 300 ppm of nominal, so two ends can differ by up to 600 ppm.
-- **Spread spectrum:** an optional downspread (about 0.5%) at 30 to 33 kHz reduces peak EMI. Both ends must be able to track it.
+- **Spread spectrum:** an optional downspread of up to 0.5% (0 to -5000 ppm), modulated at 30 to 33 kHz, reduces peak EMI. Both ends must be able to track it.
 - **Why not a clock per lane:** the CDR recovers timing per lane from the data, so lanes do not need to share timing, only frequency.
 - **Where it can hide failures:** poor reference clock jitter, spread-spectrum settings that disagree with the configured clocking mode, and a missing or late refclk during power-up all look like link training failures or intermittent errors.
+
+**Worked example:** at plus or minus 300 ppm, a 100 MHz REFCLK may sit anywhere from 99.97 to 100.03 MHz. Two independent clocks at the extremes differ by 600 ppm, which at 16 GT/s is 9.6 million UI per second of accumulated drift, absorbed by the receiver's elastic buffer through SKP ordered sets (3.06).
+
+In a system, REFCLK comes from the platform clock generator through the connector (the `REFCLK+`/`REFCLK-` pins). U.2, EDSFF and cabled designs may instead run SRIS, where the drive uses its own oscillator (3.05). Getting that mode wrong is a classic bring-up failure that looks like random correctable errors.
 FOLLOW:
 - Is REFCLK required at the device? => Normally yes on the slot, with a defined power-up order. Designs that generate their own reference must use an independent-reference clocking mode.
 - Why 100 MHz? => It is a convenient, low-jitter frequency for PLLs to multiply to multi-GHz bit rates, and it is common across all generations.
 PITFALL: Treating REFCLK as the sampling clock. The receiver samples on the recovered clock.
-VERIFY: ppm and spread-spectrum figures against the Base Specification and the CEM specification for your form factor.
 
 @@ 3.03 | Basic | Concept | tags=scrambling,lfsr,emi
 Q: Why does PCIe scramble data, and what is not scrambled?
 SHORT: A scrambler XORs the data with a pseudo-random sequence from an LFSR that both ends run in lockstep. It spreads spectral energy of repeating patterns (lower EMI), breaks up long runs so the CDR keeps seeing transitions, and improves statistical DC balance. It is not encryption. Training ordered sets and other defined symbols are exempt so the receiver can lock before the scrambler is synchronized.
 DEEP:
-- **Generations:** Gen1 and Gen2 use a 16-bit LFSR; Gen3 and above use a 23-bit LFSR with per-lane seeds so neighboring lanes do not carry identical patterns (which would add crosstalk and EMI).
+- **Generations:** Gen1 and Gen2 use a 16-bit LFSR (G(X) = X^16 + X^5 + X^4 + X^3 + 1) shared by all lanes; Gen3 and above use a 23-bit LFSR (G(X) = X^23 + X^21 + X^16 + X^8 + X^5 + X^2 + 1) with per-lane seeds so neighboring lanes do not carry identical patterns (which would add crosstalk and EMI).
 - **Synchronization:** the LFSR is reset at defined points (for example a COM symbol in Gen1/Gen2), and it does not advance for symbols that are not scrambled.
 - **Exempt symbols:** training sequences and a few other ordered-set symbols are not scrambled so a receiver can decode them before its scrambler is aligned.
-- **Test and debug:** scrambling can be disabled (through a training control bit) only at the 8b/10b speeds, for analyzers and bench work.
+- **Test and debug:** scrambling can be disabled (through the Disable Scrambling bit in the TS1/TS2 Training Control field) only at 2.5 and 5 GT/s, for analyzers and bench work. At 8 GT/s and above it is always on.
 - **Not a security feature:** the sequence is fixed and public.
+
+**Example of what scrambling fixes:** an SSD writing a buffer of zeros would, unscrambled, send a long run of identical bits: no transitions for the CDR and a strong spectral line at one frequency. After XOR with the LFSR sequence, the same zeros become a pseudo-random bit stream with plenty of transitions and a flat spectrum.
+
+Analyzers descramble automatically once they see the reset points, which is why a trace that starts mid-stream may show garbage until the next ordered set lets the analyzer synchronize its own LFSR copy.
 FOLLOW:
 - Why do lanes use different scrambler seeds? => Identical scrambled patterns on adjacent lanes would correlate, creating crosstalk and EMI peaks. Different seeds decorrelate them.
 - Can you disable scrambling at Gen4? => Not for normal operation. The disable option applies to the 8b/10b rates.
 PITFALL: Calling scrambling security or encryption.
-VERIFY: LFSR widths, polynomials, reset points, and which rates permit disabling scrambling (Base Specification, Physical Layer chapter).
 
 @@ 3.04 | Intermediate | Concept | tags=electrical-idle,detect,eios
 Q: What is electrical idle, and how does a transmitter detect that a receiver is present?
@@ -51,6 +61,10 @@ DEEP:
 - **Entering idle:** a transmitter sends an EIOS (electrical idle ordered set) so the receiver knows the silence is intentional and not a fault.
 - **Leaving idle:** the receiver's analog detector sees activity, then the CDR must re-lock using training patterns (FTS in L0s exit, TS1 and TS2 in Recovery). That relock time is the main component of low-power exit latency.
 - **Why it matters:** wake latency, L0s/L1 exit failures, and hot-plug detection all depend on these mechanisms.
+
+**Where you see it on an analyzer:** EIOS before the link goes silent on entry to L0s, L1, L2 or a speed change, and EIEOS (Electrical Idle Exit Ordered Set) at Gen3 and later when the link comes back and needs block alignment.
+
+**Validation angle:** hot-plug and power-cycle tests rely on receiver detect. A drive whose receiver termination appears late during power-up can be missed in Detect, so the root port stays in Detect.Quiet and retries every 12 ms; the symptom is a link that comes up late or only after a manual retrain.
 FOLLOW:
 - Is receiver detect a protocol handshake? => No. It is an analog measurement and needs no cooperating packets.
 - Why can a link appear absent when a card is inserted but unpowered? => The unpowered receiver's termination may not be present, so the detect measurement finds no receiver.
@@ -67,20 +81,20 @@ DEEP:
 | SRIS | Separate clocks | On, independent | Cables, backplanes, some SSD and storage systems |
 
 - **Elastic buffers:** the receiver must absorb the frequency difference between its recovered clock and its local clock, so SRIS needs deeper buffers and more frequent SKP ordered sets.
-- **Software view:** Link Status reports Slot Clock Configuration (`SlotClk+` in `lspci`), and Link Control has a Common Clock Configuration bit that software sets so both ends use matching SKP timing.
+- **Software view:** Link Status bit 12 reports Slot Clock Configuration (`SlotClk+` in `lspci`), and Link Control bit 6 is Common Clock Configuration, which software sets on both ends when they share a clock (it changes the L0s and L1 exit latencies they report). SRIS support is advertised per speed in Link Capabilities 2 (the Lower SKP OS Generation and Reception Supported Speeds vectors) and enabled in Link Control 3.
 - **Failure signature:** a mismatch in configured mode gives correctable errors that grow with traffic and spread-spectrum activity, sometimes only in specific systems.
 FOLLOW:
-- Which mode sends SKP ordered sets most often? => SRIS, roughly an order of magnitude more often than common clock.
+- Which mode sends SKP ordered sets most often? => SRIS: about every 154 symbol times at 8b/10b and every 37 blocks at 128b/130b, roughly ten times as often as with a common clock.
 - What is SSC for? => It spreads clock energy across a band to lower peak EMI. It complicates frequency tracking, which is why independent SSC needs its own architecture.
 PITFALL: Configuring SSC differently on the two ends with separate clocks. The ppm budget can be exceeded.
-VERIFY: SKP ordered set intervals for SRIS and the specific clocking mode support bits (Base Specification, Physical Layer and Link Capabilities).
 
 @@ 3.06 | Intermediate | Numeric | tags=skp,elastic-buffer,ppm
 Q: What is a SKP ordered set, and how do you know how often it must be sent?
 SHORT: A SKP ordered set is a padding pattern that the receiver may delete or insert to keep its elastic buffer centered, compensating for the small frequency difference between transmit and receive clocks. With plus or minus 300 ppm on each end, the worst-case difference is 600 ppm, so one symbol of drift accumulates every 1 / 600e-6, about 1,667 symbol times. SKP ordered sets are therefore scheduled at intervals shorter than that.
 DEEP:
 - **Interval (8b/10b):** a SKP ordered set is scheduled every 1180 to 1538 symbol times, so the receiver always has an opportunity to adjust before a slip.
-- **Interval (128b/130b):** the equivalent interval is about 370 to 375 blocks.
+- **Interval (128b/130b):** the equivalent interval is 370 to 375 blocks.
+- **Structure:** at 8b/10b a SKP ordered set is a COM followed by three SKP symbols, and a receiver adds or removes one SKP symbol at a time. At 128b/130b it is a 16-symbol ordered-set block (12 SKP symbols, a SKP_END symbol and 3 symbols of LFSR state and parity), and the receiver adds or removes SKP symbols in groups of 4.
 - **Mechanism:** if the receive clock is faster, the buffer drains and the receiver inserts a SKP symbol. If it is slower, the buffer fills and the receiver removes one. Data is never dropped because SKP symbols carry no information.
 - **SRIS and SSC:** independent spread-spectrum modulation can make the difference much larger over short periods, so SRIS intervals are far shorter.
 - **Bandwidth cost:** SKP ordered sets consume a fraction of a percent of link bandwidth, and SRIS makes that cost visible.
@@ -88,7 +102,6 @@ FOLLOW:
 - What happens if the SKP interval is too long? => The elastic buffer overflows or underflows and symbols are lost, causing decode or CRC errors.
 - Do SKP ordered sets pass through switches? => No. They are link-local and are regenerated on each link.
 PITFALL: Assuming SKP ordered sets carry payload. They are pure padding.
-VERIFY: SKP interval limits and SKP ordered set structure per encoding (Base Specification, Physical Layer chapter).
 
 @@ 3.07 | Intermediate | Concept | tags=polarity,lane-reversal,deskew
 Q: What are polarity inversion, lane reversal and lane-to-lane skew, and who handles them?
@@ -98,11 +111,15 @@ DEEP:
 - **Lane reversal:** the downstream port assigns lane numbers in Configuration. If the partner sees them in reverse order it maps them back, provided it supports reversal. It simplifies routing of connectors and mezzanine boards.
 - **De-skew:** trace length differences and electrical variation mean lanes arrive at different times. Skew is removed at the receiver using the SKP and other ordered sets that are sent simultaneously on all lanes.
 - **Failure signature:** a design that needs reversal but does not support it usually trains at x1 or fails to train.
+
+**Example of lane reversal:** an x4 device whose lane 0 is routed to the root port's lane 3 (and 1 to 2, and so on) trains normally if either side supports reversal; during Configuration the ports see the lane numbers in reverse order and one side remaps them internally. Without reversal support it may train only as x1 on the one lane whose numbering happens to match.
+
+**Why skew limits matter:** de-skew buffers are sized for the specified maximum skew. A design with long mismatched routes (for example through a cable or riser) can exceed it at higher speeds, which shows up as training failures or a narrower link rather than as data errors.
 FOLLOW:
 - Is polarity inversion optional? => No. Receivers must support it.
 - Does lane reversal affect lane-to-lane numbering seen by software? => Software sees logical lane numbers. Reversal is handled below the software-visible link registers.
 PITFALL: Assuming any x16 device supports reversal. It is optional and some devices only support the mapping they were designed for.
-VERIFY: Maximum tolerated lane-to-lane skew per generation and which link widths must support reversal.
+VERIFY: Maximum receiver lane-to-lane skew per data rate (about 20 ns at 2.5 GT/s, tightening to single-digit ns at 8 GT/s and above) in the Physical Layer chapter.
 
 @@ 3.08 | Intermediate | Numeric | tags=ui,nyquist,loss
 Q: What are the unit interval and Nyquist frequency for each generation, and why do they matter?
@@ -117,13 +134,12 @@ DEEP:
 | 5 | 32 GBaud | 31.25 ps | 16 GHz |
 | 6 | 32 GBaud (PAM4) | 31.25 ps | 16 GHz |
 
-- **Loss budget:** the end-to-end channel insertion loss budget grows with each generation, from roughly 22 dB at 4 GHz for Gen3, to 28 dB at 8 GHz for Gen4, to 36 dB at 16 GHz for Gen5, including package and connector contributions.
+- **Loss budget:** the commonly cited end-to-end channel insertion loss budget grows with each generation, from roughly 22 dB at 4 GHz for Gen3, to 28 dB at 8 GHz for Gen4, to 36 dB at 16 GHz for Gen5, including both packages and the connector. The CEM specification then divides it between the system board and the add-in card.
 - **Jitter budget:** a few picoseconds of jitter is a large fraction of a 31 ps UI at Gen5, which is why reference clock jitter, power noise and connector quality matter more each generation.
 FOLLOW:
 - Why is Nyquist half the rate? => The fastest pattern (1010...) toggles once per bit and completes a cycle every two bits, so its fundamental frequency is half the bit rate.
 - Why does Gen6 not need a higher Nyquist than Gen5? => PAM4 packs two bits per symbol at the same 32 GBaud symbol rate.
 PITFALL: Comparing channel losses at different frequencies. Always compare at the generation's Nyquist frequency.
-VERIFY: The channel insertion loss figures; confirm them in the Base Specification and CEM for your form factor.
 
 @@ 3.09 | Intermediate | Concept | tags=eye,jitter,ber
 Q: What does an eye diagram show, and how do jitter and BER relate?
@@ -131,13 +147,15 @@ SHORT: An eye diagram overlays many bit periods so the open region shows timing 
 DEEP:
 - **Deterministic jitter (DJ):** bounded. Adds linearly. Caused by ISI, reflections, duty-cycle distortion, and periodic sources such as supply ripple.
 - **Random jitter (RJ):** unbounded Gaussian. To be open at BER 1e-12, total jitter is DJ plus about 14.07 times the RJ standard deviation (a 7.03 sigma one-sided margin on each side).
+- **At Gen6:** the target is instead a first bit error rate (FBER) of about 1e-6 before FEC, with FEC and flit replay bringing the delivered error rate down.
 - **At Gen3 and above:** the receiver cannot see an open eye before equalization, so compliance measures a behavioral eye after a reference receiver equalizer is applied in software.
 - **Practical meaning:** an eye that looks acceptable on a scope may still fail 1e-12 if its tails are wide, so BER contour or margining measurements matter.
+
+**A worked jitter budget:** at Gen4 a UI is 62.5 ps. If deterministic jitter is 20 ps and random jitter has an RMS of 1 ps, total jitter at 1e-12 is 20 + 14.07 x 1 = 34 ps, leaving an eye about 28 ps wide (45% of the UI). Double the RMS random jitter to 2 ps and the eye shrinks to about 14 ps: random jitter is small per edge but multiplied by 14 at this BER, which is why reference clock quality matters so much.
 FOLLOW:
 - Why 14.07 sigma? => For BER 1e-12 the one-sided Gaussian tail is about 7.03 sigma, and it applies at both eye edges, so peak-to-peak random jitter is about 14.07 sigma.
 - Can a good eye still give errors? => Yes. Crosstalk bursts, supply noise, and non-Gaussian effects create errors the average eye does not show.
 PITFALL: Reading eye opening as a pass/fail without the BER contour or margin it was measured at.
-VERIFY: BER targets (1e-12 for the NRZ generations) and how the Gen6 pre-FEC target is specified.
 
 @@ 3.10 | Advanced | Concept | tags=channel,reflection,crosstalk,vias,gen5
 Q: What makes a Gen5 channel hard to build, and what do you do about it?
@@ -158,6 +176,7 @@ PITFALL: Assuming a channel that met the budget in simulation will meet it in th
 Q: How does lane margining work, and what do you read from it?
 SHORT: Lane margining lets a receiver measure its own timing and voltage margin while the link is in L0 and carrying traffic. Software uses the Lane Margining at the Receiver extended capability to command a lane to shift its sampling point left or right (timing) or up or down (voltage) and count errors, giving you quantified margin per lane without a scope.
 DEEP:
+- **Where it lives:** the Lane Margining at the Receiver extended capability (ID 0027h), required for ports that support 16 GT/s and above. Timing margining is mandatory; voltage margining is optional and advertised by the receiver. Retimers can be margined too, addressed as separate receivers.
 - **Mechanism:** per-lane control and status registers accept commands such as Set Error Count Limit and Step Margin (timing left or right, voltage up or down). The receiver steps its sample point until the error count exceeds the limit.
 - **Output:** margin as a fraction of the unit interval for timing, and as a fraction of voltage swing for voltage.
 - **Advantages:** works in-system, on live links, per lane, and can be automated. No scope or analyzer is needed.
@@ -167,7 +186,6 @@ FOLLOW:
 - Can you margin both directions of a link? => Yes. Each port's receiver can be margined, and software can command it through the capability registers on either side.
 - Does margining disturb traffic? => It is designed to run while the link is active, though extreme steps can induce errors that the link recovers from.
 PITFALL: Comparing absolute margin numbers between different silicon vendors. Compare trends within one design.
-VERIFY: Capability register layout, supported commands, and margining requirements per generation (Base Specification, Lane Margining chapter).
 
 @@ 3.12 | Advanced | Concept | tags=compliance,rx-test,tx-test
 Q: How is the electrical compliance of a PCIe device tested?
@@ -190,14 +208,14 @@ SHORT: Both run at 32 GBaud, so the channel loss at Nyquist (16 GHz) is about th
 DEEP:
 - **Same symbol rate, same loss:** channel insertion loss depends on the frequency content, which is set by the symbol rate. So the loss budget stays near Gen5's.
 - **Less margin per eye:** the eye height is one third, so an interferer of a given size costs three times as much relative margin.
-- **Consequences:** raw bit error rate before correction is many orders of magnitude worse than 1e-12, so lightweight forward error correction is mandatory. Errors can also come in bursts from DFE, so precoding is used to limit burst length.
+- **Consequences:** the pre-FEC target is a first bit error rate (FBER) of about 1e-6, six orders of magnitude worse than 1e-12, so lightweight forward error correction is mandatory. Errors can also come in bursts from DFE, so precoding is used to limit burst length.
 - **Protocol response:** the link moves to fixed-size flits with CRC and replay, so the residual errors after FEC are caught at the flit level.
 - **System implication:** crosstalk and power noise budgets tighten, and more designs need retimers.
 FOLLOW:
 - Why does DFE cause burst errors? => A wrong decision is fed back into the equalizer and can bias the next decisions, so one error can become several. Precoding limits this.
 - Why FEC and not just a better channel? => Meeting 1e-12 raw at PAM4 would need a channel and receiver far beyond practical, so a small amount of correction is cheaper than a perfect channel.
 PITFALL: Assuming a doubling of data rate means a doubling of channel bandwidth. Gen6 uses the same bandwidth and pays with SNR.
-VERIFY: Precoding details and target pre-FEC error rate in the current Base Specification.
+VERIFY: Which data rates define precoding and how it is requested in TS1/TS2, in the Physical Layer chapter of PCIe Base 5.0 and 6.x.
 
 @@ 3.14 | Advanced | Debug | tags=temperature,errors,triage,signal-integrity
 Q: A link is clean at room temperature but correctable errors climb at high temperature after 30 minutes. How do you separate a signal-integrity problem from a protocol problem?
@@ -220,7 +238,7 @@ Q: An SSD links up perfectly on the vendor evaluation board but fails to train o
 SHORT: Compare the platform against the eval board on clocking, power sequencing, reset, and channel. The likeliest culprits are the reference clock mode (common clock versus separate reference), power and PERST# sequencing, channel loss or connector differences, lane wiring (polarity, reversal, lane order), and BIOS or firmware settings that force speed or width.
 DEEP:
 1. **Clocking:** is REFCLK present and stable before PERST# releases? Is the slot clocking mode (common clock or SRIS) what the device expects, and is SSC on or off?
-2. **Power and reset:** are all rails stable within the specified time before PERST# deasserts, and does PERST# meet the required timing? A late rail can look like a training failure.
+2. **Power and reset:** the CEM specification requires power stable at least 100 ms before PERST# deasserts (T_PVPERL) and REFCLK stable at least 100 us before it (T_PERST-CLK). A late rail or clock can look like a training failure.
 3. **Channel:** compare insertion loss, connector type, length, riser or backplane presence. A retimer may be missing where the eval board had none but the platform is longer.
 4. **Wiring:** lane order and reversal, polarity swaps, and unused lane termination; a design relying on reversal that the device does not support trains at x1 or fails.
 5. **Platform settings:** BIOS forced link speed, bifurcation settings, ASPM defaults, and Target Link Speed.
@@ -229,7 +247,7 @@ FOLLOW:
 - Trains at Gen1 only. What is the first suspect? => Equalization or channel loss at the higher rates, since Gen1 needs no equalization. Check the equalization phase status and whether a retimer is needed.
 - Fails in Detect. What do you check? => Presence of the device's receiver termination, power and PERST# sequencing, and lane connectivity, since Detect is an analog measurement.
 PITFALL: Concluding "device bug" because it works on the eval board. Eval boards rarely resemble a real platform's channel or sequencing.
-VERIFY: Power-up timing parameters (refclk and power stable before PERST# deassertion) in the CEM specification.
+VERIFY: Any tighter power-up timing in your form-factor specification (M.2, U.2, EDSFF) than the CEM values quoted.
 
 @@ 3.16 | Principal | Trap | tags=compliance,interop,margin
 Q: The device passed PCI-SIG compliance. Why can it still fail in customer systems?
@@ -241,6 +259,15 @@ DEEP:
 - **Population variation:** corner units and aging matter. Margin should be a distribution across many units, temperatures, and voltage corners.
 - **Software and BIOS:** power-management settings, MPS and MRRS, and link-retrain triggers behave differently per platform.
 - **Validation answer:** measure margin and error rates per platform, across corners, and track link-up yield across many reset cycles, not a single pass.
+
+**What a validation team adds on top of compliance:**
+
+- Interoperability with every root port, switch and retimer the product ships with, across BIOS versions.
+- Link-up yield over thousands of power cycles and resets, since rare training failures only appear at scale.
+- Per-lane margin distributions (lane margining) across temperature and voltage corners, compared against a pass threshold agreed with the platform team.
+- Long-duration error-rate runs (correctable errors per hour) under realistic traffic.
+
+When a field failure is reported, the first question is which of these the failing configuration was never covered by.
 FOLLOW:
 - What metric would you track across platforms? => Link-up success rate over many resets, correctable error rate per hour, and per-lane margin distributions.
 - Who owns the fix when a specific platform fails? => Depends on the evidence: channel and BIOS on the platform side, equalization behavior on the silicon side, jointly analyzed with traces and margin data.

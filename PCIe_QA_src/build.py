@@ -165,7 +165,7 @@ def main():
         html = f.read()
     html = html.replace('/*__DIAGRAMS__*/', diagrams).replace('/*__DATA__*/', 'var DATA=' + blob + ';')
     out = os.path.join(ROOT, 'out', 'PCIe_QA_Study_Guide.html')
-    with open(out, 'w', encoding='utf-8') as f:
+    with open(out, 'w', encoding='utf-8', newline='\n') as f:
         f.write(html)
 
     print(f'\nBuilt {out}  ({os.path.getsize(out) / 1024:.0f} KB)')
