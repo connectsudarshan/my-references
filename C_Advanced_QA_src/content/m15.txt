@@ -337,11 +337,12 @@ DEEP:
 - The dominant cost in the contended case is not the mutex implementation itself but the kernel-mediated block-and-wake path: the waiting thread is descheduled and must be rescheduled once the lock becomes available, and that round trip through the scheduler is where the real cost lives, not in the lock's own bookkeeping.
 - This is why lock-free/atomic-based designs (module 10) can meaningfully outperform mutex-based ones specifically under contention, not necessarily in the uncontended case where the two approaches are much closer -- the benefit of avoiding a lock shows up exactly when many threads are actually fighting over the same resource.
 - These are broad, hardware- and OS-scheduler-dependent approximations, not a benchmark run in this session; treat any of these numbers as a sanity-check ballpark for reasoning about a design tradeoff, never as a number to cite precisely in a design document without measuring the actual target system.
+
+**Source note:** All figures are commonly-cited approximate orders of magnitude for typical modern hardware, not measurements taken in this session; treat as VERIFY for any real capacity-planning or design decision.
 FOLLOW:
 - Does this mean you should always prefer atomics over mutexes for performance? => No; atomics only directly replace very simple operations (a counter, a flag, a single-word CAS-based structure); anything requiring multiple related fields to change together atomically generally still needs a mutex (or a much more complex, carefully-designed lock-free structure) rather than a naive collection of independent atomics.
 - Why did 15.10's thread pool use a mutex+cond-var rather than a lock-free queue? => Because a work queue with blocking semantics (workers should sleep, not spin, when there is no work) is exactly what a condition variable is designed for; a lock-free queue would still need a separate mechanism for workers to sleep efficiently when idle, so the mutex+cond-var combination is the appropriate tool here, not a missed optimization.
 PITFALL: Quoting these figures as precise, portable constants. They vary by CPU, kernel scheduler, and current system load; use them only for order-of-magnitude reasoning, exactly as hedged here.
-VERIFY: All figures are commonly-cited approximate orders of magnitude for typical modern hardware, not measurements taken in this session; treat as VERIFY for any real capacity-planning or design decision.
 
 @@ 15.17 | Principal | Scenario | tags=boundedqueue,firstprinciples,instrumentation
 Q: Design and build a bounded blocking queue from first principles, end to end, as a real Principal-level design exercise.

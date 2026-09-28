@@ -21,11 +21,12 @@ DEEP:
 - POSIX's `mkfifo(const char *path, mode_t mode)` creates the special file itself; opening it for reading blocks until a writer also opens it (and vice versa), which is a real, sometimes-surprising blocking behavior worth remembering -- 12.05 demonstrates and confirms this exact blocking handshake.
 - Once both ends are open, a FIFO behaves exactly like an anonymous pipe for read()/write() purposes; the only functional difference is how the two ends found each other (a pathname vs. inherited file descriptors).
 - A FIFO's directory entry (the special file itself) persists until explicitly removed with unlink(), independent of whether any process currently has it open -- unlike an anonymous pipe, which disappears once its last file descriptor is closed.
+
+**Reference (checked against the Linux man-pages):** POSIX.1-2017, pipe.3p (fildes[0]=read, fildes[1]=write, unspecified whether either end is also open the other way) and mkfifo.3p (special-file creation via mkfifo(); the open-blocks-until-both-ends-present behavior is documented under the related open()/fifo semantics, not restated verbatim on mkfifo.3p itself).
 FOLLOW:
 - Can two unrelated processes use an anonymous pipe? => Not directly; they would need some other mechanism to share the file descriptor (e.g. passing it over a UNIX domain socket, or a common ancestor process that forked both and left the descriptors open), which defeats much of the simplicity anonymous pipes offer.
 - What happens if you open a FIFO for reading with O_NONBLOCK and no writer exists yet? => open() returns immediately (rather than blocking) per the nonblocking semantics documented alongside FIFO behavior, and a subsequent read simply returns no data until a writer appears.
 PITFALL: Forgetting that opening a FIFO blocks until the other end is also opened. A program that opens a FIFO for writing with no reader ever showing up will hang on that open() call, not on the first write().
-VERIFY: POSIX.1-2017, pipe.3p (fildes[0]=read, fildes[1]=write, unspecified whether either end is also open the other way) and mkfifo.3p (special-file creation via mkfifo(); the open-blocks-until-both-ends-present behavior is documented under the related open()/fifo semantics, not restated verbatim on mkfifo.3p itself).
 
 @@ 12.03 | Basic | Concept | tags=shm,sync,mandatory
 Q: Why does POSIX shared memory need an explicit synchronization primitive, when a pipe or message queue does not?
@@ -63,11 +64,12 @@ if (pid == 0) {
   Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run, the parent printed `parent read 17 bytes: "hello from child"`, confirming the full message crossed the fork() boundary through the pipe intact.
 - Both processes inherit *both* file descriptors across fork() (pipes are created before the fork specifically so this sharing happens); each side explicitly closing the end it does not use is a correctness requirement, not just tidiness -- if the parent kept fd[1] (the write end) open, its own read() could block forever after the child exits, since the pipe would still have a writer (the parent itself) even though no one will ever write.
 - This is the mechanism underlying shell pipelines (`cmd1 | cmd2`) at the OS level: the shell creates a pipe, forks both commands, and wires one command's stdout and the other's stdin to the two ends.
+
+**Reference (checked against the Linux man-pages):** POSIX.1-2017, pipe.3p (fildes[0]/fildes[1] semantics, EMFILE/ENFILE errors) -- the fork()-inheritance and close-the-unused-end pattern is standard practice built on top of pipe()'s documented behavior plus fork()'s documented file-descriptor inheritance (see the C Advanced page, module 2, for fork()'s inheritance rules in full).
 FOLLOW:
 - What happens if the child writes more data than fits in the pipe's kernel buffer before the parent reads any? => write() blocks until the parent reads enough to make room (pipes have a finite kernel buffer, commonly 64KB on Linux by default); see 12.08 for the exact atomicity guarantee POSIX makes about writes up to PIPE_BUF.
 - Does the parent need to close fd[1] before or after fork() matters? => After fork() in the parent's own copy; closing before fork() would close it in a shared context, but each process has independent descriptor tables post-fork, so each side closes its own copy of the unused end after the fork.
 PITFALL: Forgetting to close the unused end of the pipe in each process. A reader that still holds the write end open (even unintentionally) will see its own read() block forever waiting for EOF that can never arrive while a writer (itself) remains.
-VERIFY: POSIX.1-2017, pipe.3p (fildes[0]/fildes[1] semantics, EMFILE/ENFILE errors) -- the fork()-inheritance and close-the-unused-end pattern is standard practice built on top of pipe()'s documented behavior plus fork()'s documented file-descriptor inheritance (see the C Advanced page, module 2, for fork()'s inheritance rules in full).
 
 @@ 12.05 | Intermediate | Scenario | tags=fifo,mkfifo,blocking,code
 Q: Show a named pipe (FIFO) connecting two processes with no parent/child relationship required, and confirm the open-blocks-until-both-ends-present behavior.
@@ -81,11 +83,12 @@ mkfifo(path, 0600);
   Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run (here using fork() only to conveniently create two independent processes for the test, not because the mechanism requires a fork relationship -- the same code works verbatim between two unrelated programs given the same path), the reader printed `reader got 20 bytes: "hello over the fifo"`, confirming the message crossed via the named pipe with both ends discovering each other purely by path.
 - Contrast directly with 12.04's anonymous pipe: here, neither process needed to inherit a file descriptor from a common ancestor; both independently opened the same pathname, which is the entire point of using mkfifo() over pipe() when the two processes are not related by fork().
 - Once open, reading/writing a FIFO behaves identically to an anonymous pipe (same PIPE_BUF atomicity guarantees, same byte-stream-not-message semantics, 12.08/12.10) -- mkfifo() only changes how the two ends are discovered, not how data moves once they are connected.
+
+**Reference (checked against the Linux man-pages):** POSIX.1-2017, mkfifo.3p (creation semantics, EEXIST/ENOENT errors) -- the open-blocks-until-both-ends-present rule is documented in the broader FIFO-file open() semantics referenced from mkfifo.3p's SEE ALSO, not restated on mkfifo.3p's own page text.
 FOLLOW:
 - What if a process opens the FIFO with O_RDWR instead of one side each? => POSIX documents this case as producing unspecified behavior for whether the other end is also implicitly open for the complementary direction; stick to one side O_RDONLY and the other O_WRONLY for portable, well-defined behavior.
 - Does the FIFO special file need to be deleted (unlink()) when done? => Yes for cleanliness; the directory entry persists on disk until unlinked, independent of any process having it open, unlike an anonymous pipe which vanishes automatically once its last descriptor closes.
 PITFALL: Opening both ends of a FIFO from within the *same* process for a quick test and being surprised it does not block. A single process opening both ends itself will not deadlock on the open() calls (each satisfies the other), which can mask the real cross-process blocking behavior during testing.
-VERIFY: POSIX.1-2017, mkfifo.3p (creation semantics, EEXIST/ENOENT errors) -- the open-blocks-until-both-ends-present rule is documented in the broader FIFO-file open() semantics referenced from mkfifo.3p's SEE ALSO, not restated on mkfifo.3p's own page text.
 
 @@ 12.06 | Intermediate | Concept | tags=mq,open,semantics
 Q: What does mq_open() actually establish, and what are its key oflag semantics?
@@ -95,11 +98,12 @@ DEEP:
 - When O_CREAT is used with a non-NULL `attr` (an `mq_attr` struct setting `mq_maxmsg` and `mq_msgsize`), those become the queue's actual capacity limits; if the queue already existed, POSIX states attr "shall have no effect except as noted under O_EXCL" -- you cannot resize an existing queue's limits through a later mq_open() call.
 - O_EXCL's atomicity guarantee is explicit and important for the same reason as similar flags elsewhere: "the check for the existence of the message queue and the creation of the message queue if it does not exist shall be atomic with respect to other threads executing mq_open() naming the same name" -- this is what makes O_CREAT|O_EXCL a safe way to ensure exactly one creator, with no race window.
 - Whether the queue's name is visible in any filesystem path a program can otherwise access is explicitly left unspecified by POSIX ("It is unspecified whether the name appears in the file system") -- do not write code that assumes (or does not assume) a particular filesystem location for it.
+
+**Reference (checked against the Linux man-pages):** POSIX.1-2017, mq_open.3p (oflag semantics, O_EXCL atomicity, leading-slash naming rule, unspecified filesystem visibility).
 FOLLOW:
 - What happens if you mq_open() an existing queue with O_CREAT but no O_EXCL? => It simply connects to the existing queue (O_CREAT has no effect since it already exists), returning a new descriptor to the same underlying queue -- this is the normal "create if needed, otherwise just connect" idiom.
 - Can a queue be open for sending and receiving in more than one process at once? => Yes; POSIX explicitly allows a queue to "be open multiple times in the same or different processes for receiving messages" (and the same for sending) -- multiple readers and multiple writers on one queue are both legal.
 PITFALL: Using a name without a leading slash and assuming it behaves identically across systems. POSIX leaves that case implementation-defined; always use a leading `/` for portable queue names.
-VERIFY: POSIX.1-2017, mq_open.3p (oflag semantics, O_EXCL atomicity, leading-slash naming rule, unspecified filesystem visibility).
 
 @@ 12.07 | Intermediate | Scenario | tags=mq,roundtrip,code
 Q: Show a working round trip through a POSIX message queue.
@@ -116,11 +120,12 @@ ssize_t n = mq_receive(q, buf, sizeof buf, &prio);
 - `mq_send()`'s `msg_len` must be less than or equal to the queue's `mq_msgsize` attribute or the call fails with EMSGSIZE -- unlike a pipe, a message queue enforces a maximum message size up front, fixed at creation time via the attr struct.
 - Linking with `-lrt` is commonly required on Linux for the POSIX realtime message-queue functions (mq_open() and friends), distinct from `-pthread`; both may be needed together depending on what else the program uses.
 - Note `mq_open()` returns `(mqd_t)-1` on failure (not a small negative int the way many syscalls return -1), and `mqd_t` is an opaque type -- always compare against the `(mqd_t)-1` sentinel exactly as documented, not against a bare -1.
+
+**Reference (checked against the Linux man-pages):** POSIX.1-2017, mq_open.3p (attr semantics, mqd_t as an opaque descriptor type, EMFILE) and mq_send.3p (EMSGSIZE, message-length constraint against mq_msgsize).
 FOLLOW:
 - What happens if mq_receive()'s buffer is smaller than mq_msgsize? => mq_receive() requires a buffer at least as large as the queue's mq_msgsize attribute or it fails; always size the receive buffer from the queue's actual attributes, not a guessed constant.
 - Do queues persist after the creating process exits? => Yes, until explicitly removed with mq_unlink() (analogous to shm_unlink() for shared memory, 12.11) -- exiting or closing a descriptor alone does not delete the queue.
 PITFALL: Forgetting to mq_unlink() a queue after use in test code. Leftover named queues from earlier test runs can cause a later O_CREAT|O_EXCL call to unexpectedly fail with EEXIST.
-VERIFY: POSIX.1-2017, mq_open.3p (attr semantics, mqd_t as an opaque descriptor type, EMFILE) and mq_send.3p (EMSGSIZE, message-length constraint against mq_msgsize).
 
 @@ 12.08 | Intermediate | Trap | tags=pipe,pipebuf,atomicity,blocking
 Q: What does PIPE_BUF actually guarantee, and what is the common misunderstanding about pipe write atomicity?
@@ -130,11 +135,12 @@ DEEP:
 - The common mistake this trap is aimed at: assuming that because a single write() of, say, 100 bytes is atomic (won't be torn by another writer), a single read() will therefore get exactly those 100 bytes back in one call. Reads are not required to return a whole write's worth of data at once; a reader can see a write split across multiple read() calls, or combined with data from a different write, since the pipe has no concept of message boundaries -- that is precisely why message queues (12.06) exist for cases that actually need discrete message framing.
 - If a writer's single write() exceeds {PIPE_BUF}, POSIX allows that write to be interleaved with another process's concurrent write to the same pipe -- multiple writers to one pipe writing more than PIPE_BUF at a time is a real risk of interleaved, corrupted-looking data unless the application adds its own framing/locking.
 - Also worth remembering: if the pipe is full, a write() blocks (unless O_NONBLOCK) until a reader drains enough space -- this is the pipe's own natural backpressure mechanism, requiring no separate flow-control protocol for the simple case.
+
+**Reference (checked against the Linux man-pages):** POSIX.1-2017 defines {PIPE_BUF} as an implementation-defined but POSIX-minimum-bounded limits.h constant with the write-atomicity guarantee up to that size; the exact atomicity wording lives on the write() page (write.3p, fetched for this module) rather than pipe.3p itself.
 FOLLOW:
 - How would you send a "message" larger than PIPE_BUF safely with multiple writers? => Either serialize writers with your own lock so only one write() (however large) happens at a time, or switch to a mechanism with real message framing such as POSIX message queues, or add your own length-prefix framing that the reader parses back out.
 - Does PIPE_BUF atomicity apply to named pipes (FIFOs) the same way? => Yes; once opened, a FIFO behaves identically to an anonymous pipe for this purpose, since PIPE_BUF is a property of pipes/FIFOs generally, not specific to how the two ends were connected.
 PITFALL: Assuming a pipe delivers whole "messages" because each write() call happens to be atomic up to PIPE_BUF. Atomicity of a single write is not the same guarantee as message framing on the read side; a pipe never has message boundaries.
-VERIFY: POSIX.1-2017 defines {PIPE_BUF} as an implementation-defined but POSIX-minimum-bounded limits.h constant with the write-atomicity guarantee up to that size; the exact atomicity wording lives on the write() page (write.3p, fetched for this module) rather than pipe.3p itself.
 
 @@ 12.09 | Intermediate | Concept | tags=shm,ftruncate,pattern
 Q: What is the standard shm_open() + mmap() + ftruncate() sequence, and why is ftruncate() necessary?
@@ -149,11 +155,12 @@ close(fd);                                            /* mmap() keeps its own re
 - POSIX's shm_open.3p RATIONALE explicitly calls this out: "the size can be set after the open using ftruncate()... this may be necessary for systems without virtual memory hardware support in order to ensure that the memory is contiguous" -- ftruncate() is not incidental cleanup, it is the documented, required step to give the object a nonzero size.
 - `close(fd)` after mmap() is safe and common: mmap() "shall add an extra reference to the file associated with the file descriptor fildes which is not removed by a subsequent close()," so the mapping remains valid after closing the descriptor that created it; the mapping itself is torn down later with munmap().
 - A second process that only needs to *connect* to an already-sized shared memory object (created by someone else) skips ftruncate() entirely -- it just shm_open()s the same name (without O_CREAT, or with O_CREAT which has no effect on an existing object) and mmap()s it at whatever size it already knows (or queries via fstat()) the object to be.
+
+**POSIX reference (checked against the POSIX.1-2017 online text):** POSIX.1-2017, shm_open.3p (DESCRIPTION: "the shared memory object has a size of zero" on creation; RATIONALE: ftruncate()-after-open as the documented sizing mechanism; zero-initialization requirement).
 FOLLOW:
 - What happens if two processes both call ftruncate() on the same shared memory object with different sizes? => Whichever call happens later wins for the object's size going forward; coordinate size-setting to happen exactly once (typically by the single creator, before any other process maps it) to avoid this race.
 - Does shm_open() zero-initialize the memory? => Yes; POSIX requires shared memory objects to start with zero-filled contents ("initializing memory objects to zero is required," per the RATIONALE, for consistency with file/heap/stack initialization and for security reasons).
 PITFALL: Calling mmap() on a shared memory object before ftruncate()-ing it to a nonzero size. A freshly O_CREAT-created object starts at size zero; mapping it before sizing it is a common first-try mistake.
-VERIFY: POSIX.1-2017, shm_open.3p (DESCRIPTION: "the shared memory object has a size of zero" on creation; RATIONALE: ftruncate()-after-open as the documented sizing mechanism; zero-initialization requirement).
 
 @@ 12.10 | Intermediate | Cross-layer | tags=pipe,mq,contrast,boundaries
 Q: Functionally, what is the single biggest difference between a pipe and a POSIX message queue?
@@ -242,11 +249,12 @@ DEEP:
 - This advantage matters most for *bulk* data (large buffers moved frequently); for small, infrequent messages, the fixed per-syscall overhead of any mechanism (including shared memory's own synchronization primitive wait/post calls) tends to dominate, and the difference between mechanisms becomes far less significant in practice.
 - Message queues add a small amount of additional overhead over a raw pipe for the same payload size, from the priority-ordering bookkeeping (12.06) the kernel maintains -- a reasonable, hedged expectation, not a number to state as fact without measuring the specific implementation.
 - For an SSD validation harness moving bulk I/O buffers between a control process and worker processes, this is exactly why shared memory (with explicit synchronization, 12.03/12.11) is the usual choice for the actual data path, while a pipe or message queue is the usual choice for the much smaller, much less frequent control/command path (12.18 designs this end to end).
+
+**Source note:** no formal spec source (implementation- and hardware-dependent); treat as a hedged, order-of-magnitude ranking to validate by measurement on the actual target system, not a cited guarantee.
 FOLLOW:
 - Does shared memory's advantage disappear if the synchronization primitive itself is expensive? => It can shrink significantly under heavy contention on the synchronization primitive, which is exactly why module 10's contention-cost reasoning (uncontended vs. contended atomic/mutex costs) is directly relevant when designing the synchronization layer around a shared-memory data path.
 - Would you ever choose a pipe over shared memory for bulk data anyway? => Yes, when simplicity and safety (no manual synchronization to get right, no risk of the unsynchronized-race bug in 12.12) outweigh the throughput cost, particularly if the bulk transfer is not actually the measured bottleneck.
 PITFALL: Assuming shared memory is always the right choice "because it's fastest," without weighing the real synchronization-design cost and bug risk (12.03/12.12) against a workload that may not actually need the throughput.
-VERIFY: no formal spec source (implementation- and hardware-dependent); treat as a hedged, order-of-magnitude ranking to validate by measurement on the actual target system, not a cited guarantee.
 
 @@ 12.16 | Advanced | Trap | tags=mq,priority,full,blocking
 Q: What is the common misunderstanding about mq_send() and a full message queue?
@@ -256,11 +264,12 @@ DEEP:
 - Priority only ever reorders *already-enqueued, not-yet-received* messages relative to each other ("a message with a larger numeric value of msg_prio shall be inserted before messages with lower values"); it has no effect on admission when the queue is at `mq_maxmsg` capacity -- a full queue is full regardless of the new message's priority.
 - If multiple threads/processes are blocked waiting to send when space frees up, and the Priority Scheduling option is supported, "the thread of the highest priority that has been waiting the longest shall be unblocked" -- note this is about the *sender's own scheduling priority* (module 11's sched_priority), a completely different axis from msg_prio, which is easy to conflate.
 - `mq_timedsend()` is the documented way to bound how long you are willing to block on a full queue, with an absolute deadline via CLOCK_REALTIME (or the system clock if the Timers option is unsupported) -- useful when an unbounded block on a full queue is unacceptable for the caller's own latency requirements.
+
+**POSIX reference (checked against the POSIX.1-2017 online text):** POSIX.1-2017, mq_send.3p (full-queue blocking behavior, msg_prio insertion-order semantics, Priority Scheduling option's blocked-sender-unblocking rule, mq_timedsend()'s CLOCK_REALTIME-based deadline).
 FOLLOW:
 - Does a high msg_prio let a message jump ahead of a full queue's admission limit? => No; msg_prio only orders messages already accepted into the queue relative to each other, never affects whether the queue accepts a new message when it is at capacity.
 - What is the difference between "the sender blocked the longest gets unblocked first" and msg_prio ordering? => The former is about which *blocked sender* gets to enqueue next when space frees up (governed by the sender's own scheduling priority, if Priority Scheduling is supported); the latter is about where an already-enqueued message sits relative to other already-enqueued messages for receivers. They are two different priority concepts that happen to share the word "priority."
 PITFALL: Conflating a message's msg_prio with the sending thread's own scheduling priority (module 11's sched_priority). They are unrelated axes: one orders messages inside the queue, the other affects which blocked sender gets to send next.
-VERIFY: POSIX.1-2017, mq_send.3p (full-queue blocking behavior, msg_prio insertion-order semantics, Priority Scheduling option's blocked-sender-unblocking rule, mq_timedsend()'s CLOCK_REALTIME-based deadline).
 
 @@ 12.17 | Advanced | Scenario | tags=mq,priority,code
 Q: Show that mq_send()'s msg_prio actually reorders delivery regardless of send order.
@@ -287,11 +296,12 @@ received "low prio" at priority 1
 confirming send order (low, high, mid) has no bearing on receive order once priorities differ -- the queue's own internal insertion-by-priority behavior, not FIFO-by-arrival, governs what mq_receive() hands back.
 - Note the `prio` output parameter of mq_receive() is how a receiver discovers what priority a message was actually sent at; a receiver that ignores this parameter (passing NULL, which is allowed) simply gets messages in the queue's priority order without ever learning what that priority value was.
 - This directly demonstrates 12.16's point about full-queue admission being separate from ordering: all three of these sends succeeded immediately (queue was nowhere near full, `mq_maxmsg = 10`), so this test exercises pure delivery-ordering behavior, not admission/blocking behavior at all.
+
+**POSIX reference (checked against the POSIX.1-2017 online text):** POSIX.1-2017, mq_send.3p ("a message with a larger numeric value of msg_prio shall be inserted before messages with lower values... inserted after other messages... with equal msg_prio"; msg_prio < {MQ_PRIO_MAX}).
 FOLLOW:
 - What would happen if two messages were sent with the same msg_prio? => POSIX specifies "a message shall be inserted after other messages in the queue, if any, with equal msg_prio" -- equal-priority messages preserve their relative send order (FIFO within a priority level).
 - Is there an upper bound on msg_prio values? => Yes; POSIX requires msg_prio to be less than {MQ_PRIO_MAX}, an implementation-defined limit applications should query rather than assume a specific numeric ceiling for.
 PITFALL: Assuming a message queue is FIFO-by-send-order like a pipe. It is priority-ordered by design; two messages with different priorities are never guaranteed to come back out in send order, only equal-priority messages are.
-VERIFY: POSIX.1-2017, mq_send.3p ("a message with a larger numeric value of msg_prio shall be inserted before messages with lower values... inserted after other messages... with equal msg_prio"; msg_prio < {MQ_PRIO_MAX}).
 
 @@ 12.18 | Principal | Scenario | tags=design,harness,ipc,strategy
 Q: Design the IPC strategy for a validation harness with one control process and several worker processes issuing I/O to devices under test.

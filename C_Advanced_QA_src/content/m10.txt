@@ -90,11 +90,11 @@ Design details that matter:
 - Pad per-thread slots to a cache line (`_Alignas(64)`) if they live in a shared array, or false sharing brings the contention back.
 - Merge on thread exit too, or counts from short-lived threads are lost.
 
+**Source note:** none (this is a design pattern, not a spec-defined API).
 FOLLOW:
 - What if you need the running total continuously, not just at the end? => Either pay for periodic synchronized folding (e.g. every N events or every timer tick) or fold under a read-side lock only when a reader actually asks for the total, accepting slightly stale reads.
 - Does this pattern work for values threads need to see from each other in real time? => No; it trades real-time shared visibility for zero-contention writes, so it only fits accumulate-then-report use cases.
 PITFALL: Reaching for a global atomic counter by default for every "just count something" need, when a per-thread counter folded rarely would remove essentially all contention.
-VERIFY: none (this is a design pattern, not a spec-defined API).
 
 @@ 10.05 | Intermediate | Trap | tags=strtok,reentrant,strtokr
 Q: Why is strtok() unsafe across threads, and what fixes it?
@@ -166,11 +166,12 @@ DEEP:
 - The mutex's extra cost even when uncontended comes from bookkeeping (owner tracking for error-checking/recursive types, and the underlying atomic operation the mutex itself uses to implement its fast path) -- a plain atomic op has none of that.
 - Under contention, both degrade, but differently: a CAS retry loop degrades by wasting retries (still no kernel involvement, still ready to run), while a contended mutex degrades by parking the loser thread in the kernel (`futex_wait`) and later paying a real context switch and wake-up to unpark it -- see module 11 for what a context switch actually costs.
 - For validation-harness style code (module 11's high-IOPS framing), this is exactly why a per-thread or lock-free counter for a hot statistic is worth the design effort over a naive mutex-protected counter once the update rate is high enough to matter.
+
+**Source note:** no formal spec source (hardware/microarchitecture-dependent); treat as a hedged rule of thumb, not a cited guarantee.
 FOLLOW:
 - Is a spinlock's uncontended cost closer to an atomic op or to a mutex? => Closer to an atomic op (it is often built from one CAS), which is exactly why spinlocks can win for very short critical sections -- see the C Advanced page's mutex module for when spinning beats blocking.
 - Does this ordering hold on every architecture? => The relative ordering (atomic < uncontended lock < contended/blocking lock) is a reliable rule of thumb across architectures; the actual nanosecond figures are not portable and should always be measured on the target hardware.
 PITFALL: Quoting a specific number (e.g. "20ns") from memory as if it were a portable fact. State it as an approximate, hedged order of magnitude and offer to benchmark the actual target hardware instead.
-VERIFY: no formal spec source (hardware/microarchitecture-dependent); treat as a hedged rule of thumb, not a cited guarantee.
 
 @@ 10.10 | Advanced | Scenario | tags=atomic,counter,fetchadd
 Q: Show a lock-free counter using atomic_fetch_add and confirm it does not lose updates under real contention.

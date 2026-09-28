@@ -8,11 +8,12 @@ DEEP:
 - The practical consequence: if another thread acquires the mutex right after the about-to-block thread releases it (inside the wait call), a pthread_cond_signal() or pthread_cond_broadcast() that thread then issues is guaranteed to behave as if it happened after the first thread was already waiting -- the "unlock, then wait" transition is a single indivisible step from an observer's point of view, not two separate steps with a gap.
 - On successful return, "the mutex shall have been locked and shall be owned by the calling thread" -- you never need to re-lock it yourself after a cond_wait returns.
 - A condition variable becomes dynamically bound to whichever mutex the first waiting thread used, for as long as any thread is waiting on it; using a second, different mutex concurrently with the same cond var is undefined behavior.
+
+**POSIX reference (checked against the POSIX.1-2017 online text):** POSIX.1-2017, pthread_cond_wait() DESCRIPTION (the "atomically release mutex" paragraph and the mutex-binding paragraph).
 FOLLOW:
 - Why does this atomicity matter instead of just calling unlock() then wait() as two separate calls? => Two separate calls leave a window where another thread could lock the mutex, change the shared state, signal, and unlock, all before the first thread's separate wait() call ever runs -- exactly the lost-wakeup bug in 5.04, which is why POSIX bundles unlock-and-wait into one atomic operation.
 - Must the SAME mutex be passed on every call to pthread_cond_wait() for a given cond var? => Yes while any thread is waiting; the binding is dynamic and ends when the wait returns, but concurrent waits on the same cond var with different mutexes is explicitly undefined behavior.
 PITFALL: Manually calling pthread_mutex_unlock() followed by pthread_cond_wait() as two statements instead of trusting cond_wait to do the release atomically. That reintroduces exactly the race the atomic release exists to prevent.
-VERIFY: POSIX.1-2017, pthread_cond_wait() DESCRIPTION (the "atomically release mutex" paragraph and the mutex-binding paragraph).
 
 @@ 5.02 | Basic | Concept | tags=condvar,predicate-loop,mandatory
 Q: Why must every pthread_cond_wait() call be wrapped in a while loop that re-checks a predicate, never a bare wait?
@@ -22,11 +23,12 @@ DEEP:
 - "It is thus recommended that a condition wait be enclosed in the equivalent of a 'while loop' that checks the predicate" -- POSIX's own RATIONALE, stated as a direct recommendation, not left to interpretation.
 - The loop simultaneously defends against two distinct problems: a spurious wakeup (5.05, waking with no real state change) and a superfluous signal/broadcast issued by some other part of the application on the same cond var that was not meant for this waiter.
 - Checking the predicate before the first wait call also matters: if the predicate is already true when a thread arrives, it should proceed immediately without ever calling pthread_cond_wait() at all, which is exactly what the while-loop's initial condition check gives you for free.
+
+**POSIX reference (checked against the POSIX.1-2017 online text):** POSIX.1-2017, pthread_cond_timedwait()/pthread_cond_wait() RATIONALE, "Condition Wait Semantics" subsection.
 FOLLOW:
 - Is a plain `if` instead of `while` ever safe here? => No; `if` checks the predicate once, either before or after a single wait call, and does not re-check after that wait returns, so it is exposed to exactly the spurious-wakeup and superfluous-signal risks a `while` loop is designed to close.
 - Does the loop need a timeout to be "safe"? => Not for correctness against spurious wakeups; a timeout (pthread_cond_timedwait()) is a separate, optional feature for bounding how long you are willing to wait at all, unrelated to the predicate-loop requirement.
 PITFALL: Writing `if (!predicate) pthread_cond_wait(...)` instead of `while (!predicate) pthread_cond_wait(...)`. It looks nearly identical and passes casual testing, but is not safe against spurious wakeups or superfluous signals.
-VERIFY: POSIX.1-2017, pthread_cond_timedwait()/pthread_cond_wait() RATIONALE, "Condition Wait Semantics" subsection.
 
 @@ 5.03 | Basic | Concept | tags=signal,broadcast,difference
 Q: What is the basic difference between pthread_cond_signal() and pthread_cond_broadcast()?
@@ -36,11 +38,12 @@ DEEP:
 - "At least one" is deliberate: POSIX's RATIONALE explains that on a multiprocessor, an implementation of cond_signal cannot always avoid waking more than one thread (this is exactly where "spurious wakeup," 5.05, comes from at the specification level), so the standard says "at least one" rather than "exactly one."
 - "These functions... shall have no effect if there are no threads currently blocked on cond" -- signaling into an empty room is a silent no-op, not an error and not something a later waiter will see; this is precisely the mechanism behind the lost-wakeup bug (5.04).
 - Every thread woken by either call re-acquires the associated mutex before returning from cond_wait, contending for it "as if each had called pthread_mutex_lock()" -- broadcast does not mean all woken threads run at once, only that all of them are made runnable and will each, in turn, get the mutex and re-check their predicate.
+
+**POSIX reference (checked against the POSIX.1-2017 online text):** POSIX.1-2017, pthread_cond_signal()/pthread_cond_broadcast() DESCRIPTION.
 FOLLOW:
 - If broadcast wakes everyone, doesn't that waste work compared to signal? => Only the thread(s) whose predicate actually becomes true after re-acquiring the mutex do useful work; the rest re-check their while-loop condition, find it still false, and go back to waiting -- correct, but with the CPU cost of waking threads that had nothing to do.
 - When must you use broadcast instead of signal? => Whenever more than one waiter's predicate could become true from the same state change (5.08's producer/multi-consumer case), or when different waiters are blocked on different predicates sharing one cond var (5.14) -- signal alone risks waking the wrong one.
 PITFALL: Defaulting to pthread_cond_signal() everywhere because "there's usually only one waiter," without checking whether that assumption actually holds for every caller of the code, now and after future changes.
-VERIFY: POSIX.1-2017, pthread_cond_signal()/pthread_cond_broadcast() DESCRIPTION.
 
 @@ 5.04 | Intermediate | Trap | tags=lost-wakeup,demo,predicate,bare-wait
 Q: Reproduce an actual lost wakeup in a compiled program, then fix it.
@@ -86,11 +89,12 @@ int main(int argc, char **argv) {
 }
 ```
 Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run under `timeout 2 ./a.out 0` (bare wait), it printed "producer done, ready=1; starting consumer..." and then hung; the shell reported exit code 124 (killed by timeout), and "consumer: saw ready" never printed. Run as `./a.out 1` (predicate loop), it printed the ready message immediately and returned exit code 0, every time.
+
+**POSIX reference (checked against the POSIX.1-2017 online text):** POSIX.1-2017, pthread_cond_signal() DESCRIPTION ("shall have no effect if there are no threads currently blocked on cond").
 FOLLOW:
 - Why is this reproduced deterministically here, when lost wakeups are usually described as a rare timing bug? => By joining the producer thread before creating the consumer, the signal-before-any-waiter ordering is forced every single run instead of depending on scheduling luck -- real lost wakeups in production code are usually this same bug, just with a timing window that only sometimes lines up this way.
 - Would adding a sleep() in the consumer before its bare wait "fix" this? => No, and it would only make the bug rarer and harder to find; the signal still already happened (and was a no-op) before the wait call runs, regardless of how much time passes first. Only checking the predicate fixes it.
 PITFALL: "Fixing" an observed hang by adding a delay somewhere, which sometimes masks the timing window without addressing the actual bug (a missing predicate check before the wait).
-VERIFY: POSIX.1-2017, pthread_cond_signal() DESCRIPTION ("shall have no effect if there are no threads currently blocked on cond").
 
 @@ 5.05 | Intermediate | Concept | tags=spurious-wakeup,rationale,multiprocessor
 Q: Where does a spurious wakeup actually come from, and why does POSIX allow it instead of forbidding it?
@@ -100,11 +104,12 @@ DEEP:
 - Direct quote: "This effect is called 'spurious wakeup.' Note that the situation is self-correcting in that the number of threads that are so awakened is finite."
 - The efficiency argument: "the loss of efficiency for a fringe condition that occurs only rarely is unacceptable, especially given that one has to check the predicate associated with a condition variable anyway."
 - The forced-robustness argument: "An added benefit of allowing spurious wakeups is that applications are forced to code a predicate-testing-loop... This also makes the application tolerate superfluous condition broadcasts or signals... coded in some other part of the application."
+
+**POSIX reference (checked against the POSIX.1-2017 online text):** POSIX.1-2017, pthread_cond_signal() RATIONALE, "Multiple Awakenings by Condition Signal" subsection.
 FOLLOW:
 - Does a spurious wakeup mean pthread_cond_wait() returned an error? => No, it returns 0 (success) exactly as a legitimate wakeup would; there is no way to distinguish a spurious wakeup from a real one except by re-checking your own predicate, which is the entire point.
 - Can a spurious wakeup happen an unbounded number of times to the same wait call? => No -- POSIX calls the effect "self-correcting" and finite; it is not something a predicate loop needs to defend against as an infinite risk, just as a possible-at-all one.
 PITFALL: Treating a spurious wakeup as an exotic edge case unlikely to matter in practice, rather than as a routine event any predicate loop must already handle for free.
-VERIFY: POSIX.1-2017, pthread_cond_signal() RATIONALE, "Multiple Awakenings by Condition Signal" subsection.
 
 @@ 5.06 | Intermediate | Concept | tags=signal,without-mutex,predictable-scheduling
 Q: Is it legal to call pthread_cond_signal() without holding the associated mutex? What do you give up if you do?
@@ -114,11 +119,12 @@ DEEP:
 - The common, safest idiom is still: lock, mutate the shared state, signal/broadcast, unlock -- signaling while the lock is held, which is also what every demo in this module does (5.04, 5.09).
 - A narrower, sometimes-used optimization is to unlock first and signal after, to avoid the woken thread immediately blocking again on the same mutex the signaler still holds; this trades a small scheduling efficiency gain for the "predictable scheduling" guarantee POSIX ties to signaling-while-locked -- see 5.19 for the fuller trade-off discussion.
 - Whichever order is chosen, the mutation of shared state itself must always happen under the lock; only the signal/broadcast call's exact position relative to the unlock is what is flexible.
+
+**POSIX reference (checked against the POSIX.1-2017 online text):** POSIX.1-2017, pthread_cond_signal() DESCRIPTION (the "may be called... whether or not it currently owns the mutex" paragraph) and APPLICATION USAGE (signal-handler safety).
 FOLLOW:
 - Does calling pthread_cond_signal() from a signal handler (the OS kind, SIGINT etc.) count as "without the mutex," and is that safe? => That is a different, stricter problem: POSIX's APPLICATION USAGE text says explicitly "it is not safe to use the pthread_cond_signal() function in a signal handler that is invoked asynchronously," regardless of mutex ownership, because of an unavoidable race with the predicate check.
 - If you skip holding the mutex when signaling, do you still need the predicate loop on the waiter side? => Yes, unconditionally; the predicate loop's necessity (5.02) has nothing to do with whether the signaler held the mutex, only with spurious wakeups and superfluous signals, which can happen either way.
 PITFALL: Assuming "the signaler doesn't need the mutex" means the shared state it is signaling about does not either. The state mutation still must happen under the lock; only the signal call itself has flexibility in exactly when it happens relative to the unlock.
-VERIFY: POSIX.1-2017, pthread_cond_signal() DESCRIPTION (the "may be called... whether or not it currently owns the mutex" paragraph) and APPLICATION USAGE (signal-handler safety).
 
 @@ 5.07 | Intermediate | Numeric | tags=context-switch,overhead,wait-signal
 Q: Roughly how much more expensive is a genuine wait-then-signal round trip than an uncontended mutex lock/unlock?
@@ -128,11 +134,12 @@ DEEP:
 - The same RATIONALE text also states the common case (lock, touch shared data, unlock, no wait needed) should dominate: "the efficiency of a synchronization operation is bounded by the cost of mutex lock/unlock and not by condition wait... in the usual case there is no context switch" -- a condition variable is meant to be the rare path, not the common one, in a well-designed producer/consumer system.
 - The "low single-digit microseconds" figure for a Linux context switch is a widely cited approximate order of magnitude from general systems-performance literature, not a number this session measured directly on this sandbox; flagged here as a hedge rather than a fetched benchmark.
 - Practical implication for a bounded queue (5.13): sizing the buffer so producers/consumers rarely actually block (rather than exactly-1-deep) trades some memory for staying on the cheap, no-context-switch path most of the time.
+
+**POSIX reference (checked against the POSIX.1-2017 online text):** POSIX.1-2017, pthread_cond_timedwait() RATIONALE, "Performance of Mutexes and Condition Variables"; the microsecond context-switch figure is general systems-performance folklore, not a POSIX or vendor-published number -- treat it as an approximate hedge only.
 FOLLOW:
 - Does this mean condition variables are "slow" and should be avoided? => No; the comparison is against an uncontended lock, which is about as cheap as synchronization gets. A blocking wait is only ever reached when there is genuinely nothing useful to do yet, which is exactly when paying a context-switch cost (instead of spinning) is the right trade.
 - Would a busy-wait/spin loop on the predicate ever beat a real cond_wait? => Only under the same narrow conditions spinlocks beat mutexes (4.12): an extremely short expected wait and spare cores to burn; for anything longer, spinning wastes far more CPU than the one-time context-switch cost of blocking properly.
 PITFALL: Quoting the "context switch is expensive" fact to justify busy-waiting on a shared flag instead of using a condition variable, without first checking whether the actual wait times involved are short enough for that trade-off to make sense.
-VERIFY: POSIX.1-2017, pthread_cond_timedwait() RATIONALE, "Performance of Mutexes and Condition Variables"; the microsecond context-switch figure is general systems-performance folklore, not a POSIX or vendor-published number -- treat it as an approximate hedge only.
 
 @@ 5.08 | Intermediate | Scenario | tags=broadcast,multi-consumer,application-usage
 Q: A producer can insert several items at once onto a shared list that several consumer threads each pull one item from. Why does POSIX's own guidance point at broadcast here, not signal?
@@ -141,11 +148,12 @@ DEEP:
 - The predicate loop makes this safe even though every consumer wakes: each one re-checks "is there an item for me" under the mutex, and any consumer that finds the list already emptied by a faster sibling just goes back to waiting -- broadcast only wastes some wakeups, it never causes incorrect double-consumption, because the mutex still serializes the actual pop.
 - This is precisely the shape used in the bounded blocking queue's "no more items, producers are done" signal in 5.13: broadcasting done_producing ensures every consumer notices, not just one, since a signal might otherwise wake a consumer that then finds nothing and (incorrectly, on a signal-only design) has no way to learn that no more items are coming.
 - The same APPLICATION USAGE text also mentions broadcast making a read-write lock's writer-releases-to-all-waiting-readers case easier to implement, and a two-phase-commit "notify all clients" case -- the common thread in all three is "more than one waiter's predicate can become true from a single state change."
+
+**POSIX reference (checked against the POSIX.1-2017 online text):** POSIX.1-2017, pthread_cond_broadcast() APPLICATION USAGE (single-producer/multiple-consumer example, read-write lock example, two-phase-commit example).
 FOLLOW:
 - If the producer only ever inserts exactly one item at a time, does that change the answer? => Then signal is enough for the "new item available" case specifically (only one consumer can usefully take it), but the "producer is completely done, no more items ever" case still needs broadcast so every remaining consumer learns to stop waiting, exactly as 5.13's queue does.
 - Does broadcasting here risk a thundering-herd performance problem with many consumers? => It can under heavy contention (every woken thread re-contends for the mutex), which is a real cost to weigh against correctness; for a small number of consumers it is rarely significant, and it is always correct, which signal-only is not in this scenario.
 PITFALL: Using signal for a "many items became available at once" event because "it's usually one item at a time in testing," without checking what happens under the actual production insert pattern.
-VERIFY: POSIX.1-2017, pthread_cond_broadcast() APPLICATION USAGE (single-producer/multiple-consumer example, read-write lock example, two-phase-commit example).
 
 @@ 5.09 | Intermediate | Concept | tags=condvar,static-init,pthread-cond-initializer
 Q: What is PTHREAD_COND_INITIALIZER, and when do you still need pthread_cond_init() instead?
@@ -169,11 +177,12 @@ DEEP:
 - In practice, a design that always pairs one specific mutex with one specific condition variable (as the bounded queue in 5.13 does, one mutex with two condition variables, not one condition variable with two mutexes) never risks this, because there is only ever one mutex in the picture for that cond var to begin with.
 - A design that risks this is one condition variable shared across multiple, differently-locked subsystems "to save a cond var" -- if subsystem A waits on it using mutex_A while subsystem B concurrently waits on the same cond var using mutex_B, that is exactly the undefined-behavior case, and it will not necessarily crash or warn, just misbehave in implementation-specific ways.
 - EINVAL is listed as a possible (not guaranteed) error return "Different mutexes were supplied for concurrent pthread_cond_timedwait() or pthread_cond_wait() operations on the same condition variable" -- some implementations catch this, but POSIX does not require it, so passing the check on one platform proves nothing about another.
+
+**POSIX reference (checked against the POSIX.1-2017 online text):** POSIX.1-2017, pthread_cond_wait() DESCRIPTION (the mutex-binding paragraph) ("the effect of an attempt by any thread to wait on that condition variable using a different mutex is undefined"); POSIX.1-2017's ERRORS section has no EINVAL for this case, so do not count on an error code.
 FOLLOW:
 - Does the binding still apply if the two waits happen sequentially, not concurrently? => No -- the rule is specifically about concurrent waits; once every prior waiter has returned (ending the binding), a completely different mutex can be used for the next wave of waits on the same cond var without any violation.
 - Is this the same issue as the "one condition variable, two different predicates" case from 5.14? => No, that is about which threads a signal wakes; this is about which mutex a wait call is allowed to pass. They can combine (one cond var, two predicates, and mistakenly two mutexes too), but each is its own distinct rule to get right.
 PITFALL: Sharing one condition variable across two different subsystems that each have their own mutex, on the theory that "it's just a wakeup mechanism." The mutex-binding rule makes that combination undefined behavior the moment their waits overlap in time.
-VERIFY: POSIX.1-2017, pthread_cond_wait() DESCRIPTION (the mutex-binding paragraph) and ERRORS (EINVAL, "different mutexes" case, listed as "may fail").
 
 @@ 5.11 | Advanced | Cross-layer | tags=cancellation,cond-wait,cleanup
 Q: What happens to the mutex if a thread blocked in pthread_cond_wait() is canceled?
@@ -183,11 +192,12 @@ DEEP:
 - A second guarantee travels with this: a canceled thread "shall not consume any condition signals... if there are other threads blocked on the condition variable" -- cancellation and signaling are kept independent, so a canceled thread being torn down never silently steals a wakeup meant for someone else.
 - This matters directly for code with a pthread_cleanup_push() handler wrapping a cond_wait loop (a common pattern for a worker thread that must be cancelable while idle-waiting for work): the handler can always assume the mutex is locked and unlock it itself, without special-casing where the cancellation was delivered.
 - This is squarely a cross-layer fact: the language-level API call (cond_wait) has a kernel-visible, cancellation-subsystem-level contract layered on top of its ordinary blocking behavior.
+
+**POSIX reference (checked against the POSIX.1-2017 online text):** POSIX.1-2017, pthread_cond_timedwait()/pthread_cond_wait() RATIONALE, "Cancellation and Condition Wait" subsection.
 FOLLOW:
 - Does this rule apply to pthread_cond_timedwait() the same way? => Yes, identically; POSIX states the condition-wait cancellation-point behavior for both timed and non-timed waits without distinction.
 - Is PTHREAD_CANCEL_ASYNCHRONOUS relevant here, or only PTHREAD_CANCEL_DEFERRED? => The described mutex-reacquisition behavior is specifically tied to "the cancelability enable state of a thread... set to PTHREAD_CANCEL_DEFERRED," which is also the default and by far the common case; asynchronous cancellation can act at arbitrary instructions and does not get this same orderly guarantee.
 PITFALL: Writing a cancellation cleanup handler for a cond_wait loop that assumes the mutex might be unlocked at cleanup time "just in case." POSIX guarantees it is locked; unlocking an already-unlocked mutex there would itself be a bug.
-VERIFY: POSIX.1-2017, pthread_cond_timedwait()/pthread_cond_wait() RATIONALE, "Cancellation and Condition Wait" subsection.
 
 @@ 5.12 | Advanced | Scenario | tags=bounded-queue,design,two-condvars
 Q: Design the two predicates for a bounded blocking queue built from one mutex and two condition variables.
@@ -197,11 +207,12 @@ DEEP:
 - Both predicates are checked in a while loop exactly as 5.02 requires: `while (count == CAP) pthread_cond_wait(&not_full, &mtx);` for push, `while (count == 0) pthread_cond_wait(&not_empty, &mtx);` for pop -- both under the same single mutex, so both predicates are always read and written consistently.
 - A third condition needs its own signal: "no more items will ever come" (producers finished). 5.13's implementation adds a `done_producing` flag, checked in the consumer's predicate as `count == 0 && !done_producing`, and broadcasts (not signals) not_empty when producers finish, so every waiting consumer -- not just one -- learns to stop waiting rather than blocking forever (5.08's multi-waiter broadcast reasoning applies directly here).
 - This design generalizes: any bounded resource with two directions of pressure (space becoming available vs. items becoming available) tends to want exactly this "one mutex, one cond var per direction" shape, rather than cramming both predicates onto a single condition variable.
+
+**Source note:** No single POSIX clause; this design follows directly from the predicate-loop requirement (RATIONALE cited in 5.02) applied to a two-directional bounded resource, and is realized concretely in 5.13.
 FOLLOW:
 - Why not just use one condition variable for both not_full and not_empty? => It would work correctness-wise (broadcast on every push/pop and let every waiter re-check its own predicate), but wakes every waiting thread on every operation instead of only the relevant side, which is wasted work exactly like 5.08's thundering-herd trade-off, just avoidable here by using two cond vars.
 - Does the queue need a separate mutex for the head and tail indices? => No; correctness requires exactly one mutex covering count, head, tail and the buffer together, since a producer's push and a consumer's pop both touch overlapping state (count, and the slot the other index does not currently own) that must move together, not two independently-locked halves.
 PITFALL: Giving producers and consumers separate mutexes "since they touch different ends of the buffer." The count field (and the moment the buffer transitions between empty/full/neither) is shared by both ends and needs one consistent lock.
-VERIFY: No single POSIX clause; this design follows directly from the predicate-loop requirement (RATIONALE cited in 5.02) applied to a two-directional bounded resource, and is realized concretely in 5.13.
 
 @@ 5.13 | Advanced | Debug | fig=condvarflow | tags=bounded-queue,producer-consumer,compiled
 Q: Implement and run the bounded blocking queue from 5.12, with multiple producers and multiple consumers, and confirm it is actually correct.
@@ -236,11 +247,12 @@ static int q_pop(queue_t *q, int *out) {
 ```
 Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run five times, every run printed `consumed_count=20 (expect 20)  consumed_sum=210 (expect 210)  OK` -- the predicate loops on both sides, the two targeted condition variables, and the final broadcast for shutdown all held up under real concurrent interleaving, not just in a single-threaded walkthrough.
 - The fig for this module (a producer signaling a waiting consumer through the mutex-protected condition variable, with the predicate check on wake) is exactly the not_empty side of this queue's push/pop pair.
+
+**Source note:** No single POSIX clause; this composes pthread_cond_wait()'s predicate-loop requirement (5.02), pthread_cond_signal()/broadcast() semantics (5.03, 5.08), and pthread_mutex_lock()'s exclusion guarantee (module 4) into one working program.
 FOLLOW:
 - What would break if the shutdown used pthread_cond_signal() instead of broadcast? => With 3 consumers, a single signal could wake only one of them; the other two would remain blocked in their while loop forever, since done_producing being true is never re-announced to them -- exactly 5.08's multi-waiter argument, concretely realized here.
 - Why size the capacity at 4 with 20 items instead of making it large enough to never block? => The whole point of the demo is to exercise the not_full/not_empty blocking paths under real contention; a capacity of 20 (no blocking ever needed) would still be correct but would not actually test the condition-variable logic at all.
 PITFALL: Testing a bounded queue implementation with a capacity larger than the item count, concluding it is race-free because it never actually blocks. Correctness under contention has to be exercised by making blocking happen, repeatedly, not avoided by generous sizing.
-VERIFY: No single POSIX clause; this composes pthread_cond_wait()'s predicate-loop requirement (5.02), pthread_cond_signal()/broadcast() semantics (5.03, 5.08), and pthread_mutex_lock()'s exclusion guarantee (module 4) into one working program.
 
 @@ 5.14 | Advanced | Trap | tags=signal,wrong-waiter,thundering-herd
 Q: Two threads wait on the same condition variable for two different predicates. Show what goes wrong with signal, and how broadcast fixes it, with a real run.
@@ -257,11 +269,12 @@ DEEP:
 ```
 Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run, signal mode printed `waiter B finished within 1s? NO (still asleep)` on all 5 runs (with "waiter A: woke, flagA=1" appearing only after a later cleanup broadcast forced both to finish); broadcast mode printed `waiter B finished within 1s? yes` on all 3 runs, with waiter B's own wake message appearing immediately after the state change.
 - This reproduces reliably on this glibc/kernel because pthread_cond_signal() here consistently wakes the longest-waiting thread (A, created first) rather than picking arbitrarily -- POSIX only guarantees "at least one," and does not say which one, so this exact outcome is this platform's behavior, not a portable guarantee, but the failure mode (signal can wake the wrong predicate's waiter) is guaranteed possible on any conforming implementation.
+
+**POSIX reference (checked against the POSIX.1-2017 online text):** POSIX.1-2017, pthread_cond_signal() DESCRIPTION ("shall unblock at least one of the threads that are blocked on the specified condition variable", and "the scheduling policy shall determine the order in which threads are unblocked"); the specific "wakes the longest-waiting thread" behavior observed is this glibc/kernel's own scheduling choice, not POSIX-mandated.
 FOLLOW:
 - Is the fix "always broadcast," or is there a narrower one? => A narrower fix is two separate condition variables, one per predicate (5.12's pattern) -- broadcast is the fix when you specifically choose to share one cond var across distinct predicates; splitting the cond var avoids needing broadcast at all and wakes only relevant waiters.
 - Does this bug depend on which thread happens to be "created first"? => The specific platform behavior observed here does, but the bug itself does not -- POSIX's "at least one, unspecified which" wording means any conforming implementation is free to wake the wrong one, on any run, regardless of creation order.
 PITFALL: Sharing one condition variable across waiters with different predicates and using signal, on the assumption that "the right one will usually wake up." POSIX gives no such assumption to rely on, and this demo shows the wrong one waking consistently, not just occasionally.
-VERIFY: POSIX.1-2017, pthread_cond_signal() DESCRIPTION ("at least one... if any threads are blocked," no ordering guarantee specified); the specific "wakes the longest-waiting thread" behavior observed is this glibc/kernel's own scheduling choice, not POSIX-mandated.
 
 @@ 5.15 | Advanced | Concept | tags=broadcast,barrier-like,phased
 Q: How does pthread_cond_broadcast() let you build a simple "release everyone waiting at this point" signal, and how is that different from a real barrier?
@@ -271,11 +284,12 @@ DEEP:
 - What this hand-rolled version does not give you for free: counting how many threads have arrived before opening the gate (a barrier's core job), and resetting the gate back to closed for a second phase without a race between "some threads already past the old open flag" and "the flag getting reset for round two."
 - pthread_cond_broadcast()'s own APPLICATION USAGE text calls out that it "makes it easier to implement a read-write lock... needed in order to wake up all waiting readers when a writer releases its lock" -- the same "release everyone at once" primitive, applied to a different specific problem, covered fully in module 6.
 - Full barrier semantics (the count argument, PTHREAD_BARRIER_SERIAL_THREAD, and automatic reset between phases) belong to module 6's pthread_barrier_wait(); this question's scope is only what plain broadcast alone gives you toward that goal.
+
+**POSIX reference (checked against the POSIX.1-2017 online text):** POSIX.1-2017, pthread_cond_broadcast() APPLICATION USAGE (read-write lock wakeup example, generalized here to any "release everyone" gate).
 FOLLOW:
 - Could you build a reusable multi-phase barrier purely from one cond var and a broadcast? => Yes, but you would need to hand-roll the arrival count and a generation counter to avoid a thread from phase N+1 racing a slow waiter still leaving phase N -- exactly the bookkeeping pthread_barrier_wait() already does correctly, which is why module 6 uses the real primitive instead.
 - Is broadcast here doing anything different from the shutdown broadcast in 5.13? => No -- it is the same "wake every current waiter, let each re-check its own now-true predicate" mechanism; only the meaning of the predicate (queue is done vs. gate is open) differs.
 PITFALL: Hand-rolling a multi-phase barrier from a raw condition variable without a generation counter, then being surprised when a fast thread from the next phase and a slow straggler from the previous one collide on the same open/closed flag.
-VERIFY: POSIX.1-2017, pthread_cond_broadcast() APPLICATION USAGE (read-write lock wakeup example, generalized here to any "release everyone" gate).
 
 @@ 5.16 | Principal | Scenario | tags=design,bounded-queue,fairness
 Q: Design a bounded blocking queue for a real multi-producer, multi-consumer workload, and reason about its fairness.
@@ -287,11 +301,12 @@ DEEP:
 4. **Fairness is a separate concern from correctness**: nothing in pthread_cond_wait()/signal() promises waiters are served in arrival order; if fairness matters (e.g. avoiding one producer thread being perpetually out-raced by faster siblings), add an explicit sequence counter each waiter checks against, rather than assuming the mutex/cond var machinery provides it.
 5. **Measure before adding complexity**: a single mutex covering the whole queue is usually not the bottleneck for a queue (the critical sections are O(1) and tiny); resist the urge to shard a queue the way 4.15 sharded a hash table unless real contention data says otherwise.
 - The concrete throughput number for this design is workload-dependent; what to actually verify before shipping it is correctness under real concurrent load (5.13's repeated-run methodology) and the shutdown path draining cleanly with no thread left permanently blocked.
+
+**POSIX reference (checked against the POSIX.1-2017 online text):** POSIX.1-2017, pthread_cond_signal()/pthread_cond_broadcast() DESCRIPTION ("the scheduling policy shall determine the order in which threads are unblocked").
 FOLLOW:
 - What is the simplest way to add rough fairness among producers without a full ticketing scheme? => Keep producer critical sections uniformly short and avoid any producer holding the mutex across additional work; POSIX's scheduling-policy-determined wakeup then tends to behave reasonably fairly in practice, though this is a heuristic, not a guarantee.
 - How would you load-test the shutdown path specifically? => Start many producers and consumers, have producers finish at staggered times, and confirm (via the same OK/MISMATCH counting 5.13 used) that every consumer exits cleanly once done_producing is set and the queue drains, across many repeated runs, not just one.
 PITFALL: Assuming pthread_cond_signal()/broadcast() provide any ordering guarantee among waiters (FIFO, priority, or otherwise) without checking that the actual scheduling policy in use provides it. POSIX explicitly leaves this to "the scheduling policy," which is not itself a fairness guarantee.
-VERIFY: POSIX.1-2017, pthread_cond_signal()/pthread_cond_broadcast() DESCRIPTION ("the scheduling policy shall determine which threads are unblocked").
 
 @@ 5.17 | Principal | Debug | tags=production-hang,lost-wakeup,diagnosis
 Q: A worker thread pool occasionally hangs in production, with one worker stuck forever in pthread_cond_wait() even though work was clearly queued. How do you confirm it is a lost wakeup and fix it?
@@ -303,11 +318,12 @@ DEEP:
 4. **Reproduce deterministically, not by hoping.** Force the suspected ordering the way 5.04 does (make the signaling thread run to completion before the waiting thread starts, or add a controlled delay) rather than running the full system repeatedly and hoping the race recurs.
 5. **Fix at the predicate, not with a timeout band-aid.** Adding pthread_cond_timedwait() with a retry loop can mask the symptom (the stuck worker eventually times out and rechecks) without fixing the actual missing-predicate-check bug; treat a timeout as a safety net for truly unexpected conditions, not a substitute for correct signal/wait pairing.
 - This diagnosis reuses module 4's "two snapshots, look for no change" method and 5.04's exact demonstrated bug shape directly; a Principal-level answer should name both rather than describing the mechanism from scratch.
+
+**Source note:** No single POSIX clause for the diagnosis method itself; grounded in pthread_cond_wait()'s predicate-loop RATIONALE (5.02) and the concrete lost-wakeup mechanism demonstrated in 5.04.
 FOLLOW:
 - Why might this bug only show up in production and never in testing? => The lost-wakeup window depends on exact thread-start and scheduling timing that low-concurrency or single-threaded test runs rarely hit; production load, with many worker threads starting and stopping under real contention, hits the unlucky ordering far more often.
 - Is adding a timeout to every cond_wait() call a reasonable general defense? => It is a reasonable safety net against unknown-unknowns, but it should never be the primary fix for a diagnosed lost wakeup -- fix the predicate loop and signal placement first; a timeout that "fixes" a known bug just adds latency (waiting out the timeout) on every occurrence instead of preventing it.
 PITFALL: Adding a pthread_cond_timedwait() retry loop as the fix for a diagnosed lost wakeup, instead of fixing the missing predicate check or misplaced signal that actually caused it. The system stops hanging forever but still stalls for the timeout duration, every time, silently.
-VERIFY: No single POSIX clause for the diagnosis method itself; grounded in pthread_cond_wait()'s predicate-loop RATIONALE (5.02) and the concrete lost-wakeup mechanism demonstrated in 5.04.
 
 @@ 5.18 | Principal | Trap | tags=predictable-scheduling,signal-placement,tradeoff
 Q: Should you call pthread_cond_signal()/broadcast() before or after pthread_mutex_unlock()? Walk through the trade-off.
@@ -317,11 +333,12 @@ DEEP:
 - The theoretical unlock-then-signal benefit: on an implementation where the newly-woken thread cannot yet re-acquire the mutex only because the signaling thread is still about to call unlock(), waking it "one step early" relative to the unlock can reduce one avoidable wakeup-then-immediately-reblock cycle. Modern glibc's futex-based implementation makes this benefit small to negligible in practice, which is why it is rarely worth the trade.
 - The cost: with unlock-then-signal, the window between "state changed" and "signal issued" is no longer inside the same locked region as the mutation, which reopens exactly the kind of timing gap 5.04's lost-wakeup bug lives in if the code is not written with extra care (e.g. a waiter's check-then-wait sequence racing a not-yet-issued signal that is now outside the lock's protection).
 - The Principal-level judgment call: this is a micro-optimization with a real correctness risk if done carelessly, for a benefit that is often unmeasurable; the default recommendation for nearly all application code is signal/broadcast while still holding the mutex, and only reconsider with actual profiling data showing the reblock cycle matters for a specific hot path.
+
+**POSIX reference (checked against the POSIX.1-2017 online text):** POSIX.1-2017, pthread_cond_signal()/pthread_cond_broadcast() DESCRIPTION (the "predictable scheduling behavior" clause).
 FOLLOW:
 - Does this trade-off apply to broadcast the same way it applies to signal? => Yes, identically; POSIX's wording covers both functions together, and the same predictability-vs-theoretical-efficiency trade-off applies whether one or many threads are being woken.
 - Is there a way to get the efficiency benefit without the correctness risk? => Only by being very deliberate: keep the state mutation and the predicate's truth value change entirely inside the lock, unlock, then immediately signal with nothing else happening in between -- and treat this as an optimization to justify with a profiler, not a default style choice.
 PITFALL: Moving a signal/broadcast call outside the lock as a "performance improvement" without profiling data showing it matters, and without re-running the same kind of repeated-execution correctness check (5.13, 5.14) that would catch a newly-introduced timing gap.
-VERIFY: POSIX.1-2017, pthread_cond_signal()/pthread_cond_broadcast() DESCRIPTION (the "predictable scheduling behavior" clause).
 
 @@ 5.19 | Principal | Concept | tags=rationale,design-constraint,api-shape
 Q: Why did POSIX deliberately decouple condition-variable waiting from mutex acquisition instead of offering one combined "atomically unlock, wait, relock" primitive with no separate mutex object at all?
@@ -331,11 +348,12 @@ DEEP:
 - The stated benefit: "this can prevent extra context switches and provide more deterministic acquisition of a mutex when the waiting thread is signaled" -- decoupling the two operations would reopen exactly the kind of race window pthread_cond_wait()'s atomicity (5.01) exists to close, just at the wake side instead of the sleep side.
 - This is a good example of a POSIX design choice driven by a use case (hard real-time scheduling) that most application code never directly exercises, but that shapes the API everyone uses -- the predicate-loop discipline (5.02) and the mutex-binding rule (5.10) are both downstream consequences of keeping cond_wait's mutex handling atomic and built-in rather than exposed as separate composable pieces.
 - "Furthermore, the current condition wait operation matches existing practice" -- POSIX also cites prior art (existing threading libraries at standardization time) as a reason not to redesign this from scratch.
+
+**POSIX reference (checked against the POSIX.1-2017 online text):** POSIX.1-2017, pthread_cond_timedwait()/pthread_cond_wait() RATIONALE, "Features of Mutexes and Condition Variables" subsection.
 FOLLOW:
 - Does this mean condition variables are inherently a real-time feature? => No -- the coupling benefits real-time scheduling specifically, but the same atomic-unlock-wait-relock shape is exactly as useful (and exactly as necessary for correctness, via the lost-wakeup-closing atomicity) for ordinary SCHED_OTHER application code; the design serves both, not real-time alone.
 - Could an application-level library reimplement condition variables with separate unlock/wait/relock calls instead? => It could, but would reintroduce the same race window pthread_cond_wait()'s atomicity guarantee closes (5.01), unless it added its own additional synchronization to close that window itself -- which is effectively reinventing what pthread_cond_wait() already does, at extra cost.
 PITFALL: Treating the mutex-plus-cond-var pairing as an arbitrary API inconvenience to work around with a "simpler" hand-rolled decoupled version. The coupling is a deliberate correctness and real-time-determinism choice, documented as such, not an accident of history.
-VERIFY: POSIX.1-2017, pthread_cond_timedwait()/pthread_cond_wait() RATIONALE, "Features of Mutexes and Condition Variables" subsection.
 
 @@ 5.20 | Principal | Debug | tags=review,checklist,condvar-audit
 Q: You are reviewing a teammate's new producer/consumer code that uses a condition variable. What five things do you check before approving it?
@@ -347,8 +365,9 @@ DEEP:
 4. **Termination path.** Any "no more work is coming" condition uses broadcast and is itself part of the checked predicate (5.13's done_producing pattern), so no consumer can be left waiting forever after legitimate shutdown.
 5. **Actually run under contention.** Ask for (or personally run) the same repeated-execution check 5.13 and 5.14 used -- five-plus runs under real multi-thread load, not a single pass, since races by definition do not show up every time.
 - A sixth, softer check worth raising even if not blocking: is a condition variable the right tool here at all, or would a simpler primitive (a plain mutex if there is no actual waiting/blocking need, or a semaphore if it is really a counting-resource problem, module 6) fit the actual shape of the problem better?
+
+**Source note:** No single POSIX clause; this composes the predicate-loop RATIONALE (5.02), the mutex-binding rule (5.10), and the broadcast-for-multiple-waiters guidance (5.08, APPLICATION USAGE) into a review checklist.
 FOLLOW:
 - What if the author says "it passed all our tests"? => Ask specifically whether the tests exercise real concurrent contention (multiple threads actually blocking and being woken) or only single-threaded/low-concurrency paths; passing tests that never force a wait to actually block proves little about the wait/signal logic itself.
 - Is it reasonable to ask for a stress-test loop (run N times) as a review gate for any new condition-variable code? => Yes, and it costs little: 5.04's and 5.14's demos show that a genuinely broken pattern can reproduce with total reliability once the right ordering is forced, so a cheap repeated-run check in CI is a proportionate bar for code this easy to get subtly wrong.
 PITFALL: Approving condition-variable code because it "reads correctly" and passed a quick manual test, without checking the state-mutex correspondence or actually forcing concurrent contention during review.
-VERIFY: No single POSIX clause; this composes the predicate-loop RATIONALE (5.02), the mutex-binding rule (5.10), and the broadcast-for-multiple-waiters guidance (5.08, APPLICATION USAGE) into a review checklist.

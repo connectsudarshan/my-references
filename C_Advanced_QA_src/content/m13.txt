@@ -8,11 +8,12 @@ DEEP:
 - The page table maps virtual pages (a fixed-size chunk, commonly 4 KiB on x86-64) to physical frames; an entry can also be absent, meaning that virtual page currently has no physical backing.
 - The translation lookaside buffer (TLB) caches recent virtual-to-physical translations so the MMU does not walk the full page table on every access; a TLB miss forces a walk, which is why frequent context switches or huge working sets that thrash the TLB cost real time.
 - This module builds on the address-space picture from the C Language page (module 1 of this page, `Processes vs Threads & Process Memory Layout`) -- that module shows text/data/heap/stack; this module shows what actually backs those regions in physical memory and how it is mapped.
+
+**Source note:** TLB size and page-table walk cost are CPU-model-specific; treat any cycle count as an order-of-magnitude approximation (see 13.12).
 FOLLOW:
 - Is the page table itself in physical or virtual memory? => Physical memory; the CPU register (e.g. CR3 on x86-64) holds the physical address of the top-level page table, since the MMU cannot use virtual addresses to find the table that resolves virtual addresses.
 - Does every process get the same page size? => Usually the same base page size (4 KiB is standard on x86-64 and most ARM configs), though huge pages (2 MiB, 1 GiB) can back specific mappings; see 13.20.
 PITFALL: Assuming a process's contiguous virtual address range must also be contiguous in physical RAM. It almost never is; contiguity is a virtual-address illusion the page table maintains.
-VERIFY: TLB size and page-table walk cost are CPU-model-specific; treat any cycle count as an order-of-magnitude approximation (see 13.12).
 
 @@ 13.02 | Basic | Concept | tags=pagefault,minor,major
 Q: What is a page fault, and what is the difference between a minor and a major fault?
@@ -212,11 +213,12 @@ DEEP:
 6. The kernel returns to user mode at the exact faulting instruction, which now succeeds because the translation exists.
 7. If illegitimate (V is not covered by any VMA, or the access type violates the VMA's permissions), the kernel instead delivers SIGSEGV (or SIGBUS for the specific whole-page-beyond-object case in mmap.3p) to the process.
 - This is the mechanism underlying every mmap() page: the mapping call itself usually only sets up the VMA and page-table bookkeeping; the first real access is what drives steps 1-6.
+
+**Source note:** The exact fault-handling sequence and terminology (VMA, TLB) are OS/kernel-internal, not POSIX-specified; POSIX defines mmap()'s user-visible contract, not how a conforming kernel must implement paging.
 FOLLOW:
 - Where in this sequence does an mmap()'d but never-touched page's memory actually get allocated? => Not at mmap() time; it happens at step 5, the first time some instruction actually reads or writes that page, which is why mmap() itself is cheap even for a huge mapping.
 - Is the page-table walk in step 2 done by software or hardware? => On x86-64 and most current designs it is done by dedicated MMU hardware; some architectures instead trap to a software handler for the walk itself, which is a real but platform-specific difference (VERIFY for a given CPU).
 PITFALL: Assuming a page fault always means something is wrong. The overwhelming majority, in a healthy process, are the deliberate mechanism behind lazy allocation and demand paging, not errors.
-VERIFY: The exact fault-handling sequence and terminology (VMA, TLB) are OS/kernel-internal, not POSIX-specified; POSIX defines mmap()'s user-visible contract, not how a conforming kernel must implement paging.
 
 @@ 13.11 | Advanced | Scenario | tags=fork,mapshared,mapprivate,copyonwrite
 Q: After fork(), does a child's write through a MAP_SHARED mapping reach the parent? Does a write through MAP_PRIVATE?
@@ -260,11 +262,12 @@ DEEP:
 - The gap between "minor fault" and "major fault" is the entire point of demand paging being cheap for anonymous/lazy allocation but expensive the moment real I/O is involved -- this is why touching a huge freshly-mmap'd buffer for the first time (all minor faults, no I/O) is fast, while mmap()-ing and then reading a huge file you have never touched (all major faults) is bounded by storage latency.
 - For an SSD firmware validation context specifically: a major fault against your own device under test could be dominated by the device's actual read latency (which you are probably also measuring for other reasons), not by OS overhead -- do not conflate "slow page fault" with "slow storage device" without checking which one you are actually bottlenecked on.
 - These numbers move with CPU generation, kernel version, NUMA locality, and whether the page needs zeroing; use them only to sanity-check "is this the right ballpark," never as a spec-level guarantee for a design decision.
+
+**Source note:** All figures are commonly cited approximate orders of magnitude from general OS-performance literature, not from a specific measured benchmark in this session; treat as VERIFY for any real decision.
 FOLLOW:
 - Why would you ever care about minor-fault cost in a validation harness? => A tight loop that repeatedly touches freshly-allocated memory (e.g. per-iteration buffer allocation without reuse) can accumulate enough minor-fault overhead to visibly skew latency measurements you intended to attribute entirely to the device.
 - Is mlock()-ing a buffer a way to avoid this? => It prevents that specific memory from ever being paged out (so no future major fault on it), but does not avoid the one-time cost of the initial faults that bring it in.
 PITFALL: Quoting any of these numbers as an exact, portable constant in an interview or a report. State them as approximate and hedge explicitly, as done here.
-VERIFY: All figures are commonly cited approximate orders of magnitude from general OS-performance literature, not from a specific measured benchmark in this session; treat as VERIFY for any real decision.
 
 @@ 13.13 | Advanced | Concept | tags=sigbus,mmap,eof
 Q: Under what specific mmap() circumstance does POSIX say a SIGBUS is generated, and how is that different from SIGSEGV?

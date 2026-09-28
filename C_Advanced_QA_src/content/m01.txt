@@ -127,11 +127,12 @@ int main(void) {
 ```
 Compiled and run, one observed ordering (addresses are ASLR-randomized per run, but the relative ordering is consistent) was: text `0x5583e2397249` < data `0x5583e239a010` < heap `0x5583e93b62a0`, then a large gap up to the thread stacks near `0x7ff476dfeeb4`, then main's own stack local at `0x7ffcebbc0acc` -- higher than the thread stacks, consistent with the thread-stack region sitting below the main stack and above the heap. Both worker threads landed at the same address because thread 1 was joined (and its stack freed) before thread 2 was created.
 - This is exactly module 1's addition to the C page's single-thread picture (module 8, 8.06): the same text/data/heap/stack regions exist, but now there can be many stacks, one per live thread, all still inside the one shared address space.
+
+**Source note:** The exact placement (mmap region below the main stack) is a Linux/glibc implementation detail, not a POSIX guarantee; POSIX only guarantees each thread has its own stack storage.
 FOLLOW:
 - Do thread stacks grow toward each other and risk colliding? => Each thread's stack has a fixed size (default 8 MB on typical 64-bit Linux, module 3) plus a guard page below it; the implementation places new stacks with enough room to avoid collision, and a guard-page hit turns an overflow into a SIGSEGV rather than silent corruption into a neighboring stack.
 - Why did both worker threads get the same stack address here? => Because thread 1 was joined before thread 2 was created, its stack region was freed and immediately reused; two threads alive at the same time would get distinct, non-overlapping stack regions.
 PITFALL: Assuming a new thread's stack is carved out of the main thread's stack space. It is a separate mapping the implementation allocates elsewhere in the address space, not a sub-range of the initial stack.
-VERIFY: The exact placement (mmap region below the main stack) is a Linux/glibc implementation detail, not a POSIX guarantee; POSIX only guarantees each thread has its own stack storage.
 
 @@ 1.05 | Intermediate | Numeric | tags=fork,pthread_create,cost
 Q: Roughly how much more expensive is creating a process with fork() than creating a thread with pthread_create(), and why?
@@ -173,11 +174,12 @@ int main(void) {
 }
 ```
 Compiled and run, this printed `fork+waitpid: 0.1109 ms/iter` and `pthread_create+join: 0.0235 ms/iter` on this machine, for N=2000 each -- about 4.7x. This is a near-empty process (nothing to copy-on-write fault on), so the gap is at its smallest; a process with a large heap or many mappings pays more for page-table setup even though COW defers the actual data copy.
+
+**Source note:** These are wall-clock numbers from one run on one machine, not a portable benchmark; POSIX makes no performance guarantees for either call.
 FOLLOW:
 - Why doesn't COW make fork() just as cheap as thread creation? => COW avoids copying page CONTENTS, but the kernel still has to create and populate new page-table structures referencing the parent's physical pages, which pthread_create() never has to do since threads already share one set of page tables.
 - Would exec() right after fork() change this comparison? => It would add more cost (loading a new binary, module 2, 2.05), but that is a different operation being measured; this timing is fork() alone versus pthread_create() alone.
 PITFALL: Quoting a single fork-vs-thread ratio as a universal constant. The gap depends heavily on process size (mapped memory, open fds) and the kernel/allocator in use; treat any specific number, including the one measured here, as an order-of-magnitude guide, not a spec.
-VERIFY: These are wall-clock numbers from one run on one machine, not a portable benchmark; POSIX makes no performance guarantees for either call.
 
 @@ 1.06 | Intermediate | Trap | tags=errno,thread-local,concurrent
 Q: Is it safe for two threads to both trigger a failing system call and read errno concurrently?
@@ -570,11 +572,12 @@ int main(void) {
 ```
 Compiled and run, this printed `thread 1: tls_counter=3`, `thread 2: tls_counter=3`, and `main: tls_counter=100 (untouched by either thread)` -- both worker threads started their own copy at the default-initialized 0 (not main's 100), incremented it 3 times independently, and main's own copy was never touched by either.
 - Module 3 covers the full attribute/API story (__thread vs the C11 keyword _Thread_local, and the older pthread_key_create()-based thread-specific-data API); this module's point is only where TLS sits conceptually in the address-space picture: neither in the shared data segment nor on any one thread's stack, but in a separate per-thread region the runtime manages alongside each thread's other per-thread state.
+
+**Source note:** The exact mechanism (which per-thread structure holds the TLS block, and how it is reached) is an ABI/implementation detail, not something POSIX or C11 specifies; C11 (7.17-adjacent clause on storage-class specifiers, and the _Thread_local keyword itself) only guarantees the observable per-thread-copy behavior.
 FOLLOW:
 - Is a TLS variable's address the same across threads? => No; `&tls_counter` evaluated in two different threads yields two different addresses, since each thread has its own storage for it -- this is a useful sanity check when debugging a TLS-related bug.
 - Does TLS use any more memory if a thread never touches the variable? => Implementations vary; some allocate the whole TLS block eagerly at thread creation, others lazily on first access, but either way the accounting is per-thread, unlike a global which is allocated exactly once for the whole process.
 PITFALL: Assuming a `static` (file-scope) variable declared inside a function or module is automatically thread-safe because "each thread only touches its own logical state." Without __thread/_Thread_local (or explicit synchronization), a plain static or global is the SAME shared storage 1.08 demonstrates racing, no matter how the code is organized.
-VERIFY: The exact mechanism (which per-thread structure holds the TLS block, and how it is reached) is an ABI/implementation detail, not something POSIX or C11 specifies; C11 (7.17-adjacent clause on storage-class specifiers, and the _Thread_local keyword itself) only guarantees the observable per-thread-copy behavior.
 
 @@ 1.18 | Principal | Scenario | tags=processes-vs-threads,tradeoff,decision
 Q: Given everything this module establishes about what threads share automatically, when would a Principal-level engineer actually choose multiple processes over multiple threads for new validation-harness work?
