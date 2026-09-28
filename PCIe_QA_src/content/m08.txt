@@ -87,7 +87,7 @@ PITFALL: Writing the check as CL >= CC + P with unbounded integers in a model. T
 Q: How do infinite credits and UpdateFC timing fit together, and why does a late UpdateFC cost throughput?
 SHORT: InitFC (covered in the Data Link module) sets the starting credits, and a value of zero means infinite. In operation the receiver sends UpdateFC as it frees buffer, batched to save DLLP bandwidth, plus periodically as a safety net. The credit loop is transmit time plus link latency plus receiver drain plus UpdateFC delay plus return. If the credit window is smaller than bandwidth x loop time, the transmitter idles, so extra UpdateFC delay lowers throughput.
 DEEP:
-- **Infinite credit:** zero in both fields of an InitFC means infinite for that type and VC. Endpoints and Root Ports use it for completions, since they only receive completions for requests they issued and have reserved room. The transmitter skips the check and no UpdateFC is sent for that type.
+- **Infinite credit:** zero in both fields of an InitFC means infinite for that type and VC. Endpoints and Root Ports use it for completions, since they only receive completions for requests they issued and have reserved room. A Root Complex that supports no peer-to-peer traffic between its Root Ports must advertise infinite completion credits on every Root Port. The transmitter skips the check and no UpdateFC is sent for that type.
 - **The promise:** advertising infinite completion credits means having buffer for every outstanding read. Otherwise the device overflows. That is why tag count times read size must fit the completion buffer (Module 7).
 - **UpdateFC policy:** receivers usually send when a threshold of freed credits accumulates or a timer expires. The spec bounds the maximum interval between UpdateFC DLLPs and gives recommended latency limits by link width and MPS.
 - **What lengthens the loop:** slow drain (a busy host write path, IOMMU misses, a congested switch), extra hops (each link is its own loop and backpressure propagates), retimers, and L1 exit.
@@ -97,13 +97,12 @@ FOLLOW:
 - What does a receiver cost if it sends an UpdateFC for every freed credit? => DLLP bandwidth and processing. Implementations batch, which stretches the loop slightly.
 - Does the credit state survive a link retrain? => Yes. Flow control state is kept through Recovery and low-power exits. Only a link down and a new InitFC exchange reset it.
 PITFALL: Assuming a credit returns when the TLP is received. It returns when the receiving Transaction Layer has drained it.
-VERIFY: Which completion credit types Root Ports and endpoints are required (not just allowed) to advertise as infinite.
 
 @@ 8.06 | Intermediate | Concept | tags=scaled-flow-control,hdrscale,datascale,gen4,dl-feature
 Q: What is Scaled Flow Control and why was it added?
 SHORT: The original credit fields are 8 bits for headers and 12 bits for data, so the window per type is at most 127 header credits and 2047 data credits, which is 32 KB of data. That is too small for fast, wide links with long round trips. Scaled Flow Control, introduced with PCIe 4.0, adds HdrScale and DataScale fields to InitFC and UpdateFC that multiply the credit values, up to 16 times. Both link partners must support it and agree during Data Link Feature exchange.
 DEEP:
-- **Mechanism:** each InitFC and UpdateFC carries a 2-bit scale field beside the header and data values: 00b means scaling is not in use, 01b x1, 10b x4, 11b x16. The advertised credit value is multiplied by the scale factor, so at x16 the window can reach about 2032 header credits and about 32,752 data credits (roughly 512 KB).
+- **Mechanism:** each InitFC and UpdateFC carries a 2-bit scale field beside the header and data values: 00b means scaling is not in use, 01b x1, 10b x4, 11b x16. The advertised credit value is multiplied by the scale factor, so the maxima are 508 header and 8,188 data credits at x4, and 2,032 header and 32,752 data credits (roughly 512 KB) at x16. Ports that support 16 GT/s or higher must support Scaled Flow Control.
 - **Negotiation:** the Data Link Feature exchange in DL_Feature (Module 6) reports support. If either side lacks it, the link uses unscaled flow control.
 - **Why needed:** the Numeric question below shows Gen5 x16 with a 1 microsecond loop needs about 3600 data credits, above the 2047 limit.
 - **Who needs it:** an M.2 Gen4 x4 SSD moving about 7.2 GB/s of payload with a 1 microsecond loop needs about 450 data credits (7.9 GB/s of raw link rate would need about 490), well inside the unscaled range. It matters for x16 Gen5 and Gen6 devices such as GPUs, NICs and CXL cards.
@@ -113,7 +112,6 @@ FOLLOW:
 - Who chooses the scale factor? => Each receiver chooses what it advertises, provided both ends support the feature.
 - How would you see it on a trace? => The InitFC DLLPs carry the scale fields, and analyzers decode HdrScale and DataScale.
 PITFALL: Assuming a Gen4 or faster link always uses scaled flow control. Both ends must support and agree on it.
-VERIFY: Whether Scaled Flow Control support is mandatory for ports that support 16 GT/s and above, and the exact maxima per scale factor.
 
 @@ 8.07 | Intermediate | Concept | tags=virtual-channel,traffic-class,vc0,arbitration,tc-vc-mapping
 Q: What are traffic classes and virtual channels, and why do most SSD systems use only VC0?
@@ -129,7 +127,6 @@ FOLLOW:
 - Can two TCs share a VC? => Yes, the map is many to one. They then share credits and ordering.
 - Does NVMe queue arbitration (round robin, weighted) relate to VC arbitration? => No. NVMe arbitration is inside the controller and all its TLPs use TC0.
 PITFALL: Expecting extra VCs to raise SSD throughput. They separate traffic for QoS but share the same link bandwidth.
-VERIFY: Names and layout of the VC capability registers, and the malformed rule for an unmapped TC.
 
 @@ 8.08 | Intermediate | Concept | tags=ordering,posted,non-posted,completion,producer-consumer,deadlock
 Q: Describe the PCIe ordering rules for posted, non-posted and completion TLPs, and why some of them exist.
@@ -140,7 +137,7 @@ May the later TLP (row) pass an earlier TLP (column)?
 | Later TLP | Earlier posted | Earlier non-posted | Earlier completion |
 |---|---|---|---|
 | Posted | No (unless RO or IDO) | Yes, required | Permitted, not required (required only in PCIe-to-PCI bridges) |
-| Non-posted | No (unless IDO, for a different requester) | No requirement | No requirement |
+| Non-posted | No (unless IDO with a different requester, or the same requester with different PASIDs; an NPR with data may also pass with RO) | No requirement | No requirement |
 | Completion | No (unless RO or IDO) | Yes, required | Yes, except completions with the same Transaction ID keep their order |
 
 - **Producer/consumer:** the producer writes data, then a flag. A consumer that sees the flag must see the data. That needs posted-after-posted order.
@@ -153,7 +150,6 @@ FOLLOW:
 - Why do posted, non-posted and completion traffic have separate buffers and credits? => The bypass rules need separate queues, and separate credits stop one class from consuming another's buffer.
 - Which rule makes the flush read trick work? => A non-posted request cannot pass earlier posted writes, so the read's completion implies those writes have been done.
 PITFALL: Remembering the table as "everything stays in order". The key rules are the "must be able to pass" exceptions, which exist to prevent deadlock.
-VERIFY: The remaining Y/N cells of the Transaction Ordering table (non-posted versus non-posted and completions) in your spec revision.
 
 @@ 8.09 | Advanced | Numeric | tags=credit-sizing,bdp,gen5,line-rate,scaled-fc
 Q: How many credits does a Gen5 x4 link need to sustain line rate, and what happens with a longer loop or a wider link?
@@ -238,7 +234,7 @@ DEEP:
 | Shortage looks like | Requester cannot issue new reads | Transmitter port holds TLPs though the link is idle |
 
 - **Independent:** a request can have a free tag and no NPH credit, or a credit and no tag. Throughput is bounded by the smaller of tag window / latency and credit window / loop time.
-- **Posted writes:** they need no tag but do need PH and PD, so a write-heavy load can stall on credits with tags irrelevant.
+- **Posted writes:** they need no tag (the Tag field of posted requests is reserved in flit mode, and in non-flit mode its low 8 bits carry the TPH Steering Tag when TH is set) but do need PH and PD, so a write-heavy load can stall on credits with tags irrelevant.
 - **Completions:** each also consumes CplH and CplD at the requester's receiver.
 - **DLLPs:** they have no Transaction Layer buffer and are consumed by the Data Link Layer, so they need no credits (Module 6).
 - **Three counters, not one:** the DLL sequence number, the tag and the credit counters are separate mechanisms.
@@ -247,7 +243,6 @@ FOLLOW:
 - Can a completer be blocked by credits? => Yes, by the requester's CplH and CplD credits. Requesters normally advertise infinite completion credits, so it is rare.
 - Do posted writes use tags? => The Tag field is present but nothing matches on it, and the write still needs PH and PD.
 PITFALL: Fixing a credit stall by raising the tag limit, or the reverse. First find which limit is binding.
-VERIFY: Tag field rules for posted requests when 10-bit tags are enabled.
 
 @@ 8.13 | Advanced | Debug | tags=credit-stall,analyzer,nph,idle-link,counters
 Q: The link is up and clean but all I/O has stopped. How do you prove the transmitter is blocked on NPH credits, from an analyzer trace and from device counters?
@@ -320,7 +315,7 @@ VERIFY: Whether your switch exposes buffer or credit configuration, and its Upda
 Q: How would you design a test that proves a device's flow control handling: credit exhaustion, counter wraparound and infinite credit?
 SHORT: Use a protocol exerciser or a link-partner model that controls InitFC values and UpdateFC timing, plus an in-line analyzer with a credit tracker. Test minimal credits, exhaustion of each type with exact-count stops, independence of P, NP and Cpl, counter wrap at header and data widths, infinite completion credits, lost and delayed UpdateFC, and state across Recovery and link down. Pass means no TLP is ever sent without credit, no deadlock, no data loss and throughput matches the model.
 DEEP:
-1. **Minimal credits:** the partner advertises the smallest legal window. The device must work slowly and never exceed it.
+1. **Minimal credits:** the partner advertises the smallest legal window (for example 1 posted header credit and enough posted data credits for one maximum payload). The device must work slowly and never exceed it.
 2. **Exhaustion, per type:** withhold UpdateFC for NP. Count NP TLPs sent: it must equal the credits granted exactly. Release one credit and expect exactly one more TLP. Repeat for all six types. Test the data check separately: with 15 PD left and a TLP needing 16, the device waits even with PH free.
 3. **Independence and deadlock:** with NP exhausted, posted writes and completions must still flow past the blocked non-posted requests. With P exhausted, a completion queued behind an earlier posted write may legitimately wait, so do not fail the device for that; the mandatory bypasses only run past non-posted requests.
 4. **Wraparound:** run enough traffic for the header counter (256 credits) and the data counter (4096 credits, 64 KiB) to wrap many times, with tiny and maximum windows (127 and 2047), and with random TLP sizes. Aim at cases where limit and consumed straddle the wrap.
@@ -337,4 +332,4 @@ FOLLOW:
 - How do you make a wrap bug appear in minutes and not hours? => Small windows and many tiny TLPs. 256 tiny posted writes wrap the header counter, and 64 KiB of data wraps the data counter, so it takes microseconds.
 - What does a missing data-side check look like? => The device sends a large TLP when PH is available but PD is short, and the partner reports Receiver Overflow on data credits.
 PITFALL: Testing only against a production Root Port. It advertises large credits and returns them fast, so the exhaustion and wrap corners never occur. And an analyzer tracker that missed InitFC is blind.
-VERIFY: The minimum credits a receiver must advertise per type, and the exact error names and severities for credit violations.
+VERIFY: Minimum NPD and completion credit advertisements for your component type (Table 2-46).

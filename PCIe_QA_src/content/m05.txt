@@ -72,11 +72,12 @@ DEEP:
 
 - **Typical usage:** platforms often start from a moderate preset and tune from there, and firmware can pin per-lane presets in the Lane Equalization Control registers.
 - **After presets:** if a preset is not good enough the receiver requests explicit coefficients in later phases.
+
+**Tolerances:** each preset's preshoot and de-emphasis must be within plus or minus 1 dB, widened to plus or minus 1.5 dB for the -6.0 and -4.4 dB de-emphasis values (P0, P2, P7). P10 uses the transmitter's maximum de-emphasis, set by its LF value.
 FOLLOW:
 - Does every transmitter implement all 11 presets? => Yes, every port must support all of them at the rates where equalization applies. Exact dB values have a tolerance.
 - Why is P4 useful in validation? => It is the reference flat waveform. Comparing eye or margin at P4 against the negotiated preset shows how much the equalization buys you on that channel.
 PITFALL: Memorizing preset dB values as facts. Interviewers care that you know the trade-off (more de-emphasis for a lossier channel, more preshoot for a bandwidth-limited one) more than the table.
-VERIFY: Preset tolerances and the P10 definition in terms of FS and LF, in the transmitter preset table.
 
 @@ 5.05 | Intermediate | Numeric | tags=fir,coefficients,de-emphasis,math
 Q: Given a flat sum of tap magnitudes of 1, what post-cursor coefficient gives -6 dB de-emphasis, and what gives -3.5 dB?
@@ -95,11 +96,12 @@ P1  (-3.5 dB)  ->  C+1 = -0.166, C0 = 0.834
 
 - **What it shows:** a lot of equalization means the steady-state level is only half the peak level. Equalizing costs eye height at low frequency, so the receiver has to be able to tell the smaller level from noise.
 - **In a real preset table:** the pre-cursor tap and headroom constraints (FS and LF) also shape the values. This simplified model matches the post-cursor-only presets.
+
+**The spec's coefficient rules** (FS and LF in coefficient units): FS = |C-2| + |C-1| + C0 + |C+1| must stay constant, FS is 24 to 63 in full-swing mode (12 to 63 reduced swing), |C-1| <= floor(FS/4), C0 - |C-1| + |C-2| - |C+1| >= LF, and the second pre-cursor C-2 exists only at 64 GT/s with |C-2| <= floor(FS/8). A request that breaks any rule is rejected.
 FOLLOW:
 - What happens to the signal energy at DC when you go from P4 to P0? => The DC (long-run) level drops by 6 dB while the transition amplitude is unchanged.
 - Why not send a bigger amplitude instead? => The transmitter swing is bounded by the specification and by its supply, so the peak is fixed and equalization redistributes energy.
 PITFALL: Quoting -6 dB as "6 dB of boost". It is a 6 dB reduction of the steady level relative to the transition level.
-VERIFY: The definition of preset ratios in terms of FS, LF and coefficient constraints.
 
 @@ 5.06 | Intermediate | Concept | fig=eqphases | tags=eq-phases,phase0,phase1,phase2,phase3
 Q: Walk through the four phases of Gen3+ link equalization.
@@ -111,11 +113,12 @@ DEEP:
 - **Phase 3 (DSP tunes USP):** the same in the other direction.
 - **Why the receiver drives it:** only the receiver knows the eye quality at its own slicer.
 - **Done when:** both directions are tuned. The LTSSM then continues through Recovery.RcvrLock and RcvrCfg to L0.
+
+**Phase timeouts (PCIe 6.0, tolerance -0/+2 ms):** the port doing the tuning gets 24 ms (48 ms at 64 GT/s): the upstream port in Phase 2 and the downstream port in Phase 3. The downstream port waiting through Phase 2 allows 32 ms (64 ms at 64 GT/s). Phase 1 times out after 24 ms at the downstream port and 12 ms at the upstream port.
 FOLLOW:
 - Which port controls the timing of the phases? => The downstream port initiates and leads Phase 3, the upstream port leads Phase 2. If a phase times out, equalization is counted as unsuccessful. The LTSSM then goes through Recovery.Speed and retries or drops to a lower rate.
 - Where does the receiver's own EQ (CTLE and DFE) adapt? => Internally and continuously during all the phases. It has no protocol messages.
 PITFALL: Mixing up which port tunes which transmitter. In Phase 2 the upstream port is the one asking, and it is the downstream port's TX that changes.
-VERIFY: The exact per-phase timeouts for Phase 2 and Phase 3 at each port (order of tens of ms).
 
 @@ 5.07 | Advanced | Concept | tags=fs,lf,coefficient,tuning,ts1
 Q: What are FS and LF, and how does a coefficient-tuning request work?
@@ -126,11 +129,19 @@ DEEP:
 - **Request and response:** the receiver sends a TS1 carrying the full set it wants (a preset, or the three coefficient values). The transmitter echoes the values in its own TS1 once applied, or sets a Reject Coefficient Value bit if the request breaks the FS or LF constraints.
 - **Loop:** request, wait for a settling time, measure the eye or error metric, then request again. Implementations use steepest descent or an exhaustive search of a small neighbourhood.
 - **Timeout:** each phase has a bounded window, so implementations limit their search.
+
+**TS1 layout at 8b/10b and 128b/130b (PCIe 6.0):**
+
+| Symbol | Bits |
+|---|---|
+| 6 | 1:0 Equalization Control (EC, the phase), 2 Reset EIEOS Interval Count, 6:3 Transmitter Preset, 7 Use Preset / Equalization Redo |
+| 7 | 5:0 FS (when EC = 01b) or pre-cursor coefficient, 6 Transmitter Precoding On, 7 Retimer Equalization Extend |
+| 8 | 5:0 LF (when EC = 01b) or cursor coefficient |
+| 9 | 5:0 post-cursor coefficient, 6 Reject Coefficient Values, 7 even parity over symbols 6 to 8 and bits 6:0 of symbol 9 |
 FOLLOW:
 - Why not just always use the best preset and skip coefficients? => Presets are coarse. Coefficient tuning finds a better point for a specific lane, and when it fails you can still fall back on the preset.
 - Why might a device use a fixed preset and skip tuning? => Platform tuning has already been done at bring-up, so the device uses the preset from firmware or from Lane Equalization Control and finishes training in a predictable time.
 PITFALL: Treating a rejected request as an error. It is a normal limit-hit and the tuning algorithm should handle it.
-VERIFY: Symbol positions and field names in TS1 for the coefficient request and response, and the FS and LF value ranges.
 
 @@ 5.08 | Intermediate | Concept | tags=ctle,dfe,rx-eq,rx-preset
 Q: How does receiver equalization work, and why does the spec barely define it?
@@ -190,11 +201,12 @@ DEEP:
 **How a 1/(1+D) precoder works, in bits:** the transmitter sends y(n) = x(n) XOR y(n-1). The receiver recovers x(n) = y(n) XOR y(n-1). If the DFE produces a burst of flipped decisions y(n) to y(n+3), the XOR of neighboring flipped bits cancels, so only the first and last positions of the burst are wrong after decoding: a 4-bit burst becomes 2 isolated errors.
 
 That matters because the link's CRC and, at Gen6, the FEC are designed around a bounded number of symbol errors per codeword. Turning long bursts into short ones keeps more errors inside what they can detect or correct, so fewer events turn into replays.
+
+**Spec rules (PCIe 6.0):** precoding is defined only at 32 GT/s and above and must never be turned on below 32 GT/s. A receiver requests it by setting the Transmitter Precode Request bit in the EQ TS2s sent before the link moves to that rate, and the transmitter reports it in TS1 symbol 7 bit 6 (Transmitter Precoding On). At 64 GT/s precoding works on 2-bit PAM4 symbols and is bypassed for TS0 ordered sets.
 FOLLOW:
 - Why do errors matter beyond BER? => Burst length interacts with what the CRC and FEC can correct, and the error count a validator sees in counters. The same raw BER with bursts causes more replay events than with isolated errors.
 - Is precoding part of the equalization phases? => It is negotiated in the same training exchange, but it is not one of the four phases.
 PITFALL: Calling precoding a form of equalization. It changes error statistics, not the eye.
-VERIFY: Which rates define precoding, how it is requested in TS1 and the exact precoder polynomial.
 
 @@ 5.12 | Principal | Trap | tags=over-equalization,margin,tuning,crosstalk
 Q: A colleague says "just use the highest-boost preset to be safe". What is wrong with that?
@@ -226,11 +238,12 @@ DEEP:
 - **Retimer segments:** the retimer trains with the root port on one side and with the endpoint on the other. Each segment does its own equalization.
 - **Redriver problems:** it can break receiver detection, compliance and equalization negotiation, since the partners see a channel that is neither the real one nor a clean one.
 - **Gen5 trend:** at 32 GT/s the loss budget is tight enough that most long or connector-heavy topologies need retimers.
+
+**Retimer latency limit (PCIe 6.0, not in SRIS):** 32, 32, 64, 128, 256 and 512 symbol times at 2.5, 5, 8, 16, 32 and 64 GT/s, which is 128 ns at 2.5 GT/s and 64 ns at every rate from 5 GT/s up. With two retimers the round trip adds four times that latency, which designers must include in replay buffer and credit sizing.
 FOLLOW:
 - Does a retimer add latency to TLPs? => Yes, a small amount in each direction, tens of ns. Rarely visible but it counts in tight completion or latency budgets.
 - Can a link have more than one retimer? => The specification allows at most two between the two link ends, and the ports learn how many through the Retimer Present bits in TS2 (Link Status 2 bits 6 and 7). Each segment must be within its own channel budget.
 PITFALL: Treating a redriver as a lower-cost retimer. They solve different problems and a redriver cannot fix a jitter problem.
-VERIFY: The retimer latency limit in the retimer section of the Base Specification.
 
 @@ 5.14 | Advanced | Concept | tags=retimer,ltssm,skp,sris
 Q: How does a retimer behave in the LTSSM, and how do the two ports know it is there?
@@ -238,7 +251,7 @@ SHORT: A retimer has a forwarding mode in which it passes bits through, and it a
 DEEP:
 - **Two segments:** the root-port-facing side acts as an upstream port and the endpoint-facing side as a downstream port. Each side trains and equalizes independently.
 - **Forwarding:** after training, TLPs, DLLPs and ordered sets are passed through, with SKP ordered sets inserted or dropped to absorb the clock offset between the two segments.
-- **Discovery:** TS2 has Retimer Present and Two Retimers Present bits, so each port learns how many retimers are in the path.
+- **Discovery:** TS2 has Retimer Present and Two Retimers Present bits (Symbol 5 bits 4 and 5, carried in the TS2s sent at 2.5 GT/s), so each port learns how many retimers are in the path.
 - **Effects on training:** timers are extended to allow for the retimer's own training time. Equalization may take longer.
 - **Clocking:** the segments may use separate reference clocks, so a retimer supports common-clock and separate-clock modes.
 - **Configuration:** a retimer usually has its own register interface (I2C, SMBus or a management port) with firmware, presets and per-lane settings.
@@ -246,7 +259,7 @@ FOLLOW:
 - If the endpoint's Link Status shows Gen5 x4, does that prove the retimer's other side is Gen5 x4 too? => It proves the end-to-end link works at that rate, but each retimer segment negotiates separately. Read the retimer's own status to see per-segment results.
 - What does the port do with TS1 that the retimer has modified? => The retimer forwards or rewrites the training fields as the specification requires so both ports see a consistent end-to-end view.
 PITFALL: Assuming a retimer is a transparent wire in debug. Every retimer adds a component with its own firmware version, configuration, and failure modes.
-VERIFY: The TS2 symbol and bit that carry Retimer Present, and the retimer-related timeout extensions.
+VERIFY: The retimer-related timeout extensions in the LTSSM chapter.
 
 @@ 5.15 | Principal | Scenario | tags=triage,retimer,gen5,backplane,downtrain
 Q: A Gen5 x4 SSD behind a retimer on a backplane trains at Gen4, or fails intermittently at Gen5. How do you triage it?

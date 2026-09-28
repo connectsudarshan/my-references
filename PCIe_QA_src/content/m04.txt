@@ -83,7 +83,7 @@ DEEP:
 | 3 | N_FTS: number of fast training sequences needed to exit L0s |
 | 4 | Data rate identifier: supported speeds, speed change request |
 | 5 | Training control bits |
-| 6 to 15 | TS identifier (TS1 or TS2 pattern: D10.2 for TS1, D5.2 for TS2 in 8b/10b); in Gen3 and above, symbols 6 to 9 carry equalization info (EC phase, preset, and the FS, LF and coefficient values) and symbols 10 to 15 keep the identifier |
+| 6 to 15 | TS identifier (TS1 or TS2 pattern: D10.2 for TS1, D5.2 for TS2 in 8b/10b); in Gen3 and above, symbols 6 to 9 carry equalization info (EC phase, preset, and the FS, LF and coefficient values; exact layout in 5.07) and symbols 10 to 15 keep the identifier |
 
 - **Data rate identifier:** each bit advertises a supported rate, and a separate bit requests a speed change.
 - **Training control bits:** hot reset, disable link, loopback, disable scrambling, compliance receive.
@@ -92,7 +92,6 @@ FOLLOW:
 - What does N_FTS do? => It tells the transmitter partner how many FTS ordered sets to send when leaving L0s so this receiver can relock.
 - Why do TS1 and TS2 exist as two types? => TS1 means "I am still negotiating." TS2 means "I have accepted the current configuration and am ready to move on."
 PITFALL: Memorizing symbol positions without knowing what each field is used for during debug.
-VERIFY: Exact bit positions inside the Gen3+ equalization symbols (6 to 9) of TS1 and TS2.
 
 @@ 4.06 | Intermediate | Concept | fig=recovery | tags=recovery
 Q: What is Recovery, when is it entered, and what are its sub-states?
@@ -139,7 +138,6 @@ FOLLOW:
 - Why does L1 exit take longer than L0s? => The PHY must wake, relock, and pass through Recovery, whereas L0s only needs a short FTS burst.
 - What do L1 substates add? => Lower idle power by turning off the reference clock and more analog circuitry, with a longer exit latency.
 PITFALL: Assuming L1 loses configuration state. Configuration space and device state are preserved in L1.
-VERIFY: L1 substate timing parameters (T_POWER_ON, Common Mode Restore Time, LTR threshold) in the L1 PM Substates section; module 11 covers them in detail.
 
 @@ 4.09 | Intermediate | Concept | tags=l2,pme,wake,d3cold
 Q: What is L2, and how does a link enter it?
@@ -222,6 +220,8 @@ DEEP:
 - **Hardware autonomous width change:** a device can reduce width to save power when it supports it (and the Hardware Autonomous Width Disable bit allows it).
 - **Upconfigure:** a device advertises upconfigure capability in TS2. A link can move from Recovery.Idle back to Configuration to widen.
 - **Reporting:** Link Status shows negotiated width, and Link Autonomous Bandwidth Status and Link Bandwidth Management Status flag changes not initiated by software.
+
+**Flit mode (PCIe 6.0):** link upconfigure through Recovery and Configuration is not supported once flit mode is in use. Dynamic width changes are done with L0p instead (module 14).
 FOLLOW:
 - Why not run three lanes? => Widths must be power-of-two groups. Three healthy lanes become x2 (with one wasted).
 - How does software learn the width dropped? => Through Link Status (negotiated width) and the link bandwidth notification bits.

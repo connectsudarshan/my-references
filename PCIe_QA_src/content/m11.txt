@@ -220,9 +220,8 @@ L1SubCtl2: T_PwrOn=10us
 (Illustrative lspci output.)
 FOLLOW:
 - Why does L1.2 fail on some platforms even when the SSD supports it? => CLKREQ# is not routed to the clock source, the clock takes longer to become stable than the programmed T_POWER_ON, or no LTR is being sent.
-- What is the difference between PCI-PM and ASPM substate enables? => PCI-PM substates apply when software put the device in D3hot, ASPM substates when the link goes idle in D0.
+- What is the difference between PCI-PM and ASPM substate enables? => PCI-PM substates apply when software put the device in D3hot, ASPM substates when the link goes idle in D0. Only ASPM L1.2 checks the LTR threshold: both the snoop and no-snoop LTR values must be at or above it (or carry no requirement), otherwise the link uses L1.1.
 PITFALL: Assuming L1.2 is only an SSD setting. It needs the SSD, the root port, the clock buffer and the OS all agreeing on timings.
-VERIFY: Whether PCI-PM L1.2 entry also checks the LTR threshold (it is defined for ASPM L1.2), and the snoop versus non-snoop rule for the threshold comparison.
 
 @@ 11.11 | Advanced | Concept | tags=ltr,obff,snoop,latency,l1.2
 Q: What is Latency Tolerance Reporting, and why does an SSD send it?
@@ -235,11 +234,13 @@ DEEP:
 - **What an SSD does:** in an active phase, it reports a small value (tens of microseconds) so that host memory responds fast. With empty queues and no background work, it reports a large value or no requirement.
 - **What LTR gates:** the LTR_L1.2_THRESHOLD check on the link (previous question) and the platform's package C-state selection.
 - **OBFF:** Optimized Buffer Flush/Fill lets the platform hint to devices when it is awake so that they batch their DMA. It is rarely used in practice and LTR does the practical work.
+
+**Spec rules worth quoting (PCIe 6.0):** a clear Requirement bit means no requirement for that traffic type, and all-zero value and scale means the best possible service is requested. Before entering a non-D0 state, and when LTR Mechanism Enable is cleared, a device whose last LTR had a Requirement bit set must send a new LTR with both Requirement bits clear. OBFF is still defined in 6.0.
 FOLLOW:
 - What happens if a device never sends LTR? => The result depends on the platform policy and the Requirement bit rules. Many platforms then treat the device as unconstrained, but some keep the package shallow. Measure it, do not assume.
 - Why does an idle SSD sometimes block deep package idle? => Its last LTR was small (or zero) and was never relaxed, or its firmware keeps sending updates because of background activity.
 PITFALL: Treating LTR as a link-level feature. It is a system-level input, and a wrong value costs power at the package, not just at the link.
-VERIFY: Requirement bit semantics, the behavior when no LTR has been sent, and OBFF status in your Base Specification revision.
+VERIFY: Platform behavior when a device has never sent LTR.
 
 @@ 11.12 | Advanced | Concept | tags=apst,nvme,idle-timer,table,linux
 Q: How does NVMe Autonomous Power State Transition work, and what does the table contain?

@@ -155,13 +155,12 @@ DEEP:
 - **Mechanical:** x1, x4 and x8 cards fit an x16 slot (open-ended slots also accept longer cards).
 - **Electrical:** a link is only as wide as the lanes that both sides wire and train.
 - **Generation mix:** a Gen5 endpoint in a Gen3 slot runs at Gen3. Equalization and other features are negotiated per speed.
-- **Gen6:** FLIT mode is required at 64 GT/s. It is negotiated once during initial link training and then stays in force across speed changes until the link goes down. A link runs non-FLIT only if the two ends never negotiated FLIT mode, for example with a Gen5 partner.
+- **Gen6:** FLIT mode is required at 64 GT/s. It is negotiated once during initial link training and then stays in force across speed changes until the link goes down. A link runs non-FLIT only if the two ends never negotiated FLIT mode, for example with a Gen5 partner. Below 64 GT/s a flit-mode link carries each flit byte as a symbol of a 128b/130b data block (8 to 32 GT/s) or an 8b/10b symbol (2.5 and 5 GT/s), and the 6 ECC bytes are still sent for consistency.
 - **Reality check:** "should be compatible" is where interop bugs live, mostly in link-training corner cases, power-state exit timing, and BIOS enumeration quirks. Plug-fests and compliance workshops exist for that reason.
 FOLLOW:
 - Can a Gen3 root port train a Gen5 SSD? => Yes, at Gen3, provided the SSD's link training logic handles the lower rate correctly.
 - Where do compatibility bugs cluster? => Speed changes and equalization, power-state transitions, and enumeration/resource allocation.
 PITFALL: Assuming backward compatibility removes the need to test each generation combination.
-VERIFY: How flits are carried at 2.5 to 32 GT/s in flit mode (which flit fields are sent and whether FEC is applied) in the Physical Layer chapter of PCIe Base 6.x.
 
 @@ 1.09 | Intermediate | Numeric | tags=efficiency,mps,overhead
 Q: Estimate TLP efficiency for a 256-byte payload.

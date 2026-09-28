@@ -102,14 +102,13 @@ DEEP:
 
 - **Default severity is the same. Handling is not:** UR has its own enable in Device Control because it is routine (bus probing, legacy accesses). CA is rarely routine, so treat any CA from an SSD as a device defect until proven otherwise.
 - **Posted versus non-posted:** a non-posted request that fails returns a UR or CA completion, so the requester is told. For a posted write there is no completion, so the error is signaled by an ERR_ message only, and nothing tells the driver.
-- **Advisory Non-Fatal:** for certain non-fatal errors that the requester will learn about through the completion status, the specification lets the function report ERR_COR and set the Advisory Non-Fatal bit in Correctable Error Status instead of sending ERR_NONFATAL.
+- **Advisory Non-Fatal:** the cases are a completer sending a UR or CA completion, an intermediate receiver (such as a switch forwarding a poisoned TLP), the final receiver of a poisoned TLP, a requester's completion timeout, and a receiver of an unexpected completion. For these, the specification lets the function report ERR_COR and set the Advisory Non-Fatal bit in Correctable Error Status instead of sending ERR_NONFATAL.
 - **What the CPU sees:** the Root Complex commonly turns UR and CA on a CPU read into all ones (0xFFFFFFFF). A driver that treats all ones as a valid value gets wrong data.
 - **DPC:** a Downstream Port in containment returns either UR or CA for requests aimed at the contained subtree, selected by DPC Completion Control.
 FOLLOW:
 - Which one do you get for a config read of a non-existent function? => UR, and the Root Complex reports all ones to the CPU. That is how enumeration finds empty slots.
 - Should you mask UR globally to reduce log noise? => Prefer rate limiting the log. Masking UR globally hides real bugs, for example a firmware update that removed a register.
 PITFALL: Treating both as "the device said no". The first word is a hint to the cause: UR is about the request, CA is about the completer.
-VERIFY: The exact set of errors eligible for Advisory Non-Fatal reporting in your spec revision.
 
 @@ 12.06 | Intermediate | Concept | tags=poisoned,ecrc,ep-bit,td-bit,data-integrity
 Q: How do Poisoned TLPs and ECRC work, and where do they matter for an SSD?
@@ -160,11 +159,12 @@ DEEP:
 - **What the host sees:** Uncorrectable fatal AER log, and with DPC the port containing the SSD goes down. Without DPC the platform may treat it as a system error.
 - **Evidence:** the Header Log has the offending TLP for Malformed TLP and gives the length and address to compare with MPS. Receiver Overflow and Flow Control Protocol Error usually have no useful header.
 - **Validation:** deliberately set mismatched MPS and MRRS values in a lab to confirm that the platform contains the error and recovers, and that the SSD never generates oversize TLPs itself under any MPS setting.
+
+**Which errors log the TLP header (PCIe 6.0 error tables):** Poisoned TLP, ECRC, UR, CA, Unexpected Completion, ACS Violation, the egress-blocked errors, Malformed TLP and the IDE errors log the header of the first such TLP; Completion Timeout logs the request header only if the port advertises that capability. Correctable errors, Data Link Protocol Error, Surprise Down, Receiver Overflow and Flow Control Protocol Error have no TLP to log.
 FOLLOW:
 - How can MRRS cause errors? => It should not cause Malformed TLPs at the receiver. It limits read request size. A device that ignores MRRS breaks the requester's expectations, and completions may not fit the requester's buffers.
 - What does the driver do to avoid MPS mismatch? => The PCI core walks the hierarchy and programs the lowest common MPS on every device on the path. Bugs appear when it is bypassed by hot-plug or firmware settings.
 PITFALL: Chasing signal integrity for a Malformed TLP. These errors are logical, so check MPS, driver and firmware behaviour first.
-VERIFY: The complete list of malformed conditions, and which error types record a header log and which do not.
 
 @@ 12.09 | Advanced | Numeric | tags=numeric,completion-timeout,budget,switch,l1-exit
 Q: A CPU reads a register on an SSD two switches away. What is the worst-case completion time compared with the Completion Timeout settings?
@@ -251,7 +251,6 @@ FOLLOW:
 - What does the SSD see during DPC? => Its link goes down. A link-down alone does not necessarily reset the NVMe controller, so the driver's reset is what returns it to a known state.
 - Why is DPC not enabled everywhere by default? => The platform must support it, firmware may own it, and a link reset costs the outstanding I/O on that device. It suits storage backplanes well because the blast radius is one drive.
 PITFALL: Assuming that DPC clears the error. It contains the damage. The device is still in an unknown state and must be reset and re-initialized.
-VERIFY: RP PIO register names and the extended DPC fields in your spec revision.
 
 @@ 12.12 | Advanced | Concept | tags=linux,pci-error-handlers,aer-driver,windows,whea,recovery
 Q: How does the OS recover from a PCIe error? Describe the Linux flow and the Windows overview.

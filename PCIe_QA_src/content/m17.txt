@@ -242,11 +242,12 @@ DEEP:
   - LnkSta2 equalization results and per-lane margin at both ends.
   - Throughput against the link ceiling, and link-up yield over many resets.
 - **Reverse trap:** LnkSta at Gen4 on a Gen5 device may be a slot limit or Target Link Speed setting, not a fault. Compare with both ends' LnkCap and Link Control 2 first.
+
+**Spec rule (PCIe 6.0):** on a bandwidth change through Recovery and Configuration, Link Bandwidth Management Status is set if the downstream port initiated the change for reliability reasons, or if the partner did not flag it as autonomous (TS1 symbol 4 bit 6 clear); otherwise Link Autonomous Bandwidth Status is set. LBMS is also set when a software-requested retrain completes.
 FOLLOW:
 - How would you catch a link that downtrains and recovers? => Poll LnkSta and the bandwidth status bits at a short interval, keep the LTSSM history from the SSD, and count Recovery entries.
 - Is a link at less than max speed always broken? => No. Check the capabilities and settings of both ends, including the slot, BIOS and ASPM policy, before calling it a fault.
 PITFALL: Signing off link health with one screenshot of lspci output.
-VERIFY: The exact conditions that set Link Bandwidth Management Status and Link Autonomous Bandwidth Status in the Base Specification, which differ for hardware-initiated and software-initiated changes.
 
 @@ 17.13 | Advanced | Debug | fig=ltssm | tags=ltssm,history,recovery,detect,cause-mapping
 Q: You have an LTSSM state history for a failing link. How do you map the patterns to causes?

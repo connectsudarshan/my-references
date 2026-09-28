@@ -15,7 +15,6 @@ FOLLOW:
 - Which resets can a driver trigger without touching a bridge? => FLR and the D3hot to D0 power-state write, because both use the function's own registers. Hot reset and link disable need the upstream port's registers.
 - Is every warm reboot a PERST# pulse? => Usually, but platforms differ in whether they pulse PERST#, drop slot power, or gate the reference clock. Scope it rather than assume (see the warm-reboot debug question).
 PITFALL: Calling every reset a "hot reset" and treating them as interchangeable. Their scope, sticky-bit behavior and recovery timing differ.
-VERIFY: Whether your spec revision lists any further events that must cause a Conventional Reset.
 
 @@ 15.02 | Intermediate | Concept | fig=resets | tags=reset,sticky,scope,aer
 Q: What does each reset clear and what survives it, including sticky registers?
@@ -32,7 +31,6 @@ FOLLOW:
 - Why keep sticky bits across hot reset? => So a fatal error that triggered DPC or a hot reset can still be diagnosed after recovery.
 - Does a D3hot to D0 transition clear AER status? => No. Under the sticky rule only a Fundamental Reset does, and only when auxiliary power is not keeping the bits alive.
 PITFALL: Assuming FLR or hot reset gives a clean slate for error registers. Sticky bits persist and will show old errors.
-VERIFY: The auxiliary power condition for sticky-bit retention across Fundamental Reset, and the list of state FLR must not reset.
 
 @@ 15.03 | Basic | Concept | tags=perst,power-sequencing,refclk,timing
 Q: What must be true before PERST# is deasserted, and which timings matter?

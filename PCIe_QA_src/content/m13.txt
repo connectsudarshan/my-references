@@ -68,11 +68,12 @@ Assumptions: PF routing ID 0x3B00 (bus 0x3B, function 0), ARI enabled so the low
 - **Why ARI:** without ARI the low 8 bits are split into a 5-bit device number and a 3-bit function number, and a downstream port only reaches device 0. VF1 at 0x3B10 would be device 2, function 0, which cannot be addressed. ARI Forwarding Enable on the downstream port above the device (Device Control 2), plus ARI Capable Hierarchy in SR-IOV Control, lets the whole 8 bits act as the function number.
 - **Bus cost in general:** buses used = (bus of last VF) minus (PF bus) plus 1. A PF with 256 VFs at offset 1 and stride 1 ends at 0x3C00, so it also needs two buses.
 - **IOMMU view:** each VF has a different requester ID, and the ones on bus 3C sit under a different root-table entry.
+
+**Spec rules for the offset and stride:** First VF Offset must be non-zero when NumVFs is non-zero, and VF Stride non-zero when NumVFs is above 1. Both values may change when NumVFs changes or when ARI Capable Hierarchy changes, so software must re-read them after writing either. A VF may never sit on a bus number below its PF's.
 FOLLOW:
 - Is VF n always PF + n? => No. That holds only for offset 1 and stride 1. Always compute from the two registers.
 - How do you see the resulting IDs on Linux? => `lspci -t` after enabling, or the `virtfn*` symlinks under the PF's sysfs directory, which point at the VF BDFs.
 PITFALL: Forgetting that the VF count can push routing IDs onto a bus number the bridge above does not cover.
-VERIFY: What offset and stride a device reports when ARI Capable Hierarchy is clear, and whether they change with NumVFs.
 
 @@ 13.04 | Intermediate | Debug | tags=sriov,debug,vf-enable,bus-range,ari,mmio
 Q: You write a number to sriov_numvfs and the VFs do not appear. How do you find out why?

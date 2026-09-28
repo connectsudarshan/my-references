@@ -84,7 +84,7 @@ SHORT: The Requester ID (bus, device, function) says who sent a request, and the
 DEEP:
 - **Requester ID format:** Bus [15:8], Device [7:3], Function [2:0]. With ARI the device and function fields merge into an 8-bit function number.
 - **Tag scope:** unique among the non-posted requests outstanding from one Requester ID. A tag is allocated when a request is issued and freed when the last completion for it arrives. Split completions all carry the same tag.
-- **Widths:** the original tag field uses 5 bits. Extended Tag Field Enable (Device Control bit 8) makes it 8 bits. 10-bit tags need 10-Bit Tag Requester Enable in Device Control 2 and a completer that advertises 10-Bit Tag Completer Supported in Device Capabilities 2; the 256 values with the new bits at 00b are not used, which leaves 768.
+- **Widths:** the original tag field uses 5 bits. Extended Tag Field Enable (Device Control bit 8) makes it 8 bits. 10-bit tags need 10-Bit Tag Requester Enable in Device Control 2 and a completer that advertises 10-Bit Tag Completer Supported in Device Capabilities 2; the 256 values with the new bits at 00b are not used, which leaves 768. PCIe 6.0 adds 14-bit tags for flit mode (up to 16,128 outstanding).
 - **Bandwidth math:** the numeric worked out in Module 2 (about 31 reads of 256 B for Gen4 x4 at 1 microsecond). Here is the other direction: 32 tags x 256 B at a 2 microsecond round trip (through a switch and an IOMMU) caps at 4.1 GB/s, already below Gen4 x4.
 - **Buffer promise:** an endpoint that issues reads advertises infinite completion credits (Module 8), so it must own enough buffer for every outstanding tag times its read size.
 - **Ordering:** completions for different tags can come back in any order, so the requester places data by tag and address, never by arrival order.
@@ -327,11 +327,12 @@ DEEP:
 5. **Defects the checker catches:** payload above MPS (Malformed at the requester), split off an RCB boundary, out-of-order pieces, wrong Byte Count (the requester may hang or corrupt data), and duplicated tags.
 6. **SSD requester side:** its receive path must accept any legal split, including small pieces and interleaving across tags, and its reassembly must not depend on arrival order across requests.
 7. **Automation:** export traces from the analyzer scripting interface (CSV or JSON), run the checker as a script over every capture, and fail the run on any violation.
+
+**The spec rule behind the checker:** a read that does not cross an RCB-aligned boundary must be returned in a single completion. Only reads that cross one or more RCB boundaries may be split, and then only at those boundaries. RCB is 64 or 128 bytes for a Root Complex and always 128 bytes for other completers.
 FOLLOW:
 - Can a completer send the first piece before it has all the data? => Yes, in address order as data becomes available. So the first completion can arrive well before the last.
 - Would you fail a device that only copes with 128 B completions? => Yes. A requester has to accept any legal split.
 PITFALL: Writing a checker with fixed expected completion sizes. It flags legal platforms and misses real defects.
-VERIFY: The exact completion splitting rules for reads that cross RCB boundaries, and how unaligned or partial-BE reads are treated.
 
 @@ 7.17 | Principal | Scenario | tags=tags,mrrs,latency,plateau,write-iops,quantify
 Q: 4 KiB random write IOPS plateau at about 0.9 M on a Gen4 x4 SSD while reads reach 1.6 M and the NAND is idle. How do you find whether the PCIe request path is the limit?

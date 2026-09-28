@@ -10,10 +10,9 @@ DEEP:
 - **Why it matters for SSDs:** a modern NVMe SSD uses MSI-X, with one vector per completion queue, so completions land on the CPU that issued the command.
 - **Who asks for what:** a device reports which mechanisms it supports through capabilities (MSI 05h, MSI-X 11h), and the OS chooses, normally MSI-X, then MSI, then INTx.
 FOLLOW:
-- Is a device required to support INTx? => Native PCIe endpoints that generate interrupts must support MSI or MSI-X. INTx is legacy compatibility and is optional for many.
+- Is a device required to support INTx? => No. A function that generates interrupts must support MSI or MSI-X, and INTx emulation is optional. Switches must still forward INTx messages.
 - What about PME and hot-plug events? => They use the same in-band mechanisms, usually MSI or MSI-X, with the vector identified in the PCI Express Capabilities register.
 PITFALL: Imagining the interrupt as a signal separate from data. It is a memory write in the same stream, and the ordering of the two is the whole point.
-VERIFY: Whether native PCIe endpoints that support MSI or MSI-X are still required to implement INTx in your spec revision.
 
 @@ 10.02 | Basic | Concept | tags=intx,assert,deassert,swizzle,interrupt-pin
 Q: How does INTx emulation work over PCIe, and how does the INTx-to-pin mapping change through bridges?
@@ -85,10 +84,9 @@ DEEP:
 - **Why it is better than MSI:** up to 2048 vectors, arbitrary per-vector address and data, and no contiguity requirement.
 - **Requirements:** the table and PBA live in memory space, so the BAR must be programmed and Memory Space Enable must be on, and Bus Master Enable must be on for the device to send the message.
 FOLLOW:
-- Can the MSI-X table share a BAR with device registers? => Yes, but the specification wants registers not to share a 4 KB page with the table or the PBA, so that a hypervisor can trap them separately.
+- Can the MSI-X table share a BAR with device registers? => Yes, but the table and PBA must be isolated from other structures in naturally aligned 4 KB ranges (8 KB ranges or dedicated BARs are recommended), so that a hypervisor can trap them separately.
 - What does MSI-X Enable with Function Mask do? => Nothing is sent, and events accumulate in the PBA until the function mask is cleared.
 PITFALL: Rewriting a live vector's address and data without masking it first. A message in flight can go to the old CPU with the new data, or the other way around.
-VERIFY: Whether the page-sharing rule for the MSI-X table and PBA is a requirement or a recommendation in your spec revision.
 
 @@ 10.06 | Intermediate | Numeric | tags=msi-x,table-size,pba,bar-footprint,worked-example
 Q: How big are the MSI-X table and PBA for N vectors, and what BAR footprint results?
@@ -313,7 +311,7 @@ DEEP:
    - MSI-X Enable off with MSI enabled, and the both-enabled case only if the specification defines it.
    - PBA is read-only and a read has no side effect.
 4. **Update rules:** change address and data with the vector masked, and check the next message uses the new values.
-5. **Reset behavior:** table contents, mask bits (reset to masked) and PBA after Function Level Reset, controller reset (CC.EN 0 then 1), D3hot to D0, and hot reset.
+5. **Reset behavior:** table contents, mask bits (Function Mask resets to 0, each vector's Mask bit to 1, masked) and PBA after Function Level Reset, controller reset (CC.EN 0 then 1), D3hot to D0, and hot reset.
 6. **Command bits:** Bus Master Enable off means no messages, and Memory Space Enable off means table writes are not decoded.
 7. **Platform and IOMMU:** enable interrupt remapping and check remapped delivery, an invalid index or wrong requester ID producing a logged fault, and no lost interrupt while the kernel changes affinity under load.
 8. **Stress:** all vectors firing concurrently, masking and unmasking during traffic, and interrupts at line rate. Verify no message is lost or duplicated beyond what masking allows.
@@ -324,4 +322,3 @@ FOLLOW:
 - How do you inject the IOMMU faults? => Program a table entry whose handle is outside the remapping table or not present, or send from a function whose requester ID does not match the source check.
 - Which failures are most valuable to find? => Lost wake-ups around unmask, wrong state after resets, and wrong message address or data bits (for example the upper address not sent), which only show up on real platforms.
 PITFALL: Validating only through a stock OS driver. The kernel hides table writes and masks, so many corner cases never occur. Use a driver or exerciser that controls them.
-VERIFY: Reset values of MSI-X Enable, Function Mask and per-vector Mask bits after each reset type, and the TLP format rule for addresses below 4 GB, in the Base Specification.

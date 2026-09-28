@@ -146,9 +146,8 @@ DEEP:
 **Where you see this in practice:** on an analyzer placed after a cut-through switch, a TLP that ends with EDB and a bad LCRC, with no Nak following it, is a nullified TLP and is normal. The real error is on the link upstream of the switch, where a Bad TLP and Nak (and then a replay) show up. If you only probe the downstream link, you may chase a problem that belongs to the upstream link.
 FOLLOW:
 - Why not always store-and-forward? => It adds about a packet time of latency per hop, which matters at high speed and for latency-sensitive traffic.
-- Does a nullified TLP consume a sequence number? => The receiver discards it without treating it as a normal bad TLP, and it should not advance NEXT_RCV_SEQ. No Ack or Nak is scheduled for it, and it is not reported as an error.
+- Does a nullified TLP consume a sequence number? => The receiver discards it without treating it as a normal bad TLP, and it should not advance NEXT_RCV_SEQ. No Ack or Nak is scheduled for it, and it is not reported as an error. On the sending side, NEXT_TRANSMIT_SEQ is not incremented for a nullified TLP, so the next TLP reuses that sequence number.
 PITFALL: Assuming every dropped TLP means a link error. Nullified TLPs are expected switch behavior.
-VERIFY: Transmitter-side sequence-number handling for a TLP it nullifies (Data Link Layer chapter of the Base Specification).
 
 @@ 2.09 | Advanced | Concept | tags=errors,aer,layers
 Q: Which errors are detected at each layer, and how do they map to AER?
@@ -211,6 +210,7 @@ Bytes in flight = bandwidth x round-trip time (the bandwidth-delay product).
 
 - The original tag field is 5 bits (32 outstanding), the extended tag field is 8 bits (256, enabled by Extended Tag Field Enable in Device Control), and 10-bit tags (PCIe 4.0) allow up to 768 outstanding non-posted requests per requester. The 256 values with the two new tag bits at 00b are not used, so a 10-bit tag can never be mistaken for an 8-bit one.
 - Using 10-bit tags needs support on both ends: the completer must advertise 10-Bit Tag Completer Supported, and the requester needs 10-Bit Tag Requester Supported plus 10-Bit Tag Requester Enable in Device Control 2 (`lspci -vv` shows them as `10BitTagComp` and `10BitTagReq`). Switches and root ports on the path must pass the extra bits.
+- PCIe 6.0 adds 14-bit tags, used in flit mode: any Tag[13:8] value except 00 0000b is valid, allowing up to 16,128 outstanding requests, and every function that supports flit mode must accept 14-bit tags as a completer.
 - Latency is not fixed: each switch hop, retimer, IOMMU miss or host memory queue adds to the round trip, so the required tag count rises with topology depth.
 - Undersized tag pools show up as a plateau below the link rate that improves when you add queue depth or fewer hops.
 FOLLOW:
@@ -257,7 +257,7 @@ DEEP:
 
 | Value | Range |
 |---|---|
-| 0000b | default, 50 us to 50 ms (the spec recommends it not expire in under 10 ms) |
+| 0000b | default, 50 us to 50 ms; flit-capable functions must use 40 to 50 ms, others are recommended to use at least 10 ms |
 | 0001b / 0010b | 50 to 100 us / 1 to 10 ms (range A) |
 | 0101b / 0110b | 16 to 55 ms / 65 to 210 ms (range B) |
 | 1001b / 1010b | 260 to 900 ms / 1 to 3.5 s (range C) |

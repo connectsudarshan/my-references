@@ -47,7 +47,7 @@ DEEP:
 | 250 to 255 | FEC (6 B) | Three groups of 2 bytes, over everything before them |
 
 - **Overhead:** 20 of 256 bytes, or 7.8 percent. The FEC is 6 B (2.3 percent), the CRC 8 B (3.1 percent) and the DLP 6 B (2.3 percent), leaving 236 B, 92.2 percent, for TLPs.
-- **Interleave:** consecutive bytes belong to different FEC groups, so a burst of up to three consecutive bytes touches each group once and stays correctable. Each group can fix a single byte error.
+- **Interleave:** consecutive bytes belong to different FEC groups (bytes 0, 3, 6 and so on form one group), and the spec arranges it so a burst error of up to 16 bits in any lane touches at most one byte in each group. Each group can fix a single byte error.
 - **What the CRC and FEC do:** the FEC tries to correct first, then the CRC decides whether the (possibly corrected) flit is good. A bad CRC triggers a Nak and replay.
 - **NOP flits:** when there are no TLPs the link still sends flits with an empty TLP area, so the DLP information (acks, credits, power management) keeps flowing.
 - **Contrast with non-FLIT:** each TLP carries a framing token, a 12-bit sequence number and a 32-bit LCRC, and DLLPs are separate 6-byte packets with their own CRC-16.
@@ -55,7 +55,6 @@ FOLLOW:
 - Can a TLP span two flits? => Yes. TLP bytes fill the 236-byte area back to back, so a TLP can start in one flit and finish in the next.
 - Does the CRC cover the FEC bytes? => No. The CRC covers the TLP area and the DLP, and the FEC covers those plus the CRC.
 PITFALL: Treating the 256 bytes as payload. Only 236 bytes hold TLPs, and headers come out of that budget.
-VERIFY: The FEC group interleave and which DLP bytes carry which fields, in PCIe Base 6.x.
 
 @@ 14.04 | Advanced | Concept | tags=flit,framing,lcrc,sequence-number,dllp,encoding
 Q: Why does FLIT mode replace the 128b/130b framing and the per-TLP LCRC and sequence numbers?
@@ -99,13 +98,13 @@ FOLLOW:
 - Why is replay probability so much lower than the raw flit error probability? => FEC repairs most flits before the CRC check, so only uncorrectable patterns cause a Nak.
 - What does a validator watch? => Retry and Nak counts, FEC corrected counts when exposed, and replay timer events, converted to rates per flit.
 PITFALL: Assuming selective Nak means no go-back-N at all. Both exist, and behavior depends on what each side implements.
-VERIFY: Where the flit sequence number sits in the DLP, the replay command encodings, selective Nak support requirements and the replay timers.
+VERIFY: The replay command encodings, selective Nak support requirements and replay timers in the flit retry section.
 
 @@ 14.06 | Advanced | Numeric | tags=bandwidth,gen5,gen6,flit,efficiency,x4
 Q: Compare the effective payload bandwidth of a Gen5 x4 and a Gen6 x4 link with 256-byte payload TLPs.
 SHORT: Gen5 x4 gives 15.75 GB/s after 128b/130b, and with 256 B payloads and 24 B of per-TLP overhead about 14.4 GB/s of payload. Gen6 x4 gives 32 GB/s raw, 29.5 GB/s of TLP area after flit overhead (236/256), and about 27.8 GB/s of payload. The ratio is about 1.93, not 2, and it moves with TLP size, being larger for small payloads.
 DEEP:
-Assumptions: x4, one direction, 256-byte payload, 16-byte TLP headers, no ECRC, no flow control or ack traffic counted, and flit-mode TLP headers the same size as non-FLIT ones.
+Assumptions: x4, one direction, 256-byte payload, 16-byte TLP headers, no ECRC, no flow control or ack traffic counted. In flit mode the header is a header base whose size comes from the 8-bit Type field, plus 0 to 7 DW of optional Orthogonal Header Content; a 64-bit memory write without OHC is taken as 16 bytes here.
 
 1. **Gen5 raw:** 32 GT/s x 4 lanes x 128/130 / 8 = 15.75 GB/s.
 2. **Gen5 per-TLP overhead:** 4 B STP token (which carries the sequence number) + 16 B header + 4 B LCRC = 24 B. Efficiency = 256 / 280 = 91.4 percent.
@@ -129,7 +128,6 @@ FOLLOW:
 - How does a read-heavy workload change this? => The data flows as completions from the SSD to the host, plus a stream of small read request TLPs the other way. Each direction has its own budget, so compute the data direction and check that the request direction has headroom.
 - What if the flit-mode header is bigger than assumed? => Use the real header size in step 6. With 20 B the Gen6 payload efficiency drops to 92.8 percent, and the payload figure to about 27.4 GB/s.
 PITFALL: Doubling the Gen5 payload number and calling it Gen6. Flit overhead costs 7.8 percent, and the per-TLP savings only partly offset it.
-VERIFY: Flit-mode TLP header sizes (and optional header extensions) in PCIe Base 6.x.
 
 @@ 14.07 | Advanced | Concept | tags=flit,latency,fec,accumulation,replay,cxl
 Q: What latency does FLIT mode add, and when does replay hurt?
@@ -161,10 +159,9 @@ DEEP:
 - **Validation matrix:** every combination of {flit, non-flit} x {each speed} x {each partner type}, plus speed changes in both directions after flit mode is entered, plus retimers in the path (they must not disturb the negotiation).
 - **Typical failure modes:** the platform expects flit but the link trains non-FLIT because of a setting or an old partner; the training sequence field is misparsed by a retimer or device; behavior after hot reset or PERST# differs from a cold boot.
 FOLLOW:
-- Can software force a link to non-FLIT? => Not through a standard OS control. Some platform firmware offers a setting, and the Base Specification is the reference for what is allowed.
+- Can software force a link to non-FLIT? => Yes. Setting Flit Mode Disable (Link Control bit 13) stops the port advertising Flit Mode Supported (bit 0 of the data-rate symbol in TS1 and TS2), and it takes effect at the next training from Detect.
 - Is 64 GT/s possible without flit mode? => No. Flit mode is required at 64 GT/s.
 PITFALL: Assuming the mode is re-evaluated after every speed change. It is negotiated once and sticks until the link goes down.
-VERIFY: The training-sequence fields and LTSSM state where flit mode is negotiated, and the behavior at speeds below 64 GT/s.
 
 @@ 14.09 | Intermediate | Concept | tags=l0p,power,partial-width,flit,aspm
 Q: What is L0p, and how does it differ from L0s and L1?
@@ -184,11 +181,13 @@ DEEP:
   - Behavior when a burst arrives while narrowed: latency until the link widens and the throughput in the meantime.
   - Interaction with L1, speed change, reset and error recovery.
   - Power measurement at each width, and NVMe tail latency with L0p enabled against disabled.
+
+**Spec rules (PCIe 6.0):** L0p exists only in flit mode, is optional but strongly recommended for ports, and is mandatory for retimers that support flit mode. It is symmetric in width, every legal width from x1 up to the configured width must be supported, at least one lane stays active in each direction, and support is negotiated in Configuration.Complete during initial training.
 FOLLOW:
 - Does L0p change the link speed? => No, only the width. Speed changes still go through Recovery.
 - Does L0p need flit mode? => Yes. It relies on the flit-level negotiation.
 PITFALL: Treating L0p as a lower-latency L1. It saves less power than L1 but avoids the exit penalty, and it narrows bandwidth while active.
-VERIFY: Which widths are allowed, whether L0p is symmetric or can be per direction, the control and status register names, and how the LTSSM shows L0p.
+VERIFY: The L0p control and status register names and how the LTSSM reports L0p.
 
 @@ 14.10 | Basic | Concept | tags=gen7,pcie7,128gt,roadmap
 Q: What is PCIe 7.0 (Gen7), and what stays the same as Gen6?

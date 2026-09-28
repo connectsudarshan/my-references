@@ -84,7 +84,7 @@ DEEP:
 - **Software view:** Link Status bit 12 reports Slot Clock Configuration (`SlotClk+` in `lspci`), and Link Control bit 6 is Common Clock Configuration, which software sets on both ends when they share a clock (it changes the L0s and L1 exit latencies they report). SRIS support is advertised per speed in Link Capabilities 2 (the Lower SKP OS Generation and Reception Supported Speeds vectors) and enabled in Link Control 3.
 - **Failure signature:** a mismatch in configured mode gives correctable errors that grow with traffic and spread-spectrum activity, sometimes only in specific systems.
 FOLLOW:
-- Which mode sends SKP ordered sets most often? => SRIS: about every 154 symbol times at 8b/10b and every 37 blocks at 128b/130b, roughly ten times as often as with a common clock.
+- Which mode sends SKP ordered sets most often? => SRIS: at intervals of less than 154 symbol times at 8b/10b and less than 38 blocks at 128b/130b, roughly ten times as often as with a common clock.
 - What is SSC for? => It spreads clock energy across a band to lower peak EMI. It complicates frequency tracking, which is why independent SSC needs its own architecture.
 PITFALL: Configuring SSC differently on the two ends with separate clocks. The ppm budget can be exceeded.
 
@@ -115,11 +115,12 @@ DEEP:
 **Example of lane reversal:** an x4 device whose lane 0 is routed to the root port's lane 3 (and 1 to 2, and so on) trains normally if either side supports reversal; during Configuration the ports see the lane numbers in reverse order and one side remaps them internally. Without reversal support it may train only as x1 on the one lane whose numbering happens to match.
 
 **Why skew limits matter:** de-skew buffers are sized for the specified maximum skew. A design with long mismatched routes (for example through a cable or riser) can exceed it at higher speeds, which shows up as training failures or a narrower link rather than as data errors.
+
+**Receiver skew limits (PCIe 6.0, LRX-SKEW):** a receiver must de-skew up to 20 ns at 2.5 GT/s, 8 ns at 5 GT/s, 6 ns at 8 GT/s and 5 ns at 16, 32 and 64 GT/s. The budget covers channel and retimer delay differences between lanes.
 FOLLOW:
 - Is polarity inversion optional? => No. Receivers must support it.
 - Does lane reversal affect lane-to-lane numbering seen by software? => Software sees logical lane numbers. Reversal is handled below the software-visible link registers.
 PITFALL: Assuming any x16 device supports reversal. It is optional and some devices only support the mapping they were designed for.
-VERIFY: Maximum receiver lane-to-lane skew per data rate (about 20 ns at 2.5 GT/s, tightening to single-digit ns at 8 GT/s and above) in the Physical Layer chapter.
 
 @@ 3.08 | Intermediate | Numeric | tags=ui,nyquist,loss
 Q: What are the unit interval and Nyquist frequency for each generation, and why do they matter?
@@ -215,7 +216,6 @@ FOLLOW:
 - Why does DFE cause burst errors? => A wrong decision is fed back into the equalizer and can bias the next decisions, so one error can become several. Precoding limits this.
 - Why FEC and not just a better channel? => Meeting 1e-12 raw at PAM4 would need a channel and receiver far beyond practical, so a small amount of correction is cheaper than a perfect channel.
 PITFALL: Assuming a doubling of data rate means a doubling of channel bandwidth. Gen6 uses the same bandwidth and pays with SNR.
-VERIFY: Which data rates define precoding and how it is requested in TS1/TS2, in the Physical Layer chapter of PCIe Base 5.0 and 6.x.
 
 @@ 3.14 | Advanced | Debug | tags=temperature,errors,triage,signal-integrity
 Q: A link is clean at room temperature but correctable errors climb at high temperature after 30 minutes. How do you separate a signal-integrity problem from a protocol problem?
