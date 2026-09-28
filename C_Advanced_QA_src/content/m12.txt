@@ -36,11 +36,12 @@ DEEP:
 - The fix is exactly the same conceptual tool as in-process synchronization, just made cross-process: a `pthread_mutex_t` (or `sem_t`) placed inside the shared memory segment itself, initialized with `PTHREAD_PROCESS_SHARED` (for a mutex) or a nonzero `pshared` argument to `sem_init()`, so the lock's own state lives in the same shared memory both processes can see.
 - 12.11/12.12 compile and run exactly this: two processes sharing one memory segment, coordinating with `sem_init(&sem, 1, 0)` (the `1` meaning "shared between processes," per POSIX sem_init semantics), and separately, an unsynchronized version that demonstrably loses updates without it.
 - Named POSIX semaphores (`sem_open()`, distinct from the unnamed `sem_init()` used here) are an alternative when the two processes are not already sharing a memory segment together -- see 12.13 for the distinction.
+
+**POSIX reference (checked against the POSIX.1-2017 online text):** POSIX.1-2017, shm_open.3p ("shared memory itself provides no synchronization" is the module brief's framing, consistent with shm_open.3p's RATIONALE, which describes shm_open() purely as establishing a mapping, with no mention of any access serialization).
 FOLLOW:
 - Would a signal be enough to synchronize two processes accessing shared memory? => Not by itself for protecting a critical section; a signal is a good "something happened" notification but provides no mutual-exclusion guarantee over the shared memory's contents the way a mutex or semaphore does.
 - Does mmap()'s MAP_SHARED flag itself provide any ordering guarantee between processes? => No; MAP_SHARED only means writes are visible to other mappers of the same object (versus MAP_PRIVATE's copy-on-write isolation) -- it says nothing about *when* one process's write becomes visible to another relative to other operations, which is exactly what a synchronization primitive adds.
 PITFALL: Treating shared memory as "basically a shared variable, so just read and write it," forgetting that this is exactly the same class of data race as an unsynchronized shared variable between threads, just harder to debug because the two racing parties are separate processes.
-VERIFY: POSIX.1-2017, shm_open.3p ("shared memory itself provides no synchronization" is the module brief's framing, consistent with shm_open.3p's RATIONALE, which describes shm_open() purely as establishing a mapping, with no mention of any access serialization).
 
 @@ 12.04 | Intermediate | Scenario | tags=pipe,fork,code
 Q: Show a working anonymous pipe between a parent and its child process.
@@ -190,11 +191,12 @@ sem_init(&shm->parent_turn, 1, 0);
   Compiled with `gcc -std=c11 -Wall -Wextra -pthread -lrt` and run across a fork()ed parent/child pair alternating 5 turns each, the final counter printed `10 (expected 10)` on every one of three separate runs -- exact, with no lost updates, because only one side ever touches `counter` at a time by construction.
 - `sem_init(sem_t *sem, int pshared, unsigned value)`'s second argument is exactly what makes this work across processes: a nonzero `pshared` tells the implementation the semaphore may be shared between processes (as opposed to only between threads of one process), which is required precisely because the semaphore itself lives in memory both processes can see via the shared mapping.
 - This is the general pattern for 12.03's requirement: the synchronization primitive's *own state* must live somewhere both processes can access, which is why it is placed inside the shared memory segment itself rather than as a separate, process-local object.
+
+**POSIX reference (checked against the POSIX.1-2017 online text):** POSIX.1-2017, shm_open.3p (mapping establishment) and reasoning about sem_init()'s pshared argument from the C Advanced page's semaphores module (module 6), which covers sem_init() in full detail for the in-process case this extends to the cross-process case.
 FOLLOW:
 - Would a pthread_mutex_t work here instead of two semaphores? => Yes, for mutual exclusion alone, but it would need PTHREAD_PROCESS_SHARED set via pthread_mutexattr_setpshared() (module 4) and would need pairing with a process-shared condition variable to get the same strict turn-taking handoff that the two semaphores give directly here.
 - What cleans up shm->child_turn/parent_turn? => sem_destroy() on each, called once, ideally by whichever side is responsible for final cleanup (here the parent, after wait()ing for the child), followed by munmap() and shm_unlink() to remove the shared memory object itself.
 PITFALL: Using a single semaphore for two-way turn-taking instead of two. One semaphore can signal "your turn" in only one direction; a clean two-way handoff needs one semaphore per direction, exactly as this example does.
-VERIFY: POSIX.1-2017, shm_open.3p (mapping establishment) and reasoning about sem_init()'s pshared argument from the C Advanced page's semaphores module (module 6), which covers sem_init() in full detail for the in-process case this extends to the cross-process case.
 
 @@ 12.12 | Advanced | Debug | tags=shm,race,unsynced,demo
 Q: Demonstrate that shared memory with no synchronization actually loses updates across processes, the same way an unsynchronized shared variable would across threads.

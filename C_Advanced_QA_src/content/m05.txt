@@ -163,11 +163,12 @@ DEEP:
 - Destroying a condition variable follows the same rule as mutexes: "It shall be safe to destroy an initialized condition variable upon which no threads are currently blocked. Attempting to destroy a condition variable upon which other threads are currently blocked results in undefined behavior."
 - POSIX's own EXAMPLES section shows a condition variable safely destroyed immediately after a broadcast wakes every waiter and the mutex protecting it is unlocked -- the same "quiesce, then destroy" discipline as the mutex teardown example in 4.01.
 - Like mutexes, only the condition variable object itself (never a copy of it) may be used for synchronization; the same copy-and-lifetime traps from 4.13 apply identically here.
+
+**POSIX reference (checked against the POSIX.1-2017 online text):** POSIX.1-2017, pthread_cond_init()/pthread_cond_destroy() DESCRIPTION and EXAMPLES.
 FOLLOW:
 - Can you call pthread_cond_init() on a statically-initialized condition variable to "reset" it? => No; attempting to initialize an already-initialized condition variable is undefined behavior, exactly as with mutexes -- if you need a fresh one, destroy it first (once no thread is waiting) and then re-init.
 - Does the condition variable's attributes object need to outlive the pthread_cond_init() call? => No; "after a... attributes object has been used to initialize one or more [condition variables], any function affecting the attributes object... shall not affect any previously initialized [condition variables]" -- the same rule POSIX states for mutex attributes objects applies to condition variable attributes objects.
 PITFALL: Re-initializing or destroying a condition variable while a thread is still blocked on it, assuming (incorrectly) that a broadcast issued moments earlier already guarantees every waiter has fully returned from pthread_cond_wait() and released its reference to the cond var.
-VERIFY: POSIX.1-2017, pthread_cond_init()/pthread_cond_destroy() DESCRIPTION and EXAMPLES.
 
 @@ 5.10 | Advanced | Concept | tags=condvar,mutex-binding,undefined
 Q: What exactly does it mean for a condition variable to be "dynamically bound to a unique mutex," and what happens if you violate that?

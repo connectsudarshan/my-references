@@ -8,11 +8,12 @@ DEEP:
 - A semaphore initialized to N acts as a resource pool of N interchangeable slots: sem_wait() takes a slot (blocking if none are free), sem_post() returns one, and it does not matter which thread returns which slot -- this is precisely the shape a mutex cannot express, since a mutex requires the same thread that locked it to unlock it (or, for NORMAL/DEFAULT, invites undefined behavior if a different thread tries).
 - A binary semaphore (initialized to 1) can superficially look like a mutex, but still lacks ownership tracking: nothing stops thread B from calling sem_post() on a semaphore thread A "locked" with sem_wait(), whereas an ERRORCHECK mutex would reject exactly that as EPERM (module 4).
 - sem_post() is explicitly documented as safe to call from a signal handler ("shall be async-signal-safe and may be invoked from a signal-catching function"), a use case pthread_cond_signal() explicitly disclaims (5.06) -- this is a direct consequence of not needing to track ownership or interact with a mutex to be correct.
+
+**POSIX reference (checked against the POSIX.1-2017 online text):** POSIX.1-2017, sem_wait()/sem_post() DESCRIPTION (no ownership language) versus pthread_mutex_lock() DESCRIPTION ("owner").
 FOLLOW:
 - Can a semaphore be used for mutual exclusion at all? => Yes, a binary semaphore can, but a mutex is still the better tool when the accessing/releasing thread is always the same one, precisely because a mutex's ownership tracking can catch bugs (via ERRORCHECK) that a semaphore's no-ownership model cannot.
 - Why would you ever want "any thread can post" instead of strict ownership? => Whenever the releasing event is not naturally tied to the same thread that consumed a resource -- e.g. an I/O completion handler running on a different thread than the one that submitted the request and is waiting for a free slot.
 PITFALL: Using a semaphore as a drop-in mutex replacement and then relying on ownership semantics it does not have (e.g. assuming only the "locking" thread can free it). Nothing enforces that; any thread can sem_post() at any time.
-VERIFY: POSIX.1-2017, sem_wait()/sem_post() DESCRIPTION (no ownership language) versus pthread_mutex_lock() DESCRIPTION ("owner").
 
 @@ 6.02 | Basic | Concept | tags=sem-init,unnamed,pshared
 Q: What does sem_init()'s pshared argument control, and what is an "unnamed" semaphore?
@@ -26,7 +27,7 @@ DEEP:
 **POSIX reference (checked against the POSIX.1-2017 online text):** POSIX.1-2017, sem_init() DESCRIPTION and ERRORS (EINVAL, SEM_VALUE_MAX).
 FOLLOW:
 - What error does sem_init() return if value is unreasonably large? => EINVAL, if "the value argument exceeds {SEM_VALUE_MAX}" -- an implementation-defined ceiling on a semaphore's maximum count.
-- Is sem_init() guaranteed to be available on every POSIX system? => No; it is "part of the Semaphores option and need not be available on all implementations," the same optional-feature caveat that applies to barriers (6.09) and spinlocks (module 4).
+- Is sem_init() guaranteed to be available on every POSIX system? => Yes, on any system conforming to POSIX.1-2008 or later: Issue 7 moved sem_init() from the Semaphores option to the Base, as it did barriers (6.09) and spin locks (module 4). Older systems may lack unnamed semaphores (macOS, for example, has never implemented sem_init()).
 PITFALL: Calling sem_init() a second time on a semaphore that is already initialized, whether by accident (e.g. in a retry path) or intentionally to "reset" its count. Reinitializing an initialized semaphore is undefined behavior; destroy it first if a fresh one is truly needed.
 
 @@ 6.03 | Basic | Concept | tags=rwlock,readers,writer,basics
@@ -34,14 +35,15 @@ Q: What does a read-write lock let you do that a plain mutex cannot?
 SHORT: A pthread_rwlock_t distinguishes two kinds of access: any number of readers may hold the lock concurrently via pthread_rwlock_rdlock(), but a writer holding it via pthread_rwlock_wrlock() has it exclusively, with no readers and no other writer active at the same time. For a read-heavy workload where reads vastly outnumber writes, this lets concurrent readers proceed in parallel instead of serializing behind a mutex that cannot tell "just reading" apart from "about to mutate."
 DEEP:
 - "The calling thread acquires the read lock if a writer does not hold the lock and there are no writers blocked on the lock" (implementation-defined tie-breaking otherwise) -- multiple readers can be in this state simultaneously.
-- "The calling thread acquires the write lock if no other thread (reader or writer) holds the read-write lock" -- a writer is exclusive against everyone, readers and other writers alike.
+- "The calling thread shall acquire the write lock if no thread (reader or writer) holds the read-write lock rwlock" -- a writer is exclusive against everyone, readers and other writers alike.
 - Both rdlock and wrlock have a non-blocking trylock() variant (pthread_rwlock_tryrdlock()/trywrlock()) that fails with EBUSY instead of blocking, mirroring the mutex trylock pattern from module 4.
 - The trade this buys: read-heavy code gets real parallelism on reads; the cost is a more complex lock (tracking a reader count, not just locked/unlocked) and, as 6.10 shows concretely, a genuine risk of writer starvation if readers keep arriving.
+
+**POSIX reference (checked against the POSIX.1-2017 online text):** POSIX.1-2017, pthread_rwlock_rdlock()/pthread_rwlock_wrlock() DESCRIPTION.
 FOLLOW:
 - Can a thread hold both a read lock and a write lock on the same rwlock at once? => No, and trying to acquire a write lock while already holding a read lock on the same rwlock from the same thread is a documented deadlock risk (6.15), not a supported "upgrade" operation.
 - Is a read-write lock always faster than a mutex for a read-heavy workload? => Not automatically -- for very short critical sections, the extra bookkeeping an rwlock needs to track multiple readers can cost more than it saves; it wins when reads are numerous enough, and long enough, for real concurrent overlap to matter (6.08).
 PITFALL: Reaching for pthread_rwlock_t by default for any "mostly reads" workload without checking whether the critical section is long enough and contended enough for concurrent readers to actually matter.
-VERIFY: POSIX.1-2017, pthread_rwlock_rdlock()/pthread_rwlock_wrlock() DESCRIPTION.
 
 @@ 6.04 | Intermediate | Debug | tags=semaphore,resource-pool,compiled
 Q: Use a counting semaphore to cap concurrency at N, and confirm with a compiled program that the cap actually holds under real contention.
@@ -70,11 +72,12 @@ static void *worker(void *arg) {
 ```
 Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run, the output showed threads acquiring slots in varying order (e.g. thread 0, then 1 and 3 concurrently, then 4, then 2...), and the final line printed `max concurrent in_use = 2 (pool size = 2) : OK, never exceeded` -- the semaphore held all 6 threads to at most 2 concurrent holders the entire run, even though every thread requested a slot at nearly the same moment.
 - Note that in_use/max_seen still need their own mutex: the semaphore only limits how many threads can be past sem_wait() at once, it does nothing to make the increment/compare/decrement of a shared counter atomic (that is exactly 4.05's lesson, reused here).
+
+**POSIX reference (checked against the POSIX.1-2017 online text):** POSIX.1-2017, sem_wait()/sem_post() DESCRIPTION (blocking-decrement/incrementing-unlock semantics).
 FOLLOW:
 - What would happen if POOLSIZE were larger than NTHREADS? => Every thread would acquire a slot immediately with no blocking at all; the demo specifically chooses POOLSIZE < NTHREADS so the blocking path in sem_wait() is actually exercised, not just the immediate-success path.
 - Does sem_post() need to be called by the same thread that called sem_wait()? => No -- and this program's structure (each worker posts its own slot back) is a choice, not a requirement; a design where a different thread posts on behalf of a worker that finished would be equally valid, which is exactly the no-ownership property from 6.01.
 PITFALL: Assuming the semaphore alone protects any shared counters you use to observe the pool's behavior. The semaphore bounds concurrency; it does not make unrelated shared state (like a hand-rolled in_use counter) safe to touch without its own mutex.
-VERIFY: POSIX.1-2017, sem_wait()/sem_post() DESCRIPTION (blocking-decrement/incrementing-unlock semantics).
 
 @@ 6.05 | Intermediate | Numeric | tags=semaphore,overhead,hedge
 Q: How does a semaphore's lock/unlock overhead compare to a mutex's?
@@ -156,11 +159,12 @@ DEEP:
 - "At this point, the barrier shall be reset to the state it had as a result of the most recent pthread_barrier_init()" -- unlike a condition-variable-based gate you would have to reset by hand (5.15), a barrier is automatically reusable for a next phase with no extra bookkeeping.
 - "PTHREAD_BARRIER_SERIAL_THREAD... value shall be distinct from any other value returned" -- it is a sentinel, not a thread ID or count; exactly one arbitrary thread gets it per barrier-wait "round," and every other participant gets 0.
 - Results are undefined if pthread_barrier_init() is called while any thread is still blocked on the barrier, or if pthread_barrier_destroy() is called under the same condition -- the same "quiesce, then reinit/destroy" discipline as mutexes and condition variables (modules 4 and 5) applies here too.
+
+**POSIX reference (checked against the POSIX.1-2017 online text):** POSIX.1-2017, pthread_barrier_init() DESCRIPTION (count semantics, EINVAL for count 0) and pthread_barrier_wait() DESCRIPTION and RETURN VALUE; CHANGE HISTORY Issue 7 moved barriers from the Barriers option to the Base.
 FOLLOW:
 - What happens if fewer than count threads ever call pthread_barrier_wait()? => The barrier waits forever for the missing arrivals; there is no timeout variant of pthread_barrier_wait() in POSIX, so a thread that never arrives (e.g. it crashed or deadlocked elsewhere) hangs every other participant permanently.
-- Is pthread_barrier_wait() guaranteed available on every POSIX system? => No; it is part of the Barriers option (an ADVANCED REALTIME THREADS feature) and "need not be provided on all implementations," the same optional-feature caveat as spinlocks and unnamed semaphores.
+- Is pthread_barrier_wait() guaranteed available on every POSIX system? => Yes, on POSIX.1-2008 or later: Issue 7 moved it from the Barriers option to the Base, the same change as for spinlocks and unnamed semaphores.
 PITFALL: Assuming every thread eventually reaches every barrier_wait() call, without checking for an early-return/error path in worker code that could skip it and hang every other participant forever.
-VERIFY: POSIX.1-2017, pthread_barrier_wait() DESCRIPTION and pthread_barrier_init() APPLICATION USAGE (Barriers option).
 
 @@ 6.10 | Advanced | Debug | fig=rwlock | tags=rwlock,writer,contention,compiled
 Q: Run a compiled test where readers continuously re-acquire a read lock back-to-back while one writer waits. Does the writer actually get starved?
@@ -217,14 +221,15 @@ PITFALL: Calling pthread_cond_signal() (or worse, taking a mutex) directly insid
 Q: What does POSIX's own text warn about priority inversion and read-write locks specifically?
 SHORT: Every rwlock function's APPLICATION USAGE section carries the same warning: applications "may be subject to priority inversion" -- a lower-priority reader or writer holding the lock can block a higher-priority waiter while an unrelated intermediate-priority thread runs indefinitely, the same hazard module 8 covers for mutexes, now applying to rwlocks too. Unlike pthread_mutex_t, no PRIO_INHERIT/PRIO_PROTECT-style protocol attribute for pthread_rwlock_t appears in this fetched set of pages.
 DEEP:
-- The identical sentence appears in pthread_rwlock_init(), pthread_rwlock_rdlock(), and pthread_rwlock_wrlock()'s APPLICATION USAGE sections, cross-referencing "the Base Definitions volume... Section 3.285, Priority Inversion" each time -- this is POSIX flagging the same hazard consistently across the whole rwlock API surface, not a one-off caveat.
+- The identical sentence appears in pthread_rwlock_init(), pthread_rwlock_rdlock(), and pthread_rwlock_wrlock()'s APPLICATION USAGE sections, cross-referencing XBD Priority Inversion (definition 3.291) each time -- this is POSIX flagging the same hazard consistently across the whole rwlock API surface, not a one-off caveat.
 - For a mutex, module 4.17 covered the PRIO_INHERIT/PRIO_PROTECT protocol attributes that exist specifically to bound this; the pages fetched for this study guide do not show an equivalent rwlockattr protocol mechanism, so a rwlock-based critical section on a real-time system needs a different mitigation (commonly: keep the critical section short, and consider a priority-aware mutex instead of a rwlock if priority inversion risk is unacceptable and read-concurrency is not essential).
 - This is an open item worth flagging rather than guessing at: whether a specific implementation offers a real-time-safe rwlock protocol attribute is worth checking against that implementation's own documentation before relying on rwlocks in a hard real-time path.
+
+**POSIX reference (checked against the POSIX.1-2017 online text):** POSIX.1-2017, pthread_rwlock_rdlock() and pthread_rwlock_wrlock() APPLICATION USAGE: "Applications using these functions may be subject to priority inversion, as discussed in XBD Priority Inversion" (definition 3.291). POSIX defines no rwlock attribute for priority inheritance or ceilings; check the target implementation's own documentation for extensions.
 FOLLOW:
 - Does the writer-starvation risk (6.10) compound with the priority-inversion risk, or are they independent? => They are related but distinct: starvation is about a writer never getting in at all under sustained reader load; priority inversion is about a low-priority holder (reader or writer) blocking a higher-priority waiter while a third, unrelated thread runs -- a system could have one without the other.
 - Is this warning specific to rwlocks, or does POSIX say the same thing about mutexes and semaphores? => Semaphores and mutexes carry similar priority-inversion warnings in their own APPLICATION USAGE text (sem_wait()/sem_trywait() explicitly, and mutexes via their protocol-attribute mechanism); rwlocks get the identical warning without the protocol-attribute mitigation shown in these pages.
 PITFALL: Assuming an rwlock, because it "helps concurrency," is automatically a safer choice than a mutex for real-time-sensitive code. It carries the same priority-inversion warning POSIX gives mutexes, without the same documented mitigation mechanism in this fetched material.
-VERIFY: POSIX.1-2017, pthread_rwlock_rdlock()/pthread_rwlock_wrlock()/pthread_rwlock_init() APPLICATION USAGE; whether a specific rwlockattr priority protocol exists is flagged as VERIFY: check the target implementation's own pthread_rwlockattr_* documentation, not assumed absent everywhere.
 
 @@ 6.13 | Advanced | Scenario | tags=barrier,phased-computation,compiled
 Q: Use pthread_barrier_wait() to run a multi-phase parallel computation correctly, and confirm each phase's result with a compiled program.
@@ -262,7 +267,7 @@ PITFALL: Reading a shared per-phase result immediately after your own thread's p
 
 @@ 6.14 | Advanced | Trap | tags=rwlock,upgrade,edeadlk,self-deadlock
 Q: What happens if a thread holding a read lock tries to acquire the write lock on the same rwlock, expecting an "upgrade"?
-SHORT: POSIX warns "the calling thread may deadlock if at the time the call is made it holds the read-write lock" -- there is no upgrade operation, and a compiled test confirms the hang is real: the process had to be killed by a timeout after the wrlock() call, with no EDEADLK error returned on this glibc, unlike an ERRORCHECK mutex's clean error return for the analogous mistake.
+SHORT: POSIX says that if "the calling thread already owns the read-write lock for writing or reading, the call shall either deadlock or return [EDEADLK]" -- there is no upgrade operation, and a compiled test confirms the hang is real: the process had to be killed by a timeout after the wrlock() call, with no EDEADLK error returned on this glibc, unlike an ERRORCHECK mutex's clean error return for the analogous mistake.
 DEEP:
 ```c
 int main(void) {
@@ -292,11 +297,12 @@ DEEP:
 - The scope for this study page is primarily the unnamed case (sem_init()/sem_wait()/sem_post()/sem_destroy()), since that is what every demo in this module uses; named semaphores are the same underlying wait/post/value model, just reached via a name lookup (sem_open("/myname", ...)) instead of an address, and closed with sem_close() rather than destroyed directly.
 - A named semaphore persists in the kernel (or a kernel-backed namespace) independent of any one process's lifetime until explicitly removed with sem_unlink(), which is a meaningfully different lifetime model than an unnamed semaphore embedded in memory that vanishes when that memory is freed or unmapped.
 - The choice is analogous to shared memory's shm_open() (named, filesystem-like) versus a simple mmap() of an already-shared region (module 12's IPC module covers this pairing in full); semaphores mirror the same two access patterns for the same underlying reason -- some cooperating parties already share memory, others need a name to find each other.
+
+**POSIX reference (checked against the POSIX.1-2017 online text):** POSIX.1-2017, sem_unlink(): if processes still have the semaphore open, "destruction of the semaphore is postponed until all references to the semaphore have been destroyed by calls to sem_close(), _exit(), or exec", and later sem_open() calls refer to a new semaphore; sem_init() pshared semantics as in 12.11.
 FOLLOW:
 - Does a named semaphore cost more per sem_wait()/sem_post() call than an unnamed one? => Not meaningfully once opened; the extra cost is at sem_open() time (the name lookup), not on every subsequent wait/post, which use the same underlying mechanism either way.
 - If two threads in the same process want a semaphore, is there ever a reason to use the named form? => Rarely -- an unnamed semaphore with pshared=0 is simpler and sufficient for same-process threads; the named form's benefit (rendezvous without pre-shared memory) is not needed when the parties are already threads of one process.
 PITFALL: Reaching for a named semaphore by habit for a same-process, multi-threaded problem where an unnamed semaphore would be simpler and avoids managing a kernel-persistent name that must be explicitly sem_unlink()'d to avoid leaking.
-VERIFY: POSIX.1-2017, sem_init()/sem_destroy() DESCRIPTION (sem_init() has no APPLICATION USAGE text); named-semaphore specifics (sem_open(), sem_unlink()) are not among the 60 fetched pages for this study guide -- flagged as VERIFY: POSIX.1-2017, sem_open() and sem_unlink().
 
 @@ 6.16 | Principal | Scenario | tags=firmware,semaphore,resource-limiting
 Q: Design a resource-limiting layer for a validation harness that must never have more than N NVMe command queues in flight at once, across many worker threads submitting commands.

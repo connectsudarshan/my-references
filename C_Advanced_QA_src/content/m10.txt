@@ -100,7 +100,7 @@ PITFALL: Reaching for a global atomic counter by default for every "just count s
 Q: Why is strtok() unsafe across threads, and what fixes it?
 SHORT: strtok() keeps its scan position in one hidden static variable shared by the entire process, so two threads calling strtok() at the same time race on that variable and can each see the other's partially-advanced state. strtok_r() takes an explicit `char **saveptr` argument supplied by the caller, so each thread (or each independent tokenization) uses its own state with no sharing at all.
 DEEP:
-- POSIX documents `strtok_r(char *restrict s, const char *restrict sep, char **restrict lasts)`: the caller owns `lasts` (often a local variable), so there is nothing left for two callers to share.
+- POSIX documents `strtok_r(char *restrict s, const char *restrict sep, char **restrict state)`: the caller owns `state` (often a local variable), so there is nothing left for two callers to share.
 - The fix is not "add a lock around strtok()" -- that would serialize unrelated tokenization work happening on unrelated strings in different threads for no reason; the real fix is to remove the shared state entirely by using the reentrant variant.
 - This is the same shape of bug as the classic C runtime functions `gmtime()`, `strerror()`, `rand()` (fixed by `gmtime_r()`, `strerror_r()`, `rand_r()` / per-thread PRNG state) -- look for a hidden static buffer or scan pointer whenever a "no explicit state" function is called from more than one thread.
 ```c
@@ -109,11 +109,12 @@ char *tok = strtok_r(buf, ",", &save);
 while (tok) { /* use tok */ tok = strtok_r(NULL, ",", &save); }
 ```
   Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run with two threads each tokenizing their own string with `strtok_r`, both threads report the correct token count every time (3 tokens from "a,b,c", 4 from "x,y,z,w") -- there is no shared state left to race on.
+
+**POSIX reference (checked against the POSIX.1-2017 online text):** POSIX.1-2017, strtok(): "The strtok() function need not be thread-safe"; strtok_r() takes `char **restrict state`, and "the application shall ensure that the pointer pointed to by state is unique for each string (s) being processed concurrently".
 FOLLOW:
 - Does glibc's strtok() implementation happen to be internally locked? => No; POSIX explicitly allows it to be unsafe for this reason, and glibc's strtok() is not thread-safe. Never rely on an implementation detail here.
 - Is strtok_r() also safe to call reentrantly (e.g. nested tokenization of two different strings in the same thread)? => Yes, as long as each nesting level uses its own `saveptr` variable.
 PITFALL: "Fixing" a strtok() race by wrapping every call in a mutex instead of switching to strtok_r(). That serializes all tokenization process-wide and still leaves a latent bug if anyone calls strtok() outside the lock.
-VERIFY: POSIX.1-2017, strtok_r() vs strtok() thread-safety note (not among the 60 fetched pages; reasoning from the documented `char **lasts` parameter, which is the standard fix for this class of bug).
 
 @@ 10.06 | Intermediate | Concept | tags=cas,semantics,rmw
 Q: What does compare-and-swap (CAS) actually do, atomically?

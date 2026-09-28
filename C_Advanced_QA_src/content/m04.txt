@@ -6,7 +6,7 @@ SHORT: pthread_mutex_lock() blocks the calling thread until it becomes the mutex
 DEEP:
 - pthread_mutex_init() sets the mutex to the initialized, unlocked state; passing attr=NULL uses the default attributes.
 - PTHREAD_MUTEX_INITIALIZER is a static-initialization macro for statically allocated mutexes, equivalent to a dynamic pthread_mutex_init() call with attr=NULL, except that no error checks are performed for the static form.
-- "Only mutex itself may be used for performing synchronization. The result of referring to copies of mutex in calls to pthread_mutex_lock(), pthread_mutex_trylock(), pthread_mutex_unlock(), and pthread_mutex_destroy() is undefined" -- passing a struct containing a mutex by value, or memcpy-ing a locked mutex, breaks this.
+- POSIX.1-2008 wording (POSIX.1-2017 moves this rule to XSH 2.9.9, "Synchronization Object Copies and Alternative Mappings"): "Only mutex itself may be used for performing synchronization. The result of referring to copies of mutex in calls to pthread_mutex_lock(), pthread_mutex_trylock(), pthread_mutex_unlock(), and pthread_mutex_destroy() is undefined" -- passing a struct containing a mutex by value, or memcpy-ing a locked mutex, breaks this.
 - Re-initializing an already-initialized mutex, or destroying one that is currently locked, are both undefined behavior; POSIX's own example shows a mutex destroyed immediately after being unlocked inside a reference-counted object's teardown path.
 ```c
 #include <stdio.h>
@@ -22,11 +22,12 @@ int main(void) {
 }
 ```
 Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run, this prints `critical section: exclusive access here` and exits 0.
+
+**POSIX reference (checked against the POSIX.1-2017 online text):** POSIX.1-2017, pthread_mutex_lock() and pthread_mutex_init()/pthread_mutex_destroy() DESCRIPTION and RATIONALE sections.
 FOLLOW:
 - Does pthread_mutex_lock() ever return early without the lock, the way a condition wait can? => No, on success it always returns with the mutex locked and owned by the caller; a signal delivered while blocked just resumes the wait after the handler returns, per POSIX.
 - Why does destroying a locked mutex matter if it "seems to work"? => The standard leaves it explicitly undefined, so an implementation is free to corrupt internal state, and even if today's libc tolerates it, a future version or a different platform is not obligated to.
 PITFALL: Passing a pthread_mutex_t by value or copying a live mutex with memcpy and then locking the copy. Only the original object is defined for synchronization; the copy's behavior is undefined.
-VERIFY: POSIX.1-2017, pthread_mutex_lock() and pthread_mutex_init()/pthread_mutex_destroy() DESCRIPTION and RATIONALE sections.
 
 @@ 4.02 | Basic | Concept | tags=critical-section,race,shared-state
 Q: What is a critical section, and why does a shared variable need one at all?
@@ -366,10 +367,10 @@ Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run three times on a 2-C
 - This is the oversubscribed case (4 threads, 2 cores): while one thread holds the spinlock, up to 3 others can be actively spinning on 1 remaining core, burning cycles that would otherwise let the scheduler run the actual lock holder sooner; a mutex instead puts waiters to sleep, freeing the core for the holder.
 - Spinning only wins decisively when contending threads <= available cores and the critical section is a handful of instructions -- exactly the profile of very short, per-core-pinned hot loops, not general application code.
 
-**Source note:** POSIX.1-2017, pthread_spin_init() APPLICATION USAGE (Spin Locks option, not guaranteed on all implementations); the specific ns/op numbers are this run's own measurement, not a spec or vendor figure -- treat them as illustrative, not portable.
+**Source note:** POSIX.1-2017 CHANGE HISTORY, Issue 7: the spin lock functions moved from the Spin Locks option to the Base, so they are required; the specific ns/op numbers are this run's own measurement, not a spec or vendor figure -- treat them as illustrative, not portable.
 FOLLOW:
 - Would the result flip on an 8-core machine running only 4 threads? => Likely yes for a tiny critical section like a single increment, since every thread could have its own core and never actually needs to sleep while spinning; the numbers here are specific to this oversubscribed 2-core environment, not a universal ratio.
-- Is pthread_spin_lock() part of core POSIX or an optional feature? => It is part of the Spin Locks option (an ADVANCED REALTIME THREADS feature) and "need not be provided on all implementations," unlike the base mutex functions.
+- Is pthread_spin_lock() part of core POSIX or an optional feature? => Core. Spin locks were an optional feature (the Spin Locks option) in POSIX.1-2001, but Issue 7 (POSIX.1-2008, and so POSIX.1-2017) moved them to the Base, so every conforming system provides them. Very old or minimal systems may still lack them.
 PITFALL: Treating "spinlocks are faster" as a universal rule from a benchmark on one machine. The crossover depends on core count, thread count, and critical-section length; measure on the actual target, do not assume.
 
 @@ 4.13 | Advanced | Trap | tags=mutex,destroy,ub,copies
@@ -443,7 +444,7 @@ DEEP:
 - These protocols exist specifically to bound priority inversion (a low-priority thread holding a lock a high-priority thread needs, while an unrelated medium-priority thread preempts the low-priority holder and runs indefinitely) -- the full mechanism and the Mars Pathfinder story that made it famous belong to module 8.
 - Both protocols are part of an optional POSIX real-time feature set, not guaranteed on every implementation; requesting PRIO_INHERIT or PRIO_PROTECT on a platform that lacks the option typically fails at pthread_mutexattr_setprotocol() time, not silently downgrading to PRIO_NONE.
 
-**POSIX reference (checked against the POSIX.1-2017 online text):** POSIX.1-2017, pthread_mutex_lock() ERRORS (EINVAL, PRIO_PROTECT case); full protocol semantics are defined under pthread_mutexattr_setprotocol(), not among the 60 pages fetched for this page -- flagged as VERIFY: POSIX.1-2017, pthread_mutexattr_setprotocol().
+**POSIX reference (checked against the POSIX.1-2017 online text):** POSIX.1-2017, pthread_mutex_lock() ERRORS (EINVAL, PRIO_PROTECT case); pthread_mutexattr_setprotocol(): with PTHREAD_PRIO_PROTECT the owner "shall execute at the higher of its priority or the highest of the priority ceilings of all the mutexes owned by this thread" (Thread Priority Protection option).
 FOLLOW:
 - Do these protocols matter on a general-purpose SCHED_OTHER system, or only under real-time scheduling? => They matter most under SCHED_FIFO/SCHED_RR, where a fixed priority ordering makes inversion a real, bounded-time hazard; under SCHED_OTHER's fairness heuristics the effect is far less predictable either way.
 - Is choosing a protocol something you do per-mutex or globally? => Per-mutex, via the pthread_mutexattr_t passed to pthread_mutex_init(); different mutexes in the same process can use different protocols depending on which ones are actually on a real-time thread's critical path.

@@ -64,11 +64,11 @@ Compiled and run, this printed both workers running, `joined t1, return value=10
 
 For a pool of workers, joinable threads plus an orderly shutdown (signal the workers, then join them all) is the usual design, because it guarantees nothing is still using shared state when you tear it down.
 
+**POSIX reference (checked against the POSIX.1-2017 online text):** POSIX.1-2017, pthread_join() (pthread_join.3p) and pthread_detach() (pthread_detach.3p) RATIONALE sections, quoted directly.
 FOLLOW:
 - Can you detach a thread AFTER already joining it? => No; once pthread_join() succeeds the thread and its ID are gone; pthread_detach() on an already-terminated-and-joined thread ID has nothing valid to act on.
 - What if two threads both try to pthread_join() the same target? => POSIX says the results of multiple SIMULTANEOUS joins on the same target are undefined; at most one join should "own" waiting for a given thread.
 PITFALL: Creating a thread with neither a plan to join it nor to detach it. Per POSIX's own RATIONALE, "the pthread_join() or pthread_detach() function should eventually be called for every thread... so that storage associated with the thread may be reclaimed" -- an orphaned joinable thread's resources are not released until something joins or detaches it, even after it finishes running.
-VERIFY: POSIX.1-2017, pthread_join() (pthread_join.3p) and pthread_detach() (pthread_detach.3p) RATIONALE sections, quoted directly.
 
 @@ 3.03 | Basic | Concept | tags=joinable,leak,default-state
 Q: If you never join or detach a joinable thread, what actually leaks, and for how long?
@@ -241,12 +241,13 @@ int main(void) {
     return 0;
 }
 ```
-Compiled and run, both attempts printed `rc=22 (EINVAL, as expected)` -- attr-configured PTHREAD_CREATE_DETACHED and a runtime pthread_detach() call produced identical, unjoinable results, exactly as the concept predicts.
+Compiled and run, both attempts printed `rc=22 (EINVAL, as expected)` -- attr-configured PTHREAD_CREATE_DETACHED and a runtime pthread_detach() call produced identical, unjoinable results, exactly as the concept predicts. EINVAL here is glibc's choice: POSIX.1-2017 says joining a thread that is not joinable is undefined behavior, so portable code must never do it and must not rely on this error.
+
+**POSIX reference (checked against the POSIX.1-2017 online text):** POSIX.1-2017, pthread_attr_init(): "A single attributes object can be used in multiple simultaneous calls to pthread_create()"; pthread_create(): later changes to attr do not affect the created thread; pthread_join() on a non-joinable thread is undefined behavior (EINVAL is glibc's choice).
 FOLLOW:
 - Is there a race between "detach dynamically right after create" and the thread already finishing? => No; pthread_detach() operates on the thread ID/handle regardless of whether the target has already terminated, as long as it has not already been joined -- there is no unsafe window here, unlike the classic "check-then-act" races elsewhere.
-- Does modifying attr after pthread_create() affect an already-created thread? => No; pthread_attr_init.3p is explicit that a thread's attributes are fixed at creation time from whatever the attr object held AT THAT MOMENT -- later changes to the same attr object (even reused for a NEXT pthread_create() call) do not retroactively affect threads already created.
+- Does modifying attr after pthread_create() affect an already-created thread? => No; pthread_create() is explicit ("If the attributes specified by attr are modified later, the thread's attributes shall not be affected"): a thread's attributes are fixed at creation time from whatever the attr object held AT THAT MOMENT -- later changes to the same attr object (even reused for a NEXT pthread_create() call) do not retroactively affect threads already created.
 PITFALL: Assuming an attr object is consumed or invalidated by pthread_create(). It is not; the same initialized attr object can be reused for many pthread_create() calls, which is precisely the "class of threads" usage POSIX's RATIONALE describes attributes objects as being designed for.
-VERIFY: POSIX.1-2017, pthread_attr_init()/pthread_attr_destroy() (pthread_attr_init.3p): the reusability of one attr object across multiple pthread_create() calls is quoted from the DESCRIPTION; the specific attribute setter/getter function names (pthread_attr_setdetachstate() etc.) are standard POSIX API but were not each individually re-fetched from a dedicated man page for this build -- treat any specific setter's exact constant values as a VERIFY item if precision matters.
 
 @@ 3.08 | Intermediate | Numeric | tags=stacksize,default,memory-budget
 Q: What is the default per-thread stack size on a typical 64-bit Linux system, and why does that number matter when planning a harness with many threads?
@@ -609,7 +610,7 @@ Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run, this printed `attr1
 - The default is INHERIT_SCHED specifically so that a thread created with a plain, unconfigured attr (or NULL) predictably inherits the creator's scheduling context rather than some implementation-chosen default; the cost of that sensible default is that setting schedpolicy/schedparam in an attr object without ALSO setting PTHREAD_EXPLICIT_SCHED is a silent no-op, not an error.
 - Neither pthread_attr_setschedpolicy() nor pthread_attr_setschedparam() themselves fail or warn when inheritsched is left at PTHREAD_INHERIT_SCHED; the values are simply stored in the attr object and then ignored by pthread_create(), which is exactly what makes this bug easy to miss in code review.
 
-**Reference (checked against the Linux man-pages):** The default inheritsched value (PTHREAD_INHERIT_SCHED) and the requirement to set PTHREAD_EXPLICIT_SCHED for attr-based scheduling to take effect are standard POSIX pthread attribute semantics; the specific setter/getter pages (pthread_attr_setinheritsched.3p etc.) are not among the 60 fetched pages for this study guide, so treat exact wording as a VERIFY item against POSIX.1-2017 if precision matters.
+**Reference (checked against the Linux man-pages):** The default inheritsched value (PTHREAD_INHERIT_SCHED) and the requirement to set PTHREAD_EXPLICIT_SCHED for attr-based scheduling to take effect are confirmed by the Linux pages: pthread_attr_setinheritsched(3) gives PTHREAD_INHERIT_SCHED as the default, and pthread_attr_setscope(3) says attribute scheduling settings take effect in pthread_create() only with PTHREAD_EXPLICIT_SCHED.
 FOLLOW:
 - Would querying pthread_attr_getschedpolicy() on attr1 after setting it show SCHED_FIFO? => Yes; the attr object faithfully stores whatever was set, which is precisely why this bug is invisible from inspecting the attr alone -- only pthread_getschedparam() on the actual created thread (as this demo does) reveals what really took effect.
 - Does this same inheritsched default apply to pthread_setschedparam() called on an already-running thread? => No, that is a different, unrelated call: it directly changes a specific existing thread's scheduling policy/parameters immediately and always takes effect (subject to the same permission rules as 3.17), with no inheritsched concept involved at all.

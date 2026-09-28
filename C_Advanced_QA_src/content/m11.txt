@@ -8,11 +8,12 @@ DEEP:
 - The three core states worth naming precisely: running (actually on a CPU right now), ready (runnable, waiting only for a CPU), and blocked (waiting on something else -- I/O completion, a mutex, a condition variable, a signal). A thread can also be in the process of being created or having exited, but those are transient.
 - A timer interrupt (the periodic tick) is the classic trigger for preemption of a CPU-bound thread that never blocks on its own; a thread can also be preempted the instant a higher-priority thread becomes ready, without waiting for the next tick, on modern schedulers.
 - This module is Linux-flavored where noted; POSIX itself standardizes the scheduling *policies and priorities* API (sched_setscheduler(), sched_get_priority_max(), etc.) but leaves the actual scheduling algorithm implementation-defined.
+
+**Source note:** POSIX standardizes sched_setscheduler()/sched_get_priority_max() as the policy-and-priority API; the underlying preemption mechanism itself is implementation-defined, not POSIX-mandated.
 FOLLOW:
 - Does a single-threaded, single-core system still need preemption? => Yes, for multiple processes to share the one CPU; preemption is what lets the OS run more logical tasks than it has physical cores.
 - What moves a blocked thread back to ready? => Whatever it was waiting on becoming available -- I/O completing, a mutex being unlocked and this thread being woken, a signal arriving, or a timer expiring.
 PITFALL: Assuming a thread only gets preempted when it calls something like sleep() or a blocking syscall. A CPU-bound thread with no blocking calls at all is still preempted by the timer tick or a higher-priority thread becoming ready.
-VERIFY: POSIX standardizes sched_setscheduler()/sched_get_priority_max() as the policy-and-priority API; the underlying preemption mechanism itself is implementation-defined, not POSIX-mandated.
 
 @@ 11.02 | Basic | Concept | tags=policy,priority,nice
 Q: What is the difference between a scheduling policy, a priority, and a nice value?
@@ -55,17 +56,18 @@ PITFALL: Assuming all context switches cost the same. A thread-to-thread switch 
 
 @@ 11.04 | Intermediate | Concept | tags=fifo,rr,other,linux
 Q: What actually differs between SCHED_OTHER, SCHED_FIFO, and SCHED_RR?
-SHORT: SCHED_OTHER is the default time-sharing policy (Linux's CFS): fair-ish, only nice-tunable, no hard ordering guarantee. SCHED_FIFO is fixed-priority: a runnable thread runs until it blocks, yields, or a higher-or-equal-priority real-time thread preempts it, with no time-slicing among equals. SCHED_RR is the same fixed-priority model but adds a quantum, so equal-priority SCHED_RR threads round-robin against each other.
+SHORT: SCHED_OTHER is the default time-sharing policy (Linux's CFS): fair-ish, only nice-tunable, no hard ordering guarantee. SCHED_FIFO is fixed-priority: a runnable thread runs until it blocks, yields, or a higher-priority thread preempts it, with no time-slicing among equals. SCHED_RR is the same fixed-priority model but adds a quantum, so equal-priority SCHED_RR threads round-robin against each other.
 DEEP:
-- Both SCHED_FIFO and SCHED_RR are marked (REALTIME) in POSIX (sched_setscheduler.3p); a higher fixed priority always wins the CPU over a lower one under either policy, unconditionally, unlike SCHED_OTHER's fairness-based, no-guaranteed-latency behavior.
+- SCHED_FIFO and SCHED_RR are defined by POSIX's Process Scheduling option, which sched_setscheduler() belongs to; a higher fixed priority always wins the CPU over a lower one under either policy, unconditionally, unlike SCHED_OTHER's fairness-based, no-guaranteed-latency behavior.
 - SCHED_FIFO's lack of time-slicing among equal-priority threads means two SCHED_FIFO threads at the same priority, both CPU-bound and neither blocking, will not automatically share the CPU -- whichever one is running keeps running until it blocks or yields. This is a common real-world surprise.
 - SCHED_RR fixes exactly that surprise for threads at the same priority level, at the cost of some scheduling overhead for the periodic quantum expiry.
 - POSIX's sched_setscheduler() explicitly notes it is not atomic with respect to other threads in the process and that the effect depends on scheduling contention scope (system vs process) -- Linux uses 1:1 (system scope) threading, so in practice each pthread maps to its own schedulable kernel entity and this caveat is mostly academic on Linux.
+
+**POSIX reference (checked against the POSIX.1-2017 online text):** POSIX.1-2017, sched_setscheduler() (Process Scheduling option; "This function is not atomic with respect to other threads in the process"); SCHED_FIFO/SCHED_RR rules match the Linux sched(7) page (preemption only by a higher priority, RR quantum among equal priorities); Linux CFS internals for SCHED_OTHER's actual fairness algorithm are Linux-specific, not POSIX-specified.
 FOLLOW:
 - Which policy would you pick for a strict single always-highest-priority worker thread with nothing else at its priority? => SCHED_FIFO is simplest and sufficient, since there is no equal-priority sibling to round-robin against.
 - What happens if a SCHED_FIFO thread never blocks and nothing preempts it? => It runs forever, starving everything at an equal or lower priority -- see 11.08 and Linux's real-time throttling safeguard in 11.09.
 PITFALL: Assuming SCHED_RR's round-robin behavior also applies across different priority levels. Round-robin only happens among threads at the *same* priority; a strictly higher-priority thread still fully preempts, regardless of policy.
-VERIFY: POSIX.1-2017, sched_setscheduler.3p (REALTIME marking, contention-scope caveat) for SCHED_FIFO/SCHED_RR as POSIX-standard policies; Linux CFS internals for SCHED_OTHER's actual fairness algorithm are Linux-specific, not POSIX-specified.
 
 @@ 11.05 | Intermediate | Scenario | tags=sched_setscheduler,code,fifo
 Q: Show code that puts the calling process under SCHED_FIFO and confirms the change.
