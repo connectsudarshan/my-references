@@ -79,6 +79,14 @@ int main(void) {
 }
 ```
 Compiled and run, this printed three distinct `tid` values and three distinct `&local` addresses (main's near `0x7ffe...`, the two worker threads' near `0x7f09...` but a few hundred bytes apart) -- three separate stacks, three separate thread IDs, one process.
+
+**Consequences worth knowing for interviews:**
+
+- A thread's stack is private in the sense of being separate, but it is still in the shared address space: passing `&local` to another thread works, and becomes a use-after-return bug if that thread outlives the stack frame.
+- Default thread stack size on glibc is usually 8 MB of virtual memory (from `ulimit -s`); it can be changed with `pthread_attr_setstacksize`, which matters on embedded Linux with many threads.
+- `errno` is per-thread (it is a macro that expands to a thread-local location), so one thread's failing call can't clobber another thread's `errno`.
+- Signal handlers are shared by the whole process, but the mask of blocked signals is per-thread, which is how you pick which thread receives asynchronous signals (block them everywhere and use `sigwait` in one thread).
+
 FOLLOW:
 - Is errno really per-thread even though it looks like a global variable? => Yes; POSIX requires errno to behave as if thread-local (glibc implements it as a macro expanding to a per-thread storage lookup), specifically so one thread's failing call cannot corrupt another thread's error code.
 - Does pthread_self() return the same kind of value across different OSes? => No; pthread_t is an opaque type, not guaranteed to be an integer, so portable code should only compare it with pthread_equal(), not print or compare it directly (done here only for illustration).

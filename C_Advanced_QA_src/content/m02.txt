@@ -7,6 +7,33 @@ DEEP:
 - Per POSIX, the child gets its own copy of the parent's file descriptors (each referring to the SAME underlying open file description as the parent's, module 12), its own copy of pending signals reset to empty, and a fresh, single thread even if the parent was multithreaded (2.10).
 - What is NOT copied or is reset: the child's PID and parent PID differ from the parent's; alarm/interval timers are reset; file locks held by the parent are not inherited; memory locks (mlock) are not inherited.
 - "Both processes shall continue to execute from the fork() function" (fork.3p) -- this is why the idiomatic pattern branches immediately on the return value, covered in 2.06.
+
+**The canonical pattern:**
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/wait.h>
+
+int main(void) {
+    int x = 10;
+    pid_t pid = fork();
+    if (pid < 0) { perror("fork"); return 1; }
+    if (pid == 0) {                /* child */
+        x += 5;
+        printf("child: x=%d pid=%d\n", x, (int)getpid());
+        fflush(stdout);            /* flush our own output first... */
+        _exit(0);                  /* ...then _exit, which skips stdio flushing and atexit handlers */
+    }
+    waitpid(pid, NULL, 0);         /* parent: reap the child, or it stays a zombie */
+    printf("parent: x=%d (unchanged, memory is copied)\n", x);
+    return 0;
+}
+```
+
+Copy-on-write makes `fork` cheap: pages are shared read-only and copied only when either process writes. The stdio details are a classic interview trap. If the parent had unflushed `printf` output before `fork`, both processes hold a copy of the buffer and it is printed twice, especially when stdout is redirected to a file or pipe (fully buffered). The child uses `_exit` so it doesn't flush that inherited copy or run the parent's `atexit` handlers, but `_exit` also discards the child's own unflushed output, hence the explicit `fflush(stdout)` first. Without it, running the program as `./a.out | cat` loses the child's line entirely.
+
 FOLLOW:
 - Does fork() copy threads too? => No; POSIX is explicit that "a process shall be created with a single thread" even if the parent had many (2.10 covers exactly this).
 - What if fork() fails? => It returns -1 to the parent, no child is created, and errno is set to EAGAIN (resource/process limits) or ENOMEM; nothing runs on the "child side" because there is no child.

@@ -49,6 +49,38 @@ DEEP:
 - Static initializers exist so that self-initializing modules with private static synchronization state do not need a pthread_once()-guarded init function; POSIX's own RATIONALE walks through exactly this simplification.
 - A heap-allocated or per-connection mutex has no "before main()" moment to be statically initialized in, so it must go through pthread_mutex_init(), typically right after the enclosing struct is allocated.
 - Non-default attributes (PTHREAD_MUTEX_RECURSIVE or PTHREAD_MUTEX_ERRORCHECK type, or PTHREAD_PROCESS_SHARED) can only be requested through an explicit pthread_mutexattr_t passed to pthread_mutex_init(); there is no static-initializer spelling for them in POSIX itself (glibc does provide nonstandard macros like PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP for this).
+
+**A side-by-side example:**
+
+```c
+#include <pthread.h>
+#include <stdlib.h>
+
+static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;  /* static: no init call needed */
+
+struct queue {
+    pthread_mutex_t lock;
+    int items[64];
+    int count;
+};
+
+struct queue *queue_new(void) {
+    struct queue *q = calloc(1, sizeof *q);
+    if (q && pthread_mutex_init(&q->lock, NULL) != 0) {   /* heap: must init at run time */
+        free(q);
+        return NULL;
+    }
+    return q;
+}
+
+void queue_free(struct queue *q) {
+    pthread_mutex_destroy(&q->lock);   /* pair every init with a destroy */
+    free(q);
+}
+```
+
+`pthread_mutex_init` can fail (ENOMEM, EAGAIN), so check its return value; the static initializer can't fail. Don't copy an initialized mutex (for example by assigning structs), and don't re-initialize a mutex that is in use; both are undefined.
+
 FOLLOW:
 - Can you call pthread_mutex_init() on a mutex that was already set up with PTHREAD_MUTEX_INITIALIZER? => No: attempting to initialize an already-initialized mutex is undefined behavior, and the static initializer already counts as initialized.
 - Is PTHREAD_MUTEX_INITIALIZER slower or faster than the dynamic call? => Neither in the steady state; the difference is only that the static form skips the (optional) error checks pthread_mutex_init() may perform, and it needs no explicit call at startup.
@@ -152,6 +184,14 @@ int main(void) {
 ```
 Compiled with `gcc -std=c11 -Wall -Wextra -pthread` and run under `timeout 2 ./a.out`, it printed both "locking once" and "locking again..." lines and then hung; the process was killed by the timeout (shell exit code 124), and "never reached" never printed, confirming the second lock call blocked forever rather than erroring out.
 - Because glibc maps PTHREAD_MUTEX_DEFAULT to the same behavior as NORMAL, this happens with the plain PTHREAD_MUTEX_INITIALIZER too, not only with an explicitly-requested NORMAL type.
+
+**How to detect or avoid it:**
+
+- Use `PTHREAD_MUTEX_ERRORCHECK` in debug builds: the second lock returns `EDEADLK` instead of hanging, which turns a silent hang into a reportable error.
+- `PTHREAD_MUTEX_RECURSIVE` makes relocking legal (with a count), but it usually hides a design problem: a function that takes the lock calling another function that takes it again. A common fix is splitting into a public function that locks and an internal `_locked` variant that assumes the lock is held.
+- When a hang happens, attach a debugger (`gdb -p <pid>`, then `thread apply all bt`): a thread blocked in `__lll_lock_wait` whose own frame already holds the same mutex is the signature of self-deadlock. The mutex's `__owner` field in glibc shows the owning thread's TID.
+- ThreadSanitizer and Helgrind report lock-order problems between two mutexes, but a plain self-deadlock usually just hangs under them too.
+
 FOLLOW:
 - How would you actually confirm this in a real hung process instead of trusting the timeout? => Attach gdb (or use its batch mode: `gdb -p <pid> -batch -ex "thread apply all bt"`) and look for the same thread appearing twice in the backtrace, once at the outer call site and once blocked inside pthread_mutex_lock().
 - What is the fix if the same thread legitimately needs to re-enter a locked region? => Either restructure the code so the inner call does not re-lock (split into a locked wrapper and an unlocked inner function), or use PTHREAD_MUTEX_RECURSIVE deliberately (see 4.11) rather than relying on NORMAL/DEFAULT.

@@ -47,6 +47,7 @@ Q: Build the classic semaphore-pair bounded-buffer solution (not the condition-v
 SHORT: Two counting semaphores (`empty_slots` starting at the buffer capacity, `full_slots` starting at 0) plus a plain mutex for the buffer's own read/write index bookkeeping. With 3 producers and 3 consumers moving 1500 items total through an 8-slot buffer, the run completed with consumed count and checksum matching produced count and checksum exactly: `produced=1500 consumed=1500 checksum_produced=150374250 checksum_consumed=150374250 match=OK`, on all three runs tested.
 DEEP:
 ```c
+/* sketch of the core logic: buffer, BUFSZ, counters and loop bounds are declared elsewhere */
 sem_t empty_slots, full_slots;                 /* sem_init(&empty_slots, 0, BUFSZ); sem_init(&full_slots, 0, 0); */
 pthread_mutex_t mtx = PTHREAD_MUTEX_INITIALIZER;
 

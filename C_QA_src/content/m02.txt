@@ -23,6 +23,15 @@ Full precedence from highest to lowest (grouping the ones worth memorizing):
 15. `,`
 
 The practical rule: when mixing bitwise operators (`& ^ |`) with equality/relational operators in the same expression, always parenthesize; that combination is the single most common real-world precedence bug in C.
+
+**Three bugs this list explains:**
+
+- `if (status & MASK == 0)` parses as `status & (MASK == 0)`, which is `status & 0`, so it is always false. Write `if ((status & MASK) == 0)`.
+- `x << 1 + 1` is `x << 2`, because `+` binds tighter than `<<`.
+- `*p++` increments the pointer, not the pointee: postfix `++` binds tighter than unary `*`. Use `(*p)++` to increment the value.
+
+Associativity matters too: most binary operators group left to right, but assignment and `?:` group right to left, so `a = b = 0` assigns `b` first. Precedence says how an expression is grouped, not the order its operands are evaluated in (see 2.12). `-Wall` enables `-Wparentheses`, which catches the first two.
+
 FOLLOW:
 - Which operators are right-associative? => Unary operators, assignment operators, and `?:` (the ternary's third operand associates right-to-left for chained ternaries).
 - Do casts have higher precedence than binary operators? => Yes, `(int)x + y` casts only `x`, not `x + y`.
@@ -57,6 +66,15 @@ int main(void)
 }
 ```
 Compiled and run: `side_effect()` is never printed; both messages report `0` calls. `cond && side_effect()` skips the call because `cond` is 0; `cond || side_effect()` skips it because `cond` is 1.
+
+**Idioms that rely on the guarantee:**
+
+- Null guards: `if (p != NULL && p->len > 0)` never dereferences a null `p`.
+- Bounds guards: `while (i < n && buf[i] != '\0')` checks the index before reading.
+- Defaults: `if (!cfg_loaded || !cfg.enabled) return;`.
+
+Because the right operand of `&&`/`||` may be skipped, never put a required side effect there: `if (ok && write_reg(REG, v))` silently skips the write when `ok` is 0. The bitwise `&` and `|` operators do NOT short-circuit and have no sequence point, so `if (p != NULL & p->len)` dereferences NULL. Both `&&` and `||` also always yield `int` 0 or 1.
+
 FOLLOW:
 - Is this different from `&` and `|`? => Completely: `&` and `|` are bitwise operators that always evaluate both operands, with unspecified order between them and no short-circuiting at all.
 - Why does this matter for null-pointer checks? => It is why `if (p != NULL && p->field)` is safe while `if (p->field && p != NULL)` is not; the left operand is fully evaluated (and its sequence point passed) before the right is even considered.
@@ -115,6 +133,11 @@ int main(void)
 }
 ```
 Compiled and run: `a+b-c = 25`, `x + y = 0`. The second line is the sharper lesson: `-1` converted to `unsigned long` becomes `ULONG_MAX` (not a small negative-looking value), and `ULONG_MAX + 1` wraps to exactly `0`, per 6.3.1.3p2's "repeatedly adding one more than the maximum representable value" rule.
+
+**Why it matters in real code:** loops like `for (int i = 0; i < len - 1; i++)` with `size_t len` are a classic bug. When `len` is 0, `len - 1` becomes `SIZE_MAX` and the loop runs almost forever (reading out of bounds). Likewise `if (x < sizeof buf)` with a negative `int x` converts `x` to a huge unsigned value, so the check fails in the unsafe direction.
+
+The rule of thumb: when a signed and an unsigned operand of equal or higher rank meet, the signed one is converted to unsigned. Keep sizes and counts in one signedness, compare `i + 1 < len` instead of `i < len - 1`, and enable `-Wsign-compare` (in `-Wextra`) and `-Wsign-conversion` to find mixed expressions.
+
 FOLLOW:
 - What is the general rank-based rule? => Convert both operands to the type of whichever operand has the greater integer conversion rank (6.3.1.1); if ranks are equal but one is unsigned, the signed one converts to unsigned.
 - Why is this dangerous in loop bounds like `for (int i = n - 1; ...)` with `size_t n`? => If `n` is `size_t` (unsigned) and you write `n - 1` where `n` could be `0`, the subtraction happens in `size_t` and wraps to `SIZE_MAX`, not `-1`.
@@ -220,6 +243,11 @@ DEEP:
 This ordering is exactly what makes `for` and a hand-written `while` differ subtly around `continue` (module 3 covers that difference in full), and it is why `for (int i = 0; i < n; i++)` never accidentally increments `i` one extra time: the sequence within one full iteration is always controlling-expression-check, then body, then `expr3`, then back to controlling-expression-check.
 
 `clause1` (if a declaration) has its scope extend over the whole loop, including `expr2` and `expr3`, and is itself reached, in execution order, before the first evaluation of `expr2` -- this is why `for (int i = 0; ...)` lets you use `i` in all three clauses and the body, but not after the loop.
+
+**A worked trace** for `for (int i = 0; i < 3; i++) body(i);`: init `i = 0`; check `0 < 3`; `body(0)`; `i++` makes 1; check; `body(1)`; `i++`; check; `body(2)`; `i++` makes 3; check `3 < 3` fails, and the loop exits with `expr3` executed exactly 3 times.
+
+**`continue` jumps to `expr3`, not to the condition.** In a `for` loop, `continue` still runs the increment. The "equivalent" `while` loop with `i++` at the bottom of the body skips that increment on `continue` and can loop forever, which is the classic difference module 3 expands on. All three clauses are optional: `for (;;)` is the idiomatic infinite loop (an omitted `expr2` counts as nonzero).
+
 FOLLOW:
 - Can `expr2` be omitted? => Yes; an omitted controlling expression is replaced by a nonzero constant (6.8.5.3p2), making `for (;;)` an infinite loop by definition.
 - Does `clause1` run once, or once per iteration? => Exactly once, before the loop starts; only `expr2` and `expr3` repeat per iteration.
@@ -265,6 +293,11 @@ int main(void)
 }
 ```
 Compiled with `-Wall -Wextra`: gcc again catches it with `warning: operation on 'i' may be undefined [-Wsequence-point]`. Run output: `a[0]=1 a[1]=0 a[2]=0 i=1`. On this build, the index computation `i++` used the old value (`0`), and the right-hand `i` was read *after* the increment (`1`), landing `1` in `a[0]`. A compiler is equally free to read the right-hand `i` before applying the increment's side effect, landing `0` in `a[0]` instead, or to make other legal choices.
+
+**The general rule (C11 6.5p2):** if a side effect on a scalar is unsequenced relative to another side effect on the same object, or to a value computation using its value, the behavior is undefined. Other members of the same family: `i = i++ + 1;`, `f(i++, i)`, `x = x++`.
+
+**The fix is always to split the statement** so each modification sits in its own full expression: `a[i] = i + 1; i++;` (or whatever you meant). The end of a full expression is a sequence point. Don't reason from one compiler's output: the next version, another optimization level, or a different target can choose differently, and GCC's `-Wsequence-point` (in `-Wall`) catches the common cases for you.
+
 FOLLOW:
 - Why does the standard bother naming this exact example in a footnote? => Because it is exactly the kind of expression that looks "obviously" like it should write the post-increment value at the post-increment index, but the language provides no such guarantee, making it a canonical teaching example.
 - What is the safe rewrite? => Split it: `a[i] = i + 1; i++;` (or `i++; a[i-1] = i;`), whichever ordering you actually intend, with the increment on its own statement.
@@ -275,24 +308,31 @@ VERIFY: 6.5p2, footnote 84
 Q: A test asserts `printf("%d %d %d\n", tag(1), tag(2), tag(3))` prints "1 2 3" in that order because "arguments evaluate left to right." Debug the assumption, not the code.
 SHORT: The assumption itself is the bug: C does not guarantee any particular order for evaluating a function's arguments (6.5.2.2); it is unspecified. The test happens to pass on today's compiler and flags, which is exactly the kind of false confidence that unspecified behavior produces.
 DEEP:
+The original test with `tag(1), tag(2), tag(3)` passes on gcc 13/x86-64, but it proves nothing about evaluation order: each value is independent of when it is computed, so any order prints `1 2 3`. (1.13 shows that this compiler actually evaluates those arguments right to left.) The order becomes visible as soon as the arguments share state:
+
 ```c
 #include <stdio.h>
 
-int n = 0;
-int tag(int v)
-{
-    n++;
-    printf("evaluating argument #%d -> value %d\n", n, v);
-    return v;
-}
+static int counter = 0;
+static int next_id(void) { return ++counter; }
 
 int main(void)
 {
-    printf("sum = %d\n", tag(1) + tag(2) + tag(3));
+    printf("%d %d %d\n", next_id(), next_id(), next_id());
+
+    /* fixed: one call per statement, so the order is guaranteed */
+    counter = 0;
+    int a = next_id();
+    int b = next_id();
+    int c = next_id();
+    printf("%d %d %d\n", a, b, c);
     return 0;
 }
 ```
-Compiled and run on this gcc/x86-64 build: the three `tag()` calls happened to run in source order (1, then 2, then 3), producing `sum = 6`. That is a fact about this compiler and target today, not a language guarantee; many real toolchains (historically, several 32-bit x86 calling conventions, and various optimization decisions) evaluate arguments right-to-left or in whatever order is most efficient for register allocation.
+Compiled with gcc 13 (`-std=c11 -Wall -Wextra -O2`) on x86-64 Linux and run: the first line printed `3 2 1` (the last argument was evaluated first and got 1), and the fixed version printed `1 2 3`.
+
+**How to debug this kind of assumption:** make the side effects visible (log inside the argument functions as in 1.13), build with a second compiler or target (`clang`, `-m32`, an ARM cross-compiler), and look for arguments that touch shared state. The real fix is in the code, not the test: move order-dependent calls into separate statements so the test checks behavior the language actually guarantees.
+
 FOLLOW:
 - How should this actually be tested? => Assert on the *set* of values produced and the final result, not on the order argument-evaluation side effects were observed in; or restructure the code under test so it does not depend on evaluation order at all.
 - Is this the same category of bug as `i = i++ + 1`? => Related but distinct: this is *unspecified* behavior (one of several defined outcomes, compiler's choice, no diagnostic required or typically given) rather than *undefined* behavior (no defined outcome at all); see module 10 for the full three-way split.
@@ -318,6 +358,11 @@ int main(void)
 Compiled and run: `-5 / 2  = -2`, `-5 % 2  = -1`, `5 / -2  = -2`, ` 5 % -2  = 1`. Sanity-checking the identity: `(-5/2)*2 + (-5%2) = (-2)*2 + (-1) = -5`. Correct.
 
 Truncation toward zero means `-5 / 2` rounds -2.5 toward 0, giving -2 (not -3, which would be "round toward negative infinity," the other common convention used by some languages like Python).
+
+**Where it matters in firmware:** ring-buffer and wrap-around index math. `idx = (idx - 1) % N` with a signed `idx` of 0 gives `-1`, not `N - 1`, and indexing with it is out of bounds. Portable fixes: `idx = (idx + N - 1) % N`, or use unsigned indices, or for power-of-two `N`, `idx = (idx - 1) & (N - 1)` with unsigned `idx`.
+
+A mathematical (always non-negative) modulo for signed values is `((a % n) + n) % n`. Also note that `INT_MIN / -1` and `INT_MIN % -1` are undefined because the true quotient does not fit in `int`; on x86 the division traps with SIGFPE.
+
 FOLLOW:
 - Was this always true in C? => No; C89 left the rounding direction for negative operands implementation-defined. C99 (carried into C11) is the version that mandated truncation toward zero specifically.
 - What if either operand is 0? => Division by zero and `%` with a zero right operand are both undefined behavior (6.5.5p5), regardless of sign.

@@ -105,6 +105,18 @@ SHORT: ThreadSanitizer needs a rebuild with `-fsanitize=thread` but then runs wi
 DEEP:
 - Because ThreadSanitizer is compiler-integrated, it can also catch some issues an interpretation-based tool might structure differently (e.g. certain classes of signal-related or thread-lifecycle issues), while helgrind's binary-level approach can sometimes work in situations where recompiling with sanitizer support is impractical (a third-party binary, a very unusual build system).
 - Neither tool is a drop-in replacement for the other's exact detection algorithm or diagnostic detail; treat any specific claim about which one catches more of a particular bug class as something to verify empirically on your actual codebase and toolchain rather than assumed (VERIFY) -- this module only ran ThreadSanitizer directly (15.04, 15.13).
+
+**Rules of thumb from practice:**
+
+| | ThreadSanitizer | Helgrind |
+|---|---|---|
+| Setup | Rebuild with `-fsanitize=thread -g` (all code, including libraries, ideally) | Run `valgrind --tool=helgrind ./app`, no rebuild |
+| Typical slowdown | Roughly 5-15x, memory 5-10x | Often 20-100x or more |
+| Platform | x86-64, AArch64 and some others with GCC or Clang; not with ASan in the same build | Wherever Valgrind runs |
+| Custom sync (spinlocks, lock-free code) | Understands C11/GCC atomics directly | Needs client-request annotations |
+
+Both detect races only on the code paths the test actually executes, so they are only as good as the test's thread interleavings and coverage. A common approach is a nightly TSan build of the test suite, with Helgrind (or DRD) kept for third-party binaries that can't be rebuilt. These ranges vary by workload, so measure on your own codebase.
+
 FOLLOW:
 - Can you run both on the same codebase for extra confidence? => Yes, and it is a reasonable belt-and-suspenders practice for a critical validation harness, accepting the extra CI time cost of running two different heavy instrumented builds.
 - Does either tool work well with a mixed C/C++ and third-party-library codebase? => Both generally do for statically-compiled code that can be instrumented or interpreted; a closed-source or externally-provided shared library not built with matching instrumentation can limit ThreadSanitizer's visibility into that library's own internal accesses (VERIFY for a specific library and toolchain combination).

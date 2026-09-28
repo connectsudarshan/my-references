@@ -19,6 +19,11 @@ int main(void)
 }
 ```
 Compiled with `-Wall -Wextra`: gcc flags this exact shape with `warning: suggest explicit braces to avoid ambiguous 'else' [-Wdangling-else]`. Run output: `a but not b (this is what actually runs)`, confirming the `else` binds to the inner `if (b)`, exactly as 6.8.4.1p3 requires, regardless of how the indentation visually suggests otherwise.
+
+**Why it matters beyond style:** the same "indentation lies" mechanism caused Apple's 2014 "goto fail" TLS bug, where a duplicated unbraced `goto fail;` line ran unconditionally and skipped certificate verification. Coding standards such as MISRA C (rule 15.6) and CERT (EXP19-C) therefore require braces on every `if`, `else`, `for` and `while` body.
+
+To make the outer `if` own the `else`, braces are the only tool: `if (a) { if (b) x(); } else y();`. GCC's `-Wmisleading-indentation` (in `-Wall`) complements `-Wdangling-else` by flagging statements indented as if they belonged to an unbraced body.
+
 FOLLOW:
 - Does adding braces change the binding, or just make it visible? => It actually changes which `if` the `else` binds to, if you place the braces to enclose the inner `if` alone; braces make the (already-fixed) rule match your visual intent instead of fighting it.
 - Is this ambiguous in the grammar itself? => No; the grammar plus 6.8.4.1p3's rule fully disambiguates it. It only "looks" ambiguous to a human reading indentation.
@@ -47,6 +52,11 @@ int main(void)
 Compiled and run: prints `Wed`. Each `break` (6.8.6.3) terminates the switch immediately; removing the `break` after `case 3` would fall straight into `default`'s `printf("other\n")` too, printing both lines.
 
 There may be at most one `default` label (6.8.4.2p3), and it does not have to be last textually, though placing it last is the near-universal convention.
+
+**How compilers implement it:** a dense set of case values usually becomes a jump table (an indexed branch, O(1) regardless of case count); sparse values become a binary search or a chain of compares. That is why `switch` on a command opcode in a firmware dispatcher is both readable and fast.
+
+Rules worth knowing: case labels must be integer constant expressions and unique; you cannot switch on strings or floating values. Declaring a variable right after a `case` label needs a block (`case 1: { int t = ...; break; }`), and a jump past an initialized declaration into its scope leaves it uninitialized. For `enum` switches, omit `default` so `-Wswitch` (in `-Wall`) warns when a new enumerator is not handled.
+
 FOLLOW:
 - Must every case end in break? => No; intentional fall-through (module 3's later Duff's-device and fall-through questions) is legal C, just easy to get wrong by accident.
 - What type must the controlling expression have? => Integer type (6.8.4.2p1); a `switch` on a `float` or pointer is a constraint violation.
@@ -113,6 +123,22 @@ int main(void)
 }
 ```
 Compiled and run: `H: consonant`, `e: vowel`, `l: consonant`, `l: consonant`, `o: vowel`. All ten vowel labels share one `return 1;`; there is no code between the stacked labels for control to fall through *past*, which is exactly what makes this pattern safe and idiomatic rather than a latent bug.
+
+**Fall-through past code** is legitimate too, but must be marked. Example, a state-machine cleanup that undoes steps in reverse:
+
+```c
+switch (stage_reached) {
+case 3: disable_dma();      /* fall through */
+case 2: free_buffers();     /* fall through */
+case 1: power_down_phy();
+    break;
+default:
+    break;
+}
+```
+
+GCC's `-Wimplicit-fallthrough` (in `-Wextra`) warns on unmarked fall-through past code; a `/* fall through */` comment or `__attribute__((fallthrough));` silences it, and C23 standardizes `[[fallthrough]];`. Stacked labels with no code between them, as in `is_vowel`, never warn.
+
 FOLLOW:
 - Is this different from Duff's device style fall-through? => Yes; here, labels with no statements between them just group alternatives. Duff's device (this module, advanced section) falls through *past executable statements*, which is a much sharper tool used deliberately for loop unrolling.
 - Does `-Wimplicit-fallthrough` warn about this pattern? => No; gcc specifically recognizes empty-label-to-label fall-through (no statements in between) as safe and does not warn on it.
@@ -232,6 +258,14 @@ DEEP:
 This is why the following is a compile error, not just a style question: referencing `i` after the loop's closing brace fails because `i`'s scope (6.8.4/6.8.5, "a selection/iteration statement is a block whose scope is a strict subset of the scope of its enclosing block") ended there.
 
 The declaration-part restriction (6.8.5.3p2 in this module's earlier for-statement question) also matters here: the `for`'s declaration part may only declare objects with storage class `auto` or `register` -- you cannot write `for (static int i = 0; ...)`, because `static`'s "initialized once for the whole program" semantics would be nonsensical for a loop variable whose entire point is per-loop-entry initialization.
+
+**Practical consequences:**
+
+- Each `for (int i ...)` loop gets its own `i`, so two sequential loops can both use `i` without conflict, and there is no stale `i` left over to misuse after the loop.
+- If you need the final index (e.g. "where did the search stop?"), declare the variable before the loop instead: `int i; for (i = 0; i < n && a[i] != key; i++) ;` then `i` is still in scope.
+- Declarations in the `for` header are a C99 feature; strict C89 compilers (`-std=c89`, some old embedded toolchains) reject them.
+- A loop body that is a compound statement is a separate, nested block: `for (int i = 0; ...) { int i = 5; }` is legal and shadows the loop variable, which `-Wshadow` flags.
+
 FOLLOW:
 - Does each iteration get a fresh `i`, or the same object reinitialized? => The same object; `i`'s declaration runs once, before the first condition check, not once per iteration -- only the increment expression re-touches it thereafter.
 - Can you shadow an outer `i` with the for-loop's `i`? => Yes; the for-loop's `i` is in a nested (inner) scope and hides an outer `i` of the same name for the loop's duration, per the general shadowing rule (6.2.1p4).
@@ -331,6 +365,11 @@ int main(void)
 }
 ```
 Compiled with `gcc -std=c11 -Wall -Wextra`: this is a genuine compile error, not a warning: `error: jump into scope of identifier with variably modified type`, pointing at the `goto`, with follow-up notes showing where `lab3` and `a` are declared. The standard's own example (6.8.6.1p4) shows the identical shape and calls it "invalid: going INTO scope of VLA," confirming this is a documented, intentional constraint, not a compiler quirk.
+
+**The fix** is to keep the jump outside the VLA's scope: jump to a label before the block, or restructure with a loop or a function. Jumping OUT of a VLA's scope is fine (the storage is released), and jumping into the scope of an ordinary non-VLA object is legal but leaves it uninitialized.
+
+This interacts with the classic C error-handling idiom: `goto cleanup;` to a single exit label is widely used in drivers (the Linux kernel uses it everywhere), and it breaks as soon as someone adds a VLA between the `goto` and the label. Many firmware coding standards ban VLAs outright (MISRA C:2012 Rule 18.8) because their stack usage is unbounded, which also avoids this problem.
+
 FOLLOW:
 - Would a jump *within* the VLA's scope (after its declaration) be legal? => Yes; the standard's own example 2 (6.8.6.1p4) shows `goto lab4;` jumping from inside the VLA's scope to another label still inside that same scope as valid.
 - Why does a VLA specifically trigger this, but a fixed-size array does not? => A VLA's size is computed at runtime from `n`; if you skip its declaration statement, the runtime bookkeeping needed to know `a`'s size and where it lives on the stack never happens, so there is nothing well-defined for later code to index into. A fixed-size array needs no such runtime step, so jumping past its declaration (leaving it uninitialized) is legal, if unwise.

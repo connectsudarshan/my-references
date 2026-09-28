@@ -21,6 +21,40 @@ DEEP:
 - See the C Advanced page, module 3, for the mechanics of declaring and initializing thread-local storage; this module focuses on where it fits among lock-free patterns.
 - Typical use: per-thread scratch buffers, per-thread random-number-generator state, per-thread performance counters that get combined (reduced) into a global total only occasionally, not on every operation (see 10.15).
 - TLS does not help when threads truly need to see each other's updates; it only helps when each thread's data is naturally private.
+
+**A concrete example of the pattern:**
+
+```c
+#include <stdio.h>
+#include <pthread.h>
+#include <stdint.h>
+
+static _Thread_local unsigned int rng_state;   /* one per thread, no lock needed */
+
+static unsigned int fast_rand(void) {          /* xorshift32 */
+    unsigned int x = rng_state;
+    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+    return rng_state = x;
+}
+
+static void *worker(void *arg) {
+    rng_state = (unsigned int)(uintptr_t)arg * 2654435761u + 1u;   /* per-thread seed */
+    unsigned long sum = 0;
+    for (int i = 0; i < 1000000; i++) sum += fast_rand() & 1u;
+    printf("thread %lu: %lu odd values\n", (unsigned long)(uintptr_t)arg, sum);
+    return NULL;
+}
+
+int main(void) {
+    pthread_t t[4];
+    for (uintptr_t i = 0; i < 4; i++) pthread_create(&t[i], NULL, worker, (void *)i);
+    for (int i = 0; i < 4; i++) pthread_join(t[i], NULL);
+    return 0;
+}
+```
+
+Library functions like `rand()` share hidden global state (and may lock internally); a thread-local generator avoids both contention and data races. The cost is memory per thread and the need to combine results explicitly when a global view is required.
+
 FOLLOW:
 - Does TLS avoid false sharing automatically? => Not automatically; if several threads' TLS instances happen to be allocated on the same cache line by the implementation, you can still get false sharing (see the C Advanced page's memory-model module for false sharing).
 - Can TLS variables have a destructor run on thread exit? => With pthreads, use `pthread_key_create()`'s destructor argument for heap-allocated per-thread data; plain `_Thread_local` objects are just destroyed like any object with thread storage duration, no custom cleanup hook.
@@ -47,6 +81,15 @@ DEEP:
 - With TLS: every thread does `local_count++` (no synchronization at all) on every event, and only occasionally (e.g. once per second, or once at thread exit) folds `local_count` into a shared atomic total.
 - 10.15 compiles and runs this exact pattern with `_Thread_local long local_count` plus one `atomic_fetch_add` per thread at the end, and confirms the combined total is exact.
 - This generalizes to per-thread histograms, per-thread free lists (reduce allocator lock contention), and per-thread log buffers that get flushed independently.
+
+**Sizing the effect:** on a multi-core machine, a mutex or even an atomic counter incremented by every thread on every event makes the counter's cache line bounce between cores; throughput can fall as threads are added. Per-thread counters stay in each core's cache, so the hot path costs about as much as a local increment.
+
+Design details that matter:
+
+- Readers of the "current total" must accept a slightly stale value (sum of merged counts), or walk all threads' counters, which needs those counters to be reachable (a registry of per-thread slots, often a padded array indexed by thread number instead of `_Thread_local`).
+- Pad per-thread slots to a cache line (`_Alignas(64)`) if they live in a shared array, or false sharing brings the contention back.
+- Merge on thread exit too, or counts from short-lived threads are lost.
+
 FOLLOW:
 - What if you need the running total continuously, not just at the end? => Either pay for periodic synchronized folding (e.g. every N events or every timer tick) or fold under a read-side lock only when a reader actually asks for the total, accepting slightly stale reads.
 - Does this pattern work for values threads need to see from each other in real time? => No; it trades real-time shared visibility for zero-contention writes, so it only fits accumulate-then-report use cases.

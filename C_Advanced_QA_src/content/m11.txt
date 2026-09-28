@@ -22,6 +22,18 @@ DEEP:
 - `sched_get_priority_min()`/`sched_get_priority_max()` return the valid priority range for a given policy; for SCHED_FIFO/SCHED_RR on Linux this is typically 1-99, and nice/niceness has no effect on threads running under either real-time policy.
 - nice() and setpriority() only retune SCHED_OTHER's (the default, non-real-time) share of CPU time under contention; a nice-19 SCHED_OTHER thread still preempts nothing running under SCHED_FIFO or SCHED_RR, no matter how low its own priority is set.
 - See 11.04 for what SCHED_OTHER, SCHED_FIFO, and SCHED_RR each actually do differently.
+
+**How they fit together on Linux in practice:**
+
+| Policy | Priority used | nice effect |
+|---|---|---|
+| `SCHED_OTHER` (CFS/EEVDF) | static priority 0 | nice -20..19 sets CPU-share weight (about 10% per step) |
+| `SCHED_FIFO` | 1..99, runs until it blocks or yields | none |
+| `SCHED_RR` | 1..99, round-robin time slices among equal priority | none |
+| `SCHED_IDLE`, `SCHED_BATCH` | 0 | only relative to other threads of the same class |
+
+Command-line equivalents are useful in a validation lab: `chrt -f 50 ./latency_test` runs under `SCHED_FIFO` priority 50, `nice -n 10 ./bulk_job` lowers a time-sharing job's share, and `chrt -p <pid>` shows a process's current policy. Setting real-time policies requires `CAP_SYS_NICE` (or root), and a spinning `SCHED_FIFO` thread can starve everything else on its CPU, which Linux limits by default with RT throttling (`/proc/sys/kernel/sched_rt_runtime_us`).
+
 FOLLOW:
 - Can a normal (non-privileged) process lower another process's nice value? => No, only raise it (make it "nicer," lower priority) for processes it does not own sufficient privilege over; lowering nice value (raising priority) below the default typically requires elevated privilege.
 - Does setting a real-time priority require root? => On stock Linux, yes by default (CAP_SYS_NICE capability), which is exactly the permission behavior sched_setscheduler() describes as implementation-defined ("appropriate privilege").

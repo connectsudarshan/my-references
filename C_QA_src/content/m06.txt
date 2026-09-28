@@ -15,6 +15,19 @@ int main(void) {
 }
 ```
 Compiled and run: `sizeof` printed `12`, while the naive sum of member sizes was `6`; the difference is 3 padding bytes before `b` (to reach 4-byte alignment) and 3 trailing padding bytes after `c` (so the struct's total size is a multiple of `int`'s 4-byte alignment, satisfying arrays of this struct).
+
+**The layout, byte by byte** (typical 4-byte `int`):
+
+| Offset | Content |
+|---|---|
+| 0 | `a` |
+| 1-3 | padding (so `b` starts at a multiple of 4) |
+| 4-7 | `b` |
+| 8 | `c` |
+| 9-11 | trailing padding (so the next element of an array starts 4-aligned) |
+
+Reordering to `int b; char a; char c;` gives 8 bytes (only 2 trailing padding bytes). Padding matters in firmware for three reasons: RAM (arrays of thousands of structs), wire and flash formats (padding bytes change the on-media layout), and information leaks (uninitialized padding copied to a host or across a privilege boundary). `-Wpadded` reports where the compiler inserts padding, and `pahole` shows the layout of structs in a built binary.
+
 FOLLOW:
 - Does padding show up if you print the struct byte by byte? => Yes, but its contents are unspecified (C11 6.2.6.1p6): padding bytes take unspecified values, so never rely on what happens to be there.
 - Would `#pragma pack` remove this padding? => Yes, but it also removes the alignment guarantee for `b`, which can cost real performance (or fault on some architectures) for unaligned multi-byte access; see 6.10 for when that trade is actually worth it.
@@ -37,6 +50,28 @@ int main(void) {
 }
 ```
 Compiled and run: both printed `1`, confirming the converted pointer reads the same bytes as `p.x`.
+
+**The pattern this enables, C-style inheritance:** put a "base" struct as the first member, and a pointer to the derived struct can be converted to a pointer to the base and back.
+
+```c
+#include <stdio.h>
+
+struct device { int id; const char *name; };
+struct nvme_device { struct device base; int num_queues; };
+
+static void print_device(const struct device *d) { printf("%d %s\n", d->id, d->name); }
+
+int main(void) {
+    struct nvme_device n = { { 7, "nvme0" }, 64 };
+    print_device(&n.base);                       /* or (struct device *)&n */
+    struct nvme_device *back = (struct nvme_device *)&n.base;
+    printf("queues=%d\n", back->num_queues);
+    return 0;
+}
+```
+
+The guarantee covers only the first member. For a base at another position, use `offsetof` to compute the enclosing struct, which is the Linux kernel's `container_of` macro.
+
 FOLLOW:
 - Does this guarantee extend to the second member too? => No; only the initial member has this guaranteed no-padding-before-it property (6.7.2.1p15 says "there may be unnamed padding within a structure object, but not at its beginning"), so reaching `y` this way is not guaranteed.
 - Is this the mechanism behind "inheritance" tricks in C, where a base struct is embedded first in a derived struct? => Yes, that pattern relies on exactly this guarantee: a pointer to the derived struct, converted to a pointer to the base struct type, correctly reaches the embedded base struct's first member and beyond, as long as the base struct is literally the first member.
@@ -66,6 +101,27 @@ int main(void) {
 }
 ```
 Compiled and run: offsets were `0, 2, 4, 8`, and `sizeof` was `12`, exactly matching the manual walk above. `offsetof` (from `<stddef.h>`, C11 7.19p3) is the standard, portable way to get these numbers instead of computing them by hand.
+
+**Making it robust for wire and on-media formats:** if the struct describes an external layout (a command header in a submission queue, a flash metadata block), don't rely on the compiler's padding matching the spec. Either insert explicit reserved fields so no implicit padding remains (`uint8_t rsvd1;` after `opcode`, `uint8_t rsvd2[3];` after `flags`), or use `packed` (6.10). Then pin the layout with compile-time checks:
+
+```c
+#include <stddef.h>
+#include <stdint.h>
+
+struct cmd_header {
+    uint8_t  opcode;
+    uint8_t  rsvd1;
+    uint16_t nsid;
+    uint32_t cdw2;
+    uint8_t  flags;
+    uint8_t  rsvd2[3];
+};
+_Static_assert(offsetof(struct cmd_header, cdw2) == 4, "cdw2 offset");
+_Static_assert(sizeof(struct cmd_header) == 12, "cmd_header size");
+```
+
+If a later edit changes the layout, the build fails instead of the device misreading commands.
+
 FOLLOW:
 - Where exactly are the padding bytes in this layout? => One byte at offset 1 (before `nsid`), and three bytes at offsets 9-11 (after `flags`, to round the struct up to a multiple of its 4-byte alignment).
 - Would reordering the members to `opcode, flags, nsid, cdw2` change the total size? => Yes, it would shrink to 8 bytes: the two `uint8_t` fields pack together first, `nsid` then needs no padding to reach 2-byte alignment at offset 2, and `cdw2` lands exactly at offset 4 with nothing wasted.
@@ -87,6 +143,11 @@ int main(void) {
 }
 ```
 Compiled and run: `bad_order` was `24` bytes, `good_order` was `16` bytes, for the exact same four members, just reordered.
+
+**Why the reorder saves 8 bytes:** in `bad_order`, `a` (1) is followed by 7 bytes of padding before `double b`, then `c` (1) plus 3 padding before `int d`, then `d` (4), totaling 24. In `good_order`, `b` (8), `d` (4), `a` and `c` (2) and 2 trailing padding bytes total 16.
+
+**When NOT to reorder:** when the struct mirrors an external layout (hardware registers, wire formats, on-flash structures), when it is part of a stable ABI shared with other binaries, or when grouping fields by access pattern matters more (keeping fields used together in the same cache line). For internal structs, sorting by decreasing alignment is a good default, and `pahole` can suggest a better ordering for existing code.
+
 FOLLOW:
 - Why does putting `double b` first help here? => It has the largest alignment requirement (8 bytes on this target); placing it at offset 0 costs nothing, whereas placing it after a `char` forces 7 padding bytes to reach 8-byte alignment.
 - Is there ever a reason not to reorder for minimum padding? => Yes, when the struct's layout must match an external wire format or hardware register map exactly; then the order is dictated by the protocol, not by minimizing size (see 6.10 and 6.15).
@@ -114,6 +175,14 @@ int main(void) {
 }
 ```
 Compiled and run: printed `3.5` for the direct read, and `0x40600000` for the `memcpy`-based bit pattern, which is the IEEE-754 encoding of `3.5f`.
+
+**Practical notes:**
+
+- With optimization enabled, `memcpy` of 4 bytes into a local compiles to a single register move, so the safe version costs nothing.
+- GCC documents union type punning (writing one member and reading another) as supported, and C99 TC3 added a footnote that describes the result as reinterpreting the bytes, so union punning is widely used and works on mainstream compilers. Portable code that must also build as C++ (where it is clearly UB) should use `memcpy`.
+- Reading through a cast pointer (`*(uint32_t *)&f`) is the one to avoid: it violates strict aliasing (6.14) and can break under `-O2`.
+- Common firmware uses: decoding IEEE-754 floats from a byte stream, and CRC or checksum computation over a struct's bytes.
+
 FOLLOW:
 - Isn't reading `value.i` right after writing `value.f` a very common trick anyway? => It is common and works on most mainstream compilers in practice, but it is not defined by the C11 union rules in general; module 10 covers why strict aliasing makes this specific pattern risky under optimization.
 - Why is `memcpy` considered safe when a union read is not? => `memcpy` operates on `unsigned char` object representations, which C11 6.2.6.1p4-5 explicitly permits for any object, sidestepping the type-based aliasing question entirely.
@@ -139,6 +208,33 @@ int main(void) {
 }
 ```
 Compiled and run: both printed `1`, confirming `u.as_b.kind` legitimately reads the same value as `u.as_a.kind`, even though `as_a` is the active member.
+
+**The tagged-union idiom in full:** the common first member records which variant is active, so readers can switch on it safely.
+
+```c
+#include <stdio.h>
+
+enum kind { K_READ = 1, K_WRITE = 2 };
+struct rd { enum kind kind; unsigned lba; unsigned blocks; };
+struct wr { enum kind kind; unsigned lba; const void *data; };
+union cmd { enum kind kind; struct rd rd; struct wr wr; };
+
+static void dispatch(const union cmd *c) {
+    switch (c->kind) {
+    case K_READ:  printf("read lba=%u n=%u\n", c->rd.lba, c->rd.blocks); break;
+    case K_WRITE: printf("write lba=%u\n", c->wr.lba); break;
+    }
+}
+
+int main(void) {
+    union cmd c = { .rd = { K_READ, 100, 8 } };
+    dispatch(&c);
+    return 0;
+}
+```
+
+The guarantee requires the union type to be visible where the access happens; reading through two separate struct pointers without the union can still be broken by aliasing-based optimizations. This is how event types in many libraries and protocol parsers are structured.
+
 FOLLOW:
 - Does the exception cover `u.as_b.y` after writing `u.as_a.x`? => No; `x` and `y` are not part of the common initial sequence (they differ in position and type), so reading `y` here is not covered by this exception and is undefined.
 - Is a separate, explicit `tag` field outside the union a more robust pattern than relying on this rule? => Yes, and it is what 6.05's tagged-union example does; the common-initial-sequence rule is narrower and easier to get subtly wrong than an explicit external tag.
@@ -161,6 +257,11 @@ int main(void) {
 }
 ```
 Compiled and run: `sizeof` was `4`, `ready` was `1`, `mode` was `3`, all as expected for reading back what was just written; what this program cannot show is the physical bit order within that 4-byte unit, since C gives no portable way to observe it other than through the members themselves.
+
+**Implication for firmware:** a bit-field struct that "matches" a register diagram on one compiler can silently mismatch on another, or when the same code is built for a big-endian target: GCC on little-endian targets allocates the first declared field in the least significant bits, while big-endian ABIs typically start at the most significant bits. Other implementation-defined choices: which types are allowed (`_Bool`, `signed int` and `unsigned int` are required; others like `uint8_t` bit-fields are extensions), and how wide a single access to the field is on a volatile register.
+
+Many teams restrict bit-fields to purely internal, in-memory flags, and use shifts and masks (6.11) for anything that crosses a hardware or wire boundary. Vendor register headers generated for one specific compiler (for example CMSIS device headers) are the common exception.
+
 FOLLOW:
 - Can you rely on `f.ready` occupying literally bit 0 of the first byte? => No, not portably; that specific placement is a GCC/x86 convention, not a C11 guarantee, which is exactly why bit-field structs are risky for wire formats (see 6.11).
 - Does `_Bool` behave specially as a bit-field type? => Yes; C11 6.7.2.1p10 guarantees a nonzero-width `_Bool` bit-field stores 0/1 correctly, which is a narrower guarantee than plain `int`/`unsigned int` bit-fields get.
@@ -185,6 +286,16 @@ int main(void) {
 }
 ```
 Compiled and run: `p->data[0..2]` read back `0.0, 1.5, 3.0` as written, and `sizeof(struct packet)` printed `8` (just the `int n` plus its trailing padding to `double`'s alignment), confirming the array itself added nothing to the struct's own size.
+
+**Why it's used in firmware and protocols:** a header plus a variable-length payload in one allocation, which means one `malloc`/`free`, better locality, and a layout that matches wire formats like "length followed by data". Correct usage details:
+
+- Allocate with `offsetof(struct packet, data) + m * sizeof(double)` or `sizeof(struct packet) + m * sizeof(double)` (the second may overallocate a few padding bytes, which is harmless).
+- Check the multiplication for overflow when `m` comes from input.
+- A struct with a flexible array member cannot be an array element or a member of another struct, and assigning such structs (`*a = *b`) copies only the fixed part.
+- Before C99, code used the "struct hack" `double data[1];` or zero-length arrays `data[0]` (a GNU extension); both are now replaced by the standard `data[]`.
+
+The example above omitted `free(p)` and a NULL check for brevity; real code needs both.
+
 FOLLOW:
 - Why not just declare `double data[3]` directly instead? => That fixes the array length at compile time; a flexible array member lets one struct definition serve any runtime-chosen length from a single `malloc` call.
 - Can you have more than one flexible array member? => No, only the very last member of the struct may have this incomplete array form, and the struct must have at least one other named member before it.
@@ -206,6 +317,11 @@ int main(void) {
 }
 ```
 Compiled and run with GCC on this target: printed `-1`, because GCC's plain-`int` bit-fields are signed here, and the 2-bit pattern `11` is `-1` in a signed 2-bit two's-complement interpretation.
+
+**The fix is to always spell out the signedness:** `unsigned int mode : 2;` holds 0..3 on every compiler, and `signed int mode : 2;` guarantees -2..1. Plain `int` bit-fields are the only place in C where `int` might mean unsigned, which is why coding standards (MISRA C:2012 Rule 6.1) require explicitly signed or unsigned bit-field types.
+
+It also affects comparisons: with a signed field, `if (v.mode == 3)` is never true, and `-Wall` does not warn about it. A one-bit plain-`int` field is even worse, holding only 0 and -1 when signed, so `flag == 1` fails; use `unsigned` or `_Bool` for flags.
+
 FOLLOW:
 - How do you avoid this ambiguity entirely? => Declare the bit-field as `unsigned int` (or `signed int`) explicitly rather than plain `int`, which pins down the signedness the standard otherwise leaves implementation-defined.
 - Would `_Bool mode : 1;` have the same ambiguity? => No; C11 6.7.2.1p10 specifically guarantees a `_Bool` bit-field stores and reads back 0/1 correctly, with no signedness ambiguity.
@@ -227,6 +343,16 @@ int main(void) {
 }
 ```
 Compiled and run: `wire_unpacked` was `8` bytes (3 padding bytes before `lba` to reach 4-byte alignment), `wire_packed` was `5` bytes, matching the 5 bytes actually meant to be sent on the wire.
+
+**What packed costs:** the compiler must assume members are misaligned, so on cores without unaligned-access support (Cortex-M0, many older RISC cores) each member access becomes several byte loads and shifts. On cores that fault on unaligned access, taking `&pkt->lba` and passing it as a plain `uint32_t *` can crash, because the callee assumes alignment. GCC warns with `-Waddress-of-packed-member`.
+
+**Good practice for wire structs:**
+
+- Keep packed structs at the I/O boundary; copy fields into a normal struct for processing.
+- Add `_Static_assert(sizeof(struct wire_packed) == 5, "wire size");`.
+- Remember that packing doesn't fix byte order: multi-byte fields still need `le32toh`/`be32toh`-style conversion when the wire endianness differs from the CPU's.
+- MSVC uses `#pragma pack(push, 1)` ... `#pragma pack(pop)` instead of the attribute.
+
 FOLLOW:
 - Is `__attribute__((packed))` standard C11? => No, it is a GCC/Clang extension; `#pragma pack` (also nonstandard but widely supported, including by MSVC) is the other common spelling of the same idea.
 - Does packing ever cost more than it saves? => Yes; unaligned multi-byte member access inside a packed struct can be slower (extra bus cycles) or, on some non-x86 architectures, fault outright, so packed structs are typically only accessed through explicit byte-copy helpers, not by direct member dereference on strict-alignment targets.
@@ -253,6 +379,18 @@ int main(void) {
 }
 ```
 Compiled and run: printed `opcode=0x05 flags=0x01 length=0x1234`, matching the intended field layout by construction, regardless of what any compiler's bit-field packing would have chosen.
+
+**Byte order is the other half.** The shift-and-mask code above works on the integer's value, but first you need that value. If the command word arrives as 4 bytes in little-endian order, assemble it explicitly: `uint32_t raw = b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24;`. That works on any host endianness and never does an unaligned or aliasing-violating load, while casting the byte pointer to `uint32_t *` does both.
+
+Common helpers make it readable and self-documenting:
+
+```c
+#define FIELD_GET(val, shift, width) (((val) >> (shift)) & ((1u << (width)) - 1u))
+#define FIELD_PREP(v, shift, width)  (((uint32_t)(v) & ((1u << (width)) - 1u)) << (shift))
+```
+
+(The Linux kernel's `FIELD_GET`/`FIELD_PREP` take a mask instead and check it at compile time.) Watch the width-32 case: `1u << 32` is undefined, so full-width fields need a special case.
+
 FOLLOW:
 - Does this still depend on `raw`'s byte order once it comes off a wire? => Yes; `raw` itself still needs a defined byte order when it is read from a byte stream (e.g. explicit `buf[0] | buf[1]<<8 | ...`), which is a separate concern from the bit-shifting shown here.
 - When is a bit-field struct actually fine to use? => For purely in-memory flags a single program defines and consumes itself, with no cross-compiler or on-disk persistence requirement; portability across builds is the deciding factor, not "is it a protocol" per se.
@@ -325,6 +463,11 @@ int main(void) {
 }
 ```
 Compiled with `gcc -std=c11 -Wall -Wextra` (no warning at the default optimization level used here) and run: both printed `0x3f800000`, the IEEE-754 bit pattern for `1.0f`; at higher optimization levels a compiler is entitled to assume `aliased` and `f` do not overlap and could produce a different, still not-wrong-per-the-standard result, which is exactly why this is dangerous rather than merely stylistically discouraged.
+
+**How it actually breaks:** under `-O2` (which enables `-fstrict-aliasing`), the compiler may assume a `float` store and an `unsigned int` load don't touch the same memory, and reorder or cache them. The classic failure is a function that writes through one type and reads through the other; the read returns the old value. GCC warns in the simple visible cases with `-Wstrict-aliasing` (enabled by `-Wall` together with `-O2`).
+
+**The allowed exceptions** (C11 6.5p7): access through the object's own type (with signed/unsigned and qualifier variants), through an aggregate or union containing it, and through any character type. That last rule is why byte-by-byte access through `unsigned char *` is always valid. Some large codebases, like the Linux kernel, simply build with `-fno-strict-aliasing` and accept the lost optimizations.
+
 FOLLOW:
 - Does this contradict the union-based type punning from 6.05? => No, it reinforces it: reading through a raw pointer cast has the same aliasing problem as reading the wrong union member, and `memcpy` is the one technique the standard treats as always safe for both cases.
 - Is casting to `char *` and reading byte-by-byte also a strict-aliasing violation? => No; C11 makes an explicit exception for accessing any object's bytes through a character type, which is part of why `memcpy` (which does exactly that internally) is safe.
@@ -422,6 +565,17 @@ int main(void) {
 }
 ```
 Compiled and run: `sizeof` printed `8`, and all three fields read back exactly what was assigned (`5, 40, 1000000`), confirming two separate 32-bit units were allocated rather than one struct packed to the theoretical bit-minimum.
+
+**The rules that decide it:** bit-fields are packed into "addressable storage units" chosen by the implementation (for `unsigned int` on GCC x86-64, a 32-bit unit). Consecutive fields share a unit while they fit; whether a field that doesn't fit is split across units or starts a new one is implementation-defined, and GCC starts a new one. `sizeof` is then rounded up to the struct's alignment.
+
+**Control tools:**
+
+- `unsigned int : 0;` (an unnamed zero-width field) forces the next field to start in a new unit.
+- An unnamed non-zero field (`unsigned int : 3;`) reserves bits, useful for matching reserved gaps.
+- Changing the declared type changes the storage unit. With `unsigned long long c : 30;`, GCC x86-64 packs `c` into a 64-bit unit right after `b` (bits 9-38) instead of starting it at bit 32. `sizeof` is still 8, but the bit layout is different.
+
+Different ABIs (MSVC in particular) choose differently, for example not sharing a unit between fields of different declared types, so the same declaration can have different sizes across compilers.
+
 FOLLOW:
 - Would a different compiler necessarily also pick 8 bytes here? => Not guaranteed; whether a bit-field that does not fit overlaps units or starts a new one is implementation-defined (6.7.2.1p11), so another implementation could in principle choose differently, though "start a new unit" is the near-universal practical choice.
 - Does bit-field width ever affect the storage unit's own type width? => Yes in the sense that the declared type (here `unsigned int`) sets the storage unit's base width; a bit-field wider than its declared type's width is already a constraint violation (6.7.2.1p4), so `c`'s 30 bits fitting inside one 32-bit `unsigned int` unit is required, not incidental.

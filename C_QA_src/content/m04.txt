@@ -59,10 +59,16 @@ int main(void) {
     char *cp = (char *)arr;
     printf("p+1  is %ld bytes past p\n", (long)((char *)(p + 1) - (char *)p));
     printf("cp+1 is %ld bytes past cp\n", (long)((cp + 1) - cp));
+    printf("*(p+2) = %d\n", *(p + 2));
     return 0;
 }
 ```
 Compiled and run: `p+1` was 4 bytes past `p`, `cp+1` was 1 byte past `cp`, and `*(p+2)` printed `30`, matching `arr[2]`.
+
+**Why it matters for firmware:** register maps and packet buffers mix both kinds of arithmetic. With `uint32_t *regs = (uint32_t *)BASE;`, `regs + 4` is byte offset 16, not 4, a frequent bug when a datasheet lists byte offsets. Use `(volatile uint32_t *)((uintptr_t)BASE + 0x10)` or index by `offset / 4` explicitly, and keep byte-level parsing on `uint8_t *`.
+
+Pointer arithmetic on `void *` is not allowed in standard C (GCC accepts it as an extension that treats `sizeof(void)` as 1; `-Wpointer-arith` warns).
+
 FOLLOW:
 - What happens if the pointed-to type has padding, like a struct? => The unit is still `sizeof` the struct, padding included; arithmetic always moves whole elements, never partial ones.
 - Can you do pointer arithmetic on a `void *`? => Not portably: `void` has no size, so GCC's arithmetic-on-`void*`-as-`char*` is a nonstandard extension, not C11.
@@ -74,8 +80,8 @@ SHORT: A function that needs to hand the caller a new pointer value, not just a 
 DEEP:
 This is the same reason `scanf("%d", &x)` needs `&x`: to write back through a pointer, you need one more level of indirection than the type you are writing.
 ```c
+#include <stdio.h>
 #include <stdlib.h>
-#include <stddef.h>
 
 void alloc_int(int **out, int value) {
     *out = malloc(sizeof(int));
@@ -84,9 +90,17 @@ void alloc_int(int **out, int value) {
 int main(void) {
     int *p = NULL;
     alloc_int(&p, 42);   /* p is now non-NULL, and *p == 42 */
+    if (p) printf("*p = %d\n", *p);
+    free(p);
+    return 0;
 }
 ```
 Compiled and run: `*p` printed `42` after the call, confirming the caller's `p` itself was updated, not just a copy.
+
+**Common real uses:** constructor-style APIs (`int dev_open(struct dev **out)` returning an error code and handing back the object), list operations that may replace the head (`void push(struct node **head, int v)`), and output parameters in general. The pointer-to-pointer lets the callee change which object the caller's pointer refers to.
+
+A related idiom: `void free_and_null(void **pp) { free(*pp); *pp = NULL; }` clears the caller's pointer so a later accidental use fails fast, although it needs care because `int **` does not implicitly convert to `void **`.
+
 FOLLOW:
 - Is there a limit to how many `*` levels are useful? => Two is by far the most common (an out-parameter, or a 2D dynamic array of `T*` rows); three or more usually signals a design that should use a struct instead.
 - How does this relate to `argv`? => `argv` is `char **`: an array of `char *` strings, itself accessed through a pointer, which is the same "one extra level to reach a pointer value" idea.
@@ -109,6 +123,16 @@ int main(void) {
 }
 ```
 Compiled with `gcc -std=c11 -Wall -Wextra` and run: the caller printed `40` (ten 4-byte ints), the function printed `8` (one pointer on a 64-bit target). GCC's `-Wsizeof-array-argument` flags exactly this line, which is the compiler pointing at the same trap this question is about.
+
+**Ways to keep the length with the data:**
+
+- Pass it explicitly: `void process(const int *arr, size_t n)`, called as `process(arr, sizeof arr / sizeof arr[0])` where the array type is visible.
+- Pass a pointer to the whole array: `void f(int (*arr)[10])`; then `sizeof *arr` is 40, but only arrays of exactly 10 elements are accepted.
+- Wrap it: `struct buf { size_t len; int data[10]; };` so size travels with the struct.
+- Use a C99 VLA parameter to document the relationship: `void f(size_t n, int arr[n]);` (the parameter still decays; `sizeof arr` is still a pointer size).
+
+A common helper macro is `#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))`; it silently gives wrong results on pointers, so the Linux kernel's version adds a compile-time check that the argument really is an array.
+
 FOLLOW:
 - Does writing `int arr[10]` instead of `int *arr` as the parameter change anything? => No; C11 footnote 103 to 6.5.3.4 says the parameter is adjusted to the pointer type regardless of which spelling you use, so `sizeof` behaves identically either way.
 - How do you get the real element count into the function then? => Pass it explicitly as a second parameter, computed in the caller with `sizeof(arr) / sizeof(arr[0])` while the array type is still visible.
@@ -173,6 +197,7 @@ Q: How do you write one `swap` function in C that works for `int`, `double`, or 
 SHORT: Take `void *` parameters plus an explicit `size_t size`, and move bytes with `memcpy` through a temporary buffer; `void *` carries no type information, so the caller's element size must be passed in separately, exactly like `qsort` does.
 DEEP:
 ```c
+#include <stdio.h>
 #include <string.h>
 #include <stddef.h>
 
@@ -187,9 +212,16 @@ int main(void) {
     generic_swap(&x, &y, sizeof(x));
     double p = 1.5, q = 2.5;
     generic_swap(&p, &q, sizeof(p));
+    printf("x=%d y=%d p=%.1f q=%.1f\n", x, y, p, q);
+    return 0;
 }
 ```
 Compiled and run: `x,y` became `2,1` and `p,q` became `2.5,1.5`. A production version would size `tmp` dynamically (or use a fixed small max and reject larger sizes) rather than a hardcoded 64-byte stack buffer.
+
+**Why `unsigned char` and `memcpy`:** any object's bytes may be read and written as `unsigned char`, and `memcpy` does exactly that without alignment or aliasing problems, so the function works for structs and doubles alike. The library uses the same design: `qsort` and `bsearch` take `void *`, an element size and a comparison callback.
+
+Robustness points for a production version: reject `size > sizeof tmp` (or swap in chunks), do nothing when `a == b`, and note there is no type checking, so passing mismatched sizes compiles cleanly and corrupts memory. A macro version can add some safety: `#define SWAP(a, b) do { static_assert(sizeof(a) == sizeof(b), "size"); generic_swap(&(a), &(b), sizeof(a)); } while (0)`.
+
 FOLLOW:
 - Why not just use a macro instead? => A macro re-evaluates its arguments textually, which risks double side effects and cannot enforce that both arguments are the same size; a `void *` function centralizes the logic once.
 - Is this how the C standard library's own generic functions work? => Yes, `qsort` and `bsearch` use exactly this pattern: `void *` plus an explicit element size and a caller-supplied comparator.
@@ -240,6 +272,11 @@ int main(void) {
 }
 ```
 Compiled and run: `p < q` printed `1`, `p == r` printed `0`, and `p < r` printed `1` on this toolchain purely because of where the linker happened to place `arr` and `other`; that answer is not something a conforming program may rely on.
+
+**Why the standard forbids it:** C doesn't assume a flat address space. Segmented and some embedded or capability architectures (CHERI) have pointers where comparing unrelated objects has no meaningful answer, and optimizers are allowed to assume distinct objects never compare in a particular order.
+
+**When you really need an ordering** (e.g. lock ordering by address to avoid deadlocks, or checking whether a pointer lies inside a buffer), convert to `uintptr_t` first: `(uintptr_t)p < (uintptr_t)q`. The result is implementation-defined rather than undefined, and it behaves as expected on flat-memory targets. For an "is `p` inside `buf`?" check, compare the integer forms against `buf` and `buf + len`.
+
 FOLLOW:
 - Why single out relational operators and not `==`? => 6.5.9p6 defines equality purely in terms of "same object or both one-past-the-end", which needs no notion of address ordering; `<` inherently claims one address is numerically before another, which the standard only promises within one array.
 - Does this matter for real code? => Yes: sorting a list of unrelated heap pointers by comparing them with `<` is a common but technically nonportable pattern, even though it works on every mainstream flat-address-space target.
@@ -266,6 +303,18 @@ int main(void) {
 }
 ```
 Compiled and run: rows summed to `10`, `26`, `42`, matching a manual check of each row's four values.
+
+**Other ways to pass 2D data:**
+
+| Style | Declaration | Notes |
+|---|---|---|
+| Fixed columns | `int (*m)[4]` or `int m[][4]` | Column count fixed at compile time |
+| C99 VLA parameter | `void f(size_t r, size_t c, int m[r][c])` | Any size; VLA support is optional in C11 |
+| Flat buffer | `int *m, size_t cols`, index `m[i * cols + j]` | Most portable; common for images and DMA buffers |
+| Array of row pointers | `int **m` | Rows can live anywhere; NOT compatible with `int a[3][4]` |
+
+The common mistake is passing `int a[3][4]` to an `int **` parameter: the types are incompatible (the compiler warns), and indexing through it reinterprets the first row's integers as pointers, usually crashing.
+
 FOLLOW:
 - Can the column count be a runtime value instead of a literal `4`? => Yes, with a variable-length array parameter, `int (*m)[cols]`, where `cols` is an earlier parameter; C11 6.7.6.2 explicitly allows this at function scope.
 - What if you only have `int **m`? => That is a different, incompatible layout (an array of separately allocated rows); passing a true 2D array where `int **` is expected is a type error, not just a style choice.
@@ -291,6 +340,15 @@ int main(void) {
 }
 ```
 Compiled with `-Wall -Wextra`: GCC's `-Wsizeof-array-argument` fires on `buggy_count`'s `sizeof(arr)` line, naming this exact mistake. Running it printed `10`, `2`, `10`, confirming the diagnosis.
+
+**Design fixes, from simplest to safest:**
+
+- Compute the count where the array type is visible and pass it: `process(data, ARRAY_SIZE(data))`.
+- Use a sentinel value (like a string's `'\0'` or a `NULL` at the end of `argv`) when a natural terminator exists.
+- Bundle pointer and length in a struct (a "span"): `struct int_span { int *p; size_t n; };`, so they can't get separated.
+
+A guarded macro stops `ARRAY_SIZE` from being applied to a pointer: GCC's `__builtin_types_compatible_p(typeof(a), typeof(&(a)[0]))` detects the decayed case and can be turned into a compile error, which is how the Linux kernel's `ARRAY_SIZE` works.
+
 FOLLOW:
 - Would `size_t buggy_count(int *arr)` behave any differently? => No; per 6.7.6.3 a parameter written as `int arr[]` is adjusted to `int *arr`, so both spellings have identical, wrong, behavior here.
 - What is the general fix pattern? => Compute `sizeof(array)/sizeof(array[0])` only where the array's type is still visible (usually the caller), and pass the resulting count as a separate parameter.
@@ -313,6 +371,11 @@ int main(void) {
 }
 ```
 Compiled and run: printed `1 2 3 4`, using `end` only for comparison, never dereferencing it, which is exactly the boundary the standard draws.
+
+**Why even forming the pointer is UB:** the compiler may assume pointer arithmetic stays inside the object, and use that to simplify comparisons. For example, a bounds check written as `if (p + len > end)` can be optimized as if overflow never happens; when `len` is huge, `p + len` would wrap in hardware, but the compiler may delete the check entirely. The safe form compares sizes, not pointers: `if (len > (size_t)(end - p))`.
+
+Walking backwards has the same trap: `for (p = arr + n - 1; p >= arr; p--)` forms `arr - 1` on its last step, which is UB. Loop with an index (`for (size_t i = n; i-- > 0;)`) or stop at `arr` before decrementing. AddressSanitizer catches the resulting out-of-bounds accesses, although not the pointer formation itself.
+
 FOLLOW:
 - Why does the standard bother forbidding even forming an out-of-range pointer? => Because some architectures trap on computing certain invalid addresses, or the compiler may use pointer range information for optimization; the rule protects both.
 - Is `arr - 1` (one before the start) ever defined? => No, there is no "one before the beginning" exception analogous to one-past-the-end; only the past-the-end side has that special case.
@@ -334,6 +397,18 @@ int main(void) {
 }
 ```
 Compiled and run: printed `alpha`, `beta`, `gamma`, stopping at the `NULL` sentinel, exactly the pattern `argv` uses (`argv[argc]` is guaranteed null).
+
+**Trade-offs side by side:**
+
+| | `const char *names[]` | `char names[N][M]` |
+|---|---|---|
+| Storage | Pointer per entry, strings elsewhere (often in read-only `.rodata`) | One contiguous `N*M` byte block |
+| Strings modifiable? | Not if they point at literals | Yes, each row is a writable array |
+| Length per entry | Any length | Max `M - 1` characters |
+| Swapping or sorting entries | Swap pointers (cheap) | Copy whole rows |
+
+In firmware, `static const char *const state_names[] = {"IDLE", "BUSY", ...};` (both `const`s) lets the whole table live in flash; without the second `const` the pointer array itself is placed in RAM. Pairing it with an enum and a `_Static_assert` on the table size keeps names and states in sync.
+
 FOLLOW:
 - Why not just use `sizeof(names)/sizeof(names[0])` instead of a `NULL` sentinel? => That works fine for a fixed compile-time array like this one, but a sentinel lets the same loop shape work when the array was built at runtime and its length was never recorded separately.
 - Which layout is more cache-friendly for many short, similar-length strings? => The 2D array, since all the data is one contiguous block; the pointer-array version scatters each string wherever its allocation or literal happened to land.
@@ -426,6 +501,15 @@ int main(void) {
 }
 ```
 Compiled and run: `d` was `5`, and the byte-cast version was `20`, matching `5 * sizeof(int)` on a 4-byte `int`; `%td` is the correct `printf` conversion for `ptrdiff_t`.
+
+**Rules to remember:**
+
+- Subtraction is only defined when both pointers point into (or one past the end of) the same array object; subtracting pointers to unrelated objects is UB, just like relational comparison (4.10).
+- The result counts elements, so `(q - p) * sizeof *p` is the byte distance; casting both to `char *` (or `uint8_t *`) gives bytes directly.
+- `ptrdiff_t` is signed, so `p - q` is `-5` here; mixing it with `size_t` in comparisons triggers the signed/unsigned conversion trap from 2.04. Casting to `size_t` is fine once you know the result is non-negative.
+
+A typical use: after `char *end = memchr(buf, '\n', len);`, `end - buf` is the line length, and `(size_t)(end - buf) + 1` is the number of bytes to consume.
+
 FOLLOW:
 - What if `p` and `q` point into two different arrays? => Undefined behavior; 6.5.6p9 requires both pointers to point into the same array object (or one past its end) for the subtraction to be defined at all.
 - Why might the result overflow `ptrdiff_t` in theory? => On a target where an array can be larger than half the address space, the element-count difference could exceed what a signed `ptrdiff_t` can represent; this is why the standard calls that case undefined rather than defining a saturating result.

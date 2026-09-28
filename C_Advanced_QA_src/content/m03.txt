@@ -7,6 +7,16 @@ DEEP:
 - `attr` may be NULL for default attributes (module 3's remaining questions cover what those defaults are and how to change them); the SAME attributes object can be reused across multiple pthread_create() calls to create a "class" of similarly-configured threads.
 - The start routine takes exactly one `void *` argument and returns exactly one `void *` -- this is the ONLY channel for passing data in and getting a result out; 3.04-3.06 cover the real bugs this shape invites.
 - pthread_create() returns 0 on success or a nonzero error number (NOT via errno) on failure -- EAGAIN (resource/thread-count limits, 3.14) or EINVAL (bad attr).
+
+**The most common real bug with this signature** is passing the address of a loop variable:
+
+```c
+for (int i = 0; i < 4; i++)
+    pthread_create(&t[i], NULL, worker, &i);   /* BUG: all threads share one i */
+```
+
+By the time a thread reads `*(int *)arg`, `i` may have changed (or the loop may have finished), so several threads see the same id. Fixes: pass a pointer to a per-thread element (`&ids[i]` in an array that outlives the threads), pass a small integer cast through `intptr_t` (`(void *)(intptr_t)i`), or allocate a per-thread argument struct that the thread frees. Also note that `main` returning (or any thread calling `exit`) terminates the whole process, including threads still running, so join the threads first.
+
 FOLLOW:
 - Does the new thread start running immediately, or only after the creating thread continues? => Unspecified relative ordering; POSIX guarantees the thread exists and will run, but not that it starts before pthread_create() returns to the caller.
 - Why does pthread_create() return an error code directly instead of setting errno? => This is a deliberate POSIX threads convention (unlike most other POSIX calls); it avoids relying on a shared/thread-specific errno mechanism for a function whose whole purpose is to be safely callable from any thread.
@@ -44,6 +54,16 @@ int main(void) {
 }
 ```
 Compiled and run, this printed both workers running, `joined t1, return value=10` (the value t1's start routine returned, retrieved through pthread_join()'s value_ptr argument), and the detach message for t2, whose resources are reclaimed by the implementation with no further action and no retrievable status.
+
+**Rules that trip people up:**
+
+- Every thread must be joined or detached exactly once; a finished, never-joined thread keeps its stack and descriptor allocated (a "zombie thread"), which leaks memory in long-running services.
+- Joining a detached thread is undefined, and there is no way to "undetach".
+- A detached thread still dies when the process exits, so the `sleep(1)` in the example is only there to let it finish printing. Real code should not rely on sleeps.
+- You can create a thread detached from the start with `pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED)`.
+
+For a pool of workers, joinable threads plus an orderly shutdown (signal the workers, then join them all) is the usual design, because it guarantees nothing is still using shared state when you tear it down.
+
 FOLLOW:
 - Can you detach a thread AFTER already joining it? => No; once pthread_join() succeeds the thread and its ID are gone; pthread_detach() on an already-terminated-and-joined thread ID has nothing valid to act on.
 - What if two threads both try to pthread_join() the same target? => POSIX says the results of multiple SIMULTANEOUS joins on the same target are undefined; at most one join should "own" waiting for a given thread.
@@ -138,6 +158,15 @@ int main(void) {
 }
 ```
 Compiled and run, this printed `joiner: code=42 msg=done` -- the heap object survived the thread's termination (unlike a stack local would, 3.06) and was correctly freed by the joiner after use.
+
+**Alternatives to returning a heap pointer:**
+
+- Pass a caller-owned result slot in the argument struct: `struct job { int input; int result; };`, and the thread writes `job->result`. No allocation, and ownership is obvious. This is the usual choice for thread pools.
+- For a simple integer status, return it cast through `intptr_t`: `return (void *)(intptr_t)code;`.
+- Handle cancellation: if a thread may be cancelled, `pthread_join` yields `PTHREAD_CANCELED` instead of your pointer, so check before dereferencing.
+
+The ownership rule to state in an interview: whoever joins receives the pointer and must free it; a detached thread's heap result has no receiver, so it must not return one.
+
 FOLLOW:
 - What if the thread is detached (3.02) instead of joined -- who frees a heap result then? => There is no joiner to hand it to, so the thread itself must free anything it allocated for its "result" before exiting, or the design should not allocate a return value at all for a detached thread.
 - Is there a way to avoid the malloc()/free() pair entirely? => Yes, if the caller pre-allocates a result struct (on ITS OWN stack or heap) and passes a pointer to it IN via the void* argument (3.12's pattern); the thread writes into that caller-owned struct instead of allocating its own, and the caller reads it after pthread_join() confirms the thread is done -- no cross-thread free() needed at all.
@@ -377,6 +406,22 @@ int main(void) {
 }
 ```
 Compiled and run, this printed `first join rc=0 (Success)` and `second join rc=3 (No such process)` -- once the first pthread_join() completed, the thread ID `t` no longer referred to a valid, joinable thread, and the second call failed with ESRCH rather than hanging or silently succeeding again.
+
+**Why this is dangerous in real systems:** after a successful join, glibc may reuse the thread's descriptor (and the same `pthread_t` value) for the next thread created. A second join could then block on, or reap, an unrelated thread, and ESRCH is not guaranteed. The robust pattern is to track join state yourself:
+
+```c
+struct worker { pthread_t tid; int joined; };
+
+static void join_once(struct worker *w) {
+    if (!w->joined) {
+        pthread_join(w->tid, NULL);
+        w->joined = 1;
+    }
+}
+```
+
+The same reasoning applies to `pthread_detach` after a join, and to comparing `pthread_t` values: use `pthread_equal`, and don't use a thread ID after the thread has been joined or has exited while detached.
+
 FOLLOW:
 - Could the second call instead hang, crash, or return success on a different platform? => Yes, in principle; since POSIX does not define this case, a different implementation could legitimately behave differently -- treat this observed ESRCH as this platform's behavior, not a portable contract to code against.
 - Is this related to 3.09's EDEADLK self-join case? => Different mechanism, similar lesson: both are cases where calling pthread_join() outside its well-defined use (once, on a still-valid joinable thread, by exactly one caller) produces implementation-specific, not standard-guaranteed, results.

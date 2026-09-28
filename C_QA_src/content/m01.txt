@@ -136,6 +136,11 @@ int main(void)
 }
 ```
 Compiled and run: prints `1 2 3` (each call increments the same persistent object; a fresh automatic local would print `1 1 1`).
+
+**Why interviewers ask it:** the two meanings are unrelated, so the answer shows whether you know linkage and storage duration as separate ideas. In firmware, file-scope `static` is C's main encapsulation tool: module state and helpers stay private to one `.c` file, so two drivers can each have `static int init_done;` without a link clash. Block-scope `static` is handy for one-time initialization and counters, but it makes the function non-reentrant: two threads, or an ISR and main-line code, calling `next_id()` race on the same object.
+
+A third, rarer use: in an array parameter, `void f(int buf[static 16])` (C99) promises the caller passes at least 16 valid elements, which lets the compiler warn about calls with smaller arrays or NULL.
+
 FOLLOW:
 - Is a static local thread-safe? => No; without external synchronization, two threads calling `next_id()` concurrently can race on `id` (out of scope here, see the C Advanced page's concurrency modules for the memory-model treatment).
 - Why use file-scope static instead of a global? => To hide implementation details of a .c file (a translation-unit-private helper or state variable) the way a header-only "private" keyword would in other languages.
@@ -308,6 +313,11 @@ int main(void)
 }
 ```
 Compiled and run: `wrap:     200 + 100 = 44`, `saturate: 200 + 100 = 255`. The wraparound path is exactly what plain `+` followed by narrowing gives you for free; saturation always needs an explicit widened comparison, because C has no saturating-arithmetic operator.
+
+**Where it bites in practice:** accumulating `uint8_t`/`uint16_t` sensor or ADC samples. Wraparound turns an overload into a small value that looks valid, which is worse than a clamp. The recipe works for any width: widen, compare, then narrow.
+
+For the widest types there is no wider type to promote to, so check before adding: `if (a > UINT32_MAX - b) return UINT32_MAX;`, or use GCC/Clang `__builtin_add_overflow(a, b, &sum)`; C23 standardizes this as `ckd_add` in `<stdckdint.h>`. In hot DSP loops, ARM cores provide saturating instructions (`QADD`, `UQADD8`) that are usually reached through intrinsics rather than plain C.
+
 FOLLOW:
 - Does this generalize to signed types? => No directly; signed overflow itself is undefined behavior (module 10), so the "compute in a wider signed/unsigned type, then clamp" pattern must widen enough to avoid ever overflowing during the intermediate computation.
 - Is there a compiler builtin that helps? => gcc/clang expose `__builtin_add_overflow` for detecting overflow without relying on promotion width tricks; useful once you cannot simply widen further.
@@ -367,11 +377,16 @@ int tag(int v)
 
 int main(void)
 {
-    printf("sum = %d\n", tag(1) + tag(2) + tag(3));
+    printf("%d %d %d\n", tag(1), tag(2), tag(3));
     return 0;
 }
 ```
-Compiled and run on this gcc/x86-64 build: it happened to evaluate `tag(1)`, then `tag(2)`, then `tag(3)`, in that order, giving `sum = 6`. That left-to-right result is what this particular compiler chose today; the standard does not promise it, and other compilers (or the same compiler targeting a different ABI, such as most 32-bit x86 calling conventions which traditionally push arguments right-to-left) commonly choose the opposite order.
+Compiled with gcc 13 (`-std=c11 -Wall -Wextra`) on x86-64 Linux, at both `-O0` and `-O2`: the log shows `tag(3)` evaluated first, then `tag(2)`, then `tag(1)`, right to left. The final line still reads `1 2 3`, because each returned value lands in its own format slot. So the "left to right" assumption is already false on one of the most common toolchains, and other compilers or targets may choose left to right, or change their choice between versions.
+
+What depends on the order is every side effect inside the arguments: log lines, a shared counter like `n`, reads from a FIFO or a clear-on-read status register, or two calls consuming from the same stream. The calls don't overlap (each function call is indeterminately sequenced with respect to the others), but which runs first is unspecified.
+
+**The fix:** when order matters, evaluate into named locals in separate statements, `int a = read_fifo(); int b = read_fifo(); log_pair(a, b);`, because the end of each full expression is a sequence point. The same applies to operands of most binary operators: `tag(1) + tag(2) + tag(3)` is grouped as `(tag(1) + tag(2)) + tag(3)`, but the order of the three calls is still unspecified.
+
 FOLLOW:
 - Is this the same rule as the unsequenced-side-effect UB in module 2? => Related but distinct: evaluating each *argument value* in an unspecified order is well-defined (each argument is fully sequenced internally), whereas `i++ + i++` mixes a side effect and a value use of the same object with no sequencing at all, which is undefined, not just unspecified.
 - How do you write logging code safely then? => Evaluate anything with a side effect into a named local variable on its own statement first, then pass the already-computed values to the logging call.

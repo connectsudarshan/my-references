@@ -35,6 +35,38 @@ DEEP:
 - The classic APPLICATION USAGE example from mmap.3p: `fildes = open(...); address = mmap(0, len, PROT_READ, MAP_PRIVATE, fildes, some_offset); /* use data at address */` replaces `lseek` + `read` into a buffer.
 - mmap() requires the file descriptor to have been opened with read permission regardless of `prot`, and with write permission if `PROT_WRITE` is requested for a `MAP_SHARED` mapping (mmap.3p DESCRIPTION).
 - The mapping survives fork() (mmap.3p: "The mapping type is retained across fork()"); see 13.11.
+
+**A small file-reading example with both approaches:**
+
+```c
+#include <stdio.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+
+int main(int argc, char **argv) {
+    if (argc < 2) return 1;
+    int fd = open(argv[1], O_RDONLY);
+    if (fd < 0) { perror("open"); return 1; }
+    struct stat st;
+    if (fstat(fd, &st) < 0 || st.st_size == 0) { close(fd); return 1; }
+
+    const char *p = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (p == MAP_FAILED) { perror("mmap"); close(fd); return 1; }
+    close(fd);                               /* the mapping stays valid after close */
+
+    size_t lines = 0;
+    for (off_t i = 0; i < st.st_size; i++)
+        lines += (p[i] == '\n');
+    printf("%zu lines\n", lines);
+    munmap((void *)p, (size_t)st.st_size);
+    return 0;
+}
+```
+
+**When to prefer which:** `mmap` shines for large files with random access or data shared between processes; `read` is often as fast or faster for a single sequential pass, and handles pipes, sockets and files that change size. With `mmap`, I/O errors and truncation show up as `SIGBUS` on access rather than as an error return, which matters for storage validation tools reading possibly failing media.
+
 FOLLOW:
 - Does mmap() itself read the file's contents into memory immediately? => No; typically only the page table entries are set up, and the actual file data faults in lazily on first access (a major fault) unless the OS chooses to prefetch.
 - Can you mmap() a device file to talk to hardware registers? => Yes, that is exactly the memory-mapped I/O idiom used in 13.15, though a plain regular file stands in there for a real device node.

@@ -22,6 +22,24 @@ DEEP:
 - What counts as an "access" to a volatile object is implementation-defined (6.7.3p7 last sentence) -- e.g. whether a struct-of-bitfields access touches one byte or the whole word is up to the compiler/ABI.
 - volatile is a compiler-only contract: it constrains code generation, not the CPU or bus. It gives you no memory barrier, no cache-coherence guarantee, and no atomic read-modify-write.
 - Classic legitimate uses: memory-mapped I/O registers, and a flag written by a signal handler and polled by the rest of the program (see 7.11).
+
+**A register-polling example that relies on the contract:**
+
+```c
+#include <stdint.h>
+
+#define STATUS_REG (*(volatile uint32_t *)0x40001000u)
+#define READY_BIT  (1u << 0)
+
+void wait_ready(void)
+{
+    while ((STATUS_REG & READY_BIT) == 0)
+        ;   /* each iteration performs a real 32-bit load */
+}
+```
+
+Without `volatile`, the compiler may read the register once and spin forever (7.10 shows the assembly). What `volatile` still does not do: order the register write that starts a DMA against earlier normal stores to the DMA buffer (use a barrier such as `__DSB()` on ARM or a compiler/memory fence), make a read-modify-write like `STATUS_REG |= BIT` atomic against an ISR, or make a flag shared between threads correct (use C11 atomics; see the C Advanced page, module 7).
+
 FOLLOW:
 - Does volatile stop the CPU from reordering the access at the hardware/bus level? => No. On architectures with weak memory ordering you still may need a hardware barrier; volatile only controls what the compiler emits, not what the bus or cache does with it afterward.
 - Is `volatile int x; x++;` a safe increment across threads? => No, it is a non-atomic read-modify-write with no synchronization; use `<stdatomic.h>` for that (see the C Advanced page's memory-model module).
@@ -182,6 +200,21 @@ DEEP:
 - Reproduced from 7.06: `wait_volatile` compiles to a loop containing `movl flag_v(%rip), %eax` inside `.L2`; `wait_plain` compiles to `movl flag_p(%rip), %eax` **once**, followed by `.L8: jmp .L8` with no further memory access.
 - This is a good interview exercise because it forces you past "the standard says volatile prevents optimizing it away" into actually demonstrating the mechanism with a real toolchain and real output, which is the level a Principal reviewer expects.
 - The method generalizes: whenever someone claims "the compiler wouldn't do that," the answer is to compile the actual code at the actual flags and read the assembly, not to argue from intuition.
+
+**Reproducing it yourself** (the method is the lesson):
+
+```c
+int flag_p;
+volatile int flag_v;
+
+void wait_plain(void)    { while (!flag_p) ; }
+void wait_volatile(void) { while (!flag_v) ; }
+```
+
+Build with `gcc -O2 -S poll.c` (or paste into Compiler Explorer) and compare the two functions. The plain version loads once and then jumps to itself, because the compiler may assume nothing else changes `flag_p` inside a loop with no calls or volatile accesses (and C11 6.8.5p6 even lets it assume such a side-effect-free loop terminates). The volatile version keeps the load inside the loop.
+
+Two useful extensions for a review: show that `-O0` hides the bug (no caching at all, which is why "works in debug, hangs in release" is the classic symptom), and show that adding an opaque function call to the loop body also forces a reload, which is why the bug sometimes disappears when someone adds logging.
+
 FOLLOW:
 - What if the reviewer says "but -O0 works fine"? => Point out `-O0` is not what ships; firmware release builds use optimization, and the bug is specifically an optimization-dependent one -- reproduce at the shipped flags.
 - Is there a way to see this without reading assembly, e.g. from the source alone? => Not reliably; the standard leaves this to the implementation, so the only ground truth is what your actual compiler emits for your actual flags.
@@ -295,6 +328,29 @@ DEEP:
 - `const volatile` is the correct qualification for a read-only status register or free-running hardware counter: the program must never write it (const catches accidental writes at compile time) but must re-read it every time (volatile stops caching).
 - Contrast with plain `volatile` (a read/write register) and plain `const` (a compile-time constant the compiler can freely fold, cache, or place in ROM).
 - Repeated qualifiers (`const const int x;`) behave as if written once (6.7.3p5); this is rarely written directly but can arise through typedef composition.
+
+**A complete example** of the pattern for a free-running hardware timer:
+
+```c
+#include <stdint.h>
+
+#define TIMER_COUNT (*(const volatile uint32_t *)0x40002004u)
+
+uint32_t elapsed_since(uint32_t start)
+{
+    return TIMER_COUNT - start;   /* unsigned subtraction handles counter wraparound */
+}
+
+void delay_ticks(uint32_t ticks)
+{
+    uint32_t start = TIMER_COUNT;
+    while (elapsed_since(start) < ticks)
+        ;
+}
+```
+
+A write like `TIMER_COUNT = 0;` is a compile error because of `const`, and each call rereads the counter because of `volatile`. Read the qualifier from the inside out: `const volatile uint32_t *` is a pointer to a read-only, externally changing 32-bit object. The unsigned-subtraction trick makes elapsed-time math correct across a single wrap of the counter, a detail that interviewers often add as a follow-up.
+
 FOLLOW:
 - Can you cast away const on a const volatile register and write to it anyway? => Doing so and writing is undefined behavior if the object is genuinely declared const, exactly as in 7.05 -- the hardware may also simply ignore or fault on the write, since many read-only registers are physically not writable.
 - Why not just use plain const for a hardware counter that never seems to change during a debug session? => Because "never changes" is only true from the abstract machine's viewpoint if nothing outside the program can change it; a free-running counter or a register another core writes needs volatile regardless of how it appears in a single debug session.

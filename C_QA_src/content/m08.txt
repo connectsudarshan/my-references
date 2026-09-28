@@ -54,6 +54,26 @@ DEEP:
 - aligned_alloc(alignment, size) (7.22.3.1) is the standard's answer for stricter, caller-specified alignment: "size shall be an integral multiple of alignment," and alignment must be a valid, implementation-supported alignment.
 - In firmware, this matters directly for DMA buffers and certain SIMD/vector loads that fault (or are simply undefined) on misaligned access -- malloc's default guarantee is not automatically enough for those.
 - Practical check: `((uintptr_t)ptr % required_alignment) == 0` after allocation is a reasonable runtime sanity check when porting code between allocators.
+
+**Concrete numbers:** on x86-64 glibc, `malloc` returns 16-byte aligned memory (`alignof(max_align_t)` is 16); on 32-bit ARM it is typically 8. A cache-line-aligned (64-byte) or page-aligned buffer therefore needs one of these:
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+
+int main(void) {
+    size_t len = 4096;
+    void *dma = aligned_alloc(64, len);          /* C11: len must be a multiple of 64 */
+    if (!dma) return 1;
+    printf("aligned to 64: %d\n", (int)((uintptr_t)dma % 64 == 0));
+    free(dma);                                   /* freed with plain free() */
+    return 0;
+}
+```
+
+For a static buffer, `_Alignas(64) static uint8_t buf[4096];` (C11) or `__attribute__((aligned(64)))` does the same without the heap. Many RTOS and bare-metal environments have no `aligned_alloc`; the manual fallback over-allocates by `align - 1 + sizeof(void *)`, rounds the pointer up, and stores the original pointer just before the returned address so it can be freed later.
+
 FOLLOW:
 - Is malloc's alignment guarantee the same on every platform? => The requirement (support any fundamental-alignment object) is portable, but the actual numeric alignment (8, 16 bytes, etc.) is implementation-defined and can differ by platform/ABI.
 - What does aligned_alloc do if size is not a multiple of alignment? => The standard's description requires size to be an integral multiple of alignment; passing a non-multiple is a constraint the caller must satisfy, not something aligned_alloc is specified to correct for you.
@@ -319,6 +339,22 @@ DEEP:
 - glibc's malloc(0), for example, commonly returns a non-NULL, unique pointer you can legally pass to free but must not use to store or read anything through.
 - This matters for generic code that computes an allocation size from a variable (e.g. `malloc(n * sizeof(*p))` where n can be 0 at runtime) -- treating a NULL result as "always an allocation failure" is wrong if the implementation's malloc(0) legitimately returns NULL for a *zero-size, successful* request; the two cases (real failure vs. zero-size success) are indistinguishable from the return value alone.
 - The safe pattern: special-case size-zero requests in your own code before calling malloc, rather than relying on any particular implementation's malloc(0) behavior.
+
+**A wrapper that makes the behavior predictable:**
+
+```c
+#include <stdlib.h>
+
+void *xmalloc(size_t n)
+{
+    if (n == 0)
+        n = 1;          /* always return a unique, freeable pointer */
+    return malloc(n);   /* NULL now always means "out of memory" */
+}
+```
+
+The same ambiguity exists for `realloc(p, 0)`: historically some implementations freed `p` and returned NULL, others returned a minimal allocation, so callers could leak or double free. C23 made `realloc` with size 0 undefined behavior, so never call it that way; call `free` explicitly. Static analyzers (and `-Walloc-zero` in GCC) can flag zero-size allocations, which is useful in firmware where size arithmetic from host input can yield 0.
+
 FOLLOW:
 - Is realloc(ptr, 0) specified the same way? => The C11 text ties this to "the space requested," so the same implementation-defined either-NULL-or-nonzero-as-if behavior applies; note this exact corner (realloc with size 0) was tightened further in C23, so treat it as another spot where citing "C11 says X" needs the version caveat.
 - Should firmware code ever call malloc(0) deliberately? => Generally avoid it; if a zero-length buffer is a valid state in your protocol, model it explicitly (e.g. a length field of 0 with a NULL or sentinel pointer) rather than relying on allocator corner-case behavior.
