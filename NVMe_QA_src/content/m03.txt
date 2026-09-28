@@ -62,11 +62,13 @@ DEEP:
 - **Opcode layout:** bits 1:0 give the data transfer direction (00b none, 01b host to controller, 10b controller to host, 11b both) and bits 7:2 the function (Base 2.3, Figure 91).
 - **PSDT:** 00b means the data pointer holds PRPs. 01b and 10b mean SGL, with the metadata pointer either a contiguous buffer or an SGL segment. Detail is in the PRP and SGL module.
 - **Status field:** bits 31:17 of DW3 are the 15-bit status. Status code tables are in the Status Codes module.
+
+**ZNS reference (checked against ZNS 1.4):** Zone Append returns the Assigned LBA: Dword 0 holds bits 31:00 and Dword 1 bits 63:32, undefined if the command fails (ZNS 1.4, 3.4.1.2).
 FOLLOW:
 - Where is the opcode's function decided, in the SQE or by the queue? => By the opcode plus which queue: admin opcodes only work on the admin SQ, and I/O opcodes only on I/O SQs.
 - Which CQE fields identify the command? => The pair SQID (DW2) and CID (DW3). CID alone is not enough when a CQ is shared.
 PITFALL: Reading the phase tag as part of the status code. It shares the same 16-bit halfword, but it is bit 0 of that halfword and the status code starts at bit 1.
-VERIFY: The Zone Append 64-bit result across DW0 and DW1 (NVMe Zoned Namespace Command Set Specification), and which commands use CDW2 and CDW3 (command set specifications).
+VERIFY: Which commands use CDW2 and CDW3 (command set specifications).
 
 @@ 3.04 | Intermediate | Concept | tags=qsize,mqes,full,empty,outstanding,cq-overflow
 Q: How is queue size defined, when is a queue full, and what really limits the number of commands in flight?

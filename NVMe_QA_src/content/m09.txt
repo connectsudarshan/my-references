@@ -18,11 +18,12 @@ DEEP:
 - **Validity:** the status field means nothing until P matches the phase the host expects for that pass of the CQ. A stale slot has the old phase.
 - **Success:** SCT 0 and SC 0. P is 1 on the first pass, so DW3 is nonzero on a valid first-pass entry, but on the second pass P is 0 and a success with CID 0 has DW3 = 0.
 - **Two numbering conventions:** analyzers show the raw DW3. Linux stores the status shifted right by one to drop P, so its SC sits in bits 7:0, SCT in 10:8, CRD in 12:11, M in bit 13 and DNR in bit 14 (masks 1800h, 2000h and 4000h).
+
+**ZNS reference (checked against ZNS 1.4):** Zone Append returns the Assigned LBA: Dword 0 holds bits 31:00 and Dword 1 bits 63:32, undefined if the command fails (ZNS 1.4, 3.4.1.2).
 FOLLOW:
 - Is the status field valid before the phase tag matches? => No. Until P matches the expected phase the slot is stale, and no bit in it means anything.
 - Does a failed command still return the SQ Head Pointer? => Yes. Every CQE carries SQHD and SQID, so an error completion frees its SQ slot exactly as a success does.
 PITFALL: Comparing DW3 to zero to detect success. P is 1 on first-pass entries and 0 on second-pass ones, so mask it out and test SCT and SC.
-VERIFY: The use of DW0 and DW1 by Zone Append is defined in the Zoned Namespace Command Set Specification, not in Base 2.3.
 
 @@ 9.02 | Basic | Concept | tags=sct,status-code-type,decode,path
 Q: What are the status code types, and how do you read a status such as SCT 2 SC 81h?
@@ -40,11 +41,13 @@ DEEP:
 - **Where ZNS lives:** zone errors are SCT 1 with SC B8h to BFh (Zoned Boundary Error, Zone Is Full, Zone Is Read Only, Zone Is Offline, Zone Invalid Write, Too Many Active Zones, Too Many Open Zones, Invalid Zone State Transition), listed in Base 2.3, Figure 104.
 - **Path related:** these drive multipath failover, so the host cares whether it was the path or the media that failed (module 14).
 - **Generic 80h and up:** these values are I/O command set specific (NVM and ZNS, or Key Value for 85h to 89h) and are still in SCT 0. In every SCT the SC space splits into 00h to 7Fh (Admin, Fabrics or shared), 80h to BFh (I/O command set or Fabrics specific) and C0h to FFh (vendor) (Base 2.3, 4.2.3).
+
+**ZNS reference (checked against ZNS 1.4):** The zone statuses B6h to BFh, and the commands each applies to, are defined in ZNS 1.4 Figure 11.
 FOLLOW:
 - Who defines SCT 7? => The vendor. A validator should log the raw pair and map it through the vendor's documentation, never guess.
 - Which type would a failed ANA-inaccessible path return? => SCT 3, SC 02h, Asymmetric Namespace Access Inaccessible. It is a path problem, not a media error, and the host may retry on another path.
 PITFALL: Printing only SC. Log SCT and SC together, plus the DNR and M flags, ideally with the decoded name.
-VERIFY: The meaning of the 80h to BFh codes (LBA Out of Range, the zone errors) is defined by the NVM and Zoned Namespace Command Set Specifications. Base 2.3 only lists them.
+VERIFY: The meaning of 80h to 85h (LBA Out of Range and others) in the NVM Command Set Specification.
 
 @@ 9.03 | Basic | Concept | tags=generic-status,invalid-opcode,invalid-field,cid-conflict,data-transfer,internal-error
 Q: When does a controller return Invalid Opcode, Invalid Field, Command ID Conflict, Data Transfer Error and Internal Error?

@@ -352,11 +352,12 @@ DEEP:
 7. **Fault injection:** NAND program or erase failure mid-zone should produce a defined Read Only or Offline transition with correct reports and no data loss below the write pointer.
 8. **Host stack:** `nvme zns` commands, fio with `--zonemode=zbd`, and the Linux zoned block layer tools.
 9. **Exit criteria:** transition table complete, requirement traceability, statistical clean-cycle target for power loss (see the sample-size question), soak with mixed sequential zone workloads, no open critical defects.
+
+**ZNS reference (checked against ZNS 1.4):** When each B6h to BFh status applies: Figure 11 and 2.1.1.2.1.1. Zone states after reset: set only after an NVM Subsystem Reset or all controllers completing shutdown, with open zones becoming Closed, or Empty if nothing was written (2.1.1.3). MAR and MOR are 0's based, FFFFFFFFh meaning no limit (Figure 49). Zone Append returns the Assigned LBA: Dword 0 holds bits 31:00 and Dword 1 bits 63:32, undefined if the command fails (ZNS 1.4, 3.4.1.2).
 FOLLOW:
 - What do you reuse from conventional-namespace validation? => Self-describing data pattern (with generation per LBA range), reset matrix, soak monitors and evidence bundle. New work is the zone model and negative status coverage.
 - What is the hardest bug class here? => State divergence after a power cut or NAND failure: the drive reports a zone state or write pointer that disagrees with the data on media.
 PITFALL: Testing only the happy path of sequential writes. Most bugs live in the transitions and the resource limits.
-VERIFY: In the NVMe Zoned Namespace Command Set Specification: when each B8h to BFh status applies (Base 2.3 Figure 104 only lists the values and names), zone state transitions after a controller reset (open zones to Closed), the encoding of max active and open resources (zero-based, all ones for no limit), and Append completion field layout.
 
 @@ 20.17 | Principal | Trap | tags=oracle,mutation,false-pass,seeded-bugs,test-quality,page-cache
 Q: A nightly suite has been green for three months, yet a data-loss bug reaches the field. In how many ways can a test pass without testing, and how do you prove the suite can fail?
