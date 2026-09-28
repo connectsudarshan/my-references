@@ -27,6 +27,8 @@ CSS = """
 .deep-def .deep-lbl{color:#7ec8e3;}
 .deep-x{margin-top:18px;font-size:15px;line-height:1.75;color:var(--text);}
 .deep-x p{margin:0 0 10px 0;}
+.deep-x ul{margin:0 0 10px 0;padding-left:22px;}
+.deep-x li{margin:0 0 4px 0;}
 .deep-x .deep-lbl,.deep-f .deep-lbl{color:var(--accent);}
 .deep-pit{margin-top:16px;padding:12px 16px;border-radius:6px;border:1px solid rgba(255,157,157,0.35);background:rgba(255,157,157,0.06);font-size:14px;line-height:1.65;}
 .deep-pit .deep-lbl{color:#ff9d9d;}
@@ -46,7 +48,22 @@ function deepInline(s){
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
     .replace(/`([^`]+)`/g,'<code>$1</code>').replace(/\\*\\*([^*]+)\\*\\*/g,'<strong>$1</strong>');
 }
-function deepParas(s){ return String(s).split(/\\n\\s*\\n/).map(p => '<p>' + deepInline(p.replace(/\\n/g,' ')) + '</p>').join(''); }
+function deepParas(s){
+  // Blank lines separate blocks; inside a block, consecutive "- " lines become a list and other lines a paragraph.
+  return String(s).split(/\\n\\s*\\n/).map(block => {
+    let html = '', para = [], items = [];
+    const flushP = () => { if (para.length) { html += '<p>' + deepInline(para.join(' ')) + '</p>'; para = []; } };
+    const flushL = () => { if (items.length) { html += '<ul>' + items.map(i => '<li>' + deepInline(i) + '</li>').join('') + '</ul>'; items = []; } };
+    block.split('\\n').forEach(line => {
+      const t = line.trim();
+      if (/^- /.test(t)) { flushP(); items.push(t.slice(2)); }
+      else if (items.length && t && /^\\s/.test(line)) { items[items.length - 1] += ' ' + t; }
+      else if (t) { flushL(); para.push(t); }
+    });
+    flushP(); flushL();
+    return html;
+  }).join('');
+}
 function renderDeepTop(q){
   return q.deep ? `<div class="deep-def"><span class="deep-lbl">DEFINITION</span>${deepInline(q.deep.d)}</div>` : '';
 }
