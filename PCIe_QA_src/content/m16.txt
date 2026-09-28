@@ -14,7 +14,7 @@ FOLLOW:
 - What happens with Bus Master Enable clear? => The SSD cannot DMA, so it cannot fetch commands or return data. The driver sets it during probe.
 - Why is BAR0 64-bit? => It can map above 4 GB. But a 64-bit non-prefetchable BAR behind a bridge still has to fit the bridge's 32-bit non-prefetchable window (see the hot-plug debug question in module 15).
 PITFALL: Thinking NVMe commands travel through config space or a special bus. It is plain memory reads and writes.
-VERIFY: The class code, the BAR0 size and prefetchable requirement, and where the MSI-X table and PBA live, in the NVMe Base and NVMe over PCIe Transport specifications.
+VERIFY: Where the MSI-X table and PBA live on your controller, and any BAR0 prefetchable requirement in the NVMe over PCIe Transport Specification.
 
 @@ 16.02 | Basic | Concept | tags=bar0,registers,cap,cc,csts,doorbell,dstrd
 Q: What is in the NVMe BAR0 register space, and how are the doorbell addresses computed?
@@ -22,7 +22,7 @@ SHORT: BAR0 begins with CAP (capabilities, 8 bytes), VS (version), INTMS and INT
 DEEP:
 | Offset | Register | Purpose |
 |---|---|---|
-| 00h | CAP (8 B) | MQES, timeout, doorbell stride, NSSR support, supported command sets, page sizes, CMB and PMR support |
+| 00h | CAP (8 B) | MQES (bits 15:0), TO (31:24, 500 ms units), DSTRD (35:32), NSSRS (36), CSS (44:37), MPSMIN and MPSMAX (51:48, 55:52), PMRS (56), CMBS (57) |
 | 08h | VS | Spec version implemented |
 | 0Ch, 10h | INTMS, INTMC | Mask and unmask pin-based or MSI interrupts (not MSI-X) |
 | 14h | CC | EN, command set, memory page size, arbitration, shutdown notification, queue entry sizes |
@@ -38,7 +38,6 @@ FOLLOW:
 - Are doorbell writes ordered against each other? => They are posted writes to one device on one path, so they arrive in order. A later tail value implies the earlier entries are already in place, provided the driver wrote the entries first.
 - Why do drivers avoid reading CSTS or doorbells in the fast path? => Every MMIO read is a non-posted request that stalls the core for about a microsecond or more.
 PITFALL: Treating a doorbell as a counter of new commands. It is the queue index, and writing a wrong index corrupts the queue.
-VERIFY: All offsets, CAP field positions (MQES, TO in 500 ms units, DSTRD, NSSRS, CSS, MPSMIN and MPSMAX, CMBS, PMRS), the stride formula, and the NSSR value in the NVMe Base Specification register chapter.
 
 @@ 16.03 | Intermediate | Concept | tags=bring-up,init,cc-en,admin-queue,csts
 Q: What does NVMe controller bring-up look like as PCIe transactions?
@@ -58,7 +57,7 @@ FOLLOW:
 - Why is CC set only after AQA, ASQ and ACQ? => The controller uses those addresses as soon as it becomes ready, so they must be valid first.
 - What does CAP.TO bound? => The worst-case time for CSTS.RDY to change after CC.EN changes, in 500 ms units.
 PITFALL: Polling CSTS.RDY forever. Use CAP.TO as the timeout, and on expiry treat the controller as failed.
-VERIFY: Admin opcodes (Identify 06h, Create I/O SQ 01h, Create I/O CQ 05h, Set Features 09h), the Number of Queues Feature ID (07h), and the CC field encodings for entry sizes and page size.
+VERIFY: The CC field encodings for entry sizes and page size in the NVMe Base Specification.
 
 @@ 16.04 | Basic | Concept | tags=queues,sq,cq,phase-tag,doorbell,queue-depth,shadow-doorbell
 Q: How do NVMe submission and completion queues work, and how does queue depth relate to PCIe tags?
@@ -76,7 +75,7 @@ FOLLOW:
 - Why doesn't the host read the CQ tail register? => The phase tag tells it whether an entry is new, so the completion path is a memory read with no MMIO.
 - What does a queue-full condition mean on the bus? => The host has stopped ringing doorbells for new commands. Check CQ head doorbell writes are being made, or the controller cannot free SQ entries.
 PITFALL: Equating NVMe queue depth with the PCIe outstanding-request limit. They are separate resources.
-VERIFY: CQE field layout, phase tag initial value, admin queue size limits, and the Doorbell Buffer Config opcode (7Ch) in the NVMe Base Specification.
+VERIFY: The Doorbell Buffer Config opcode (7Ch) and whether your controller supports it.
 
 @@ 16.05 | Intermediate | Concept | fig=nvmeflow | tags=read,4kb,tlp,flow,doorbell,cqe,msix
 Q: What does one 4 KB NVMe read look like on the PCIe bus, TLP by TLP?
@@ -101,43 +100,43 @@ VERIFY: Whether your controller fetches one SQE or several per MRd, and whether 
 
 @@ 16.06 | Advanced | Numeric | tags=tlp-count,bytes,read,write,overhead,mps,rcb
 Q: How many TLPs and how many bytes cross the link for one 4 KB read and one 4 KB write?
-SHORT: With MPS 256, MRRS 512, 64-bit host addresses and no lists, a 4 KB read is 22 TLPs and about 4.75 KB on the wire, of which 19 TLPs and 4606 B go device to host. A 4 KB write is 30 TLPs and about 4.9 KB, of which 4594 B go host to device. The data phase is 88 to 89 percent of the busy direction. If the host returns 64-byte completions the write costs 78 TLPs.
+SHORT: With MPS 256, MRRS 512, 64-bit host addresses and no lists, a 4 KB read is 22 TLPs and about 4.7 KB on the wire, of which 19 TLPs and 4568 B go device to host. A 4 KB write is 30 TLPs and about 4.8 KB, of which 4556 B go host to device. The data phase is about 90 percent of the busy direction. If the host returns 64-byte completions the write costs 78 TLPs.
 DEEP:
-Assumptions: per-TLP link overhead 10 B (2 B sequence + 4 B LCRC + 4 B STP framing at 128b/130b), no ECRC, 4DW (16 B) headers for host memory and device BAR addresses, 3DW (12 B) for completions and for MSI-X to a 32-bit interrupt address, no PRP list, one SQE per fetch, no doorbell batching, and DLLPs and SKPs ignored.
+Assumptions: per-TLP link overhead 8 B (4 B STP token, which carries the sequence number, + 4 B LCRC at 128b/130b), no ECRC, 4DW (16 B) headers for host memory and device BAR addresses, 3DW (12 B) for completions and for MSI-X to a 32-bit interrupt address, no PRP list, one SQE per fetch, no doorbell batching, and DLLPs and SKPs ignored.
 4 KB read (device writes data to host):
 | Step | TLP | Direction | Count | Wire bytes each | Total |
 |---|---|---|---|---|---|
-| SQ tail doorbell | MWr 4 B | host to SSD | 1 | 30 | 30 |
-| SQE fetch | MRd 64 B | SSD to host | 1 | 26 | 26 |
-| SQE completion | CplD 64 B | host to SSD | 1 | 86 | 86 |
-| Data | MWr 256 B | SSD to host | 16 | 282 | 4512 |
-| CQE | MWr 16 B | SSD to host | 1 | 42 | 42 |
-| MSI-X | MWr 4 B | SSD to host | 1 | 26 | 26 |
-| CQ head doorbell | MWr 4 B | host to SSD | 1 | 30 | 30 |
-Total 22 TLPs, 4752 B. SSD to host: 19 TLPs, 4606 B (efficiency 4096 / 4606 = 88.9 percent). Host to SSD: 3 TLPs, 146 B.
-4 KB write (device reads data from host), MRRS 512, completions of 256 B: the two doorbells, SQE MRd and CplD as above, then 8 MRd of 512 B (26 B each) and 16 CplD of 256 B (278 B each), CQE and MSI-X. Total 30 TLPs, 4896 B. Host to SSD 4594 B (89.2 percent), SSD to host 302 B.
-- **RCB and completion size:** if the host splits completions into 128 B pieces the write is 46 TLPs and the host to SSD direction is 4946 B (82.8 percent). At 64 B pieces it is 78 TLPs and 5650 B (72.5 percent).
+| SQ tail doorbell | MWr 4 B | host to SSD | 1 | 28 | 28 |
+| SQE fetch | MRd 64 B | SSD to host | 1 | 24 | 24 |
+| SQE completion | CplD 64 B | host to SSD | 1 | 84 | 84 |
+| Data | MWr 256 B | SSD to host | 16 | 280 | 4480 |
+| CQE | MWr 16 B | SSD to host | 1 | 40 | 40 |
+| MSI-X | MWr 4 B | SSD to host | 1 | 24 | 24 |
+| CQ head doorbell | MWr 4 B | host to SSD | 1 | 28 | 28 |
+Total 22 TLPs, 4708 B. SSD to host: 19 TLPs, 4568 B (efficiency 4096 / 4568 = 89.7 percent). Host to SSD: 3 TLPs, 140 B.
+4 KB write (device reads data from host), MRRS 512, completions of 256 B: the two doorbells, SQE MRd and CplD as above, then 8 MRd of 512 B (24 B each) and 16 CplD of 256 B (276 B each), CQE and MSI-X. Total 30 TLPs, 4836 B. Host to SSD 4556 B (89.9 percent), SSD to host 280 B.
+- **RCB and completion size:** if the host splits completions into 128 B pieces the write is 46 TLPs and the host to SSD direction is 4876 B (84.0 percent). At 64 B pieces it is 78 TLPs and 5516 B (74.3 percent).
 - **Batching:** one doorbell per N commands, one SQE fetch for several entries, and a CQ head doorbell per N completions cut the control TLPs. At 4 KB the control overhead is only about 2 percent of the busy direction, so the data TLP size matters far more.
 FOLLOW:
 - Which direction is the bottleneck for reads and for writes? => Reads load the SSD to host direction, writes load the host to SSD direction. Full duplex means mixed traffic can exceed either alone.
 - How many tags does one 4 KB write use? => 9 non-posted requests (the SQE fetch plus 8 data reads), each holding a tag until its completions return.
 PITFALL: Counting only data TLPs. The control TLPs matter for small I/O rates, and the completion split matters for writes.
-VERIFY: Framing overhead for your generation (8b/10b, 128b/130b or FLIT), the header sizes for your address map, and what completion size your Root Complex actually returns.
+VERIFY: Header sizes for your address map, and what completion size your Root Complex actually returns.
 
 @@ 16.07 | Principal | Numeric | tags=iops,ceiling,gen4,gen5,4k-random,overhead
 Q: What is the PCIe ceiling on 4 KB random read IOPS for a Gen4 x4 and a Gen5 x4 SSD, and how honest a predictor is it?
-SHORT: The busy direction carries about 4606 B per 4 KB read at MPS 256. Gen4 x4 (7.877 GB/s) allows about 1.71 M IOPS and Gen5 x4 (15.75 GB/s) about 3.42 M, or about 1.70 M and 3.39 M with SKP and DLLP overhead. It is an upper bound, not a prediction. Gen4 drives usually hit controller or NAND limits first, while Gen5 drives come close enough that PCIe efficiency matters.
+SHORT: The busy direction carries about 4568 B per 4 KB read at MPS 256. Gen4 x4 (7.877 GB/s) allows about 1.72 M IOPS and Gen5 x4 (15.75 GB/s) about 3.45 M, or about 1.71 M and 3.42 M with SKP and DLLP overhead. It is an upper bound, not a prediction. Gen4 drives usually hit controller or NAND limits first, while Gen5 drives come close enough that PCIe efficiency matters.
 DEEP:
 1. Link rate: Gen4 x4 = 16 GT/s x 4 x 128/130 / 8 = 7.877 GB/s. Gen5 x4 = 15.754 GB/s, per direction.
-2. Bytes per read (SSD to host) from the previous question: 16 data TLPs x 282 B + MRd 26 B + CQE 42 B + MSI-X 26 B = 4606 B.
+2. Bytes per read (SSD to host) from the previous question: 16 data TLPs x 280 B + MRd 24 B + CQE 40 B + MSI-X 24 B = 4568 B.
 3. IOPS = link bytes per second / bytes per IO.
 | Host MPS | Bytes per IO | Gen4 x4 | Gen5 x4 |
 |---|---|---|---|
-| 128 | 5022 | 1.57 M | 3.14 M |
-| 256 | 4606 | 1.71 M | 3.42 M |
-| 512 | 4398 | 1.79 M | 3.58 M |
-4. Extras: one SKP ordered set per about 370 blocks costs about 0.3 percent, and a few DLLPs per IO another 0.5 percent. That gives about 4642 B and 1.70 M and 3.39 M at MPS 256.
-- **Sanity check:** 3 M IOPS at 4 KB is 12.3 GB/s of payload, and with about 4.6 KB per I/O on the wire it is about 13.8 GB/s, which is 88 percent of the Gen5 x4 raw rate. That is inside the PCIe envelope but leaves little headroom.
+| 128 | 4952 | 1.59 M | 3.18 M |
+| 256 | 4568 | 1.72 M | 3.45 M |
+| 512 | 4376 | 1.80 M | 3.60 M |
+4. Extras: one SKP ordered set per about 370 blocks costs about 0.3 percent, and a few DLLPs per IO another 0.5 percent. That gives about 4605 B and 1.71 M and 3.42 M at MPS 256.
+- **Sanity check:** 3 M IOPS at 4 KB is 12.3 GB/s of payload, and with about 4.57 KB per I/O on the wire it is about 13.7 GB/s, which is 87 percent of the Gen5 x4 raw rate. That is inside the PCIe envelope but leaves little headroom.
 - **Honesty about measured numbers:** datasheet random-read figures for current drives are typically below the ceilings, roughly 1.0 to 1.6 M for Gen4 x4, and about 1.5 to 2.6 M for consumer Gen5 x4 drives with enterprise Gen5 drives reaching around 3 M. The controller, NAND parallelism, firmware and host CPU cost per I/O usually bind first. PCIe becomes the limit only if MPS is small, the link is down-trained, or completions are split finely.
 - **Use:** a measured IOPS well below the bound says look at the host and the drive. A measured IOPS near the bound says look at MPS, batching and link efficiency.
 FOLLOW:
@@ -148,15 +147,15 @@ VERIFY: Current datasheet IOPS for the drives you compare, and the MPS your plat
 
 @@ 16.08 | Advanced | Concept | tags=sequential,throughput,mps,mrrs,tags,credits,gen4,gen5
 Q: Why does Gen4 x4 sequential throughput top out near 7 GB/s and Gen5 x4 near 14 GB/s, and how do MPS, MRRS, tags and credits shape it?
-SHORT: The link's raw rate is 7.88 and 15.75 GB/s. Each TLP carries roughly 26 bytes of overhead, so a 256-byte payload is about 91 percent efficient, giving 7.15 and 14.3 GB/s, and about 1 percent less for SKPs and DLLPs. Real drives report about 7.0 to 7.4 and 14 to 14.8 GB/s. MPS sets the payload efficiency, and tags, MRRS and credits decide whether the link stays full.
+SHORT: The link's raw rate is 7.88 and 15.75 GB/s. Each TLP carries 24 bytes of overhead with a 4DW header, so a 256-byte payload is about 91 percent efficient, giving 7.2 and 14.4 GB/s, and about 1 percent less for SKPs and DLLPs. Real drives report about 7.0 to 7.4 and 14 to 14.8 GB/s. MPS sets the payload efficiency, and tags, MRRS and credits decide whether the link stays full.
 DEEP:
-| MPS | Efficiency (26 B overhead) | Gen4 x4 | Gen5 x4 |
+| MPS | Efficiency (24 B overhead) | Gen4 x4 | Gen5 x4 |
 |---|---|---|---|
-| 128 | 83.1 % | 6.55 GB/s | 13.09 GB/s |
-| 256 | 90.8 % | 7.15 GB/s | 14.30 GB/s |
-| 512 | 95.2 % | 7.50 GB/s | 14.99 GB/s |
-With about 1 percent for SKP and DLLPs: 7.08 and 14.16 at MPS 256, and 7.42 and 14.84 at MPS 512.
-- **MPS:** the smallest MPS on the path wins, so a switch or root port at 128 B costs 8 to 9 percent. Drives quoted at the top of the range imply an MPS 512 path.
+| 128 | 84.2 % | 6.63 GB/s | 13.27 GB/s |
+| 256 | 91.4 % | 7.20 GB/s | 14.40 GB/s |
+| 512 | 95.5 % | 7.52 GB/s | 15.05 GB/s |
+With about 1 percent for SKP and DLLPs: 7.13 and 14.26 at MPS 256, and 7.45 and 14.90 at MPS 512.
+- **MPS:** the smallest MPS on the path wins, so a switch or root port at 128 B costs about 8 percent. Drives quoted at the top of the range imply an MPS 512 path.
 - **Tags and MRRS (SSD reading host memory, the write path):** bytes in flight = bandwidth x round trip. Gen5 x4 at 2 microseconds needs about 31.5 KB, or about 62 reads of 512 B. With 32 tags of 512 B at 2 microseconds you cap near 8.2 GB/s. Extended or 10-bit tags and a larger MRRS are needed at Gen5.
 - **Credits (SSD writing host memory, the read path):** the Root Complex must advertise enough posted data credits and return them fast. At a 1 microsecond credit loop Gen4 x4 needs about 7.9 KB, or about 490 credits of 16 B. Verify with the analyzer's InitFC and UpdateFC values (module 8).
 - **Other limits:** IOMMU translation, host memory bandwidth, NUMA distance, and the controller's DMA engine.
@@ -175,23 +174,23 @@ DEEP:
 - **Data TLP sizing:** each TLP is at most MPS, must not cross a 4 KB boundary, and stays inside one fragment.
 | Buffer layout for 4 KB | Data TLPs | Wire bytes | Efficiency |
 |---|---|---|---|
-| 16 fragments of 256 B (or contiguous) | 16 | 4512 | 90.8 % |
-| 32 fragments of 128 B | 32 | 4928 | 83.1 % |
-| 64 fragments of 64 B | 64 | 5760 | 71.1 % |
+| 16 fragments of 256 B (or contiguous) | 16 | 4480 | 91.4 % |
+| 32 fragments of 128 B | 32 | 4864 | 84.2 % |
+| 64 fragments of 64 B | 64 | 5632 | 72.7 % |
 - **Latency:** a list fetch is a dependent round trip. Controllers prefetch lists, but a long chain adds latency to the first data byte.
 - **Host side:** Linux uses PRPs by default and can use SGLs when the controller advertises them (the `sgl_threshold` parameter controls it).
 FOLLOW:
 - Does SGL reduce bus traffic for a contiguous buffer? => No. Same data TLPs, plus a descriptor to read.
 - What does a bit bucket save? => Data that the host does not want is not transferred at all, saving MWr TLPs on reads.
 PITFALL: Assuming SGL is always faster. It removes host copies for scattered buffers but adds descriptor fetches, and tiny fragments become tiny TLPs.
-VERIFY: The PRP list chaining rule, SGL descriptor types and the Identify Controller SGL support field in the NVMe Base Specification, and the Linux `sgl_threshold` default.
+VERIFY: The Linux `sgl_threshold` default on your kernel.
 
 @@ 16.10 | Intermediate | Concept | tags=msix,interrupts,coalescing,polling,vector
 Q: How does NVMe use MSI-X, and what does interrupt coalescing do to latency and PCIe traffic?
 SHORT: Each completion queue names an interrupt vector when it is created. The controller signals a completion by sending a 4-byte posted MWr to the address and data in that vector's MSI-X table entry, after the CQE write. Interrupt coalescing (Set Features: a count threshold and a time in 100 microsecond units) delays the interrupt to reduce the rate. It lowers CPU load at high queue depth and adds latency at low queue depth.
 DEEP:
 - **Vectors:** Linux allocates one MSI-X vector per I/O queue (usually per CPU) plus one for admin, and sets affinity so the completion lands on the submitting CPU.
-- **On the bus:** a 4-byte MWr, 26 B or 30 B on the wire, negligible bandwidth. Its cost is CPU time.
+- **On the bus:** a 4-byte MWr, 24 B or 28 B on the wire (3DW or 4DW header), negligible bandwidth. Its cost is CPU time.
 - **Ordering:** the MSI-X MWr follows the CQE in the same posted stream, so the handler sees the CQE.
 - **Masking:** a masked vector sets its pending bit in the PBA and fires on unmask. INTMS and INTMC are for pin-based and MSI interrupts, not MSI-X.
 - **Coalescing:** the aggregation threshold and aggregation time come from the Interrupt Coalescing feature, and the Interrupt Vector Configuration feature can turn coalescing off per vector. Default is usually none, because it hurts latency.
@@ -201,7 +200,6 @@ FOLLOW:
 - What does coalescing do at QD1? => It can add up to the aggregation time to every completion. That is why it is usually off for latency-sensitive workloads.
 - Why is the interrupt a separate posted write and not part of the CQE? => The CQE is a memory write for polling hosts. The interrupt is a separate message to the interrupt controller, so both models work.
 PITFALL: Turning on coalescing to raise IOPS and forgetting the QD1 latency hit.
-VERIFY: The Interrupt Coalescing and Interrupt Vector Configuration Feature IDs (08h and 09h) and their units, and the MSI-X table entry format (module 10).
 
 @@ 16.11 | Advanced | Concept | tags=cmb,pmr,p2p,bar,queue-placement,acs
 Q: Where can queues live, and what do CMB and PMR change on the PCIe side?
@@ -254,14 +252,14 @@ FOLLOW:
 - What if the CTO is programmed to 64 s? => It exceeds the NVMe timeout, so the driver's own reset MMIO reads can stall the CPU up to the CTO, and the reset looks hung.
 - What state do in-flight commands end in after the reset? => They are cancelled and requeued or failed. The SSD never posts their CQEs.
 PITFALL: Treating the NVMe timeout as the first symptom. Look earlier in the AER log for a CTO.
-VERIFY: The CTO ranges and default in Device Capabilities 2 and Device Control 2 (module 12), the Linux defaults (`nvme_core.io_timeout`, `admin_timeout`), and the exact driver message text on your kernel.
+VERIFY: The Linux defaults (`nvme_core.io_timeout`, `admin_timeout`) and exact driver message text on your kernel.
 
 @@ 16.14 | Advanced | Debug | tags=sequential,plateau,gen4,checklist,iommu,numa,fio
 Q: Sequential read plateaus at 3.2 GB/s on a Gen4 x4 drive. What do you check, and in what order?
-SHORT: 3.2 GB/s is about what a Gen3 x4 or Gen4 x2 link can deliver (ceiling about 3.5 GB/s), so read LnkSta first. If the link is 16 GT/s x4, check MPS, MRRS, AER counters, IOMMU mode, NUMA and IRQ placement, workload parameters (block size and queue depth), thermal and power state, and finally the drive's own limits. Change one variable at a time.
+SHORT: 3.2 GB/s is about what a Gen3 x4 or Gen4 x2 link can deliver (ceiling about 3.6 GB/s), so read LnkSta first. If the link is 16 GT/s x4, check MPS, MRRS, AER counters, IOMMU mode, NUMA and IRQ placement, workload parameters (block size and queue depth), thermal and power state, and finally the drive's own limits. Change one variable at a time.
 DEEP:
-1. **Link:** `lspci -vv -s <BDF>`, compare LnkCap to LnkSta. 8 GT/s x4 or 16 GT/s x2 gives a ceiling of 3.94 GB/s raw, about 3.5 after overhead, so 3.2 fits. Then triage the link (modules 4 and 5).
-2. **Payload sizes:** DevCtl MaxPayload and MaxReadReq. MPS 128 caps Gen4 x4 at about 6.5 GB/s, which alone would not explain 3.2.
+1. **Link:** `lspci -vv -s <BDF>`, compare LnkCap to LnkSta. 8 GT/s x4 or 16 GT/s x2 gives a ceiling of 3.94 GB/s raw, about 3.6 after overhead, so 3.2 fits. Then triage the link (modules 4 and 5).
+2. **Payload sizes:** DevCtl MaxPayload and MaxReadReq. MPS 128 caps Gen4 x4 at about 6.6 GB/s, which alone would not explain 3.2.
 3. **Errors:** AER correctable counters before and after the run. Rising Bad TLP and replays cut throughput (module 6).
 4. **Credits and tags:** with an analyzer, InitFC values and whether the SSD stalls on credits, and how many tags the SSD uses.
 5. **IOMMU:** `dmesg | grep -i iommu`. Strict translation on every DMA can cut throughput. Try passthrough mode as an experiment.
@@ -278,10 +276,10 @@ VERIFY: Which figures on the drive's datasheet apply to your capacity and worklo
 
 @@ 16.15 | Advanced | Debug | tags=iops,qd32,doorbell,coalescing,little-law,triage
 Q: Measured 4 KB random read IOPS is half the datasheet at QD32. How do you find out why?
-SHORT: First apply Little's law: 32 outstanding at 500 K IOPS implies 64 microseconds per I/O, so compare latency to the drive's. Then compute PCIe bytes per I/O (about 4.6 KB) to show whether the link is a limit, check the link speed and width, and check the test conditions behind the datasheet number. Then look at doorbell batching, interrupt coalescing, and per-queue and per-core limits.
+SHORT: First apply Little's law: 32 outstanding at 500 K IOPS implies 64 microseconds per I/O, so compare latency to the drive's. Then compute PCIe bytes per I/O (about 4.57 KB) to show whether the link is a limit, check the link speed and width, and check the test conditions behind the datasheet number. Then look at doorbell batching, interrupt coalescing, and per-queue and per-core limits.
 DEEP:
 1. **Little's law:** IOPS = QD / latency. 500 K IOPS at QD32 is 64 microseconds mean. If the drive's true latency is 80 microseconds, QD32 on one queue can only give 400 K. Datasheet numbers are often at QD128 or 256 across several threads.
-2. **PCIe bytes per I/O:** about 4606 B upstream (question 16.06). 500 K IOPS is 2.3 GB/s, 29 percent of Gen4 x4. So PCIe is not the limit unless the link is degraded: Gen3 x2 tops out near 430 K IOPS.
+2. **PCIe bytes per I/O:** about 4568 B upstream (question 16.06). 500 K IOPS is 2.3 GB/s, 29 percent of Gen4 x4. So PCIe is not the limit unless the link is degraded: Gen3 x2 tops out near 430 K IOPS.
 3. **Link and MPS:** LnkSta, DevCtl and AER, as in the plateau question.
 4. **Doorbells:** count doorbell MWr per I/O on the analyzer. Two per I/O means no batching. At 500 K IOPS that is 1 M MMIO writes per second, which costs CPU. Batch submits (io_uring, `iodepth_batch_submit`).
 5. **Interrupts:** `/proc/interrupts` shows the interrupt rate. A coalescing setting (feature 08h) can hold completions and stretch latency. Try polled I/O for comparison.

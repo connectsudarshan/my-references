@@ -28,7 +28,7 @@ lspci -vvv -s 01:00.0              # LnkCap/LnkSta, DevCtl, CESta/UESta, L1SS
 lspci -xxxx -s 01:00.0             # raw 4 KB config dump, keep it for offline decode
 setpci -s 01:00.0 CAP_EXP+0x12.w   # raw Link Status (offset 0x12 in the PCIe capability)
 cat /sys/bus/pci/devices/0000:01:00.0/current_link_speed
-nvme smart-log /dev/nvme0          # temperature, media_errors, unsafe_shutdowns
+nvme smart-log /dev/nvme0          # temperature, media_errors, unsafe_shutdowns (Unexpected Power Losses)
 nvme error-log /dev/nvme0
 journalctl -k -b -1 | grep -Ei "nvme|aer|dpc|pcieport"   # previous boot's kernel log
 fio --name=rd --filename=/dev/nvme0n1 --rw=randread --bs=4k --iodepth=32 --ioengine=io_uring --direct=1 --time_based --runtime=600
@@ -42,13 +42,13 @@ FOLLOW:
 - The link looks fine in lspci but I/O times out. What next? => Read CSTS and the NVMe logs, then trace the command path (doorbell, SQE fetch, data, CQE, interrupt). See the NVMe over PCIe module and the scenarios module.
 - Why journalctl -b -1? => After a reboot that lost the drive, the interesting messages are in the previous boot's log, provided the journal is persistent.
 PITFALL: Running the commands after a reset or a driver reload. Sticky AER bits, driver counters and device state have already changed.
-VERIFY: setpci capability names (CAP_EXP) and lspci output labels on your pciutils version, and the sysfs attributes available on your kernel.
+VERIFY: setpci capability names and lspci output labels on your pciutils version, and the sysfs attributes available on your kernel.
 
 @@ 17.03 | Basic | Concept | tags=windows,windbg,etw,powershell,vendor-tools
 Q: What are the Windows equivalents of the Linux PCIe and NVMe debug tools?
 SHORT: Device Manager and PowerShell Get-PnpDeviceProperty show the link speed and width the OS recorded. WinDbg kernel debugging with !pci dumps config space. Event Viewer shows WHEA-Logger PCIe error events and storage reset events. Windows Performance Recorder and Analyzer capture ETW traces of the storage stack, Get-StorageReliabilityCounter gives SMART-like data, and diskspd or fio generate load. Vendor tools cover NVMe logs.
 DEEP:
-- **Link facts:** the PCI device properties in Device Manager (Details tab) or `Get-PnpDeviceProperty -InstanceId <id>` list current and maximum link speed and width. Compare current against maximum.
+- **Link facts:** the PCI device properties in Device Manager (Details tab) or `Get-PnpDeviceProperty -InstanceId <id>` list current and maximum link speed and width (`DEVPKEY_PciDevice_CurrentLinkSpeed`, `CurrentLinkWidth`, `MaxLinkSpeed`, `MaxLinkWidth`). Compare current against maximum.
 - **Config space and topology:** WinDbg in kernel mode: `!pci` dumps PCI config space, `!devnode` and `!devstack` show the device tree and stack. This needs a debug connection.
 - **Errors:** the Windows System event log has WHEA-Logger events for corrected and uncorrected PCIe errors, but only if firmware handed AER control to the OS. Storport and stornvme reset events (for example "Reset to device ... was issued") mark command timeouts.
 - **Tracing:** `wpr` records ETW with storage providers, and WPA shows I/O latency by layer. Use it to see which I/Os stalled and for how long.
@@ -58,7 +58,7 @@ FOLLOW:
 - Windows shows no PCIe errors but the drive drops. Is the link healthy? => Not proven. Firmware may own AER so the OS never sees it, and the WHEA channel may be filtered. Check platform settings and use vendor or analyzer data.
 - Why compare Windows and Linux on the same box? => It splits OS and driver behavior from hardware. If the failure follows the hardware in both, the cause is below the OS.
 PITFALL: Assuming the absence of WHEA events means the link had no errors. It only means none were reported to the OS.
-VERIFY: DEVPKEY names for link speed and width, WHEA-Logger event IDs, stornvme and storport reset event IDs, and whether your NVMe passthrough tool supports the log pages you need.
+VERIFY: WHEA-Logger, stornvme and storport event IDs on your Windows version, and whether your NVMe passthrough tool supports the log pages you need.
 
 @@ 17.04 | Intermediate | Concept | fig=stack | tags=method,triage,bisect,layers
 Q: What is your disciplined method for debugging a PCIe or NVMe failure?
@@ -86,7 +86,7 @@ PITFALL: Changing several variables at once (new BIOS, new drive, new cable) and
 Q: What visibility does the SSD itself give you for PCIe problems, and what do you ask the firmware team to provide?
 SHORT: The SSD can log what no external tool can: its own LTSSM history, Recovery and speed-change counts, equalization results, per-lane margin, Bad TLP and replay counters as its MAC saw them, and which reset (PERST#, CC.EN, FLR, subsystem reset) arrived and when. Access is through vendor log pages, host-initiated and controller-initiated telemetry, UART and JTAG.
 DEEP:
-- **Vendor log pages:** Get Log Page with a vendor-specific log identifier returns firmware counters and trace buffers.
+- **Standard and vendor log pages:** Error Information is log ID 01h, SMART / Health 02h, Telemetry Host-Initiated 07h and Telemetry Controller-Initiated 08h. Get Log Page with a vendor-specific identifier (C0h to FFh) returns firmware counters and trace buffers.
 - **Telemetry:** the host-initiated log is a snapshot the host requests on demand. The controller-initiated log is created by the SSD itself on an internal event such as an assert, so it can capture the state of a crash.
 - **UART:** a firmware console for prints, register peeks and history dumps. **JTAG or SWD:** halts cores and reads the PCIe controller and PHY registers directly, useful when the firmware is hung.
 - **Counters to request:**
@@ -101,7 +101,7 @@ FOLLOW:
 - How do you line up an SSD-side log with a host-side trace? => Use a shared marker: a GPIO toggle from firmware, a unique command ID or LBA, or an analyzer trigger, since the clocks differ.
 - Who should define the counter set? => Validation, with firmware. Ask for counters that map to the layer checklist and that are readable in production firmware, not just a debug build.
 PITFALL: Trusting a debug-build result for a timing-sensitive failure. If the failure disappears on the debug build, timing changed.
-VERIFY: Log identifiers for the Error Information, SMART, Telemetry Host-Initiated and Telemetry Controller-Initiated pages and the vendor-specific range in the NVMe Base Specification, and any standardized telemetry defined by the OCP Datacenter NVMe SSD specification.
+VERIFY: Any standardized telemetry defined by the OCP Datacenter NVMe SSD specification that your product must support.
 
 @@ 17.06 | Intermediate | Concept | tags=analyzer,interposer,probe,visibility
 Q: Compare protocol analyzer connection methods, and what an analyzer can and cannot see.
@@ -184,7 +184,7 @@ FOLLOW:
 - Which direction does margining at the root port measure? => The SSD-to-host direction: the SSD transmitter, the channel and the root port receiver. Margining at the SSD receiver measures host to SSD.
 - Does the platform always let you margin? => No. Some root ports do not implement it or firmware locks it, so plan for the case where only the SSD side can be margined.
 PITFALL: Reporting one margin number per link. Report per lane and per direction, since the worst lane decides the link.
-VERIFY: Which data rates require Lane Margining at the Receiver support (and whether voltage margining is mandatory), the extended capability ID (0027h), the retimer receiver numbering, and the pciutils margining tool (pcilmr) and its minimum version.
+VERIFY: The retimer receiver numbering in the margining commands, and the pciutils version that ships the pcilmr margining tool.
 
 @@ 17.10 | Intermediate | Concept | tags=compliance,pci-sig,integrators-list,cbb,clb,loopback
 Q: How does the PCI-SIG compliance program work at a concept level, and what do the test boards and loopback do?
@@ -206,14 +206,14 @@ VERIFY: Exact names and status of the PCI-SIG workshop and Integrators List prog
 
 @@ 17.11 | Advanced | Numeric | tags=analyzer,capture-buffer,filtering,line-rate
 Q: How long does a 64 GB analyzer capture buffer last at Gen4 x4 full line rate, and what does filtering buy you?
-SHORT: A Gen4 x4 link carries about 7.88 GB/s per direction after decoding. Capturing both directions at full rate is about 15.75 GB/s, so 64 GB fills in about 4.1 seconds (8.1 s for one direction), and Gen5 x4 halves that to 2 seconds. Dropping TLP payloads keeps about 26 of about 282 bytes per 256 B TLP, roughly 11 times longer: about 44 s at saturation, and less of a gain for traffic that is mostly small TLPs, which shrink far less than payload-heavy traffic.
+SHORT: A Gen4 x4 link carries about 7.88 GB/s per direction after decoding. Capturing both directions at full rate is about 15.75 GB/s, so 64 GB fills in about 4.1 seconds (8.1 s for one direction), and Gen5 x4 halves that to 2 seconds. Dropping TLP payloads keeps about 24 of about 280 bytes per 256 B TLP, roughly 12 times longer: about 47 s at saturation, and less of a gain for traffic that is mostly small TLPs, which shrink far less than payload-heavy traffic.
 DEEP:
-Assumptions: Gen4 x4, 16 GT/s x 4 lanes x 128/130, the analyzer stores about one byte per decoded byte with no compression, a 256 B payload with a 4DW header, and a 64 GB buffer. Real analyzers add timestamp and metadata, so treat this as an upper bound (vendor detail, VERIFY).
+Assumptions: Gen4 x4, 16 GT/s x 4 lanes x 128/130, the analyzer stores about one byte per decoded byte with no compression, a 256 B payload with a 4DW header, and a 64 GB buffer. Real analyzers add timestamp and metadata, so treat this as an upper bound.
 1. Per direction: 16e9 x 4 x 128/130 / 8 = 7.877 GB/s.
 2. Both directions saturated: 2 x 7.877 = 15.75 GB/s. Time = 64 / 15.75 = **4.06 s**. One direction only: 64 / 7.877 = 8.1 s.
 3. Gen5 x4: double the rate, so 2.03 s for both directions.
-4. Filtering payloads: one 256 B TLP is 256 + 16 (header) + 2 (sequence number) + 4 (LCRC) + 4 (framing token) = 282 B. Keeping everything but the payload is 26 B, a ratio of 10.8. Saturated: 4.06 x 10.8 = **44 s**.
-5. A realistic 4 KB random read workload at 3.5 GB/s of payload: upstream about 3.5 x 282/256 = 3.9 GB/s, plus about 0.2 GB/s downstream (assumed: doorbells, SQE completions, DLLPs), so about 4.1 GB/s total. Unfiltered: 64 / 4.1 = **16 s**. Header-only: the upstream data shrinks to 3.9 x 26/282 = 0.36 GB/s, while the small downstream TLPs stay near 0.2 GB/s, so about 0.56 GB/s and 64 / 0.56 = **about 114 s**.
+4. Filtering payloads: one 256 B TLP is 256 + 16 (header) + 4 (STP token with the sequence number) + 4 (LCRC) = 280 B. Keeping everything but the payload is 24 B, a ratio of 11.7. Saturated: 4.06 x 11.7 = **47 s**.
+5. A realistic 4 KB random read workload at 3.5 GB/s of payload: upstream about 3.5 x 280/256 = 3.83 GB/s, plus about 0.2 GB/s downstream (assumed: doorbells, SQE completions, DLLPs), so about 4.0 GB/s total. Unfiltered: 64 / 4.0 = **16 s**. Header-only: the upstream data shrinks to 3.83 x 24/280 = 0.33 GB/s, while the small downstream TLPs stay near 0.2 GB/s, so about 0.53 GB/s and 64 / 0.53 = **about 121 s**.
 6. SKP ordered sets are about 16 B per 370 or so blocks, roughly 0.3 percent. They clutter the trace but barely change capture time.
 
 - **Conclusion:** even 64 GB gives seconds to minutes. So capture must be trigger-driven, with a ring buffer, pre-trigger depth and header-only or otherwise filtered capture for anything that takes longer to happen than that.
@@ -222,7 +222,7 @@ FOLLOW:
 - Which direction fills first in a read-heavy workload? => Upstream, since the SSD sends the data. Some analyzers let you allocate buffer per direction or filter one side.
 - How would you capture a failure that appears once per hour? => Trigger on the earliest symptom, header-only, hardware-trigger a save, re-arm automatically, and log which triggers fired.
 PITFALL: Quoting buffer time at full line rate for a trace of a real workload, or at the decoded rate for an analyzer that stores raw symbols with overhead.
-VERIFY: How your analyzer stores data (raw symbols versus decoded, timestamp overhead, compression) and the SKP ordered-set interval for 128b/130b in the Base Specification.
+VERIFY: How your analyzer stores data (raw symbols versus decoded, timestamp overhead, compression).
 
 @@ 17.12 | Advanced | Trap | tags=lnksta,link-up,retrain,lbms,health
 Q: The lab report says "link up at Gen5 x4, so the link is healthy". Why is that not proof, and what else do you check?
@@ -277,7 +277,7 @@ Q: Sequential read throughput is 7.0 GB/s at 25 C but drops to about 6.2 GB/s at
 SHORT: First prove it is PCIe replay and not SSD thermal throttling: check the SSD temperature and throttle counters, and compare the loss with the Bad TLP rate. An 11 percent loss implies a BER near 2e-6, or about 1e5 Bad TLPs per second. Then localize the temperature-sensitive part with local heating and cooling, run lane margining at both ends across temperature, and test whether a retrain at temperature restores the link.
 DEEP:
 1. **Rule out throttling:** `nvme smart-log` composite temperature and thermal management counters. Throttling cuts throughput without Bad TLPs. Here Bad TLPs rise on the receiver of the read direction, which is the root port, so replay is real.
-2. **Quantify with the replay model** (Data Link module, Gen4 x4, 282 B TLPs, window of 30 TLPs): efficiency = 1 / (1 + 67,200 x BER). A drop from 7.0 to 6.2 GB/s (efficiency about 0.886) gives BER = (1/0.886 - 1) / 67,200 = about 1.9e-6. Per-TLP error probability is 2240 x 1.9e-6 = 4.3e-3. At 7.0 GB/s that is about 24.8 million TLPs per second, so about 1e5 Bad TLPs per second.
+2. **Quantify with the replay model** (Data Link module, Gen4 x4, 280 B TLPs, window of 30 TLPs): efficiency = 1 / (1 + 67,200 x BER). A drop from 7.0 to 6.2 GB/s (efficiency about 0.886) gives BER = (1/0.886 - 1) / 67,200 = about 1.9e-6. Per-TLP error probability is 2240 x 1.9e-6 = 4.3e-3. At 7.0 GB/s of 256 B payloads that is about 27 million TLPs per second, so about 1.2e5 Bad TLPs per second.
 3. **Sanity check the counters:** if the measured rate is 10 per second, replay explains almost none of the loss. Note AER status bits are sticky flags and OS counters count reported events, so they undercount. Use the SSD's or root port's PHY counters, or the analyzer, for true rates.
 4. **Localize:** the chamber heats everything. Use a thermal head or spot heating and cooling on the SSD controller, the retimer, the root complex and the connector one at a time. Swap parts, and run margining on both ends at 25 C and 70 C.
 5. **Separate margin loss from stale equalization:** at 70 C, force a retrain (Retrain Link) or re-equalize. If errors vanish, equalization adapted at 25 C is stale. If they stay, real margin was lost.
@@ -302,8 +302,8 @@ DEEP:
 | L0 reached, config reads return CRS or the BIOS times out | SSD firmware not ready in time |
 | Config space reads fine, driver finds no controller | CSTS.RDY or firmware issue after enumeration |
 
-2. **Measure the reset:** scope PERST#, refclk and the 3.3 V rail through the reboot. Was PERST# asserted at all, for how long, and was refclk stable before it was released? The CEM parameters are about 100 ms from power valid to PERST# release, and refclk stable about 100 microseconds before release (VERIFY).
-3. **Dirty shutdown:** check `unsafe_shutdowns` in the smart-log. If a warm reboot without a shutdown notification forces power-loss recovery in firmware, the SSD may take seconds to become ready. A robust device brings the link up early and returns CRS or CSTS.RDY = 0 until ready. It should not delay training.
+2. **Measure the reset:** scope PERST#, refclk and the 3.3 V rail through the reboot. Was PERST# asserted at all, for how long, and was refclk stable before it was released? The CEM parameters are 100 ms from power valid to PERST# release (T_PVPERL), and refclk stable at least 100 microseconds before release (T_PERST-CLK).
+3. **Dirty shutdown:** check `unsafe_shutdowns` (Unexpected Power Losses) in the smart-log. If a warm reboot without a shutdown notification forces power-loss recovery in firmware, the SSD may take seconds to become ready. A robust device brings the link up early and returns CRS or CSTS.RDY = 0 until ready. It should not delay training.
 4. **Time it:** from PERST# release to first TS1, to L0, to the first successful config read, and to CSTS.RDY. Compare the failing boot with a good one.
 5. **Confirm with a rescan:** after the OS is up, `echo 1 > /sys/bus/pci/rescan`. If the drive appears, the link and drive were slow, not dead.
 6. **Fix options:** firmware (start training and answer CRS sooner, shorten recovery), BIOS (longer wait or a proper PERST# pulse), platform (PERST# and refclk timing).
@@ -311,7 +311,7 @@ FOLLOW:
 - Why does the rescan result matter? => It separates "not ready in time" from "not on the link". A drive that appears later was alive and late.
 - Would you also try hot reset and FLR? => Yes, as separate variables. A warm reboot may not toggle PERST#, so hot reset paths and SSD reset handling in the Resets module are relevant.
 PITFALL: Treating a warm reboot as a mild cold boot. It removes the power cycle that cleans up the SSD, retimer and clock state.
-VERIFY: PERST# and refclk timing parameters in the CEM specification, and the requirements for device readiness and CRS behavior after Conventional Reset in the Base Specification.
+VERIFY: The requirements for device readiness and CRS behavior after Conventional Reset for your SSD's firmware boot time.
 
 @@ 17.16 | Principal | Debug | tags=correlation,nak,bios,poison,two-factor
 Q: Three failures each follow one variable: NAK storms after a specific TLP size, completion timeouts only with one host BIOS version, and poisoned TLPs from the SSD only on writes to one address range. How do you attack each one?
@@ -331,7 +331,6 @@ FOLLOW:
 - The NAK storm is deterministic at one size and only above Gen2. What does that suggest? => A 128b/130b framing or alignment issue, not signal integrity. Confirm with the same size at Gen2, and by reading the wire LCRC.
 - Timeouts vanish when ASPM L1 is disabled in the new BIOS. What does that mean? => The exit latency or LTR handling under that BIOS is too slow for the device. Check L1 substate settings and completion timeout range.
 PITFALL: Changing the variable and a second thing at once. A two-factor experiment (hold one fixed, sweep the other) is the only way to separate host address from LBA from buffer.
-VERIFY: Poisoned TLP and Completion Timeout bit names and default completion timeout range in the Base Specification, and the 128b/130b STP token and framing rules.
 
 @@ 17.17 | Principal | Scenario | tags=automation,triage,pipeline,classification,evidence
 Q: How would you build a triage-automation pipeline that collects evidence on failure and classifies the failure signature?
@@ -374,7 +373,7 @@ DEEP:
 |---|---|
 | Rail voltage | Nominal, and the low and high limits of the form factor's supply tolerance |
 | Temperature | Cold, ambient, hot (case and ambient), plus thermal ramps |
-| Refclk | SSC off and on (down-spread, about 30 to 33 kHz modulation), frequency offset toward the plus and minus limits (VERIFY) |
+| Refclk | SSC off and on (down-spread up to 0.5 percent at 30 to 33 kHz modulation), frequency offset toward the plus and minus 300 ppm limits |
 | Channel | Best and worst slot, cable and backplane length, with and without retimer, several units |
 | Speed and width | Gen1 to Gen5, and forced downtrain and retrain |
 | Events | Cold power cycle, warm reboot, hot reset, FLR, CC.EN toggle, L1.2 entry and exit |
@@ -396,4 +395,4 @@ FOLLOW:
 - One unit fails once in 3,000 cycles. Is it a fail? => The 95 percent upper bound with one failure is about 4.7 / n, near 0.16 percent. Investigate it as a real defect first. Do not average it away.
 - Why include SSC off? => Some systems run without spread spectrum, and a design that passes only with SSC on may depend on clock tolerance it does not have. Test both.
 PITFALL: Pooling all units and corners into one pass rate. A corner or unit that fails is hidden by the many that pass.
-VERIFY: Supply tolerance for your form factor, the refclk frequency tolerance and SSC parameters in the CEM and Base Specifications, and the fixtures used for refclk offset.
+VERIFY: Supply tolerance for your form factor and the fixtures used for refclk offset.

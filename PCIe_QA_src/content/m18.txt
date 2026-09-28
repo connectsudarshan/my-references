@@ -4,8 +4,8 @@
 Q: Walk through everything that happens from power-on until the first NVMe read completes.
 SHORT: Power rails and REFCLK stabilize, then PERST# is released. The LTSSM trains Detect, Polling, Configuration to L0 at 2.5 GT/s, then changes speed to the maximum, and the Data Link Layer completes flow control initialization. Firmware enumerates and assigns BARs, the OS driver maps BAR0, programs the admin queues and sets CC.EN, waits for CSTS.RDY, identifies the controller, creates the I/O queues, and finally a read goes doorbell, SQE fetch, data DMA, CQE and MSI-X.
 DEEP:
-1. **Power and clock:** supply rails reach their limits, REFCLK runs stably, then the platform releases PERST#. The CEM allows roughly 100 ms from power valid to PERST# release and wants REFCLK stable before release (VERIFY).
-2. **Link training** (see the LTSSM module): Detect, Polling, Configuration, L0 at 2.5 GT/s. Then a speed change through Recovery, with equalization at Gen3 and above, up to the highest common rate. Training must start soon after PERST# release (about 20 ms, VERIFY).
+1. **Power and clock:** supply rails reach their limits, REFCLK runs stably, then the platform releases PERST#. The CEM requires at least 100 ms from power valid to PERST# release (T_PVPERL) and REFCLK stable at least 100 microseconds before release (T_PERST-CLK).
+2. **Link training** (see the LTSSM module): Detect, Polling, Configuration, L0 at 2.5 GT/s. Then a speed change through Recovery, with equalization at Gen3 and above, up to the highest common rate. The LTSSM must start training (enter Detect) within 20 ms of the end of the Fundamental Reset.
 3. **Data Link Layer:** DL_Init sends InitFC1 and InitFC2 for VC0, then DL_Active, and TLPs can flow.
 4. **Enumeration** (see Config Space & Enumeration): firmware waits after reset, handles CRS while the SSD boots, reads the Vendor ID, assigns bus numbers, sizes and assigns BARs, and sets Memory Space and Bus Master Enable. Class code 010802h identifies an NVMe controller.
 5. **Driver bind:** the driver maps BAR0 and reads CAP (queue depth limit, doorbell stride, timeout CAP.TO in 500 ms units) and VS.
@@ -17,25 +17,25 @@ FOLLOW:
 - Which step has the longest and most variable time? => CC.EN to CSTS.RDY, which depends on firmware initialization and can approach the CAP.TO limit, followed by BIOS and OS enumeration.
 - Why create the CQ before the SQ? => The Create I/O SQ command names the CQ that receives its completions, so that CQ has to exist first.
 PITFALL: Treating "link up" as "device usable". Between L0 and the first I/O are DL_Active, enumeration, BAR programming, CC.EN and queue creation, each with its own failure signature.
-VERIFY: PERST# and REFCLK timing in the CEM, the 20 ms link-training start rule, CRS behavior, and the admin opcodes and field names in the NVMe Base Specification.
+VERIFY: CRS timing for your SSD's firmware boot, and the admin opcodes and field names in the NVMe Base Specification.
 
 @@ 18.02 | Advanced | Cross-layer | tags=read,tlp,mps,flow-control,ordering,latency
 Q: Trace a 4 KB read from the application down to NAND and back at every PCIe layer, with numbers.
-SHORT: The driver writes a 64-byte SQE and a 4-byte doorbell (a posted MWr). The SSD fetches the SQE (MRd and completion), reads NAND, then DMA-writes the 4 KB as sixteen 256-byte MWr TLPs, a 16-byte CQE and a 4-byte MSI-X write. That is 22 TLPs, about 4.6 KB upstream and about 150 B downstream. The data takes about 0.57 microseconds on Gen4 x4, negligible next to the NAND read.
+SHORT: The driver writes a 64-byte SQE and a 4-byte doorbell (a posted MWr). The SSD fetches the SQE (MRd and completion), reads NAND, then DMA-writes the 4 KB as sixteen 256-byte MWr TLPs, a 16-byte CQE and a 4-byte MSI-X write. That is 22 TLPs, about 4.6 KB upstream and about 140 B downstream. The data takes about 0.57 microseconds on Gen4 x4, negligible next to the NAND read.
 DEEP:
-Assumptions: Gen4 x4, MPS 256 B, a 4 KB aligned buffer (one PRP), and a fixed per-TLP cost of 10 B (2 sequence number, 4 LCRC, 4 framing) plus the header: 16 B for 4DW memory requests and 12 B for completions. So a memory TLP adds 26 B and a completion adds 22 B.
+Assumptions: Gen4 x4, MPS 256 B, a 4 KB aligned buffer (one PRP), and a fixed per-TLP cost of 8 B (4 B STP token carrying the sequence number, 4 B LCRC) plus the header: 16 B for 4DW memory requests and 12 B for completions. So a memory TLP adds 24 B and a completion adds 20 B.
 1. **Application to driver:** `pread` with O_DIRECT or io_uring, the block layer, then the NVMe driver builds the SQE (opcode 02h Read, PRP1 = buffer address) in the host SQ.
-2. **Doorbell:** MWr, 4 B payload, posted, to BAR0 at 1000h plus the queue offset (stride from CAP.DSTRD). Wire size 30 B.
-3. **SQE fetch:** SSD issues an MRd for 64 B (non-posted, with a Tag), the Root Complex returns a CplD. Wire size 26 B up, about 86 B down.
+2. **Doorbell:** MWr, 4 B payload, posted, to BAR0 at 1000h plus the queue offset (stride from CAP.DSTRD). Wire size 28 B.
+3. **SQE fetch:** SSD issues an MRd for 64 B (non-posted, with a Tag), the Root Complex returns a CplD. Wire size 24 B up, 84 B down.
 4. **NAND and FTL:** address translation, NAND read, ECC. Tens of microseconds for a typical TLC read (assumed 50 to 100 microseconds). This is where most of the latency is.
-5. **Data DMA:** 4096 / 256 = 16 MWr TLPs, each 256 + 26 = 282 B, so 4512 B. At 7.877 GB/s that is 573 ns (286 ns on Gen5 x4). Efficiency 4096 / 4512 = 90.8 percent. A memory TLP cannot cross a 4 KB boundary, so an aligned buffer needs no split beyond MPS.
+5. **Data DMA:** 4096 / 256 = 16 MWr TLPs, each 256 + 24 = 280 B, so 4480 B. At 7.877 GB/s that is 569 ns (284 ns on Gen5 x4). Efficiency 4096 / 4480 = 91.4 percent. A memory TLP cannot cross a 4 KB boundary, so an aligned buffer needs no split beyond MPS.
 6. **Flow control:** the 16 MWr TLPs use 16 posted-header credits and 16 x 16 = 256 posted-data credits (one data credit is 16 B). The Root Complex returns them with UpdateFC as its memory controller drains.
-7. **Completion:** CQE is a 16 B MWr (42 B on the wire) with the phase bit, then MSI-X is a 4 B MWr (26 B, a 3DW header because the interrupt address is below 4 GB). The driver later writes the CQ head doorbell (30 B).
+7. **Completion:** CQE is a 16 B MWr (40 B on the wire) with the phase bit, then MSI-X is a 4 B MWr (24 B, a 3DW header because the interrupt address is below 4 GB). The driver later writes the CQ head doorbell (28 B).
 8. **Ordering matters:** the CQE and MSI-X are posted writes behind the data writes on the same path, so posted ordering guarantees the host sees the data before it sees the completion (see Flow Control & Ordering).
-9. **Totals:** 22 TLPs. Upstream 26 + 4512 + 42 + 26 = 4606 B. Downstream 30 + 86 + 30 = 146 B, plus DLLPs.
+9. **Totals:** 22 TLPs. Upstream 24 + 4480 + 40 + 24 = 4568 B. Downstream 28 + 84 + 28 = 140 B, plus DLLPs.
 - **Latency budget:** PCIe round trips (doorbell to SQE fetch, then data, CQE and interrupt) add a few microseconds, while NAND adds tens. At QD1 the link speed barely matters, and at high QD it sets the ceiling.
 FOLLOW:
-- How does MPS 128 or 512 change this? => 128 B gives 32 TLPs and 83 percent efficiency, and 512 B gives 8 TLPs and 95 percent. The header cost is fixed per TLP.
+- How does MPS 128 or 512 change this? => 128 B gives 32 TLPs and 84 percent efficiency, and 512 B gives 8 TLPs and about 95 percent. The header cost is fixed per TLP.
 - What if the buffer is not 4 KB aligned? => The SSD needs two PRP entries, and the transfer splits at the page boundary into more, smaller TLPs.
 PITFALL: Assuming the completion can overtake the data. It cannot on the same path, because posted writes stay in order, and that is what NVMe relies on.
 VERIFY: Whether your platform's MPS is 128 B, 256 B or 512 B, the NAND read latency of your part, and the CQE and PRP field details in the NVMe Base Specification.
@@ -101,7 +101,7 @@ DEEP:
   2. Log SSD temperature, throttle counters, LnkSta, AER rates and Recovery counts every few seconds beside throughput.
   3. Repeat with a preconditioned drive, with a fan or heatsink change, and on another host.
 - **Prove the link is not the bottleneck:**
-  1. Ceiling: Gen5 x4 is about 15.75 GB/s per direction, about 14.3 GB/s at 256 B MPS. If you measure 3 GB/s, the link is at 20 percent.
+  1. Ceiling: Gen5 x4 is about 15.75 GB/s per direction, about 14.4 GB/s at 256 B MPS. If you measure 3 GB/s, the link is at 20 percent.
   2. Change the link: run at Gen4 (about 7.9 GB/s) or x2. If throughput does not move, the link is not limiting. If it drops proportionally, it is a co-limit.
   3. Watch the link: zero replay, no Recovery, no credit stalls in an analyzer or PHY counters.
   4. Use an SSD DMA loopback test (vendor tool) that moves data without NAND, to show the link and host can sustain the rate.
@@ -114,12 +114,12 @@ VERIFY: Your drive's thermal thresholds and throttle fields in the SMART log, an
 
 @@ 18.06 | Principal | Numeric | tags=topology,switch,bifurcation,lanes,oversubscription,numa,hot-plug
 Q: Design a 24-drive Gen5 NVMe server: budget the lanes and bandwidth, choose between direct attach and switches, and say what you validate.
-SHORT: Twenty-four x4 drives need 96 lanes. Each Gen5 x4 is 15.75 GB/s per direction raw. Direct attach gives every drive its full lanes but consumes 96 of the host's lanes. Three switches with x16 uplinks use 48 host lanes but cap each 8-drive group near 57 GB/s, a 2:1 lane and about 1.7:1 bandwidth oversubscription at 12 GB/s per drive. Choose by the workload's real limit, such as network bandwidth.
+SHORT: Twenty-four x4 drives need 96 lanes. Each Gen5 x4 is 15.75 GB/s per direction raw. Direct attach gives every drive its full lanes but consumes 96 of the host's lanes. Three switches with x16 uplinks use 48 host lanes but cap each 8-drive group near 58 GB/s, a 2:1 lane and about 1.7:1 bandwidth oversubscription at 12 GB/s per drive. Choose by the workload's real limit, such as network bandwidth.
 DEEP:
-Assumptions: Gen5 x4 drive = 32 GT/s x 4 x 128/130 = 15.75 GB/s per direction; 256 B MPS gives 256 / 282 = 90.8 percent TLP efficiency; each drive sustains 12 GB/s; the host has about 160 usable Gen5 lanes across two sockets (VERIFY per platform).
+Assumptions: Gen5 x4 drive = 32 GT/s x 4 x 128/130 = 15.75 GB/s per direction; 256 B MPS gives 256 / 280 = 91.4 percent TLP efficiency; each drive sustains 12 GB/s; the host has about 160 usable Gen5 lanes across two sockets (VERIFY per platform).
 1. **Lanes:** 24 x 4 = 96 lanes for drives.
 2. **Direct attach:** 96 host lanes, no oversubscription. Aggregate 24 x 12 = 288 GB/s. Leaves about 64 lanes for NICs and others.
-3. **Three switches, eight drives each, x16 uplink:** downstream 32 lanes and upstream 16, so 2:1 by lanes. Uplink 63.0 GB/s raw, x 0.908 = 57.2 GB/s usable. Demand 8 x 12 = 96 GB/s, so 1.7:1 oversubscription. Per drive about 7.2 GB/s when all are busy. Aggregate cap 3 x 57.2 = 172 GB/s. Uses 48 host lanes.
+3. **Three switches, eight drives each, x16 uplink:** downstream 32 lanes and upstream 16, so 2:1 by lanes. Uplink 63.0 GB/s raw, x 0.914 = 57.6 GB/s usable. Demand 8 x 12 = 96 GB/s, so 1.7:1 oversubscription. Per drive about 7.2 GB/s when all are busy. Aggregate cap 3 x 57.6 = 173 GB/s. Uses 48 host lanes.
 4. **Compare with the consumer:** two 400 GbE NICs are about 100 GB/s per direction. Either option exceeds that, so a network-bound server does not need direct attach. A local analytics server that scans at 288 GB/s does.
 5. **Host memory:** each DMA byte lands in DRAM and is read again, so DRAM traffic is at least 2x. 12 channels of DDR5-4800 are about 461 GB/s peak per socket (assumed).
 6. **NUMA:** put 12 drives on each socket, keep the NIC and the application on the same node, and avoid cross-socket DMA.
@@ -131,8 +131,8 @@ Assumptions: Gen5 x4 drive = 32 GT/s x 4 x 128/130 = 15.75 GB/s per direction; 2
    - Error counters under full load, plus power and thermal with all drives busy.
    - Hot-plug on each slot, DPC containment, NUMA placement, and staggered power-up to limit inrush.
 FOLLOW:
-- Why not x8 uplinks to save cost? => A Gen5 x8 uplink halves the cap to about 28.6 GB/s per switch, or 3.6 GB/s per drive at 8 per switch. Fine for cold storage, poor for hot NVMe.
-- What could make the measured number lower than 57.2 GB/s per uplink? => MPS smaller than 256 B, non-optimal completions, switch arbitration, and host DMA limits.
+- Why not x8 uplinks to save cost? => A Gen5 x8 uplink halves the cap to about 28.8 GB/s per switch, or 3.6 GB/s per drive at 8 per switch. Fine for cold storage, poor for hot NVMe.
+- What could make the measured number lower than 57.6 GB/s per uplink? => MPS smaller than 256 B, non-optimal completions, switch arbitration, and host DMA limits.
 PITFALL: Comparing lane counts instead of bandwidth to the real consumer. Oversubscription is acceptable when the downstream limit (network, CPU, DRAM) is below the uplink cap.
 VERIFY: The usable lane count per platform, switch part port counts and features (DPC, peer-to-peer), and any inter-socket bandwidth limit.
 
@@ -153,7 +153,7 @@ DEEP:
 - **Ask for:**
   1. Full dmesg from boot to the event, and the previous boot's log.
   2. `lspci -vvv` for the SSD and upstream ports, before and after.
-  3. `nvme smart-log` and `error-log` (unsafe shutdown and power cycle counts), controller-initiated telemetry.
+  3. `nvme smart-log` and `error-log` (Unexpected Power Losses, formerly unsafe shutdowns, and power cycle counts), controller-initiated telemetry.
   4. Kernel, BIOS, drive firmware, slot, backplane, rack and PSU details, plus BMC event log (power and thermal).
   5. Whether the drive came back on a rescan or needed a power cycle.
   6. How many drives, slots and servers show the same pattern.
@@ -176,8 +176,8 @@ DEEP:
 |---|---|---|
 | 1 percent | 299 | 459 |
 | 0.5 percent | 598 | 919 |
-| 0.1 percent | 2,995 | 4,604 |
-| 0.01 percent | 29,957 | 46,050 |
+| 0.1 percent | 2,995 | 4,603 |
+| 0.01 percent | 29,956 | 46,050 |
 
 4. **With failures:** 1 failure in n gives an upper bound of about 4.74 / n, 2 failures about 6.3 / n. Report the bound with the count, and use an exact interval, not just k / n.
 5. **Time budget:** at 45 s per trial, one cell of 3,000 trials takes 37.5 h on one rig. A tiered plan: tier 1 is 300 per cell x 45 cells = 13,500 trials (bound 1 percent per cell), tier 2 is 3,000 in the three worst cells = 9,000 trials. Total 22,500 trials = 281 h, or about 47 h on six rigs.
@@ -204,7 +204,7 @@ DEEP:
   3. Hot-add: enumeration, BAR assignment and driver bind, with bus numbers and windows reserved (see the Resets, Hot-Plug module).
   4. Repeat behind a switch, with DPC, and confirm the error does not spread to other ports.
   5. Neighbors: run I/O on adjacent drives during insertion and removal, and check for errors caused by rail dips or crosstalk.
-- **Device side:** surprise removal is a power loss for the drive. Verify power-loss protection, that `unsafe_shutdowns` increments, and that data acknowledged with a flush survived.
+- **Device side:** surprise removal is a power loss for the drive. Verify power-loss protection, that the Unexpected Power Losses counter (`unsafe_shutdowns` in nvme-cli) increments, and that data acknowledged with a flush survived.
 - **Pass criteria:** thousands of cycles, zero hangs, zero panics, all neighbor I/O uninterrupted, re-enumeration every time, no data loss for acknowledged writes.
 FOLLOW:
 - What does the host see on a surprise removal? => Surprise Down at the port (or a hot-plug event), pending requests never complete and time out, and the NVMe driver sees reads of all 1s. A hot-plug slot should treat it as a removal, not a fatal error.
@@ -237,7 +237,7 @@ FOLLOW:
 - Why not just use a redriver? => It does not reset jitter or noise and cannot recover a marginal link that is jitter limited. It can also interfere with equalization.
 - What would change your decision toward redesign? => Margin that is structurally short across many slots, no cost or schedule room for retimer validation, or a Gen5 roadmap for the same backplane.
 PITFALL: Choosing a retimer because it is the fastest fix without asking whether the loss is at one slot or across the backplane.
-VERIFY: The loss budgets per generation (28 dB at 8 GHz for Gen4, 36 dB at 16 GHz for Gen5) and what part of the total belongs to the host, backplane and drive.
+VERIFY: What part of the loss budget belongs to the host, backplane and drive in the CEM or form-factor specification you design to.
 
 @@ 18.11 | Advanced | Scenario | tags=error-handling,injection,containment,recovery,data-integrity
 Q: How do you validate error handling end to end: inject, contain, log, recover, and verify data?
@@ -276,7 +276,7 @@ DEEP:
 | Signaling | NRZ | NRZ | PAM4, 32 GBaud |
 | Encoding and framing | 128b/130b | 128b/130b | FLIT mode, FEC and CRC |
 | Channel budget | About 28 dB at 8 GHz | About 36 dB at 16 GHz | Similar Nyquist, far less SNR |
-| Error model | Raw BER near 1e-12, LCRC replay | Same, precoding to limit DFE bursts | Raw pre-FEC BER much higher, FEC corrects and flit replay catches the rest |
+| Error model | Raw BER near 1e-12, LCRC replay | Same, precoding to limit DFE bursts | First bit error rate about 1e-6 before FEC; FEC corrects and flit replay catches the rest |
 | Typical debug counters | Bad TLP, replay, Recovery | Same, plus retimer statistics | FEC and flit error and replay counts (VERIFY names) |
 | Retimers | Sometimes | Often | More often |
 | Instruments | Analyzer, scope | Higher bandwidth | Flit-aware analyzer, much higher bandwidth |
@@ -290,7 +290,7 @@ FOLLOW:
 - Why do Gen5 drives more often need retimers than Gen4? => The channel budget at 16 GHz Nyquist is tighter for the same board and connector, so more topologies exceed it.
 - What do you keep from a Gen4 plan for Gen6? => The layered method, reset and enumeration tests, NVMe tests, corner matrix and statistics. Replace the electrical and error-model tests.
 PITFALL: Assuming a Gen5 test plan scales to Gen6 by changing the speed. PAM4, FEC and flits change what an error is.
-VERIFY: Flit size and field layout, FEC and replay behavior, L0p, Gen6 counter names and requirements in PCIe Base 6.x, and Gen6 compliance program status.
+VERIFY: Gen6 FEC, CRC and flit replay counter names in PCIe Base 6.x, and Gen6 compliance program status.
 
 @@ 18.13 | Advanced | Trap | tags=nvme,timeout,doorbell,msi-x,checkpoints,clean-counters
 Q: The NVMe driver logs an I/O timeout but every PCIe counter is clean. Where do you look next?
@@ -314,14 +314,14 @@ FOLLOW:
 - What default timeouts should you keep in mind? => Linux uses about 30 s for I/O and 60 s for admin commands by default (nvme_core parameters). A short timeout in your test may only be exposing a long firmware pause.
 - PBA bit set but no interrupt: what does it mean? => The device sent the interrupt but the vector or function was masked, so it is pending. Look at the host's masking and the driver.
 PITFALL: Reading "no AER errors" as "not PCIe". Lost or delayed packets need an analyzer or a device-side log to show.
-VERIFY: Default nvme_core timeout parameter names and values on your kernel, and the MSI-X Function Mask and PBA layout in the Interrupts module and spec.
+VERIFY: Default nvme_core timeout values on your kernel (`io_timeout` is usually 30 s, `admin_timeout` 60 s).
 
 @@ 18.14 | Advanced | Cross-layer | tags=l1.2,aspm,ltr,power,latency,clkreq
 Q: Explain L1.2 power-saving trade-offs and how you validate that latency targets are met.
 SHORT: L1.2 gates the reference clock and turns off the link's common-mode bias, so idle power drops, but the first I/O after idle pays an exit latency of tens of microseconds or more (the drive's T_POWER_ON plus common-mode restore plus Recovery). LTR tells the host how much latency the device tolerates. Validate by measuring idle power, state residency and the QD1 latency-versus-idle-gap curve, and require the tail latency to meet the target.
 DEEP:
 - **Mechanism (see the Power Management module):** the L1 PM Substates capability adds L1.1 and L1.2. L1.2 needs CLKREQ# to let the platform remove REFCLK, and LTR to decide when it is safe. The link enters L1.2 only when idle long enough and LTR allows.
-- **Trade-off:** saves the most idle power (the difference between L0 idle and L1.2 idle is large for a drive, on the order of hundreds of mW, VERIFY), costs exit latency on the first I/O, which lands in the p99 and p99.9 at low queue depth.
+- **Trade-off:** saves the most idle power (the difference between L0 idle and L1.2 idle is large for a drive, on the order of hundreds of mW; measure it for your drive), costs exit latency on the first I/O, which lands in the p99 and p99.9 at low queue depth.
 - **Interplay with NVMe:** APST puts the controller in a deeper NVMe power state after idle, with its own entry and exit latencies. The two exit latencies can add.
 - **Validation steps:**
   1. Confirm entry: read L1SS control bits and LTR values, watch CLKREQ# and REFCLK on a scope, use PHY residency counters, and measure the 3.3 V rail power.
@@ -335,7 +335,7 @@ FOLLOW:
 - Why can LTR values make L1.2 never engage? => If the device reports a tolerance below the L1.2 exit latency (or the threshold), the platform will not allow L1.2.
 - Where do you look if the tail latency got worse after enabling substates? => The idle-gap curve, the exit latency, LTR values, and APST settings.
 PITFALL: Validating only that the link enters L1.2 and saves power. The requirement is the tail latency, so measure the first I/O after idle.
-VERIFY: L1.1 versus L1.2 clock and common-mode behavior, the T_POWER_ON and Common Mode Restore Time fields, typical exit latency, and LTR threshold rules in the Base Specification.
+VERIFY: Typical L1.2 exit latency on your platform (programmed T_POWER_ON and Common Mode Restore Time) and your drive's idle power in each state.
 
 @@ 18.15 | Advanced | Cross-layer | tags=rapid-fire,link,physical,ltssm,electrical
 Q: Rapid fire: link and physical. Answer ten one-liners.
@@ -355,7 +355,6 @@ FOLLOW:
 - Which of these did you have to hedge on? => Say plainly which ones: the numbers that sit under VERIFY in this guide, such as budgets and timeouts. Say where you would look them up.
 - How would you extend one answer into a debug story? => Choose one, for example Rollover, and say what you would read (AER, LnkSta, LTSSM history) and what you would change.
 PITFALL: Padding one-liners with detail. Give the crisp answer first and let the interviewer pull the depth.
-VERIFY: The 36 dB and 28 dB budget figures, SKP interval, and encoding overheads in the Base Specification.
 
 @@ 18.16 | Advanced | Cross-layer | tags=rapid-fire,protocol,system,nvme,tlp,aer
 Q: Rapid fire: protocol and system. Answer ten one-liners.
@@ -375,7 +374,7 @@ FOLLOW:
 - Pick one answer you gave and describe a failure that violates it. => For example, a completion arriving before its data would break the producer-consumer model, which shows up as stale data with a good CQE.
 - Which answers depend on the platform? => MPS and RCB, completion timeout values, and DPC and AER ownership, so state them as defaults, not universal facts.
 PITFALL: Answering from memory of one platform. MPS, RCB and timeouts vary, so say "typically".
-VERIFY: The MSI-X table size limit, the doorbell offset and stride rules, and FLR and CC.EN behavior in the Base and NVMe specifications.
+VERIFY: How the NVMe over PCIe Transport Specification describes FLR versus CC.EN for your controller.
 
 @@ 18.17 | Principal | Scenario | tags=communication,leadership,root-cause,stakeholders,status
 Q: How do you communicate a root cause and fix status to stakeholders?
