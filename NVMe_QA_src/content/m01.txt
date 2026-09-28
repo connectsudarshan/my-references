@@ -101,11 +101,13 @@ DEEP:
 - **Fibre Channel:** the FC mapping is defined by the FC-NVMe standards from INCITS T11 rather than by an NVMe transport document.
 - **Revisions:** 2.0 was released in June 2021. Base 2.1 came in 2024, and 2.2 and 2.3 followed in 2025 (the 2.3 cover page is dated July 31, 2025). Check nvmexpress.org for the current revision, since ECNs and TPs are folded in over time.
 - **Practical effect:** a requirement about Read lives in the NVM Command Set specification, one about Create I/O Queue in Base, and one about doorbell layout in the PCIe transport specification. Cite the right document and revision in every test.
+
+**ZNS reference (checked against ZNS 1.4):** Zone Append is opcode 7Dh (ZNS 1.4, Figure 9).
 FOLLOW:
 - Where would you find the Zone Append opcode? => In the ZNS Command Set specification. It is an I/O opcode (7Dh) that exists only in a ZNS namespace.
 - Where are the Fabrics commands, such as Connect, defined in 2.x? => In the Base specification, with the transport bindings in the RDMA and TCP transport specifications. Before 2.0 they lived in the separate NVMe over Fabrics specification.
 PITFALL: Citing "NVMe 1.4 section X" for a 2.x feature, or hunting for command-set details in Base. Under 2.x the same question may be split across two or three documents.
-VERIFY: The release dates of 2.0 to 2.2 (Base 2.3 shows only its own date), and the Zone Append opcode 7Dh (Zoned Namespace Command Set Specification).
+VERIFY: The release dates of NVMe 2.0 to 2.2 (Base 2.3 shows only its own date).
 
 @@ 1.06 | Intermediate | Concept | tags=host,controller,roles,command-flow,pull-model
 Q: Walk through the roles of host and controller for one I/O command at a high level.
@@ -209,11 +211,13 @@ DEEP:
 - **Key Value:** opcode 01h is Write in the NVM command set but Store in the KV command set. Only the namespace's command set tells you which.
 - **Linux:** the kernel selects CSI-aware setup automatically and exposes zoned namespaces through the zoned block layer (`blkzone`, `nvme zns` in nvme-cli).
 - **Validation angle:** test each opcode against a namespace of the wrong command set. Check that CNS 07h with a CSI that is not supported or not enabled fails with Invalid Field in Command, and that attaching a namespace of a non-enabled command set fails with I/O Command Set Not Enabled.
+
+**ZNS reference (checked against ZNS 1.4):** Zone Management Send is 79h, Zone Management Receive 7Ah and Zone Append 7Dh (Figure 9); a write must start at the zone's write pointer, else Zone Invalid Write (2.1.1.2.1.1).
 FOLLOW:
 - Can one controller expose an NVM namespace and a ZNS namespace at once? => Yes, when CC.CSS selects all supported I/O command sets and the I/O Command Set Profile combination includes both. Each namespace carries its own CSI.
 - When can CC.CSS change? => Only while CC.EN is 0, together with the other configuration fields such as the page size and arbitration mechanism. Change it and re-enable.
 PITFALL: Assuming an I/O opcode value has one meaning everywhere. Decode opcodes with the namespace's CSI.
-VERIFY: ZNS opcodes 79h, 7Ah and 7Dh and the write pointer rule (Zoned Namespace Command Set Specification), Key Value Store opcode 01h (Key Value Command Set Specification), and whether Active Namespace ID list CNS 02h hides namespaces of command sets that are not enabled (Base 2.3 does not say).
+VERIFY: Key Value Store opcode 01h (Key Value Command Set Specification), and whether Active Namespace ID list CNS 02h hides namespaces of command sets that are not enabled (Base 2.3 does not say).
 
 @@ 1.10 | Advanced | Scenario | tags=dual-port,multipath,nqn,nguid,nsid,duplicate-identity
 Q: After connecting a second path to a dual-port SSD, the same 3.84 TB namespace shows up twice, as /dev/nvme0n1 and /dev/nvme1n1. Is it a bug, and what could go wrong?
