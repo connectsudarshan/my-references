@@ -366,10 +366,11 @@ vuln malloc returned non-NULL
 fixed alloc returned NULL
 ```
 The math: `(size_t)-1` is `SIZE_MAX` (2^64 - 1 on this platform, an unsigned type so this cast is well-defined per 6.3.1.3p2, not UB); dividing by 4 and adding 10 deliberately produces a count where `count * 4` exceeds 2^64 and wraps to 36 (mod 2^64) instead of the true, enormous product. `malloc(36)` then succeeds and returns a real but far-too-small allocation; any code that trusted `count` records now fit and wrote that many 4-byte records would overflow that 36-byte block on record number 10 -- a heap overflow whose root cause is the earlier integer overflow, several lines before the actual out-of-bounds write. The fixed version rejects the request before multiplying by checking `count > SIZE_MAX / size` (rearranged from `count * size > SIZE_MAX` to avoid overflowing while checking for overflow).
+
+**C11 reference (checked against N1570):** 7.22.3.2p2-3: calloc allocates space for nmemb objects of size bytes and returns a null pointer or a pointer to the space, with no explicit overflow rule. Checked on glibc 2.39: calloc(SIZE_MAX / 4 + 10, 4) returns NULL with ENOMEM, while malloc of the wrapped product (36 bytes) succeeds.
 FOLLOW:
 - Why is (size_t)-1 well-defined here instead of undefined like signed overflow? => size_t is an unsigned type, and unsigned arithmetic (including converting a negative value like -1 to an unsigned type) is defined by the standard to wrap modulo 2^N (6.3.1.3p2), unlike signed overflow which is undefined behavior.
 - Is calloc a safer alternative to malloc(count*size) for this exact pattern? => The C11 text itself only says calloc(nmemb, size) allocates space for nmemb objects of size size and zero-fills it (7.22.3.2p2), with no explicit overflow-checking guarantee; in practice, quality implementations (glibc among them) do reject an overflowing nmemb*size internally, which is why calloc is still the preferred call here, but that check is a quality-of-implementation property to verify for your target, not a portable C11 guarantee.
-VERIFY: Whether the specific libc on your target's calloc actually rejects an overflowing nmemb*size; the C11 standard text itself does not mandate this.
 PITFALL: Checking `count * size == 0` as an overflow test; a wrapped product can land on any value, including a plausible-looking nonzero one (36 here), not just zero, so that check misses the overflow entirely.
 
 @@ 17.12 | Advanced | Scenario | tags=length-prefixed,bounds-check

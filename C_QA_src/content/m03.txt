@@ -222,7 +222,7 @@ PITFALL: Using `<=` "by habit" when translating a 1-based mathematical descripti
 
 @@ 3.07 | Intermediate | Scenario | tags=recursion,factorial
 Q: Write both a recursive and an iterative factorial, and identify which calls in the recursive version are (and are not) tail calls.
-SHORT: `fact_recursive`'s call `n * fact_recursive(n - 1)` is NOT a tail call: the multiplication happens *after* the recursive call returns, so the compiler must keep a stack frame per call to remember `n` for that pending multiply. A true tail call would return the recursive call's result directly with no further work, which this does not do.
+SHORT: `fact_recursive`'s call `n * fact_recursive(n - 1)` is NOT a tail call: the multiplication happens *after* the recursive call returns, so without optimization each call keeps a stack frame to remember `n`. A true tail call returns the recursive call's result directly with no further work. Optimizers may still remove this recursion (gcc 13 at -O2 turns it into a loop), but C never guarantees that.
 DEEP:
 ```c
 #include <stdio.h>
@@ -247,12 +247,13 @@ int main(void)
     return 0;
 }
 ```
-Compiled and run: `recursive 10! = 3628800`, `iterative 10! = 3628800`. Both correct; the difference this question cares about is stack usage, not the result: `fact_recursive` grows one stack frame per recursive call (10 frames deep for `fact_recursive(10)`), while `fact_iterative` uses one fixed-size frame regardless of `n`.
+Compiled and run: `recursive 10! = 3628800`, `iterative 10! = 3628800`. Both correct; the difference this question cares about is stack usage, not the result: without optimization `fact_recursive` grows one stack frame per recursive call (10 frames deep for `fact_recursive(10)`), while `fact_iterative` uses one fixed-size frame regardless of `n`.
+
+**Source note:** No C11 clause defines tail calls or requires their elimination. Checked with gcc 13: at -O0 `fact_recursive` still calls itself, at -O2 the call is gone.
 FOLLOW:
 - Could `fact_recursive` be rewritten as a tail call? => Yes, with an accumulator parameter: `fact_tail(n, acc)` returning `fact_tail(n-1, n*acc)` directly with nothing left to do afterward -- that call is in tail position.
 - Does C guarantee tail-call optimization even for a genuine tail call? => No (this module's later question covers this precisely); it is purely a quality-of-implementation choice some compilers make at higher optimization levels, never a standard requirement.
 PITFALL: Assuming any recursive function that "looks simple" is automatically stack-safe for large inputs; only truly tail-recursive code even has a *chance* of being optimized into a loop, and C never guarantees that optimization happens.
-VERIFY: (no direct C11 clause guarantees or defines "tail call optimization"; the standard is silent on it, which is itself the load-bearing fact for the FOLLOW-up question below)
 
 @@ 3.08 | Intermediate | Concept | tags=for-loop,scope
 Q: In `for (int i = 0; i < n; i++) { ... }`, what is the scope of `i`, and when exactly is `i`'s declaration "reached" relative to the loop's first condition check?
@@ -388,11 +389,12 @@ DEEP:
 For `if (a > b) x = 1; else x = 2;` compiled with `gcc -S -O0` on x86-64, the generated assembly is recognizably: load `a` and `b`, `cmp` them, a conditional jump (`jg`/`jle`-family) to one of two blocks that each set `x` and then jump to a shared continuation point. A `switch` with densely packed, contiguous `case` values is often compiled as a jump table (an array of code addresses indexed by the controlling value) instead of a chain of compares, trading a small amount of memory for O(1) dispatch regardless of how many cases exist -- this is one reason `switch` can be strictly faster than an equivalent `if`/`else if` chain for many cases.
 
 Why this matters for firmware/embedded review: branch mispredictions on a pipelined CPU cost real cycles (the pipeline speculatively executes one path and must flush/refetch if it guessed wrong), so a hot ISR or tight polling loop with a data-dependent, hard-to-predict branch can measurably slow down compared to a branch-free rewrite (e.g., using arithmetic/bitwise selection instead of a conditional, where the target actually benefits from it) -- but this is a targeted, profile-driven optimization, not a default coding style, since branch-free code is usually harder to read and the compiler's own branch-prediction hints or profile-guided optimization often already handle it well.
+
+**Source note:** Code generation is outside C11's scope. Checked with gcc 13 -O0 on x86-64: the `if` compiles to `cmpl`, `jle` to the else block, and `jmp` over it.
 FOLLOW:
-- Does C give you any way to hint branch likelihood to the compiler? => Not in standard C11 (this is a GNU extension via `__builtin_expect`, or the `[[likely]]`/`[[unlikely]]` attributes added later in C++20 and, separately, C23); C11 itself has no portable branch-hint mechanism.
+- Does C give you any way to hint branch likelihood to the compiler? => Not in standard C11. GCC and Clang provide `__builtin_expect`. C++20 added `[[likely]]`/`[[unlikely]]`, but C23 did not adopt them: C23's standard attributes are `deprecated`, `fallthrough`, `maybe_unused`, `nodiscard`, `noreturn`, `unsequenced` and `reproducible`, and gcc 13 ignores `[[likely]]` in C mode with a warning. So C still has no portable branch hint.
 - Is a `switch` always compiled as a jump table? => No; the compiler chooses based on the case values' density and count -- sparse or few cases typically still compile as a compare chain.
 PITFALL: Assuming a `switch` is unconditionally faster than an `if`/`else if` chain; it depends entirely on how the compiler chooses to lower it, which in turn depends on the actual case values, not just the source-level construct used.
-VERIFY: (codegen behavior is outside the C11 standard's scope, which specifies observable behavior only, not translation strategy; cited here as a documented cross-layer fact, not a standard clause)
 
 @@ 3.13 | Advanced | Scenario | tags=recursion,tail-call,stack
 Q: Does the C standard require tail-call optimization? What actually happens if you write deep, truly tail-recursive C code?
@@ -540,8 +542,9 @@ int main(void)
 Compiled and run on this host (not the embedded target, since `getrlimit`/`RLIMIT_STACK` is POSIX, not C11 or available on a bare-metal firmware target -- see this page's note on POSIX content living on the C Advanced page; this host's OS-level default is shown purely to illustrate the calculation): `stack limit = 8388608 bytes, assumed frame = 48 bytes`, `rough max recursion depth ~= 174762`. On the actual 8 KB embedded target from the question, the same formula gives 8192 / 48 ~= 170.
 
 The correct method for a real firmware review, not just this arithmetic: (1) get the actual per-call frame size from the linker map file or by disassembling the function and reading its stack-pointer adjustment instruction, not from guessing based on local variable declarations, since padding, saved registers, and compiler-inserted spill slots all add to it; (2) multiply by the worst-case recursion depth the input data can actually produce (not an assumed "typical" depth); (3) compare against the *task's* stack allocation, not the whole system's, since an RTOS often gives each task a small, fixed stack independent of total RAM; (4) add margin for interrupt handlers that might fire and use the same stack while the recursion is deep, if the ISR and the task share a stack on this target.
+
+**POSIX reference (checked against the POSIX.1-2017 online text):** getrlimit() and RLIMIT_STACK ("the maximum size of the initial thread's stack, in bytes") are in <sys/resource.h> under POSIX's XSI option, not ISO C11. Arithmetic re-checked: 8192 / 48 = 170.7 and 8388608 / 48 = 174762.7.
 FOLLOW:
 - Why is 48 bytes/frame just an assumption here, not a fact? => Actual frame size depends on the specific function's locals, saved registers, and the compiler/optimization level; the only reliable number comes from inspecting the compiled function, not from estimating based on source-level variable declarations.
 - What is the safer design alternative to trusting a depth estimate? => Convert the recursion to an explicit iterative algorithm with your own bounded, heap- or static-allocated stack/queue data structure (module 15 covers iterative rewrites of classic recursive algorithms), removing the question of native call-stack depth entirely.
 PITFALL: Sizing a task's stack based on "it worked in testing" recursion depth rather than the worst-case input the code must actually handle in the field; a parser recursing on user- or network-supplied nested structures is a classic stack-exhaustion attack surface.
-VERIFY: (RLIMIT_STACK and getrlimit are POSIX, not ISO C11; flagged per this page's convention for POSIX-adjacent content -- see AUTHORING guidance; the recursion-depth arithmetic itself is ordinary division, not standard-dependent)

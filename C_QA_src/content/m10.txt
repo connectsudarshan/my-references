@@ -139,7 +139,7 @@ int main(void) {
 ```
 Compiled with `gcc -std=c11 -Wall -Wextra`: no diagnostic, prints `1069547520`, which is the raw IEEE-754 bit pattern of `1.5f` reinterpreted as a 32-bit signed integer. This value looked "right" here only because nothing reordered the accesses; it is not evidence the code is standard-conforming.
 - **Why the character-type exception exists:** 6.5p7 explicitly allows access through a character type, which is why `unsigned char *` is the one universally safe way to inspect an object's bytes (used for the endianness check in Module 11) without violating effective type.
-- **The standard-conforming ways to reinterpret bits:** `memcpy` into an object of the target type (copies bytes, no aliasing violation, and every real compiler optimizes a small fixed-size `memcpy` into the same load/store the pointer cast would have produced), or a `union` of the two types (C11 explicitly permits reading a different union member than was last written as an implementation-defined "extension" many implementations document; only `memcpy` is unconditionally portable).
+- **The standard-conforming ways to reinterpret bits:** `memcpy` into an object of the target type (copies bytes, no aliasing violation, and every real compiler optimizes a small fixed-size `memcpy` into the same load/store the pointer cast would have produced), or a `union` of the two types (C11 6.5.2.3p3 and footnote 95 define reading a member other than the one last written as reinterpreting the bytes in the new type, so it is valid C, though the value depends on the representations and it is not valid C++; `memcpy` works in both languages).
 - **Why this bites at -O2 and not -O0:** the whole reason a compiler is allowed to assume no aliasing between differently-typed pointers is so it can keep values in registers and skip reloading from memory across such accesses; at low optimization it usually reloads from memory every time anyway, so the visible bug often appears only after turning optimization on, which is exactly backwards from where most people go looking for it.
 
 **C11 reference (checked against N1570):** 6.5p6 and p7 (effective type and the list of allowable accessing lvalue types), footnote 88.
@@ -232,7 +232,7 @@ PITFALL: Concluding "no warnings and no sanitizer errors" means the code has no 
 
 @@ 10.10 | Advanced | Debug | tags=ubsan,array-bounds,report-reading
 Q: Read this UBSan report and identify the bug: "q10.c:5:23: runtime error: index 5 out of bounds for type 'int [5]'".
-SHORT: This is UndefinedBehaviorSanitizer's array-bounds check, and it names the exact file, line, and column of the offending subscript expression, plus the static array type it violated. It fires here because the compiler can see the full declared type `int [5]` at the access site; it means an index of 5 was used against an array whose valid indices are 0 through 4.
+SHORT: This is UndefinedBehaviorSanitizer's bounds check (`-fsanitize=bounds` in GCC; Clang calls it `array-bounds`), and it names the exact file, line, and column of the offending subscript expression, plus the static array type it violated. It fires here because the compiler can see the full declared type `int [5]` at the access site; it means an index of 5 was used against an array whose valid indices are 0 through 4.
 DEEP:
 ```c
 #include <stdio.h>
@@ -253,15 +253,16 @@ q10.c:5:5: runtime error: load of address 0x7fffe5011054 with insufficient space
 32767
 ```
 1. **First line, the bounds check:** column 23 is the `arr[idx]` expression; the type `int [5]` tells you the declared array size directly from the diagnostic, no need to go find the declaration first.
-2. **Second and third lines, a separate address-sanitizer-style check** UBSan's `-fsanitize=undefined` also performs for out-of-bounds loads: it shows the actual bytes at and after the computed address, with a caret marking where the read started, which is directly the byte pattern of whatever memory happened to follow `arr` on the stack.
+2. **Second and third lines, a separate check:** UBSan's object-size check (`-fsanitize=object-size`, also part of GCC's `-fsanitize=undefined`) fires on the load itself: it shows the actual bytes at and after the computed address, with a caret marking where the read started, which is directly the byte pattern of whatever memory happened to follow `arr` on the stack.
 3. **The plain, non-sanitized run still "succeeds"** and prints `32767` (some indeterminate stack value), which is exactly why this class of bug is dangerous in production: it neither crashes nor looks obviously wrong.
 4. **The fix is a bounds check before the access**, `if (idx >= 0 && idx < 5) use(arr[idx]);`, or restructuring so `idx` cannot reach an invalid value in the first place (a `switch` or a lookup table sized to match every valid input).
 - **Why plain -Wall does not catch this:** `idx` is a variable, not a compile-time constant, so there is nothing for a purely static pass to disprove; UBSan's bounds check is inserted at compile time but evaluated against the actual runtime value of `idx`.
+
+**Reference (checked with gcc 13.3 in WSL):** `-fsanitize=bounds` alone produces the first message and `-fsanitize=object-size` alone produces the second; both are part of GCC's `-fsanitize=undefined`.
 FOLLOW:
 - Would this be caught if `arr` were accessed through a pointer parameter instead of the local array directly? => Usually not by this specific check, since UBSan's array-bounds instrumentation relies on the compiler still knowing the static array type at the access site; once the array has decayed to a plain pointer passed into another function, that type information is typically gone and AddressSanitizer (a different tool, `-fsanitize=address`) is what catches the out-of-bounds memory access instead.
 - Is `idx` itself required to be undefined before the subscript runs? => No, computing `idx = 5` is completely fine; the undefined behavior is specifically in using it as a subscript into a 5-element array, per the pointer-arithmetic rule in 6.5.6p8 (array subscripting `arr[idx]` is defined as `*(arr + idx)`).
 PITFALL: Reading only the first line of a multi-part sanitizer report and missing that a single bad access can trigger more than one check.
-VERIFY: The specific set of checks bundled under gcc's -fsanitize=undefined (`array-bounds` is one of several sub-checks; the exact sub-check list is a gcc-documentation fact, not a language-standard one).
 
 @@ 10.11 | Advanced | Concept | tags=indeterminate-value,trap-representation,uninitialized
 Q: What does the standard actually say about reading an uninitialized automatic variable, and is it always undefined behavior?

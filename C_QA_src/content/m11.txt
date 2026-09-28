@@ -284,11 +284,12 @@ Compiled with `gcc -std=c11 -Wall -Wextra`, prints `sign=1 exp=129 (unbiased 2) 
 2. **Reconstructing the value from the fields:** IEEE-754 single precision is `(-1)^sign * 1.mantissa * 2^(exp - 127)` for a normal number (leading `1.` implicit and not stored). Here, sign=1 (negative), unbiased exponent 2 (`2^2 = 4`), and mantissa `0x500000 = 0b101_0000...0` over 23 bits represents `0.625` when interpreted as `mantissa / 2^23`, giving significand `1.625`; `-1 * 1.625 * 4 = -6.5`, matching the original value.
 3. **Annex F is C11's IEEE-754 binding**, and this module treats it as the assumed floating-point model since essentially every modern target implements it that way, though C11 itself does not require IEEE-754 outside of Annex F's optional conformance; `__STDC_IEC_559__` being defined is the standard way to check whether Annex F applies on a given implementation.
 - **Why interviewers ask this:** it tests whether the representation is understood as an engineered trade-off (range from the exponent, precision from the mantissa) rather than memorized trivia, and it is directly relevant to firmware that must interpret raw floating-point telemetry or protocol fields byte-for-byte.
+
+**C11 reference (checked against N1570):** F.1: an implementation that defines __STDC_IEC_559__ shall conform to Annex F; 6.10.8.3 lists __STDC_IEC_559__ as conditionally defined. gcc 13 with glibc 2.39 defines it as 1, and the program prints the output shown.
 FOLLOW:
 - What would exp == 0 and exp == 255 mean instead of an ordinary value like 129? => exp == 0 signals a denormal (or exact zero if the mantissa is also 0), and exp == 255 signals infinity (mantissa 0) or NaN (nonzero mantissa), both special cases Module 11's later question on denormals and NaN covers.
 - Does this decoding change for a negative zero versus positive zero? => Yes, both have exp=0 and mantissa=0, differing only in the sign bit, and this is exactly the "negative zero" case that compares equal to positive zero under == but has a different bit pattern, worth remembering when doing byte-level comparisons instead of numeric ones.
 PITFALL: Reinterpreting float bits with a pointer cast instead of memcpy. It compiles and often "just works" at -O0, which is exactly the strict-aliasing trap covered in Module 10.
-VERIFY: C11 Annex F (IEC 60559 floating-point binding) and whether __STDC_IEC_559__ is defined on the target toolchain.
 
 @@ 11.11 | Advanced | Numeric | tags=float-epsilon,comparison,rounding
 Q: Why does accumulating 0.1f ten times not equal 1.0f exactly, and how should the comparison be written instead of `==`?
@@ -410,11 +411,12 @@ Compiled with `gcc -std=c11 -Wall -Wextra`, prints `01 02 03 04` (the value's by
 2. **Contrast with the naive approach** of `*(uint32_t *)wire = v;` (casting the buffer to a `uint32_t *` and storing directly), which both violates strict aliasing (Module 10) and bakes in whatever the host's memory byte order happens to be, producing wire bytes that differ between little- and big-endian hosts for the identical protocol value, exactly the bug demonstrated in the Principal question later in this module.
 3. **Why not just use htonl/ntohl:** those are POSIX/BSD sockets-API functions (`<arpa/inet.h>`), not part of ISO C; they do the same job on POSIX systems, but a firmware target without a POSIX sockets stack needs the portable-C version shown here regardless, so it is worth knowing the underlying technique rather than only the POSIX shortcut.
 4. **This scales to any field width:** the same shift-and-mask pattern generalizes to 16-bit, 64-bit, or non-power-of-two bit-field widths (Module 6), and is the standard technique behind any protocol header parser that must produce identical results on every target it ships to.
+
+**POSIX reference (checked against the POSIX.1-2017 online text):** htonl(), htons(), ntohl() and ntohs() are declared in <arpa/inet.h> and "shall convert 16-bit and 32-bit quantities between network byte order and host byte order"; they are not part of ISO C11.
 FOLLOW:
 - Does this approach need any compile-time endianness detection at all? => No, that is precisely its advantage over the memory-cast approach: it needs no `#if` on byte order and no runtime check, since the shifts and masks are endianness-agnostic by construction.
 - Would a get_le32 (little-endian wire format) function look different? => Yes, only the byte-to-shift-amount mapping changes (buf[0] pairs with the lowest shift, buf[3] with the highest), while the technique (explicit shifts and masks, never a memory cast) stays identical.
 PITFALL: Believing a portable-looking `struct` laid directly over wire bytes via a pointer cast is "basically the same thing." It reintroduces both the strict-aliasing violation and the host-endianness dependency this technique specifically avoids.
-VERIFY: htonl/ntohl and <arpa/inet.h> are POSIX.1-2017, not ISO C11; treat any question needing them as belonging on the C Advanced page, referenced here only for contrast.
 
 @@ 11.15 | Advanced | Scenario | tags=popcount-builtin,firmware-register,performance
 Q: A firmware routine counts set bits in a status register on every interrupt using a naive bit-by-bit loop, and profiling shows it is hot. What are the realistic options, and how do you validate the replacement is correct?

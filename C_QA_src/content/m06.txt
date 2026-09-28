@@ -154,8 +154,8 @@ FOLLOW:
 PITFALL: Reordering struct members purely to save space in a struct whose layout is also used as a fixed on-disk or on-wire format, breaking compatibility with existing data.
 
 @@ 6.05 | Intermediate | Concept | tags=union,type-punning
-Q: Why is reading a union member other than the one last written considered undefined behavior in general, and what is the one safe way to reinterpret bytes?
-SHORT: C11 6.2.6.1p7 says the bytes not corresponding to the last-written member take unspecified values, and reading a value through the wrong member is a form of type punning the standard does not define, except for the specific common-initial-sequence case (6.5.2.3p6, see 6.06). The one portable way to reinterpret an object's bytes as another type is to `memcpy` its object representation, never to read it back through a different union member or pointer type.
+Q: Is reading a union member other than the one last written defined in C11, and what is the most portable way to reinterpret bytes?
+SHORT: Yes, with caveats. C11 6.5.2.3p3 and footnote 95 say the stored bytes are reinterpreted as the member you read ("type punning"); the value depends on the implementation's representations and is undefined only if it is a trap representation. `memcpy` gives the same result and is also valid C++, so it is the most portable choice. The truly undefined version is reading through a cast pointer (6.14).
 DEEP:
 ```c
 #include <stdio.h>
@@ -183,10 +183,11 @@ Compiled and run: printed `3.5` for the direct read, and `0x40600000` for the `m
 - Reading through a cast pointer (`*(uint32_t *)&f`) is the one to avoid: it violates strict aliasing (6.14) and can break under `-O2`.
 - Common firmware uses: decoding IEEE-754 floats from a byte stream, and CRC or checksum computation over a struct's bytes.
 
+**C11 reference (checked against N1570):** 6.5.2.3p3 and footnote 95 (reading another member reinterprets the object representation, possibly a trap representation); 6.2.6.1p4 (object representation copied with memcpy) and p7 (bytes beyond the member last stored are unspecified).
 FOLLOW:
-- Isn't reading `value.i` right after writing `value.f` a very common trick anyway? => It is common and works on most mainstream compilers in practice, but it is not defined by the C11 union rules in general; module 10 covers why strict aliasing makes this specific pattern risky under optimization.
-- Why is `memcpy` considered safe when a union read is not? => `memcpy` operates on `unsigned char` object representations, which C11 6.2.6.1p4-5 explicitly permits for any object, sidestepping the type-based aliasing question entirely.
-PITFALL: Writing one union member and reading a different, unrelated-type member expecting a defined "reinterpret" result, when the standard only defines that for members sharing a common initial sequence.
+- Is reading `value.i` right after writing `value.f` actually safe? => In C11, yes: both members are 4 bytes and `int32_t` has no trap representations, so you get the float's bit pattern. It is not valid C++, and it only holds when the access goes through the union: taking `&value.f`, casting it to `int32_t *` and dereferencing is the strict-aliasing problem again (6.14).
+- Why prefer `memcpy` if a union read is defined? => `memcpy` works on `unsigned char` object representations, which C11 6.2.6.1p4 permits for any object. It needs no union declared around the data, works on memory you did not create as a union (such as a byte buffer from the wire), and is also defined in C++.
+PITFALL: Treating union punning and pointer-cast punning as equally undefined. The union read is defined in C11 (only its value is implementation-specific); the pointer cast violates 6.5p7. The real union trap is reading a larger member after writing a smaller one: the extra bytes are unspecified (6.2.6.1p7).
 
 @@ 6.06 | Intermediate | Scenario | tags=union,common-initial-sequence
 Q: Two structs in a union both start with `int kind;`. Is it defined to read `.kind` through whichever struct member is not the one currently active?
@@ -237,7 +238,7 @@ The guarantee requires the union type to be visible where the access happens; re
 
 FOLLOW:
 - Does the exception cover `u.as_b.y` after writing `u.as_a.x`? => No; `x` and `y` are not part of the common initial sequence (they differ in position and type), so reading `y` here is not covered by this exception and is undefined.
-- Is a separate, explicit `tag` field outside the union a more robust pattern than relying on this rule? => Yes, and it is what 6.05's tagged-union example does; the common-initial-sequence rule is narrower and easier to get subtly wrong than an explicit external tag.
+- Is a separate, explicit `tag` field outside the union a more robust pattern than relying on this rule? => Yes: the usual layout is `struct { int kind; union { ... } u; }`, with the tag outside the union. The common-initial-sequence rule is narrower and easier to get subtly wrong than an explicit external tag.
 PITFALL: Assuming the common-initial-sequence exception covers the whole struct, when it only covers the members that are actually identical in type and position up to some point.
 
 @@ 6.07 | Intermediate | Concept | tags=bitfields,portability
@@ -462,17 +463,17 @@ int main(void) {
     return 0;
 }
 ```
-Compiled with `gcc -std=c11 -Wall -Wextra` (no warning at the default optimization level used here) and run: both printed `0x3f800000`, the IEEE-754 bit pattern for `1.0f`; at higher optimization levels a compiler is entitled to assume `aliased` and `f` do not overlap and could produce a different, still not-wrong-per-the-standard result, which is exactly why this is dangerous rather than merely stylistically discouraged.
+Compiled with `gcc -std=c11 -Wall -Wextra` (no warning at -O0, and none at -O2 -Wall either, because the cast and the dereference are separate statements; the one-expression form `*(unsigned int *)&f` does get a -Wstrict-aliasing warning at -O2 -Wall, checked with gcc 13) and run: both printed `0x3f800000`, the IEEE-754 bit pattern for `1.0f`; at higher optimization levels a compiler is entitled to assume `aliased` and `f` do not overlap and could produce a different, still not-wrong-per-the-standard result, which is exactly why this is dangerous rather than merely stylistically discouraged.
 
 **How it actually breaks:** under `-O2` (which enables `-fstrict-aliasing`), the compiler may assume a `float` store and an `unsigned int` load don't touch the same memory, and reorder or cache them. The classic failure is a function that writes through one type and reads through the other; the read returns the old value. GCC warns in the simple visible cases with `-Wstrict-aliasing` (enabled by `-Wall` together with `-O2`).
 
 **The allowed exceptions** (C11 6.5p7): access through the object's own type (with signed/unsigned and qualifier variants), through an aggregate or union containing it, and through any character type. That last rule is why byte-by-byte access through `unsigned char *` is always valid. Some large codebases, like the Linux kernel, simply build with `-fno-strict-aliasing` and accept the lost optimizations.
 
+**C11 reference (checked against N1570):** 6.5p6-7 (effective type and the list of allowed access types) for the pointer cast; 6.5.2.3p3 and footnote 95 for union type punning, which is defined.
 FOLLOW:
-- Does this contradict the union-based type punning from 6.05? => No, it reinforces it: reading through a raw pointer cast has the same aliasing problem as reading the wrong union member, and `memcpy` is the one technique the standard treats as always safe for both cases.
+- Is this the same problem as union type punning (6.05)? => No. Reading a different union member is defined in C11 (6.5.2.3p3, footnote 95: the bytes are reinterpreted). Reading through a pointer cast to an unrelated type violates the effective-type rule in 6.5p7. `memcpy` is valid in both situations and also in C++.
 - Is casting to `char *` and reading byte-by-byte also a strict-aliasing violation? => No; C11 makes an explicit exception for accessing any object's bytes through a character type, which is part of why `memcpy` (which does exactly that internally) is safe.
 PITFALL: "Fixing" a strict-aliasing warning by adding a cast instead of switching to `memcpy`; the cast silences nothing about the actual undefined behavior, only about a compiler diagnostic.
-VERIFY: Strict aliasing's formal basis (the "effective type" rules) is covered in depth in module 10; this module states the union/pointer-cast consequence only.
 
 @@ 6.15 | Principal | Scenario | tags=protocol,design
 Q: Design a packed C struct for a simplified NVMe-style command header (1-byte opcode, 1-byte flags, 2-byte command ID, 4-byte namespace ID, 8-byte PRP pointer) that is guaranteed to match its documented wire layout.
