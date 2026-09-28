@@ -59,11 +59,12 @@ Example: the write pointer is 100 and the host submits W1 (LBA 100, 8 blocks) th
 | Zone Append | Many | Host loses address control (5.11, 5.15) |
 
 Note the other write-side status codes: a Write to a Full zone returns Zone Is Full (B9h), a Write past the zone capacity returns Zone Boundary Error (B8h). Zone Invalid Write is specifically the SLBA versus write pointer mismatch.
+
+**ZNS reference (checked against ZNS 1.4):** Command Ordering Requirements: the controller does not order Address-Specific Writes, and the host must enforce any order it needs. A write aborted with a zone status writes nothing; a write that fails after starting may leave the write pointer inside its range, one past it, or invalid (2.1.1.2.1.1).
 FOLLOW:
 - Does a Zone Invalid Write damage the zone? => No. The failed Write places no data and leaves the write pointer where it was.
 - Does Linux let you issue overlapping Writes to a zone? => The block layer serializes writes per zone (zone write plugging), so ordinary filesystem writes do not hit this, but raw passthrough does.
 PITFALL: Passing a single-queue in-order test and concluding that overlapping Writes are safe.
-VERIFY: That the Base Specification gives no execution-order guarantee even within one submission queue, and that a failed Write leaves the write pointer unchanged.
 
 @@ 5.04 | Intermediate | Concept | tags=zasl,mdts,limits,identify
 Q: What is ZASL and how does it limit Zone Append?
@@ -78,11 +79,13 @@ DEEP:
 **Why splitting matters:** a large Write can be cut into ordered chunks and the result is one contiguous range. A large append cut into several appends comes back as several ALBAs, which need not be adjacent when other appends interleave. A record bigger than ZASL therefore needs extent-based indexing, or serialization of its chunks (submit the next after the previous CQE), or a Write path.
 
 **Validator cases:** append exactly ZASL bytes (expect success), one block more (expect Invalid Field in Command), and check that MDTS is not the bound you observe. Confirm the limit again after any firmware update or format change to a different LBA size.
+
+**ZNS reference (checked against ZNS 1.4):** ZASL: 0h means the Zone Append limit is MDTS; otherwise a power of two in CAP.MPSMIN units that includes metadata only when it is interleaved (so a separate metadata buffer does not count), and ZASL shall not exceed MDTS (Figure 49). ZNS 1.4 defines no specific status for exceeding it.
 FOLLOW:
 - MDTS is 512 KiB and ZASL is 4. What is the largest append? => 64 KiB (2^4 x 4 KiB with MPSMIN 0). The smaller limit governs appends.
 - What does ZASL = 0 tell you? => No separate append limit is declared, so MDTS applies.
 PITFALL: Sizing appends by MDTS. The append limit can be far smaller, and exceeding it fails the whole command.
-VERIFY: That an over-limit append returns Invalid Field in Command (base NVMe transfer-size behavior, not restated in the ZNS spec), and how ZASL is treated with a separate, non-interleaved metadata buffer.
+VERIFY: The status for an over-limit Zone Append (NVMe Base Specification transfer-size rules).
 
 @@ 5.05 | Intermediate | Concept | tags=ordering,atomicity,alba,completion
 Q: What ordering and placement guarantees does Zone Append give, and what does it not give?
@@ -253,11 +256,12 @@ Confirmed, not vendor-specific (ZNS 1.4, 3.4.1 and Figure 26, CDW12 bit 25): if 
 - **Linux:** sets the remap bit only when appending with reference tag checking enabled.
 - **Validator matrix:** PRACT 0 and 1, PRCHK bits, PIREMAP 0 and 1, PI type, and extended versus separate metadata buffers. Read back each case with reference tag checking and expect no Reference Tag Check Error (SCT 2h, SC 84h). Negative case: corrupt the host-supplied tags and expect the write-side check to fail.
 - **ZASL:** metadata counts toward the append size limit when interleaved with the logical block data (5.04).
+
+**ZNS reference (checked against ZNS 1.4):** 3.4.1.1: checks on host-supplied PI follow the NVM Command Set PRCHK rules; with PIREMAP 1 the stored reference tag is ILBRT + (ALBA - ZSLBA), then +1 per block; for Type 1 an ILBRT that does not match the masked ZSLBA gives Invalid Protection Information; PIREMAP 0 with Type 1, or 1 with Type 3, is rejected with Invalid Protection Information. PRACT gets no ZNS-specific rule.
 FOLLOW:
 - Does PIREMAP change the guard or application tag? => No. Only the reference tag values written to media.
 - With PRACT=1 who generates the tags? => The controller, so the host buffer carries no PI bytes; ILBRT and PIREMAP still set the reference tag base the same way.
 PITFALL: Type 1 PI with PIREMAP clear. The spec requires the controller to reject this combination outright with Invalid Protection Information, not silently write tags at the guessed address.
-VERIFY: PRACT's precise interaction with the ILBRT check when PIREMAP is set to 1 is not spelled out beyond the general PRACT behavior in the NVM Command Set Specification.
 
 @@ 5.12 | Advanced | Trap | tags=address-prediction,report-zones,write-pointer,coverage
 Q: A host submits four 8-block appends to an empty zone and assumes they land at ZSLBA, +8, +16, +24. Why is that wrong, and what does Report Zones show mid-flight?
@@ -269,11 +273,12 @@ Example with ZSLBA = Z. Assigned ALBAs: rec1 at Z+16, rec2 at Z+0, rec3 at Z+24,
 - **Report Zones mid-flight:** the write pointer it returns may lag behind appends whose completions are still pending, and it changes between your read and your use. Whether it already includes uncompleted appends is not something to depend on. Use it only when quiesced.
 - **Right pattern:** update the index from the CQE.
 - **Coverage assertion for the validator:** count ALBA inversions (pairs where a later-submitted append got a lower ALBA). If the count is zero over a run at QD 32, the test did not exercise concurrency and its pass means little. Add multiple queues and random submit delays until inversions appear.
+
+**ZNS reference (checked against ZNS 1.4):** The write pointer is increased on successful completion of a write operation (2.1.1.2.1.1); ZNS 1.4 does not say how Report Zones reflects commands still being processed.
 FOLLOW:
 - Would the guess be right with one SQ and QD 4? => It may hold on a given firmware, but nothing in the spec promises it.
 - How can address prediction be made legal? => Serialize: submit the next append only after the previous CQE. That is QD 1 and gives up the benefit.
 PITFALL: Using the write pointer from Report Zones as the address of an outstanding append.
-VERIFY: Whether a Report Zones write pointer can include appends that are not yet completed to the host.
 
 @@ 5.13 | Advanced | Cross-layer | tags=power-loss,durability,recovery,torn-append
 Q: What can the host conclude about completed and in-flight appends after a power loss or controller reset?
@@ -290,11 +295,13 @@ DEEP:
 - Cut power to the SSD only (programmable slot power or PDU), keeping the host alive so its journal survives. Journal: record id, ALBA, CQE time, FUA or flush status.
 - Cut at random offsets during append bursts at several queue depths, thousands of cycles.
 - Assertions: durable-acknowledged records intact; every LBA below the recovered pointer readable; content below the pointer matches journal records, with at most one torn tail; recovered pointer not below the durable high-water mark.
+
+**ZNS reference (checked against ZNS 1.4):** A Controller Level Reset is not one of the events that set initial zone states (2.1.1.3). A write aborted with a zone status writes nothing; a write that fails after starting may leave the write pointer inside its range, one past it, or invalid (2.1.1.2.1.1). ZNS adds only a Zone Is Offline rule to Flush (3.3.4).
 FOLLOW:
 - Should acknowledged non-FUA appends survive? => Not necessarily. Only with a non-volatile write cache or a Flush issued after their CQEs.
 - How do you detect a torn tail? => The record header length or CRC fails, or the record extends past the recovered write pointer.
 PITFALL: Comparing the recovered write pointer with the pointer seen just before the cut. A lower value is legal for non-durable data. Compare only with the durable high-water mark.
-VERIFY: Zone state of open zones after a controller-level reset, that the write pointer may land inside a multi-block append, and how Flush relates to zone append durability, in the ZNS and NVM Command Set specifications.
+VERIFY: How Flush relates to Zone Append durability, in the NVM Command Set Specification.
 
 @@ 5.14 | Principal | Scenario | tags=test-design,oracle,concurrency,fault-injection
 Q: Design a validation suite for Zone Append concurrency on new firmware. What is the oracle and what do you assert?

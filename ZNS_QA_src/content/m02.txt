@@ -41,11 +41,12 @@ DEEP:
 - **Size versus capacity:** the LBAs at zone offsets ZCAP to ZSZE-1, that is above ZSLBA+ZCAP-1, are not usable. The split lets the zone size stay a round number for address math while the device picks a capacity that fits its NAND geometry.
 - **Write pointer:** an LBA inside the zone, reported in the zone descriptor. Writes land at it and advance it. Zone states and the exact WP rules are module 3.
 - **Capacity totals:** the namespace size covers all zones at ZSZE each. Usable capacity is the sum of the ZCAP values (zonedstorage.io).
+
+**ZNS reference (checked against ZNS 1.4):** ZNS 1.4 has no rule that NSZE be a multiple of ZSZE; the only ZSZE rule is that it shall not be 0h (LBA Format Extension; Annex A.5 only relates the fields). Figure 4: the write pointer is valid only in Empty, Implicitly Opened, Explicitly Opened and Closed; for Full, Read Only and Offline it provides no information.
 FOLLOW:
 - Can zones in one namespace have different sizes? => No. Zone size is a namespace-wide constant. Only capacity may differ per zone, and only when the Variable Zone Capacity bit in ZOC is set.
 - Why is the write pointer an LBA and not a byte offset? => All NVMe addressing is in logical blocks, and the size of a block depends on the LBA format in use.
 PITFALL: Assuming the whole address range up to ZSZE is usable. The gap between ZCAP and ZSZE is address space with no storage behind it.
-VERIFY: ZNS 1.4 does not state whether NSZE must be an exact multiple of ZSZE (Annex A.5 shows equal zones but does not require the total to divide evenly). WP validity per zone state is resolved in module 3 (Figure 4: valid only in Empty, Implicitly Opened, Explicitly Opened and Closed).
 
 @@ 2.04 | Intermediate | Concept | tags=cap-css,cc-css,command-set-selection,init
 Q: How does a host enable zoned command sets: what do CAP.CSS and CC.CSS do?
@@ -129,11 +130,12 @@ Assumptions: all zones have the same capacity, no variable zone capacity, 4096-b
 8. LBA 2,050,000: zone = 2,050,000 div 524,288 = 3. Offset = 2,050,000 - 1,572,864 = 477,136, which is at least 442,368, so the LBA is above the zone capacity.
 - **Linux view:** chunk_sectors and the zone length are 524,288 x 8 = 4,194,304 sectors. Each zone reports its capacity separately, so `blkzone report` shows both.
 - **Test use:** the first LBA beyond capacity and the last LBA of the zone are the natural boundary test points.
+
+**ZNS reference (checked against ZNS 1.4):** No status is specific to the ZCAP-to-ZSZE gap. A write must start at the write pointer (else Zone Invalid Write) and fit in the remaining writable blocks (else Zone Boundary Error), 2.1.1.2.1.1. All logical blocks of an Empty zone are deallocated (2.1.1.5), and reads of a zone in any state except Offline follow the NVM Command Set's deallocated or unwritten block rules (2.1.1.2.1.2), so these reads are not an error under ZNS.
 FOLLOW:
 - The device is reformatted to 512-byte LBAs and the same ZSZE block count applies. What changes? => The zone becomes 256 MiB. ZSZE is reported per LBA format, so read the entry for the format in use and never assume a byte size.
 - How would a host find the zone of an LBA fast? => Divide by ZSZE, which is a shift when ZSZE is a power of two. That is why the zone size stays round and the capacity absorbs the odd geometry.
 PITFALL: Sizing a dataset from the address space (1 TiB) instead of the usable capacity (864 GiB), then running out of zones midway.
-VERIFY: The status a controller returns for a read or write that touches LBAs between ZCAP and ZSZE (module 7).
 
 @@ 2.08 | Intermediate | Concept | tags=commands,nvm-command-set,zone-append,opcodes
 Q: Which NVM commands remain valid on a zoned namespace, and which commands are new?
@@ -221,11 +223,13 @@ DEEP:
 - **Per-format zone size:** each LBA format entry has its own ZSZE. 0x80000 blocks is 2 GiB at 4 KiB but 256 MiB at 512 B. A Format NVM to another LBA format changes the zone geometry, so a validator must re-read Identify after every format.
 - **Alignment:** ZSLBA is a multiple of ZSZE, so a non-power-of-two size still aligns, but only to that size.
 - **Test:** for each LBA format, check ZSZE is constant across zones, ZSLBA(n) equals n x ZSZE, ZCAP is at most ZSZE, and the Linux block device still appears as zoned.
+
+**ZNS reference (checked against ZNS 1.4):** The only ZSZE constraint is that it shall not be 0h; there is no power-of-two rule. Format NVM or Namespace Management initializes every zone to Empty or Offline (2.1.1.3).
 FOLLOW:
 - Where should odd geometry go instead? => Into ZCAP. Three-die stripes of a given size become the capacity, and the rest of the power-of-two zone is unused address space.
 - Does the block layer need equal zones? => It has assumed power-of-two zone sizes, with a smaller last zone tolerated. Support for other sizes may be newer, so test on the kernel you ship.
 PITFALL: Validating on QEMU, which accepts odd zone sizes, and concluding a Linux host will accept them too.
-VERIFY: Whether the spec places any constraint on ZSZE, current kernel handling of non-power-of-two zone sizes, and how Format NVM interacts with zone state.
+VERIFY: Current Linux handling of non-power-of-two zone sizes on the kernel under test.
 
 @@ 2.12 | Advanced | Cross-layer | tags=linux,sysfs,queue-limits,discovery
 Q: How do the Identify fields turn into what Linux shows for a zoned NVMe namespace, and how do you use that in validation?
@@ -279,11 +283,13 @@ DEEP:
 6. **Host cross-check:** compare the raw values with sysfs and `blkzone report`, on at least two kernel versions.
 7. **Automation:** a script (Python with nvme-cli JSON output or ioctl passthrough) that dumps to a versioned JSON per firmware build, then a diff step. Run as a gate on every build, fast enough for pre-merge.
 8. **Decision criteria:** invariant failure is a defect. A claim that behavior contradicts is a defect. A value change between builds without a release note is a flagged regression. An allowed but unusual value (for example ZOC bits set) is a compatibility note, not a fail.
+
+**ZNS reference (checked against ZNS 1.4):** Spec-stated invariants include: ZSZE nonzero; zone status codes and the commands each applies to (Figure 11, B6h to BFh, command specific); resource accounting and the Too Many Active and Too Many Open rules (2.1.1.4.1); write pointer validity per state (Figure 4).
 FOLLOW:
 - How do you cover multiple namespaces cheaply? => Iterate over the active list and per-CSI list, and check counts match between CNS 02h and 07h.
 - What about SR-IOV or multi-controller drives? => Run per controller, and confirm shared namespaces report the same zone geometry through every controller.
 PITFALL: Checking only the default LBA format and the first namespace. Geometry bugs usually appear at the second format or the last zone.
-VERIFY: Which invariants are stated as requirements in the spec (ZSLBA spacing, MOR and MAR, reserved fields) and the expected status codes for each negative case.
+VERIFY: Which reserved fields must be rejected with Invalid Field in Command rather than ignored (NVMe Base Specification rules).
 
 @@ 2.15 | Principal | Debug | tags=triage,linux,read-only,zone-append,firmware-update
 Q: After a firmware update, a ZNS SSD shows up on Linux read-only, or its block device disappears. Walk through the root-cause method.

@@ -10,11 +10,12 @@ Example used through this module (all illustrative): 6 channels x 2 dies = 12 di
 - **Reset:** the block list goes back to the free pool and the blocks are erased (8.06). Because the zone is exactly a whole set of erase blocks, no live data shares a block with anything else, so there is nothing to garbage-collect.
 - **Why a stripe and not one block:** one die programs a TLC wordline in hundreds of microseconds, so a zone of one block would write at a fraction of drive bandwidth. Width buys per-zone throughput and costs zone size (8.04).
 - **Conventional contrast:** a conventional FTL mixes data of many lifetimes in one superblock, so blocks need GC before erase. Zone alignment moves that decision to the host.
+
+**Source note:** The mapping is not defined by the NVMe ZNS specification. Confirm the layout with the vendor if a test depends on it.
 FOLLOW:
 - Does every zone use the same set of dies? => Usually the same die set with different block numbers, so any zone can reach full bandwidth. Some designs use narrower zones on subsets of dies to trade per-zone speed for isolation.
 - Can the host see the layout? => No. The host sees zone start, size, capacity and state only. The interleave can change between firmware versions.
 PITFALL: Deriving die or channel placement from the LBA and building a test that depends on it. Nothing in the interface promises the mapping.
-VERIFY: The mapping is not defined by the NVMe ZNS specification. Confirm the layout with the vendor if a test depends on it.
 
 @@ 8.02 | Basic | Concept | tags=zcap,zsze,geometry,reserve,capacity
 Q: Why is Zone Capacity smaller than Zone Size, and what in the firmware decides the value?
@@ -71,11 +72,12 @@ Assumptions: 6 channels x 2 dies = 12 dies, 4 planes, 1,024 pages of 16 KiB per 
 
 Peak rate = dies x 192 KiB / 0.8 ms (die-limited, six 1.2 GB/s channels would allow 7.2 GB/s).
 - **Consequence:** wider zones favor a few big sequential writers and make Reset and Finish expensive. Narrow zones favor many writers and need a larger MOR and more buffer.
+
+**Source note:** Nothing here is spec-defined geometry. Real NAND page sizes, plane counts, program times and reserved fractions come from the vendor datasheet.
 FOLLOW:
 - Why not size the zone to 768 MiB exactly? => Confirmed: the ZSZE field definition (ZNS 1.4, Figure 50) only requires it be non-zero, with no power-of-two requirement in the spec text. A non-power-of-two zone size breaks shift-based host math and the Linux driver rejects it (see 2.11), which is a driver constraint, not a spec one.
 - What changes if the drive has 16 dies? => The stripe becomes 1 GiB, a power of two, and ZCAP can equal ZSZE if nothing is reserved.
 PITFALL: Reporting usable capacity from NSZE. Sum ZCAP instead, and expect a smaller number.
-VERIFY: Nothing here is spec-defined geometry. Real NAND page sizes, plane counts, program times and reserved fractions come from the vendor datasheet.
 
 @@ 8.05 | Intermediate | Numeric | tags=l2p,mapping,arithmetic,block-list,read-path
 Q: How does a read find its NAND page without an L2P table, and what indirection remains?
@@ -92,11 +94,12 @@ Table size: 1,040 zones x 48 blocks x 4 B = 195 KiB. A page-level table for the 
 - **Above the write pointer:** the zone metadata already says the LBA was never written, so the controller can answer without a NAND read (the returned data follows the namespace's rule for unwritten blocks, see 3.11).
 - **What breaks the arithmetic:** padding holes in the middle of a zone, parity rotation, mixed SLC and TLC blocks in one zone, and any per-page relocation. Designs therefore relocate whole blocks and keep the block list mutable.
 - **Effect on reads:** no map lookup miss, so read latency is flat, which is a large part of the ZNS latency benefit (compare the DRAM-less discussion in NVMe page module 17).
+
+**Source note:** Interleave, page order and row size are vendor choices. Treat the numbers as an illustration of the method.
 FOLLOW:
 - Where does the block list live? => In RAM, backed by a NAND journal and checkpoint (8.09). At about 200 bytes per zone it is cheap to persist.
 - What if a block fails in the middle of a Full zone? => Firmware copies the block's pages to a spare and edits one block-list entry. LBAs and rows do not change (8.10).
 PITFALL: Concluding a ZNS SSD needs no metadata reads at all. Zone state and block lists must be resident and correct, and a corrupt entry misroutes a whole slot.
-VERIFY: Interleave, page order and row size are vendor choices. Treat the numbers as an illustration of the method.
 
 @@ 8.06 | Intermediate | Concept | tags=reset,erase,deferred-erase,free-pool,erase-count
 Q: What does the firmware do during Reset Zone, and what design choices decide its latency?
@@ -116,11 +119,12 @@ DEEP:
 
 - **Ordering rule:** a block must be erased and verified before its first program. A deferred design must track dirty blocks across power loss, so recovery re-erases anything whose erase may not have finished.
 - **Data remains:** until erase, old data physically remains. Reads of an Empty zone are answered from metadata as unwritten, so it is invisible to the host but matters for secure erase and sanitize requirements.
+
+**ZNS reference (checked against ZNS 1.4):** 3.4.3.1.5: Reset moves Implicitly Opened, Explicitly Opened, Closed and Full zones to Empty (Empty is a no-op; Read Only and Offline give Invalid Zone State Transition), sets the write pointer to ZSLBA, and clears ZDEV, FZR, RZR, ZFC and ZRWAV; with VZC it may change ZCAP.
 FOLLOW:
 - How can a validator tell the designs apart? => Reset latency versus fill level: flat and microseconds means deferred, growing with fill means synchronous. Then run writes right after a reset storm and watch for stalls.
 - Does Reset of a half-filled zone erase the whole stripe? => Design specific. Many erase only blocks that were programmed, so latency and erase wear track fill level.
 PITFALL: Reading a fast Reset completion as a cheap Reset. In a deferred design the erase debt is paid by the next writer or reader.
-VERIFY: Which states Reset accepts and the metadata cleared by Reset (write pointer, descriptor extension, attribute bits) in the ZNS Command Set Specification.
 
 @@ 8.07 | Intermediate | Concept | tags=finish,padding,partial-program,waf,open-block
 Q: What does the firmware do at Finish Zone with a partly programmed stripe, and what does padding cost?
@@ -133,11 +137,12 @@ Assumptions from 8.03 and 8.04: program unit per stripe 2.25 MiB, zone stripe 76
 4. **Open blocks:** many NAND parts limit how long a block may stay partly programmed, because unprogrammed pages in a written block are sensitive to read disturb and retention effects. That is one reason a controller might finish a zone itself (Zone Finished by Controller) or set Finish Zone Recommended (see 6.10). Confirm limits in the NAND datasheet.
 - **Gap reads:** LBAs between the last write and ZCAP were never host-written. The mapping says unwritten, so the read returns the namespace's unwritten-block data without NAND access (4.04).
 - **Mid-zone padding is different:** padding at Finish is harmless because no later data needs that space. Padding in the middle of an open zone would create a hole in the arithmetic mapping (8.05).
+
+**Source note:** Whether your drive pads the unit, pads to end, or uses a separate area. The Finish, padding and gap-read behavior are vendor and DLFEAT dependent.
 FOLLOW:
 - Does Finish change ZCAP? => No. The zone is Full and its capacity is unchanged, and the write pointer is no longer meaningful.
 - Does Finish on an Empty zone program anything? => It should not need to. A design may not even allocate blocks, which is a lazy-allocation choice worth probing.
 PITFALL: Assuming Finish is metadata only. It can trigger a program, and a frequent Finish of small zones shows up as media writes far above host writes.
-VERIFY: Whether your drive pads the unit, pads to end, or uses a separate area. The Finish, padding and gap-read behavior are vendor and DLFEAT dependent.
 
 @@ 8.08 | Intermediate | Trap | tags=background,refresh,scan,latency,assumptions,soak
 Q: A test plan asserts that a ZNS SSD has no garbage collection, so p99.99 latency must stay within 2x the median through a long soak. Is the assertion sound?
@@ -173,11 +178,12 @@ DEEP:
 - **Recovery order:** load the newest checkpoint, replay the journal, scan the tails of zones that were open or closed to rebuild each WP, re-check dirty and erase-pending blocks, rebuild free pools and counters, then set ready.
 - **Cost:** the scan grows with the number of active zones (bounded by MAR), which is one more reason for a small active limit. With MAR 14 the firmware scans at most 14 zone tails.
 - **Descriptor extension:** persisted per zone as well (see 6.09). Whether it must survive power loss is a spec point to check.
+
+**ZNS reference (checked against ZNS 1.4):** Initial zone states are set only after an NVM Subsystem Reset or when all controllers report shutdown complete (ST 0, SHST 10b): an open zone becomes Closed if its write pointer is past ZSLBA, ZDEV is set or its ZRWA holds data, otherwise Empty; Full stays Full; Read Only and Offline stay; an NVM Subsystem Reset may also move zones to Full (2.1.1.3). A Controller Level Reset alone is not one of these events. ZNS 1.4 has no power-loss rules of its own. A Zone Descriptor Extension stays associated until the zone becomes Empty or Offline (5.3).
 FOLLOW:
 - What state do Open zones come back in after a power cycle? => Closed, or Empty if nothing was written, since open resources do not survive a reset (see 3.09). Full, Read Only and Offline zones keep their state.
 - Where does the journal live? => In system blocks, often in an SLC-mode area, sized to bound recovery. Layout is vendor specific.
 PITFALL: Treating the WP as a stored variable. It is derived at recovery from NAND, so its post-crash value is a consequence of the scan rules, and those rules need tests.
-VERIFY: Zone state after a controller reset or power cycle, and what the specification requires to persist (WP, descriptor extension) in the ZNS Command Set Specification.
 
 @@ 8.10 | Advanced | Concept | tags=bad-block,spare,offline,read-only,zcap,program-fail
 Q: How does the firmware handle factory and grown bad blocks in a zoned namespace, and when does a zone lose capacity, go Read Only or go Offline?
@@ -197,11 +203,12 @@ DEEP:
 - **Data already completed:** with a write-back buffer, a program failure can put previously completed writes at risk. The firmware must keep buffered data until the program is verified, and power-loss protection must cover the retry (8.14).
 - **Host signals:** a Zone Descriptor Changed event and Changed Zone List (see 6.11), plus Available Spare in SMART. Namespace-wide Critical Warning bit 3 is a different, coarser condition (see 3.16).
 - **Capacity impact:** each Offline zone removes ZCAP bytes from usable capacity. Host software must budget for it.
+
+**ZNS reference (checked against ZNS 1.4):** Moves to Read Only or Offline occur by mechanisms outside the spec (2.1.1.3), so it defines no triggering status; the write pointer is not valid in Read Only (Figure 4); such controller-initiated changes raise Zone Descriptor Changed (not excluded by Figure 43); RZR, FZR and ZFC are cleared in Read Only and Offline (5.4 to 5.6); a ZRWA is flushed before Read Only (5.7).
 FOLLOW:
 - Why keep spares per (die, plane) and not one global pool? => Because a spare from another plane usually cannot join a multi-plane program, so pool exhaustion is local. Some NAND allows more freedom.
 - Can a zone shrink instead of going Offline? => Only where the drive sets the Variable Zone Capacity bit. Many host stacks, including the Linux driver, do not accept that, so many designs avoid it.
 PITFALL: Modeling bad blocks as one percentage of the whole drive. The limit is the worst slot pool.
-VERIFY: Which status a command that triggers a Read Only transition returns, the WP value in a Read Only zone, and the descriptor changed mechanics in the NVMe Base and ZNS specifications.
 
 @@ 8.11 | Advanced | Debug | tags=program-fail,write-fault,read-only,trace,spare,telemetry
 Q: Two zones show anomalies during a sequential write test, one with an isolated 4 ms write and no error, one with a Write Fault and then a Read Only zone. Explain both from the firmware side and say what to collect.
@@ -225,11 +232,13 @@ report zone 40: ZS byte 0xD0 (Read Only), WP 0xa2c020
 4. **Data check:** read back everything below the reported WP. With write-back buffering, completed writes just before the fault can be lost (the firmware must not report a WP past data it cannot read).
 5. **Host signals:** the command's DNR bit, Changed Zone List and Zone Descriptor Changed event, Error Information log, SMART Available Spare.
 Verdict rule: zone 12 passes if data reads back and grown-bad-block counters rise by exactly one. Zone 40 passes only if the fault was injected, or telemetry shows the slot pool at zero. A Write Fault with spares available is a firmware bug.
+
+**ZNS reference (checked against ZNS 1.4):** Zone statuses are command-specific values B6h to BFh (Figure 11); the trigger for Read Only is outside the spec; the write pointer is invalid in Read Only (Figure 4).
 FOLLOW:
 - Can the host reset or finish zone 40? => No. Both fail in Read Only. The host copies out the data, then either leaves the zone or uses the Offline action (see 4.05).
 - Why does the retry complete in 40 us? => The controller rejects it from zone metadata with no NAND work. It shows Read Only is a lasting zone state and not a transient error.
 PITFALL: Blindly retrying a Write Fault to the same zone. It can be followed by a zone state change, so run Report Zones before deciding.
-VERIFY: SCT and SC values for Write Fault and the zone status codes, which status triggers the Read Only transition, and the WP value reported for a Read Only zone.
+VERIFY: The SCT and SC of Write Fault in the NVMe Base Specification.
 
 @@ 8.12 | Advanced | Scenario | tags=wear-leveling,static,dynamic,erase-count,host-placement,metadata-zone
 Q: The host decides which zones are rewritten. How does the controller keep wear even, and what happens if a host resets one metadata zone every 60 seconds?
@@ -243,11 +252,12 @@ Assumptions: 3,000 P/E cycles rated, 1,040 zones, 1,100 block positions per plan
 - **Host contribution:** a zoned host should rotate hot roles through many zones (metadata, journal) instead of one. Wear awareness at the host layer is often worth more than firmware leveling.
 - **Metrics:** min, mean and max erase counts (vendor telemetry), spread over time, and the number of static relocations. A widening max-min spread under a hot/cold workload signals a bug.
 - **Test:** drive a skewed reset workload (one hot zone, many cold) at high speed, log the spread, and confirm that it stays within the design bound and that Percentage Used does not run ahead of average wear.
+
+**Source note:** Endurance ratings (3,000 cycles here is illustrative) and any vendor telemetry field that reports erase-count spread.
 FOLLOW:
 - Why not level only on reset? => Cold Full zones never reset, so their blocks stay young. Dynamic leveling cannot touch them.
 - Does static leveling change the host's view? => No LBAs move. Only the block list changes, and the copy may add latency or use media writes, visible in counters.
 PITFALL: Trusting that placement is the host's responsibility, so the controller does no leveling. The controller still owns block-level wear.
-VERIFY: Endurance ratings (3,000 cycles here is illustrative) and any vendor telemetry field that reports erase-count spread.
 
 @@ 8.13 | Advanced | Cross-layer | tags=retention,read-disturb,scan,refresh,full-zone,open-block
 Q: How do retention, read disturb and background scanning work at zone level, and how is a Full zone refreshed without the host?
@@ -260,11 +270,12 @@ DEEP:
 - **Host visibility:** the Reset Zone Recommended attribute is a hint that the data in a Full zone is aging and should be rewritten by the host while it is still healthy. A validator should confirm the attribute does not appear without cause.
 - **Failure:** an unrecoverable read returns a media error status, and the firmware may mark the zone Read Only.
 - **Validation:** fill zones, bake at elevated temperature (an accelerated retention model), read back and compare, and separately hammer reads on one zone and watch latency, ECC counters and refresh activity. Check that LBA content is unchanged after refresh and that no ZDC event fires for an invisible block swap.
+
+**ZNS reference (checked against ZNS 1.4):** RZR (5.4) is for a Full zone and FZR (5.5) for Implicitly Opened, Explicitly Opened or Closed zones when the controller schedules an internal operation; each has a per-zone selector (RZRTL, FZRTL) pointing at RRL/RRL1-3 or FRL/FRL1-3 in seconds; acting on them is optional for the host; both clear in Read Only and Offline. Read-disturb thresholds are NAND-vendor data.
 FOLLOW:
 - Does refresh cost the host anything? => Extra media writes and read latency during the copy. It should not change zone state or LBAs. Media Units Written rises without host writes.
 - Why are cold zones the risk? => Retention degrades with time since program. Hot zones are rewritten, so they refresh themselves through host Reset.
 PITFALL: Assuming zoned data needs no refresh because it is never overwritten. It is more exposed to retention, since a Full zone can sit untouched for years.
-VERIFY: The definition and trigger of Reset Zone Recommended and Finish Zone Recommended, and any time limits, in the ZNS Identify Namespace. Read-disturb thresholds come from the NAND vendor.
 
 @@ 8.14 | Principal | Cross-layer | tags=power-loss,write-pointer,plp,multi-pass,recovery,fault-injection
 Q: How should a ZNS firmware treat the write pointer and buffered data across power loss, and how do you test that design?
@@ -277,11 +288,13 @@ DEEP:
 5. **Cut points:** derive them from the firmware state machine, not time. Examples: last page of a unit on one die, between dies of one unit, during the dump, during a journal write, mid erase, mid replacement copy, during recovery itself, and during the recovery of a recovery.
 6. **Why deterministic:** to catch a window of width w within a cycle T at random, p = w/T and the cuts needed for 99 percent confidence are ln(0.01)/ln(1-p). A 100 us window in a 1 ms cycle needs 44 cuts, but 5 us in 10 ms needs about 9,200. Use firmware debug hooks or a trace-triggered power switch for narrow windows.
 7. **Oracle:** per zone record submitted, completed and durable ends before the cut. After boot check the bound above, read back everything below WP, check other zones are untouched, and time to ready against CAP.TO.
+
+**ZNS reference (checked against ZNS 1.4):** Initial zone states are set only after an NVM Subsystem Reset or when all controllers report shutdown complete (ST 0, SHST 10b): an open zone becomes Closed if its write pointer is past ZSLBA, ZDEV is set or its ZRWA holds data, otherwise Empty; Full stays Full; Read Only and Offline stay; an NVM Subsystem Reset may also move zones to Full (2.1.1.3). A Controller Level Reset alone is not one of these events. ZNS 1.4 has no power-loss rules of its own.
 FOLLOW:
 - What does Report Zones after a cut show for a zone that was Open? => Closed with the recovered WP, or Empty if nothing survived, per the rules in 3.09 and 3.15.
 - What is a good sign that the design is sound? => Repeated cuts during recovery still converge to the same state, and the recovered WP never exceeds accepted_end or drops below durable_end.
 PITFALL: Checking only that the drive comes back. Verify content below the WP, not just its value, and repeat with cuts inside recovery.
-VERIFY: The WP and data durability rules after unexpected power loss, and Zone state after a power cycle, in the NVMe Base and ZNS Command Set Specifications. Multi-pass behavior is NAND and vendor specific.
+VERIFY: Write pointer and data durability after unexpected power loss (NVMe Base Specification).
 
 @@ 8.15 | Principal | Numeric | tags=reset,erase,tail-latency,quantify,erase-suspend,pacing
 Q: Quantify how zone resets from a host that writes 2 GB/s affect read tail latency and write throughput, and what would you do about it?
@@ -303,11 +316,12 @@ Assumptions: zone capacity 768 MiB, 12 dies, a multi-plane erase of 4 blocks tak
 - **Mitigation, firmware:** erase suspend (a read interrupts the erase, cost tens to hundreds of microseconds), staggering die erases so not all 12 are busy at once, and pacing background erase.
 - **Mitigation, host:** spread resets over time, avoid reset bursts, and reset zones ahead of need.
 - **Validation:** per-I/O latency log for reads (QD1 reads over a hot region while a second stream resets zones at a set rate), compare the tail with resets off, and check that the tail scales with reset rate as the model says.
+
+**Source note:** Erase time, suspend latency and suspend limits come from the NAND datasheet and firmware. The 10 ms figure is an assumption.
 FOLLOW:
 - How would you prove the read outliers come from erases? => Timestamp every Reset command and every read over 1 ms. If slow reads cluster in the erase window (between Reset submission and completion for a synchronous design, shortly after completion for a deferred one), erase blocking is confirmed.
 - What if suspend is present but the tail persists? => Check suspend limits: a NAND may allow only a few suspends per erase, or resume with a delay. Compare p99.9 against the model.
 PITFALL: Watching throughput only. Erase cost is 2.5 percent of die time, so throughput hides it, and the damage is in the tail.
-VERIFY: Erase time, suspend latency and suspend limits come from the NAND datasheet and firmware. The 10 ms figure is an assumption.
 
 @@ 8.16 | Principal | Concept | tags=slc,slc-cache,fold,vzc,endurance,dump-area
 Q: You must decide how a ZNS SSD uses SLC-mode blocks. What are the options, what do they cost, and what do you have to validate?
@@ -325,11 +339,12 @@ DEEP:
 - **Zone effects:** data still lands in zone order and folds sequentially into whole stripes, so fold is efficient. A Reset must cover both SLC and TLC copies, and a zone's block list can have mixed modes (which breaks pure arithmetic mapping if not designed for).
 - **Endurance:** SLC-mode blocks have much higher cycle ratings than TLC, but every buffered byte adds an SLC program to a TLC program. Device WAF is up to 2 for cached bytes.
 - **Validate:** rate versus fill (cliff shape), fold behavior across idle, power cut during fold (each LBA must have exactly one valid copy afterward), reset while a zone is partly folded, and endurance accounting.
+
+**Source note:** Whether the drive uses SLC for zone data, journal or dump only, is vendor specific. Ask for the design or infer it from rate-versus-fill and capacity measurements.
 FOLLOW:
 - Why do many ZNS designs still keep a small SLC area? => For metadata, the journal and the power-loss dump area, where cheap durability matters more than capacity.
 - What breaks if fold and Reset race? => A reset may erase blocks the fold is reading or writing. The firmware must serialize them, and tests must cross the two operations with power cuts.
 PITFALL: Assuming a ZNS drive has no SLC cache. Many use one, and the performance cliff and endurance accounting still apply.
-VERIFY: Whether the drive uses SLC for zone data, journal or dump only, is vendor specific. Ask for the design or infer it from rate-versus-fill and capacity measurements.
 
 @@ 8.17 | Principal | Scenario | tags=validation,test-plan,fault-injection,telemetry,firmware-update,regression
 Q: How would you plan the validation of the firmware and FTL side of a ZNS SSD: what must be tested, how do you observe it, and how do you decide it is enough?

@@ -113,11 +113,12 @@ Assumptions: 4 TiB user capacity, 4 KiB mapping granularity, 4-byte physical add
 
 - **Why reads still work:** inside a zone the LBA-to-die, block and page mapping is arithmetic on the stripe layout, so no per-LBA table is needed.
 - **What does not shrink:** DRAM used for write buffers, per-block wear and validity metadata, bad block tables and firmware structures. Real ZNS drives may still carry DRAM for these, so the benefit is often lower cost and power rather than no DRAM.
+
+**Source note:** Typical mapping granularity and entry width on shipping drives are vendor-specific, so present them as assumptions.
 FOLLOW:
 - Why is a 4-byte entry enough? => 2^32 units x 4 KiB = 16 TiB of addressable space, above the 4 TiB drive.
 - Does the DRAM saving change the failure model? => Yes. A small table can be persisted quickly, so power-loss recovery is simpler, but write-buffer contents still need capacitor-backed flushing.
 PITFALL: Claiming a ZNS SSD ships with no DRAM. The mapping table shrinks by orders of magnitude, but other DRAM users remain.
-VERIFY: Typical mapping granularity and entry width on shipping drives are vendor-specific, so present them as assumptions.
 
 @@ 1.07 | Intermediate | Concept | tags=zns,nvme,command-set,overview
 Q: What exactly is ZNS in NVMe terms, and where does it stand in the market?
@@ -128,11 +129,13 @@ DEEP:
 - **Relationship to SMR:** same host-managed model, shared software stack, flash-specific additions.
 - **Availability:** enterprise ZNS drives have shipped (for example the Western Digital Ultrastar DC ZN540 and Samsung PM1731a), and Linux gained ZNS support in the 5.x series.
 - **Market view, hedged:** ZNS needs zone-aware software, so adoption has been narrower than the original hype suggested. The backward-compatible Flexible Data Placement (FDP) specification appears to have drawn more attention. Treat this as an assessment to confirm against current vendor roadmaps.
+
+**ZNS reference (checked against ZNS 1.4):** The Zoned Namespace Command Set's Command Set Identifier is 02h.
 FOLLOW:
 - Is ZNS a new transport or a new interface? => Neither. It is a command set that runs over the same queues and transports as NVM.
 - Which Linux kernel introduced ZNS support? => The 5.x series, around 5.9, with zone append support in the block layer.
 PITFALL: Treating "ZNS" as a product feature switch. It is a different namespace type with different rules, not a mode of a conventional namespace.
-VERIFY: Ratification timing (TP 4053, 2020) and inclusion in NVMe 2.0; the Zoned command set CSI value; first Linux kernel with ZNS support; which vendors currently ship ZNS drives.
+VERIFY: Ratification timing (TP 4053, 2020) and inclusion in NVMe 2.0, the first Linux kernel with ZNS support, and which vendors ship ZNS drives. ZNS 1.4 has no revision history.
 
 @@ 1.08 | Intermediate | Concept | tags=latency,tail-latency,gc,reset
 Q: Why do conventional SSDs show tail latency spikes, and what does ZNS change?
@@ -168,11 +171,12 @@ Assumptions: 4096 GiB raw NAND, OP ratio a = spare / user capacity, ZNS reserve 
 - **Read the result carefully:** the model is a worst-case-like uniform random workload. Real drives with hot and cold separation do better, so the gap is smaller in practice.
 - **Do not double count:** capacity gain and WAF gain are separate levers. A vendor can sell the WAF gain as endurance or trade it for capacity.
 - **Host GC moves the goalposts:** any host-side relocation adds back to total WAF. See the last question in this module.
+
+**Source note:** The (1+a)/(2a) approximation is a widely quoted greedy-GC model, so cite it as a rule of thumb, not a measured value.
 FOLLOW:
 - Why does WAF fall as OP rises? => GC victims are drawn from a larger pool of blocks, so they hold less valid data when chosen.
 - Is the 3 percent reserve a spec value? => No. It is an assumption. Real reserves depend on media, bad block budget and firmware.
 PITFALL: Mixing GB and GiB. Raw NAND is binary while user capacity is often decimal, and this alone can add several points of apparent OP.
-VERIFY: The (1+a)/(2a) approximation is a widely quoted greedy-GC model, so cite it as a rule of thumb, not a measured value.
 
 @@ 1.10 | Advanced | Concept | tags=host-burden,gc,resources,tradeoffs
 Q: What does ZNS take away from the host in flexibility, and what new work does it create?
@@ -320,8 +324,9 @@ Method for fairness:
 - **Sensitivity:** vary fill and lifetime alignment. The gain should degrade in a predictable way as alignment worsens.
 
 - **Pitfall in the design:** an unfair baseline, such as comparing ZNS against a conventional drive left at 7 percent OP with a tuned software stack against a stock one.
+
+**Source note:** The example factors are assumptions, not measurements; label them as such in any presentation.
 FOLLOW:
 - What single metric would you present to management? => Cost per user byte written over the drive lifetime at target p99.9, which combines capacity, endurance and QoS.
 - How does validation feed the model? => Firmware defects that add hidden relocation show up as device WAF above about 1.05 in the zone-aligned test, which directly weakens the case.
 PITFALL: Attributing the whole gain to ZNS when part of it came from better software lifetime hints that would also help a conventional drive.
-VERIFY: The example factors are assumptions, not measurements; label them as such in any presentation.

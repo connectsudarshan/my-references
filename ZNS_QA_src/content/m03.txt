@@ -9,11 +9,12 @@ DEEP:
 - **Zone Append:** the exception in addressing. The host names the zone and the device chooses the LBA (module 5).
 - **Only type 2h:** ZBC/ZAC SMR drives also have Conventional and Sequential Write Preferred zones. A ZNS zone descriptor carries the type in byte 0, and the Linux NVMe driver rejects any zone whose type is not 2h.
 - **Zone is logical:** a zone is an address-space contract, not an erase block. How firmware maps a zone to NAND is module 8.
+
+**ZNS reference (checked against ZNS 1.4):** ZNS 1.4 has no rule that NSZE be a multiple of ZSZE (ZSZE only has to be nonzero). Zone Type 2h (Sequential Write Required) is the only defined value; others are reserved.
 FOLLOW:
 - Can one namespace mix conventional and zoned regions? => No. A zoned namespace (Command Set Identifier 2h) contains only zones. Conventional and zoned namespaces coexist as separate namespaces (module 2).
 - Must Zone Size be a power of two? => Not that I could confirm in the spec text (see VERIFY), but the Linux NVMe driver source I checked rejects non-power-of-two zone sizes, so real hosts effectively assume it.
 PITFALL: Equating a zone with a NAND erase block. Zone Size and capacity are host-facing numbers and firmware is free to stripe a zone over many blocks and dies.
-VERIFY: ZNS 1.4 does not say whether the namespace size must be an exact multiple of Zone Size (Annex A.5 only shows equal-size zones, with no stated multiple rule). Zone Type 2h (Sequential Write Required) is the only defined value; all others are reserved (ZNS 1.4, Figure 38).
 
 @@ 3.02 | Basic | Concept | tags=write-pointer,wp,sequential,invalid-write
 Q: What is the write pointer, and how does it move?
@@ -28,11 +29,12 @@ While the WP is valid it satisfies ZSLBA <= WP < ZSLBA + ZCAP. Once a write reac
 - **Where the host reads it:** only Report Zones returns the WP. A normal Write completion does not carry it, so hosts keep their own shadow copy. Zone Append is the exception, because its completion returns the LBA where data landed (module 5).
 - **Related statuses:** Zone Invalid Write (SCT 1, SC BCh), Zone Boundary Error (B8h) and Zone Is Full (B9h). Linux names them NVME_SC_ZONE_INVALID_WRITE and so on, with the 0x1xx values. Module 7 covers the full set.
 - **Queue depth caveat:** with several writes in flight to one zone, the host must submit them in WP order and the device must process them in order, or the second write hits Zone Invalid Write. This is why Zone Append exists.
+
+**ZNS reference (checked against ZNS 1.4):** Initial zone states are set only after an NVM Subsystem Reset or when all controllers report shutdown complete (ST 0, SHST 10b): an open zone becomes Closed if its write pointer is past ZSLBA, ZDEV is set or its ZRWA holds data, otherwise Empty; Full stays Full; Read Only and Offline stay; an NVM Subsystem Reset may also move zones to Full (2.1.1.3). A Controller Level Reset alone is not one of these events. ZNS 1.4 has no power-loss rules of its own. Write pointer durability across unexpected power loss is left to the NVMe Base Specification and the product.
 FOLLOW:
 - Can the WP move backward? => Only via Reset Zone in normal operation. After unexpected power loss it may come back lower than the host last saw if the data was not durable (see 3.15).
 - Does a Flush or FUA change the WP? => No. The WP advances on successful write completion. Durability of that data follows the usual Flush and FUA rules.
 PITFALL: Expecting the WP in the write completion. Only Zone Append returns an LBA, so a host that does not track the WP must call Report Zones.
-VERIFY: ZNS 1.4 gives no zone-specific durability guarantee for the WP after an Unexpected Power Loss; that is governed by the NVMe Base Specification's volatile write cache and unexpected-power-loss rules (see the NVMe page).
 
 @@ 3.03 | Basic | Concept | tags=zone-size,zone-capacity,zsze,zcap,vzc
 Q: What is the difference between Zone Size and Zone Capacity?
@@ -44,11 +46,12 @@ DEEP:
 - **Writes past capacity:** a write that would cross ZSLBA + ZCAP is aborted (Zone Boundary Error in the QEMU model), and the zone is Full when the WP reaches ZSLBA + ZCAP.
 - **Reads in the gap:** the LBAs from offset ZCAP to ZSZE-1 behave like deallocated blocks on a read and are not allowed to be written (ZNS 1.4, Annex A.5).
 - **Capacity accounting:** usable space is the sum of ZCAP, not NSZE (worked in 3.08).
+
+**ZNS reference (checked against ZNS 1.4):** If VZC is 1, Reset Zone may change ZCAP, and the controller then sets the Zone Capacity Changed bit in CQE Dword 0 (3.4.3.1.5). A write whose SLBA is not the write pointer returns Zone Invalid Write (2.1.1.2.1.1).
 FOLLOW:
 - Why not just make capacity equal to size? => Zone Size is a power of two for host math, while capacity tracks superblock geometry, which rarely is.
 - Which value decides when a zone is Full? => Capacity. Reaching ZSLBA + ZCAP fills the zone even though ZSZE more addresses exist.
 PITFALL: Filling to Zone Size in a test. The last ZSZE - ZCAP LBAs are not writable, so a host or test that plans on ZSZE hits a boundary error.
-VERIFY: Zone Capacity can change on Reset Zone when VZC is 1 (ZNS 1.4, 3.4.3.1.5 and Annex A.5, confirmed). A write starting inside the gap fails as Zone Invalid Write (start not at WP) or Zone Is Full once the zone has reached capacity; there is no separate gap-specific status.
 
 @@ 3.04 | Intermediate | Concept | tags=zone-descriptor,report-zones,zone-attributes,extension
 Q: What is inside a zone descriptor, and how is a Report Zones buffer laid out?
@@ -151,11 +154,12 @@ DEEP:
 7. Usable space: 256 x 56,320 = 14,417,920 LBAs = 55 GiB, which is 55 / 64 = 85.9 percent.
 8. Lookup: LBA 0x64A000 is zone 0x64 = 100, offset 0xA000 = 40,960 < ZCAP, so it is writable range. LBA 0x65E000 is zone 101 with offset 0xE000 = 57,344 > ZCAP, so it falls in the gap.
 9. Fill count: 56,320 / 32 = 1,760 writes of 128 KiB (32 LBAs) fills a zone exactly.
+
+**ZNS reference (checked against ZNS 1.4):** ZNS 1.4 does not require NSZE to be a multiple of ZSZE; the example assumes it for clean arithmetic.
 FOLLOW:
 - How does the zone lookup change if Zone Size is not a power of two? => The host divides instead of shifting: zone = LBA / ZSZE, and offset = LBA mod ZSZE.
 - What does the state look like after write number 1,760 of 128 KiB? => Full, and Report Zones shows state Eh.
 PITFALL: Sizing the dataset from NSZE. A 64 GiB namespace stores 55 GiB, and a host GC or capacity plan that ignores the gap runs out of zones early.
-VERIFY: ZNS 1.4 does not say the namespace size must be an exact multiple of Zone Size (the example assumes it for clean arithmetic; Annex A.5 does not state the requirement either way).
 
 @@ 3.09 | Advanced | Concept | tags=controller-transitions,power-cycle,reset,initial-state
 Q: Which transitions does the controller make on its own, and what happens to open zones across a power cycle or controller reset?
@@ -275,7 +279,7 @@ DEEP:
 3. **Monotonic WP:** between Resets, WP never decreases, and after each completed write it equals the old WP plus blocks written (for Append, returned LBA plus length).
 4. **Transition legality:** only the table in 3.06 plus declared controller moves. Offline is terminal. Read Only never returns to writable.
 5. **Resources:** open count <= open limit and active count <= active limit (MOR and MAR are zero-based in Identify, and the kernel uses MOR + 1, so 0xFFFFFFFF means no limit).
-6. **Rejected commands:** a failed command must leave state and WP unchanged. Check by reporting the zone right after.
+6. **Rejected commands:** a command aborted with a zone status must leave state and WP unchanged. A write that fails after it started is different: ZNS 1.4 (2.1.1.2.1.1) lets the WP land inside the range, one past it, or become invalid. Check by reporting the zone right after.
 
 - **Declared nondeterminism:** the controller may close any Implicitly Opened zone when resources run out, may move zones to Read Only or Offline, and after power loss the WP may lie between last durable and last submitted. The model holds an allowed set, not one value.
 - **Race handling:** compare after draining the queues, since a report can race in-flight writes.
@@ -300,11 +304,13 @@ DEEP:
    - Zone Full without Finish or capacity reached: bad recovery rule.
 5. **Repeat** at many cut points (random, at zone boundaries, at Finish, at Reset) and plot WP_loss = submitted_end - WP_new.
 - **With PLP:** power-loss protection should flush volatile data, so completed writes are expected to survive. Any loss is a bug, and the rollback window shrinks to in-flight commands.
+
+**ZNS reference (checked against ZNS 1.4):** Initial zone states are set only after an NVM Subsystem Reset or when all controllers report shutdown complete (ST 0, SHST 10b): an open zone becomes Closed if its write pointer is past ZSLBA, ZDEV is set or its ZRWA holds data, otherwise Empty; Full stays Full; Read Only and Offline stay; an NVM Subsystem Reset may also move zones to Full (2.1.1.3). A Controller Level Reset alone is not one of these events. ZNS 1.4 has no power-loss rules of its own.
 FOLLOW:
 - How do you make the cut reproducible? => Use a programmable power switch or the drive's power-fail injection and trigger on a command count or timer, logging exact command IDs and submit times. Use FUA on marker writes so the durable lower bound is known.
 - What if WP_new is below durable_end on only one zone? => Check whether that zone was mid-Finish or mid-Reset at the cut, which are metadata-heavy operations, and reproduce that specific sequence.
 PITFALL: Comparing WP_new to the last completed write instead of the last durable point. Completed does not mean durable when a volatile cache is on.
-VERIFY: The durability and WP-rollback rules the ZNS spec and NVM Command Set give for unexpected power loss, and how PLP is declared.
+VERIFY: Durability and write-pointer rules for unexpected power loss in the NVMe Base and NVM Command Set specifications, and how the product declares power-loss protection.
 
 @@ 3.16 | Principal | Scenario | tags=read-only,offline,media-fault,fault-injection,triage
 Q: During an endurance run a few zones go Read Only. How do you root-cause it, and how do you design a test for that behavior?
@@ -319,11 +325,13 @@ DEEP:
    - The open and active counts drop, since Read Only zones are neither.
    - Offline Zone moves it to Offline, then reads fail with Zone Is Offline.
 5. **Host side:** evacuate valid data, mark the zone dead in the allocator and adjust capacity accounting.
+
+**ZNS reference (checked against ZNS 1.4):** A controller-initiated move to Read Only or Offline raises a Zone Descriptor Changed event (EFh) and lists the zone in the optional Changed Zone List log (BFh); only host-requested and certain write-driven transitions are excluded (Figure 43).
 FOLLOW:
 - Can Reset Zone bring the space back? => No, it fails with Invalid Zone State Transition. Only a vendor mechanism or reformat may recover the space (check the spec and vendor documents).
 - How do you know how much valid data a Read Only zone holds when WP is invalid? => From the host's own record (the shadow model's last completed write), and by reading until the device returns the unwritten value.
 PITFALL: Expecting the WP field to say how much survives in a Read Only zone. It is invalid there, so the host must keep its own bookkeeping.
-VERIFY: Critical Warning bit 3 meaning in the NVMe Base Specification, and which log (Changed Zone List or asynchronous event) reports the change on your device.
+VERIFY: Critical Warning bit 3 in the NVMe Base Specification.
 
 @@ 3.17 | Principal | Concept | tags=coverage,state-machine,test-plan,fault-injection,automation
 Q: How would you build a coverage plan for the zone state machine, and how do you reach the states that cannot be entered by commands alone?

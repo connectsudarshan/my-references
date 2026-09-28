@@ -146,7 +146,7 @@ VERIFY: The ZenFS open policy in the ZenFS source (zbd_zenfs.cc calls only close
 
 @@ 6.08 | Intermediate | Trap | tags=trap,closed,crash,recovery,power-cycle
 Q: After a host crash or power cycle a restarted application gets Too Many Active Zones on its first write. Why?
-SHORT: Zone state is persistent device state, not host state. Open zones are returned to Closed at a power cycle or NVM subsystem reset (whether a controller-level reset alone does so is unconfirmed), and Closed zones stay active. The restarted host starts counting from zero, but the device still holds every zone the previous instance left partly written. Recovery must reconcile with Report Zones, then finish, reset or resume those zones.
+SHORT: Zone state is persistent device state, not host state. Open zones are returned to Closed at a power cycle or NVM subsystem reset (a controller-level reset alone is not an event the spec defines initial zone states for), and Closed zones stay active. The restarted host starts counting from zero, but the device still holds every zone the previous instance left partly written. Recovery must reconcile with Report Zones, then finish, reset or resume those zones.
 DEEP:
 - **What happens at a reset or power cycle:** zones that were Implicitly or Explicitly Opened become Closed (or Empty if nothing was written), and their write pointers are kept. Open resources are freed but active resources are not.
 - **What the host believes:** its in-memory table is gone, so it thinks zero zones are active.
@@ -181,12 +181,12 @@ Confirmed (ZNS 1.4, 2.1.1.3(b)): a zone's initial state after an NVM Subsystem R
 
 @@ 6.10 | Advanced | Concept | tags=zae,fzr,rzr,zfc,frl,rrl,excursion
 Q: What are FZR, RZR, FRL, RRL and a Zone Active Excursion, and why would a device do that?
-SHORT: A device may want zones not to stay active or Full indefinitely. It advertises time limits (FRL and RRL) and sets Finish Zone Recommended or Reset Zone Recommended in the zone attributes. If the host ignores a recommendation, a device that supports Zone Active Excursions may itself Finish the zone: the zone goes to Full, the Zone Finished by Controller bit is set, and the host is notified.
+SHORT: A device may want zones not to stay active or Full indefinitely. It advertises time limits (FRL and RRL) and sets Finish Zone Recommended or Reset Zone Recommended in the zone attributes. Separately, and at any time, a device that supports Zone Active Excursions may Finish an active zone itself: the zone goes to Full, the Zone Finished by Controller bit is set, and the host is notified.
 DEEP:
 - **Capability:** ZOC bit 1 in Identify says the namespace may perform Zone Active Excursions. ZOC bit 0 is Variable Zone Capacity.
 - **Zone attributes byte in the descriptor:** bit 0 ZFC (Zone Finished by Controller), bit 1 FZR (Finish Zone Recommended), bit 2 RZR (Reset Zone Recommended), bit 7 ZDEV.
 - **Why it exists (typical):** a zone left partly written for a long time strands NAND in open blocks with retention and data-integrity exposure. A zone left Full with stale data pins capacity. Vendors want the host to close the loop.
-- **FRL:** the limit after which FZR may be set. **RRL:** the analogous limit for RZR (which zone states it applies to is in the specification). Newer revisions add FRL1 to FRL3 and RRL1 to RRL3, selected per zone. Units and start-of-timer rules are in the specification.
+- **FRL:** the number of seconds after FZR is set before the device may take its own action on the zone (0h means no limit reported). **RRL:** the same for RZR. RZR applies to Full zones (5.4), FZR to Implicitly Opened, Explicitly Opened and Closed zones (5.5). FRL1 to FRL3 and RRL1 to RRL3 also exist, and each zone's Zone Attributes Information field selects which one applies. A Zone Active Excursion is orthogonal to FZR (5.6): it is not defined as the consequence of ignoring a recommendation.
 - **The excursion:** the controller does a Finish itself. The zone becomes Full, ZFC is 1, resources are released, and a Zone Descriptor Changed notice is sent (module 6.11).
 - **Linux:** the NVMe driver refuses namespaces whose ZOC is nonzero (dmesg: "zone operations:2 not supported for namespace:1"). A ZAE device is unusable with mainline Linux, so devices meant for Linux hosts normally report ZOC of 0.
 FOLLOW:
@@ -236,11 +236,12 @@ Assumptions: MAR field = 13 (14 active), MOR field = 7 (8 open), zone capacity 1
 3. **Cost of Finish instead of parking:** finishing a zone at 25 percent fill gives up 0.75 x 1077 = 808 MiB. At 50 percent fill, 538.5 MiB. Parking costs an active slot, and Finish costs capacity, so the trade is per workload.
 4. **Why a rotation slot:** when a writer fills a zone, opening the next before the old one is Full needs both an extra open and an extra active. Without the slot, rotation fails with Too Many Open Zones exactly when the load is highest.
 5. **Why serialize:** two simultaneous rotations need 2 slots. A semaphore of 1 turns a fatal race into a short wait.
+
+**Source note:** None for the arithmetic. Check real MAR and MOR from Identify on the target drive.
 FOLLOW:
 - What changes if MAR equals MOR at 8? => No separate parking budget: open writers and parked Closed zones share the same 8 slots, so each parked zone takes a slot from a writer. Finish or Reset zones instead of parking them.
 - What do you monitor? => Open and active counts from Report Zones per second, rotation wait time, and Too Many status counts (should be zero).
 PITFALL: Budgeting only steady-state writers. The peaks are at rotation and at recovery after a crash.
-VERIFY: None for the arithmetic. Check real MAR and MOR from Identify on the target drive.
 
 @@ 6.13 | Advanced | Debug | tags=debug,too-many-open,too-many-active,blkzone,nvme-cli
 Q: Writes to a zoned namespace start failing after N zones. How do you find out why?
@@ -315,11 +316,12 @@ DEEP:
 5. **Bisect:** replay the trace with one event class at a time. Reduce to the minimum sequence, for example "write to Empty zone, inject write error, check probe".
 6. **Report:** the sequence, k, the healing behaviour, and the model diff. The fix belongs in the firmware's error and rollback paths, and the regression test is the probe run after every injected error type.
 - **Add the probe to the suite:** run it at the end of every test, not only after this soak.
+
+**Source note:** None for the method. Confirm the vendor tooling available to read internal resource counters, which is the fastest confirmation.
 FOLLOW:
 - Why not trust Report Zones as the truth? => It reports zone states, not the controller's internal counters. A leak shows only as a mismatch between the two.
 - What if k is negative, the device allows more than MAR? => A counter underflow or double release. It is also a bug, and it may let the host exceed the buffer sizing that MAR protects.
 PITFALL: Fixing the symptom by resetting all zones every time. The leak returns and the underlying error path stays untested.
-VERIFY: None for the method. Confirm the vendor tooling available to read internal resource counters, which is the fastest confirmation.
 
 @@ 6.17 | Principal | Cross-layer | tags=zae,policy,host,firmware,integrity
 Q: How would you validate a device that supports Zone Active Excursions, and what host policy would you write for it?
@@ -337,8 +339,9 @@ DEEP:
 - **Host policy:** every Report Zones interval, sweep for FZR and RZR. Prefer to keep writing or Finish, on your schedule, rather than let the device decide. Reset RZR zones when the data is dead.
 - **Compatibility:** mainline Linux refuses a ZOC nonzero namespace, so the host must be SPDK, xNVMe or a modified driver. State this in the test plan.
 - **Design point:** an excursion costs the remaining capacity of the zone. Size the zones and the FRL against the slowest writer.
+
+**ZNS reference (checked against ZNS 1.4):** 5.6: a Zone Active Excursion is a vendor-specific action that moves an Implicitly Opened, Explicitly Opened or Closed zone to Full at any time, independent of FZR; the controller shall set ZFC and generate a Zone Descriptor Changed event. FRL and RRL are the seconds after FZR or RZR is set before the device may act (Figure 49). ZNS 1.4 says nothing about commands in flight to that zone.
 FOLLOW:
 - How do you tell an excursion from a host bug that finished the zone? => ZFC. It is set only when the controller did it.
 - What does a device with ZAE change in capacity planning? => Slow writers lose unwritten capacity, so plan to fill or finish every active zone within FRL.
 PITFALL: Validating only the happy path where the host reacts in time. The excursion path is the one that has firmware-specific rollback, resource release and notification logic.
-VERIFY: The definition and trigger of a Zone Active Excursion, the FRL and RRL timer semantics, in-flight command handling, and notification requirements in the ZNS Command Set Specification.

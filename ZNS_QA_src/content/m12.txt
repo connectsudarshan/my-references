@@ -40,11 +40,12 @@ Assumptions: 4 KiB LBAs, uniform zones, no variable zone capacity, and reserve s
 Conventional comparison: the device hides its OP and you cannot change it. Here the OP is explicit and yours, so it is a tunable in the capacity plan, not a constant.
 - **Tracking:** count zones by state at start-up and after every Zone Descriptor Changed event, and re-run the plan when spares drop below the reserve.
 - **Test hook:** fill the namespace to the sellable limit with a realistic overwrite pattern and confirm GC keeps the free pool above 8 zones.
+
+**ZNS reference (checked against ZNS 1.4):** ZNS 1.4 does not require NSZE to be a multiple of ZSZE, and Format NVM may initialize zones to Offline (2.1.1.3); whether spares are pre-marked Offline is product-specific.
 FOLLOW:
 - What if Identify reports a variable zone capacity? => Plan per zone from Report Zones, not from a single ZCAP value, and recompute after each Reset (module 3).
 - Does the drive also keep hidden spare NAND? => Yes, for bad blocks and internal metadata, and that is one reason ZCAP is below ZSZE. The size of it is vendor-specific.
 PITFALL: Quoting capacity from the LBA space (ZSZE x zones). Capacity is ZCAP x zones, and then minus your own reserves.
-VERIFY: Whether the specification requires the namespace size to be an exact multiple of the zone size, and whether spare zones are ever pre-marked Offline at format time on your product.
 
 @@ 12.03 | Basic | Trap | tags=trap,reset,trim,delete,space-reclaim
 Q: Trap: "when the application deletes an object, the store just issues Reset Zone on its zone, like TRIM." What is wrong with this?
@@ -55,11 +56,13 @@ DEEP:
 - **Why lifetime matters:** if objects written together die together (same TTL, same table, same compaction generation), the counter reaches zero on its own and reclaim costs one Reset and no copying. Mixed lifetimes leave zones partly live and force relocation.
 - **Cost:** a Reset erases every block of the zone (see 4.14 for the timing model). A reset storm after a bulk delete competes with foreground I/O, so queue resets and rate-limit them.
 - **Related trap:** a block-layer discard (REQ_OP_DISCARD) is not a Reset Zone. Space reclaim on zoned storage is a store or filesystem job that issues explicit zone resets. f2fs and btrfs zoned mode do this themselves, and f2fs turns its section-sized discards into resets (9.09).
+
+**ZNS reference (checked against ZNS 1.4):** Dataset Management may deallocate logical blocks in a zoned namespace (2.1.1.5); ZNS adds only a Zone Is Offline rule to it (3.3.3) and gives it no effect on zone state or the write pointer.
 FOLLOW:
 - Can a host use Dataset Management deallocate on a ZNS namespace? => ZNS 1.4 adds only one rule for it: abort with Zone Is Offline if the range touches an Offline zone (3.3.3). It defines no special deallocate effect on zone space accounting or the write pointer, so do not rely on it for reclaim; that is Reset Zone's job alone.
 - How do you validate the live-byte accounting? => After a random delete and write workload, walk the index, sum live bytes per zone, and compare with the counters. Any drift eventually causes a wrong Reset (data loss) or a leaked zone (capacity loss).
 PITFALL: Resetting a zone based on the counter without waiting for outstanding readers and relocations. That converts an accounting bug into data loss.
-VERIFY: How Dataset Management deallocate behaves on zoned namespaces in the NVM Command Set Specification (ZNS 1.4 adds no deallocate-specific accounting rule), and whether your kernel forwards block-layer discard to zoned NVMe devices.
+VERIFY: Whether your kernel forwards block-layer discard to zoned NVMe devices.
 
 @@ 12.04 | Intermediate | Scenario | tags=write,append,design,queue-depth,ordering
 Q: You are designing the write path of a log-structured store. How do you decide between Write and Zone Append, and how many zones do you keep open?
@@ -81,11 +84,13 @@ Worked sizing (assumptions): 2 GB/s target, 409.6 MB/s per zone at QD 1 (16 KiB 
 - **Decision rule I use:** start with Write and per-zone owners. Move to Append when the open budget or a shared log forces it, and pay for it with self-describing records and an in-flight table.
 - **Keep both paths behind one interface** so the tests can run either, and so a device without append (or a kernel that emulates it, 5.08) still works.
 - **Validate at the boundary:** run the same workload in both modes and compare the final index and zone contents byte for byte.
+
+**ZNS reference (checked against ZNS 1.4):** Zone Append (7Dh) is optional (Figure 9); support is advertised through the Commands Supported and Effects log (NVMe Base Specification).
 FOLLOW:
 - Does Linux change the answer? => The block layer serializes plain Writes per zone (zone write plugging), so ordering is safe there but adds CPU and limits per-zone QD. Passthrough and SPDK give you no such protection (5.03).
 - Which mode is easier to fault-inject? => Write, because the outcome is deterministic. Append needs a completion-time oracle (5.14).
 PITFALL: Choosing Append to raise QD, then forgetting that the resource budget and PI reference tags now depend on addresses you only learn at completion.
-VERIFY: That Zone Append is optional and how support is advertised on your product (Commands Supported and Effects log), plus the current Linux zone write plugging behavior for your kernel.
+VERIFY: Current Linux zone write plugging behavior on your kernel.
 
 @@ 12.05 | Intermediate | Scenario | tags=gc,victim,hot-cold,throttle,policy
 Q: Design the garbage collection policy for a host log-structured store on ZNS. What do you decide, and what can go wrong?
@@ -104,11 +109,12 @@ DEEP:
    - Livelock at high utilization: victims all have u near 1, so GC moves data forever for little gain.
    - Reset before the last reader is done (12.15).
    - GC reading a zone that has gone Read Only: it can still read, but it must copy everything out.
+
+**Source note:** None for the method. Simple Copy (module 11) may offload relocation on some devices, so check its status on your product before assuming host reads and writes.
 FOLLOW:
 - How do you tune it? => Measure the victim live-fraction distribution and the free-pool time series under a replay of the real workload, then adjust watermarks and cold-stream separation. Do not tune on uniform random writes.
 - How is this different from device GC? => Same idea, but the host knows object lifetimes and can align zones to them. The device cannot, which is the reason for ZNS (module 1).
 PITFALL: Tuning GC on a fresh, mostly empty drive. The policy only shows its cost near the sellable capacity limit.
-VERIFY: None for the method. Simple Copy (module 11) may offload relocation on some devices, so check its status on your product before assuming host reads and writes.
 
 @@ 12.06 | Intermediate | Cross-layer | tags=migration,conventional,trim,random-write,assumptions
 Q: An application runs on a conventional NVMe SSD and must move to a ZNS SSD. What breaks first, and how do you find each problem before production?
@@ -156,11 +162,13 @@ DEEP:
 7. **Reserve:** verify active zones are within MAR before opening new writers (6.08).
 
 Recovery time is bounded by checkpoint interval times write rate. Assumption: 2 GiB written between checkpoints and a 3 GB/s scan gives about 0.7 s, independent of capacity.
+
+**ZNS reference (checked against ZNS 1.4):** Initial zone states are set only after an NVM Subsystem Reset or when all controllers report shutdown complete (ST 0, SHST 10b): an open zone becomes Closed if its write pointer is past ZSLBA, ZDEV is set or its ZRWA holds data, otherwise Empty; Full stays Full; Read Only and Offline stay; an NVM Subsystem Reset may also move zones to Full (2.1.1.3). A Controller Level Reset alone is not one of these events. ZNS 1.4 has no power-loss rules of its own.
 FOLLOW:
 - How do you test recovery? => Power-cut at every operation type (append, Finish, Reset, checkpoint write, GC copy) with a programmable switch, then compare the recovered index with a model of durable operations.
 - Why two checkpoint slots? => A torn checkpoint write must not destroy the previous good one, and sequential-only zones cannot overwrite it, so it rotates through a small zone ring.
 PITFALL: Assuming the device write pointer is the end of valid data. It is the end of what the device accepted, and the last record may be torn.
-VERIFY: Zone state and write pointer after a controller reset and after unexpected power loss, and the durability rules for the write pointer, in the ZNS and NVM Command Set specifications.
+VERIFY: Write-pointer durability after unexpected power loss (NVMe Base and NVM Command Set specifications).
 
 @@ 12.08 | Intermediate | Debug | tags=write-pointer,mismatch,timeout,shadow-state,report-zones
 Q: The store's in-memory write pointer for a zone is 8 blocks behind what Report Zones returns. How do you find out who is right?
@@ -194,11 +202,12 @@ Discriminating experiment:
 5. If needed, capture the SQEs and CQEs on the wire or with the kernel tracepoints and check whether cid 21 executed.
 
 **Host fix:** after a timeout, treat the zone's write pointer as unknown, stop submitting to the zone, and resynchronize with Report Zones before the next write (module 7).
+
+**ZNS reference (checked against ZNS 1.4):** The write pointer increases on successful completion of a write (2.1.1.2.1.1); ZNS 1.4 does not say how Report Zones reflects commands still in progress. A write aborted with a zone status writes nothing; a write that fails after starting may leave the write pointer inside its range, one past it, or invalid (2.1.1.2.1.1).
 FOLLOW:
 - Could the mismatch be a firmware bug even when a timeout happened? => Yes, but the timeout explains it fully. Prove or refute it by reproducing without a timeout.
 - Why is the write pointer the reliable side? => It is the device's own state and it only advances when it accepted data. Host shadow state is derived from messages that can be lost.
 PITFALL: Adjusting the host shadow to match Report Zones without finding which command caused the difference. The next mismatch will then be a data loss you cannot explain.
-VERIFY: Whether a Report Zones write pointer can include commands the host has not yet seen complete, and that a failed Write leaves the write pointer unchanged.
 
 @@ 12.09 | Advanced | Debug | tags=open,stuck,implicit-open,explicit-open,close,resources
 Q: Report Zones shows several zones Open long after the workload stopped, and later a new writer fails. Are the zones stuck, and how do you decide whether it is a host or a firmware problem?
@@ -225,11 +234,13 @@ Discriminating experiment:
 4. Do a controller reset (CC.EN cycle) and check that previously Open zones are Closed, or Empty if nothing was written (3.09 marks this as unconfirmed for a controller-only reset, so a power cycle is the firm case). Compare with the model.
 
 **Host policy:** an application that stops writing to a zone for more than a few seconds should Close it. The store should also Close all its open zones on clean shutdown, and reconcile leftovers on start-up (12.07).
+
+**ZNS reference (checked against ZNS 1.4):** A Controller Level Reset alone is not an initial-state event (2.1.1.3). The controller closes an Implicitly Opened zone of its choosing only when a command needs an open resource and none is free (2.1.1.4.1).
 FOLLOW:
 - Does Close free an active slot? => No. A Closed zone stays active and holds the active resource until it is Finished or Reset (6.04).
 - Why can a stuck Open zone block a new writer that uses implicit open? => It usually cannot, since the controller may close an implicit zone to make room. If it does, the firmware refuses to evict, which is worth a bug report (6.06).
 PITFALL: Treating Open zones after a crash as corruption and Resetting them. Their data may be the only copy. Reconcile first.
-VERIFY: Zone condition labels printed by blkzone on your util-linux version (oi for implicit open, oe for explicit open), whether a controller-only reset closes open zones, and whether the ZNS specification requires the controller to implicitly close before returning Too Many Open Zones.
+VERIFY: blkzone zone condition labels on your util-linux version.
 
 @@ 12.10 | Advanced | Numeric | tags=gc,waf,bandwidth,budget,victim,free-pool
 Q: A store writes 500 MB/s of user data to a ZNS SSD that can sustain 2 GB/s of sequential writes. What does host GC cost at different victim utilizations, and how much user bandwidth is left?
@@ -252,11 +263,12 @@ Assumptions: user write rate R = 500 MB/s, drive sequential write ceiling W = 2,
 6. **What u is in practice:** it is not the same as overall space utilization. With hot and cold separation the victims are the cold-dead zones with low u. Measure the victim distribution (12.05) instead of assuming it.
 
 Device side: verify the assumption of WAF near 1 with the drive's own counters, not the host's (see the fair-benchmark method in module 1).
+
+**Source note:** The zone capacity and write ceiling are assumptions, so replace them with values measured on the target drive, and check that the device write counters are exposed (for example in the OCP SMART log).
 FOLLOW:
 - What do you do when u is high? => Increase host OP (fewer sellable zones, 12.02), improve stream separation, or lower the user rate. Adding GC threads only steals foreground bandwidth.
 - Does Simple Copy change the bandwidth? => It can remove the host PCIe and DRAM traffic for GC, but the NAND still programs the copies, so the write budget is unchanged (module 11).
 PITFALL: Reporting WAF from a fresh drive. Steady-state u only appears after the sellable capacity has been filled and overwritten.
-VERIFY: The zone capacity and write ceiling are assumptions, so replace them with values measured on the target drive, and check that the device write counters are exposed (for example in the OCP SMART log).
 
 @@ 12.11 | Advanced | Debug | tags=zone-append,alba,cqe,cid,ioctl,units
 Q: Zone Append completions carry addresses the host does not expect: one outside the zone it addressed, one duplicated, one truncated. How do you decide whether it is decoding, bookkeeping or firmware?
@@ -315,11 +327,12 @@ Discriminating experiment:
 4. If Report Zones shows fewer than MOR open, run the leak probe (6.16) and the in-flight test: quiesce, then repeat.
 
 **Fix:** a single resource arbiter in the store that owns open and active slots: acquire before opening, release on Full, Close, Finish, Reset or Read Only, reserve slots for GC (12.05), and treat Too Many Open Zones as a retriable condition with backoff and never as a fatal error.
+
+**ZNS reference (checked against ZNS 1.4):** 2.1.1.4.1: when an open resource is needed and MAR exceeds MOR, the controller shall close one Implicitly Opened zone of its choosing and proceed, returning Too Many Open Zones only if no zone is Implicitly Opened. ZNS 1.4 does not address commands in flight to the zone it closes and never mentions DNR.
 FOLLOW:
 - Should Too Many Open Zones be retried? => Yes with backoff, since it usually clears when another zone closes. Do not retry Too Many Active Zones without freeing a zone (6.05).
 - How do you keep the regression test cheap? => Model the peak open count in the harness and inject rollovers on all streams at once.
 PITFALL: Budgeting for the steady state. Failures happen at the peak: rollover, GC bursts and retries.
-VERIFY: Whether the specification allows or requires implicit close when an implicit zone has commands in flight, and whether Too Many Open Zones may carry DNR.
 
 @@ 12.13 | Advanced | Debug | tags=reset,latency,stall,erase,gc,queues
 Q: Foreground write latency jumps from 200 us to tens of milliseconds whenever GC resets a zone, and some Reset Zone commands take 400 ms. How do you triage it?
@@ -415,11 +428,13 @@ Discriminating analysis:
 4. For a stale-data result, compare against DLFEAT and the zone state at read time (3.11).
 
 **Fixes on the host:** epoch-based reclamation or per-zone reader reference counts so a Reset waits for readers that could hold an old location. A short quarantine before a reset zone is reallocated. Put a zone generation number in every record header and reject records from an older generation.
+
+**ZNS reference (checked against ZNS 1.4):** After Reset the zone is Empty and all its logical blocks are deallocated (2.1.1.5); reads follow the NVM Command Set's deallocated block rules. ZNS 1.4 says nothing about when the media erase happens.
 FOLLOW:
 - Why does the CRC not fully protect you? => It detects the wrong data but not the cause. It can also pass if a reused location holds a valid record of another object with the same size, so bind the header to the object id and generation.
 - How does this differ from a conventional SSD? => There, a stale read returns old data of the same LBA, which is a stable, if wrong, value. Here Reset makes the location unwritten or reuses it, so the race is louder and cheaper to catch.
 PITFALL: Assuming the drive is at fault because it returned zeros. A returned unwritten value after a Reset is what the device is supposed to do.
-VERIFY: The values a read returns after Reset Zone (DLFEAT), whether reads of an Empty zone above the write pointer fail or return data (DLFEAT and DULBE), and whether the specification allows deferred erase to complete after the Reset completion.
+VERIFY: DLFEAT and DULBE behavior (NVM Command Set Specification).
 
 @@ 12.16 | Principal | Cross-layer | tags=evidence,triage,host-logs,firmware-logs,analyzer,bug-report
 Q: A customer reports data errors and write failures on a ZNS SSD in their store. What evidence do you collect from the host, the firmware and the analyzer, in what order, so that the firmware team can act on it?
@@ -477,8 +492,10 @@ DEEP:
    - Soak: 72 h at 2 GB/s writes is about 518 TB, roughly 135 fills of the 3.5 TiB writable capacity (assumed drive), with GC active.
    - Zero silent data corruption, zero unexplained state divergence, and every failure classified host or device.
 6. **Automation:** the store's trace and the model checker are the product of the campaign. Make every failure a replayable trace, and every trace a regression test.
+
+**ZNS reference (checked against ZNS 1.4):** Initial zone states are set only after an NVM Subsystem Reset or when all controllers report shutdown complete (ST 0, SHST 10b): an open zone becomes Closed if its write pointer is past ZSLBA, ZDEV is set or its ZRWA holds data, otherwise Empty; Full stays Full; Read Only and Offline stay; an NVM Subsystem Reset may also move zones to Full (2.1.1.3). A Controller Level Reset alone is not one of these events. ZNS 1.4 has no power-loss rules of its own.
 FOLLOW:
 - What do you prioritize when time is short? => Data integrity after power cuts, then recovery correctness, then state machine agreement, then resources, then performance.
 - What does the device suite (module 10) add? => Per-command conformance and boundary cases without a store on top. This campaign asks whether a real host survives the device, which finds different bugs.
 PITFALL: Counting hours of soak instead of covering fault points. A week of quiet writes never cuts power during a Reset.
-VERIFY: How your power-cut rig and firmware error-injection interface work, and the NVMe zone attribute and state behavior after resets in your revision, which decide the pass criteria for those rows.
+VERIFY: How your power-cut rig and firmware error-injection interface work.
