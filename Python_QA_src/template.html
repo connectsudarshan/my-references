@@ -1,0 +1,344 @@
+<title>Python Interview Questions Reference</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<style>
+.hljs{color:#d8dee9}
+.hljs-keyword,.hljs-built_in,.hljs-meta .hljs-keyword{color:#81a1c1}
+.hljs-string,.hljs-meta .hljs-string{color:#a3be8c}
+.hljs-number,.hljs-literal{color:#b48ead}
+.hljs-comment{color:#6f7f99;font-style:italic}
+.hljs-title,.hljs-title.function_,.hljs-section{color:#88c0d0}
+.hljs-attr,.hljs-attribute,.hljs-property{color:#8fbcbb}
+.hljs-type,.hljs-title.class_{color:#8fbcbb}
+.hljs-variable,.hljs-params,.hljs-subst{color:#d8dee9}
+.hljs-meta{color:#d08770}
+
+:root{
+  color-scheme:dark;
+  --bg:#0e2036; --bg-panel:#123049; --bg-sidebar:#0a1a2c;
+  --line:#2f5578; --line-soft:#1c3852;
+  --accent:#ffd43b; --accent-dim:#c9a93a; --py-blue:#6aa7de;
+  --text:#e7eef6; --text-dim:#8fa9c2; --text-faint:#6a86a3;
+  --code-bg:#081422; --good:#9fdf9f; --bad:#ff9d9d;
+  --easy:#9fdf9f; --moderate:#ffd43b; --difficult:#ff9d9d;
+}
+*{box-sizing:border-box;}
+html,body{margin:0;padding:0;background:var(--bg);color:var(--text);font-family:'IBM Plex Sans',system-ui,-apple-system,'Segoe UI',sans-serif;}
+body{background-color:var(--bg);background-image:linear-gradient(var(--line-soft) 1px,transparent 1px),linear-gradient(90deg,var(--line-soft) 1px,transparent 1px);background-size:28px 28px;background-attachment:fixed;min-height:100vh;}
+::selection{background:var(--accent);color:#0e2036;}
+code{font-family:'IBM Plex Mono',ui-monospace,Consolas,monospace;}
+.app{display:flex;min-height:100vh;}
+
+.sidebar{width:320px;flex-shrink:0;background:var(--bg-sidebar);border-right:1px solid var(--line);position:sticky;top:0;height:100vh;display:flex;flex-direction:column;}
+.sidebar-header{padding:20px 20px 14px;border-bottom:1px solid var(--line);}
+.kicker{font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:0.08em;color:var(--accent);margin:0 0 6px;}
+.sidebar-header h1{font-size:17px;margin:0 0 10px;font-weight:600;line-height:1.3;cursor:pointer;}
+.stat-row{display:flex;gap:12px;flex-wrap:wrap;font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--text-dim);}
+.stat-row b{color:var(--accent);font-variant-numeric:tabular-nums;}
+.search-box{padding:12px 16px;border-bottom:1px solid var(--line);}
+.search-box input{width:100%;background:var(--bg-panel);border:1px solid var(--line);color:var(--text);padding:9px 12px;border-radius:5px;font-family:inherit;font-size:13.5px;outline:none;}
+.search-box input:focus{border-color:var(--accent);}
+.search-box input::placeholder{color:var(--text-faint);}
+.filter-row{padding:10px 16px;display:flex;gap:6px;flex-wrap:wrap;border-bottom:1px solid var(--line);}
+.chip{font-family:'IBM Plex Mono',monospace;font-size:10.5px;padding:4px 9px;border-radius:12px;border:1px solid var(--line);color:var(--text-dim);cursor:pointer;user-select:none;background:none;}
+.chip.active{background:var(--accent);color:#0e2036;border-color:var(--accent);font-weight:600;}
+.chip:focus-visible{outline:2px solid var(--accent);outline-offset:1px;}
+.nav-groups{flex:1;overflow-y:auto;padding-bottom:30px;}
+.nav-group-label{font-family:'IBM Plex Mono',monospace;font-size:10.5px;letter-spacing:0.06em;padding:14px 18px 6px;color:var(--text-faint);cursor:pointer;display:flex;justify-content:space-between;gap:8px;}
+.nav-group-label:hover{color:var(--text);}
+.nav-item{display:flex;align-items:baseline;gap:8px;padding:6px 16px 6px 22px;cursor:pointer;font-size:13px;color:var(--text-dim);border-left:2px solid transparent;line-height:1.4;}
+.nav-item:hover{background:rgba(255,255,255,0.03);color:var(--text);}
+.nav-item.active{background:rgba(255,212,59,0.08);color:var(--accent);border-left-color:var(--accent);}
+.nav-item .qnum{font-family:'IBM Plex Mono',monospace;font-size:10.5px;color:var(--text-faint);min-width:34px;flex-shrink:0;}
+.nav-item .lv{width:6px;height:6px;border-radius:50%;flex-shrink:0;margin-top:5px;align-self:flex-start;}
+.nav-item .known{margin-left:auto;color:var(--good);font-size:11px;}
+.empty{color:var(--text-faint);font-size:13px;padding:14px 18px;}
+
+.main{flex:1;min-width:0;display:flex;flex-direction:column;}
+.topbar{padding:14px 40px;border-bottom:1px solid var(--line);background:rgba(14,32,54,0.9);backdrop-filter:blur(6px);position:sticky;top:env(safe-area-inset-top,0px);z-index:5;display:flex;align-items:center;justify-content:space-between;gap:10px;}
+.crumb{font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--text-faint);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.crumb .current{color:var(--accent);}
+.tb-actions{display:flex;gap:8px;align-items:center;flex-shrink:0;}
+.btn{background:var(--bg-panel);border:1px solid var(--line);color:var(--text);font-family:'IBM Plex Mono',monospace;font-size:12px;padding:7px 12px;border-radius:5px;cursor:pointer;transition:border-color .15s,color .15s;}
+.btn:hover,.btn:focus-visible{border-color:var(--accent);color:var(--accent);outline:none;}
+.btn:disabled{opacity:.35;cursor:default;border-color:var(--line);color:var(--text);}
+.btn.on{border-color:var(--accent);color:var(--accent);}
+.btn.done{border-color:var(--good);color:var(--good);}
+.menu-btn{display:none;}
+
+.content{padding:40px 56px 100px;max-width:940px;}
+.qcard{animation:fadein .2s ease;}
+@keyframes fadein{from{opacity:.4;transform:translateY(4px);}to{opacity:1;transform:none;}}
+@media (prefers-reduced-motion:reduce){.qcard{animation:none;}}
+.q-meta{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px;}
+.level-badge{font-family:'IBM Plex Mono',monospace;font-size:10.5px;font-weight:700;letter-spacing:0.06em;padding:3px 8px;border-radius:3px;color:#0e2036;}
+.level-badge.Easy{background:var(--easy);} .level-badge.Moderate{background:var(--moderate);} .level-badge.Difficult{background:var(--difficult);}
+.q-num{font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--text-faint);}
+.q-title{font-size:26px;line-height:1.3;margin:0 0 22px;font-weight:650;text-wrap:balance;}
+.q-title code,.q-answer code{background:rgba(255,255,255,0.07);padding:1px 6px;border-radius:3px;font-size:0.86em;color:#ffe58a;}
+.q-answer{font-size:15.5px;line-height:1.75;padding:16px 20px;background:var(--bg-panel);border-left:3px solid var(--accent);border-radius:0 4px 4px 0;}
+.q-answer p{margin:0 0 10px;} .q-answer p:last-child{margin:0;}
+.q-answer ul{margin:4px 0 10px;padding-left:20px;} .q-answer li{margin:3px 0;}
+.q-answer strong{color:#fff;}
+.reveal{display:flex;justify-content:center;padding:26px;border:1px dashed var(--line);border-radius:6px;background:rgba(18,48,73,0.5);}
+.code-stack{display:flex;flex-direction:column;gap:22px;margin-top:26px;}
+.code-wrap{position:relative;}
+.code-label{position:absolute;top:-11px;left:16px;background:var(--accent);color:#0e2036;font-family:'IBM Plex Mono',monospace;font-size:10.5px;font-weight:700;letter-spacing:0.05em;padding:2px 8px;border-radius:3px;}
+.code-label.out{background:var(--good);}
+pre{background:var(--code-bg);border:1px solid var(--line-soft);border-radius:6px;padding:20px 22px;overflow-x:auto;margin:0;}
+pre code{font-size:13px;line-height:1.65;}
+.out-wrap pre{background:#06101b;border-style:dashed;color:#cfe8cf;}
+.out-wrap pre code{font-size:12.5px;}
+.q-actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:30px;}
+.footer-nav{display:flex;justify-content:space-between;gap:12px;margin-top:22px;padding-top:22px;border-top:1px solid var(--line-soft);}
+.footer-nav .btn{padding:10px 16px;font-size:12.5px;text-align:left;}
+.footer-nav .dir{color:var(--text-faint);font-size:10px;display:block;}
+.kbd-hint{font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--text-faint);margin-top:14px;}
+
+.home-hero h2{font-size:34px;margin:0 0 10px;line-height:1.15;}
+.home-hero p{font-size:16px;line-height:1.7;color:var(--text-dim);max-width:70ch;margin:0;}
+.home-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin:22px 0 8px;}
+.stat-box{background:var(--bg-panel);border:1px solid var(--line-soft);border-radius:6px;padding:12px 14px;}
+.stat-box .n{font-family:'IBM Plex Mono',monospace;font-size:24px;font-weight:700;color:var(--accent);font-variant-numeric:tabular-nums;}
+.stat-box .l{font-size:12px;color:var(--text-dim);margin-top:2px;}
+.section-label{font-family:'IBM Plex Mono',monospace;font-size:12px;letter-spacing:0.1em;color:var(--accent-dim);margin:34px 0 14px;display:flex;align-items:center;gap:10px;}
+.section-label::after{content:'';flex:1;height:1px;background:var(--line);}
+.section-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:10px;}
+.section-card{background:var(--bg-panel);border:1px solid var(--line-soft);border-radius:6px;padding:13px 15px;cursor:pointer;text-align:left;color:var(--text);font:inherit;transition:border-color .15s,transform .15s;}
+.section-card:hover,.section-card:focus-visible{border-color:var(--accent);transform:translateY(-2px);outline:none;}
+.sc-title{font-weight:600;font-size:14px;margin-bottom:6px;}
+.sc-meta{font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--text-dim);display:flex;justify-content:space-between;gap:8px;}
+.bar{height:3px;background:var(--line-soft);border-radius:2px;margin-top:8px;overflow:hidden;}
+.bar span{display:block;height:100%;background:var(--good);}
+.tips{margin:0;padding-left:18px;color:var(--text-dim);font-size:14px;line-height:1.7;}
+
+@media(max-width:900px){
+  .sidebar{position:fixed;left:-330px;z-index:20;transition:left .2s;box-shadow:8px 0 24px rgba(0,0,0,0.4);height:100%;padding-top:env(safe-area-inset-top,0px);}
+  .sidebar.open{left:0;}
+  .content{padding:28px 16px 80px;}
+  .topbar{padding:10px 16px;}
+  .menu-btn{display:inline-block;}
+  .q-title{font-size:21px;}
+  .tb-actions .hide-sm{display:none;}
+}
+</style>
+
+<div class="app">
+  <nav class="sidebar" id="sidebar" aria-label="Questions">
+    <div class="sidebar-header">
+      <p class="kicker">PYTHON · INTERVIEW PREP</p>
+      <h1 onclick="go(null)">Python Interview Questions Reference</h1>
+      <div class="stat-row"><span><b id="statShown">0</b> shown</span><span><b id="statKnown">0</b> known</span></div>
+    </div>
+    <div class="search-box"><input id="search" type="search" placeholder="Search questions and answers…" aria-label="Search questions"></div>
+    <div class="filter-row" id="levelFilters"></div>
+    <div class="filter-row" id="extraFilters"></div>
+    <div class="nav-groups" id="navGroups"></div>
+  </nav>
+  <div class="main">
+    <div class="topbar">
+      <div class="crumb">Python Q&amp;A / <span class="current" id="crumbCurrent">Overview</span></div>
+      <div class="tb-actions">
+        <button class="btn hide-sm" id="quizBtn" title="Hide answers until you reveal them">Quiz mode: off</button>
+        <button class="btn" id="randBtn" title="Random question from the current filter">Random</button>
+        <button class="btn menu-btn" onclick="document.getElementById('sidebar').classList.toggle('open')">☰</button>
+      </div>
+    </div>
+    <div class="content" id="content"></div>
+  </div>
+</div>
+
+<script>
+const QUESTIONS = /*__DATA__*/[];
+const SECTIONS = /*__SECTIONS__*/{};
+const SECTION_ORDER = Object.keys(SECTIONS).map(Number);
+const LV_COLOR = {Easy:'var(--easy)', Moderate:'var(--moderate)', Difficult:'var(--difficult)'};
+
+let activeLevels = new Set(['Easy','Moderate','Difficult']);
+let onlyUnknown = false, onlyCode = false, quiz = false, revealed = false;
+let query = '', current = null;
+const collapsed = new Set();
+
+const KEY = 'pyqa-known';
+let known = new Set();
+try { known = new Set(JSON.parse(localStorage.getItem(KEY) || '[]')); } catch(e) {}
+try { quiz = localStorage.getItem('pyqa-quiz') === '1'; } catch(e) {}
+function saveKnown(){ try { localStorage.setItem(KEY, JSON.stringify([...known])); } catch(e) {} }
+
+function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function inline(s){
+  return esc(s).replace(/`([^`]+)`/g,'<code>$1</code>').replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>');
+}
+function renderAnswer(text){
+  return text.split(/\n\s*\n/).map(block=>{
+    const lines = block.split('\n');
+    if (lines.every(l=>/^\s*- /.test(l))) return '<ul>'+lines.map(l=>'<li>'+inline(l.replace(/^\s*- /,''))+'</li>').join('')+'</ul>';
+    return '<p>'+inline(lines.join(' '))+'</p>';
+  }).join('');
+}
+function matches(q){
+  if (!activeLevels.has(q.level)) return false;
+  if (onlyUnknown && known.has(q.num)) return false;
+  if (onlyCode && !q.code) return false;
+  if (query){
+    const h = (q.question+' '+q.answer+' '+q.code).toLowerCase();
+    if (!query.toLowerCase().split(/\s+/).every(w=>h.includes(w))) return false;
+  }
+  return true;
+}
+function filtered(){ return QUESTIONS.filter(matches); }
+
+function buildFilters(){
+  const lf = document.getElementById('levelFilters');
+  ['Easy','Moderate','Difficult'].forEach(l=>{
+    const c = document.createElement('button');
+    c.className='chip active'; c.textContent=l;
+    c.onclick=()=>{ activeLevels.has(l)?activeLevels.delete(l):activeLevels.add(l); c.classList.toggle('active'); buildSidebar(); };
+    lf.appendChild(c);
+  });
+  const ef = document.getElementById('extraFilters');
+  [['Not known yet',()=>onlyUnknown=!onlyUnknown],['Has code',()=>onlyCode=!onlyCode]].forEach(([label,fn])=>{
+    const c = document.createElement('button');
+    c.className='chip'; c.textContent=label;
+    c.onclick=()=>{ fn(); c.classList.toggle('active'); buildSidebar(); };
+    ef.appendChild(c);
+  });
+}
+
+function buildSidebar(){
+  const box = document.getElementById('navGroups');
+  box.innerHTML='';
+  let shown = 0;
+  SECTION_ORDER.forEach(s=>{
+    const items = QUESTIONS.filter(q=>q.section===s && matches(q));
+    if (!items.length) return;
+    shown += items.length;
+    const label = document.createElement('div');
+    label.className='nav-group-label';
+    label.innerHTML='<span>'+s+'. '+esc(SECTIONS[s]).toUpperCase()+'</span><span>'+(collapsed.has(s)?'+':'−')+' '+items.length+'</span>';
+    label.onclick=()=>{ collapsed.has(s)?collapsed.delete(s):collapsed.add(s); buildSidebar(); };
+    box.appendChild(label);
+    if (collapsed.has(s)) return;
+    items.forEach(q=>{
+      const el = document.createElement('div');
+      el.className='nav-item'+(current&&current.num===q.num?' active':''); el.id='nav-'+q.num; el.tabIndex=0;
+      el.innerHTML='<span class="lv" style="background:'+LV_COLOR[q.level]+'"></span><span class="qnum">Q'+q.num+'</span><span>'+inline(q.question.length>70?q.question.slice(0,68)+'…':q.question)+'</span>'+(known.has(q.num)?'<span class="known">✓</span>':'');
+      el.onclick=()=>go(q.num);
+      el.onkeydown=e=>{ if(e.key==='Enter'){ go(q.num);} };
+      box.appendChild(el);
+    });
+  });
+  if (!shown) box.innerHTML='<div class="empty">No questions match these filters.</div>';
+  document.getElementById('statShown').textContent = shown;
+  document.getElementById('statKnown').textContent = known.size;
+}
+
+function renderHome(){
+  const withCode = QUESTIONS.filter(q=>q.code).length, withOut = QUESTIONS.filter(q=>q.output).length;
+  let h = '<div class="home-hero"><p class="kicker">OVERVIEW</p><h2>Python Interview Questions</h2>'+
+    '<p>'+QUESTIONS.length+' questions from basics to internals, grouped into '+SECTION_ORDER.length+' topics and three difficulty levels. Every code example on this page was executed with Python 3.14 when the page was built, and its real output is shown beneath it. Use quiz mode to hide answers, and mark questions you know to filter them out next time.</p>'+
+    '<div class="home-stats">'+
+      '<div class="stat-box"><div class="n">'+QUESTIONS.length+'</div><div class="l">Questions</div></div>'+
+      '<div class="stat-box"><div class="n">'+withCode+'</div><div class="l">With code</div></div>'+
+      '<div class="stat-box"><div class="n">'+withOut+'</div><div class="l">With executed output</div></div>'+
+      '<div class="stat-box"><div class="n">'+known.size+'</div><div class="l">Marked known</div></div>'+
+    '</div></div>'+
+    '<div class="section-label">TOPICS</div><div class="section-list">';
+  SECTION_ORDER.forEach(s=>{
+    const qs = QUESTIONS.filter(q=>q.section===s);
+    const k = qs.filter(q=>known.has(q.num)).length;
+    const lv = l=>qs.filter(q=>q.level===l).length;
+    h += '<button class="section-card" onclick="go('+qs[0].num+')"><div class="sc-title">'+s+'. '+esc(SECTIONS[s])+'</div>'+
+      '<div class="sc-meta"><span>'+qs.length+' questions</span><span>'+lv('Easy')+' · '+lv('Moderate')+' · '+lv('Difficult')+'</span></div>'+
+      '<div class="bar"><span style="width:'+(100*k/qs.length)+'%"></span></div></button>';
+  });
+  h += '</div><div class="section-label">HOW TO USE THIS PAGE</div><ul class="tips">'+
+    '<li><b>← / →</b> move through the questions in the current filter; <b>R</b> jumps to a random one; <b>Space</b> reveals the answer in quiz mode; <b>K</b> marks it known.</li>'+
+    '<li>The level chips filter by difficulty. "Not known yet" hides what you have already marked.</li>'+
+    '<li>For design patterns in depth, open the companion page <i>Python Design Patterns Field Reference</i>.</li></ul>';
+  return h;
+}
+
+function renderQuestion(q){
+  const list = filtered(), i = list.findIndex(x=>x.num===q.num);
+  const prev = i>0?list[i-1]:null, next = i>=0&&i<list.length-1?list[i+1]:null;
+  const hide = quiz && !revealed;
+  let body;
+  if (hide){
+    body = '<div class="reveal"><button class="btn on" onclick="reveal()">Show answer (Space)</button></div>';
+  } else {
+    body = '<div class="q-answer">'+renderAnswer(q.answer)+'</div>';
+    if (q.code){
+      body += '<div class="code-stack"><div class="code-wrap"><span class="code-label">PYTHON</span><pre><code class="language-python">'+esc(q.code)+'</code></pre></div>'+
+        (q.output?'<div class="code-wrap out-wrap"><span class="code-label out">OUTPUT</span><pre><code class="nohighlight">'+esc(q.output)+'</code></pre></div>':'')+'</div>';
+    }
+  }
+  const k = known.has(q.num);
+  return '<div class="qcard"><div class="q-meta"><span class="level-badge '+q.level+'">'+q.level.toUpperCase()+'</span>'+
+    '<span class="q-num">Q'+q.num+' · Section '+q.section+': '+esc(q.sectionTitle)+'</span></div>'+
+    '<h2 class="q-title">'+inline(q.question)+'</h2>'+body+
+    '<div class="q-actions"><button class="btn'+(k?' done':'')+'" onclick="toggleKnown('+q.num+')">'+(k?'✓ Known':'Mark as known (K)')+'</button></div>'+
+    '<div class="footer-nav">'+
+      '<button class="btn" '+(prev?'onclick="go('+prev.num+')"':'disabled')+'><span class="dir">← PREV</span>'+(prev?'Q'+prev.num:'')+'</button>'+
+      '<button class="btn" '+(next?'onclick="go('+next.num+')"':'disabled')+' style="text-align:right"><span class="dir">NEXT →</span>'+(next?'Q'+next.num:'')+'</button>'+
+    '</div><p class="kbd-hint">'+(i+1)+' of '+list.length+' in current filter</p></div>';
+}
+
+function paint(){
+  const c = document.getElementById('content');
+  if (!current){ c.innerHTML = renderHome(); document.getElementById('crumbCurrent').textContent='Overview'; }
+  else {
+    c.innerHTML = renderQuestion(current);
+    document.getElementById('crumbCurrent').textContent = 'Q'+current.num+' · '+current.sectionTitle;
+    if (window.hljs) c.querySelectorAll('pre code.language-python').forEach(el=>hljs.highlightElement(el));
+  }
+}
+function go(num){
+  current = num ? QUESTIONS.find(q=>q.num===Number(num)) || null : null;
+  revealed = false;
+  document.querySelectorAll('.nav-item.active').forEach(e=>e.classList.remove('active'));
+  if (current){
+    const el = document.getElementById('nav-'+current.num);
+    if (el){ el.classList.add('active'); el.scrollIntoView({block:'nearest'}); }
+    if (location.hash !== '#q'+current.num) history.replaceState(null,'','#q'+current.num);
+  } else if (location.hash) history.replaceState(null,'',location.pathname+location.search);
+  paint();
+  document.getElementById('sidebar').classList.remove('open');
+  window.scrollTo(0,0);
+}
+function reveal(){ revealed = true; paint(); }
+function toggleKnown(n){ known.has(n)?known.delete(n):known.add(n); saveKnown(); buildSidebar(); paint(); }
+function step(d){
+  if (!current) { const l = filtered(); if (l.length) go(l[0].num); return; }
+  const l = filtered(), i = l.findIndex(x=>x.num===current.num);
+  const t = l[i+d]; if (t) go(t.num);
+}
+function random(){ const l = filtered(); if (l.length) go(l[Math.floor(Math.random()*l.length)].num); }
+function setQuiz(v){
+  quiz = v; try { localStorage.setItem('pyqa-quiz', v?'1':'0'); } catch(e) {}
+  const b = document.getElementById('quizBtn'); b.textContent = 'Quiz mode: '+(v?'on':'off'); b.classList.toggle('on', v);
+  revealed = false; paint();
+}
+
+document.getElementById('search').addEventListener('input', e=>{ query = e.target.value.trim(); buildSidebar(); });
+document.getElementById('quizBtn').onclick = ()=>setQuiz(!quiz);
+document.getElementById('randBtn').onclick = random;
+document.addEventListener('keydown', e=>{
+  if (e.target.tagName==='INPUT' || e.metaKey || e.ctrlKey || e.altKey) return;
+  if (e.key==='ArrowRight') step(1);
+  else if (e.key==='ArrowLeft') step(-1);
+  else if (e.key==='r' || e.key==='R') random();
+  else if ((e.key==='k' || e.key==='K') && current) toggleKnown(current.num);
+  else if (e.key===' ' && current && quiz && !revealed){ e.preventDefault(); reveal(); }
+});
+window.addEventListener('hashchange', ()=>{ const m = location.hash.match(/^#q(\d+)$/); go(m?m[1]:null); });
+
+buildFilters();
+setQuiz(quiz);
+buildSidebar();
+const m0 = location.hash.match(/^#q(\d+)$/);
+go(m0 ? m0[1] : null);
+</script>
