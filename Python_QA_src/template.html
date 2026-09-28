@@ -83,6 +83,16 @@ code{font-family:'IBM Plex Mono',ui-monospace,Consolas,monospace;}
 .q-answer p{margin:0 0 10px;} .q-answer p:last-child{margin:0;}
 .q-answer ul{margin:4px 0 10px;padding-left:20px;} .q-answer li{margin:3px 0;}
 .q-answer strong{color:#fff;}
+.x-label{font-family:'IBM Plex Mono',monospace;font-size:11px;font-weight:700;letter-spacing:0.08em;color:var(--accent);margin:28px 0 10px;}
+.x-terms{display:grid;grid-template-columns:minmax(120px,max-content) 1fr;gap:8px 16px;margin:0;padding:14px 18px;background:var(--bg-panel);border:1px solid var(--line-soft);border-radius:6px;font-size:14.5px;line-height:1.6;}
+.x-terms dt{font-weight:600;color:#fff;} .x-terms dd{margin:0;}
+.x-pitfall{padding:12px 18px;background:var(--bg-panel);border:1px solid var(--line-soft);border-left:3px solid var(--bad);border-radius:0 6px 6px 0;font-size:14.5px;line-height:1.65;}
+.x-pitfall p{margin:0 0 8px;} .x-pitfall p:last-child{margin:0;}
+.x-follow details{border:1px solid var(--line-soft);border-radius:6px;background:var(--bg-panel);margin:0 0 8px;}
+.x-follow summary{cursor:pointer;padding:10px 16px;font-size:14.5px;font-weight:600;}
+.x-follow .x-fa{padding:0 16px 12px;font-size:14.5px;line-height:1.65;} .x-fa p{margin:0 0 8px;} .x-fa p:last-child{margin:0;}
+.x-terms code,.x-pitfall code,.x-follow code{background:rgba(255,255,255,0.07);padding:1px 6px;border-radius:3px;font-size:0.86em;color:#ffe58a;}
+@media (max-width:700px){.x-terms{grid-template-columns:1fr;gap:2px 0;} .x-terms dd{margin-bottom:8px;}}
 .reveal{display:flex;justify-content:center;padding:26px;border:1px dashed var(--line);border-radius:6px;background:rgba(18,48,73,0.5);}
 .code-stack{display:flex;flex-direction:column;gap:22px;margin-top:26px;}
 .code-wrap{position:relative;}
@@ -184,7 +194,7 @@ function matches(q){
   if (onlyUnknown && known.has(q.num)) return false;
   if (onlyCode && !q.code) return false;
   if (query){
-    const h = (q.question+' '+q.answer+' '+q.code).toLowerCase();
+    const h = (q.question+' '+q.answer+' '+q.code+' '+(q.terms||[]).flat().join(' ')+' '+(q.pitfall||'')+' '+(q.follow||[]).flat().join(' ')).toLowerCase();
     if (!query.toLowerCase().split(/\s+/).every(w=>h.includes(w))) return false;
   }
   return true;
@@ -275,6 +285,12 @@ function renderQuestion(q){
       body += '<div class="code-stack"><div class="code-wrap"><span class="code-label">PYTHON</span><pre><code class="language-python">'+esc(q.code)+'</code></pre></div>'+
         (q.output?'<div class="code-wrap out-wrap"><span class="code-label out">OUTPUT</span><pre><code class="nohighlight">'+esc(q.output)+'</code></pre></div>':'')+'</div>';
     }
+    if (q.terms && q.terms.length)
+      body += '<div class="x-label">KEY TERMS</div><dl class="x-terms">'+q.terms.map(t=>'<dt>'+inline(t[0])+'</dt><dd>'+inline(t[1])+'</dd>').join('')+'</dl>';
+    if (q.pitfall)
+      body += '<div class="x-label">COMMON PITFALL</div><div class="x-pitfall">'+renderAnswer(q.pitfall)+'</div>';
+    if (q.follow && q.follow.length)
+      body += '<div class="x-label">FOLLOW-UP QUESTIONS</div><div class="x-follow">'+q.follow.map(f=>'<details><summary>'+inline(f[0])+'</summary><div class="x-fa">'+renderAnswer(f[1])+'</div></details>').join('')+'</div>';
   }
   const k = known.has(q.num);
   return '<div class="qcard"><div class="q-meta"><span class="level-badge '+q.level+'">'+q.level.toUpperCase()+'</span>'+

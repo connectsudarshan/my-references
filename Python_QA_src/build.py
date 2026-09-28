@@ -5,6 +5,10 @@ Usage (from this folder):
     python build.py --check    # validate + run snippets, no output files
     python build.py --only 7   # run snippets of section 7 only (fast iteration)
 
+Extras: extras/xNN_*.py (same name as the content file, with x instead of s)
+define EXTRAS = [X(index, question_start, terms=[(term, meaning)], pitfall=..., follow=[(q, a)])];
+they add key terms, a common pitfall and follow-up questions under each answer.
+
 Content: content/sNN_*.py, each defining QUESTIONS = [Q(...), ...] using the
 helper `Q(section, level, question, answer, code=None, run=True)`.
 - level: "Easy" | "Moderate" | "Difficult"
@@ -52,11 +56,25 @@ class Q(dict):
                          run=bool(code) and run, expect_error=expect_error)
 
 
+def X(idx, starts, terms=(), pitfall="", follow=()):
+    """Extras for question number `idx` (0-based, file order) of the matching content file."""
+    return dict(idx=idx, starts=starts, terms=[list(x) for x in terms], pitfall=textwrap.dedent(pitfall).strip(),
+                follow=[[a.strip(), textwrap.dedent(b).strip()] for a, b in follow])
+
+
 def load():
     qs = []
     for f in sorted((HERE / "content").glob("s*.py")):
         ns = runpy.run_path(str(f), init_globals={"Q": Q})
-        qs.extend(ns["QUESTIONS"])
+        part = ns["QUESTIONS"]
+        xf = HERE / "extras" / ("x" + f.name[1:])       # extras/x01_02_basics_types.py pairs with content/s01_02_basics_types.py
+        if xf.exists():
+            for x in runpy.run_path(str(xf), init_globals={"X": X})["EXTRAS"]:
+                q = part[x["idx"]]
+                assert q["question"].startswith(x["starts"]), f"{xf.name} #{x['idx']}: {q['question'][:50]!r} does not start with {x['starts']!r}"
+                assert "terms" not in q, f"{xf.name} #{x['idx']}: duplicate extras"
+                q.update(terms=x["terms"], pitfall=x["pitfall"], follow=x["follow"])
+        qs.extend(part)
     return qs
 
 
@@ -104,6 +122,7 @@ def main():
     counts = {s: sum(1 for q in qs if q["section"] == s) for s in SECTIONS}
     print("per section:", counts)
     print("levels:", {l: sum(1 for q in qs if q["level"] == l) for l in LEVELS})
+    print("with extras:", sum(1 for q in qs if q.get("terms")))
     print(f"total {len(qs)} questions, {sum(1 for q in qs if q['code'])} with code, "
           f"{sum(1 for q in qs if q['output'])} with executed output")
     if errs:
