@@ -35,7 +35,7 @@ FOLLOW:
 PITFALL: Multiplying Linux values by the LBA size. Every zone address and length in the ioctls, blkzone and chunk_sectors is in 512-byte sectors, so with 4 KiB LBAs divide by 8 before comparing with nvme-cli (sysfs zone_append_max_bytes and zone_write_granularity are in bytes).
 VERIFY: ioctl numbers and the v2 report and cached flag in include/uapi/linux/blkzoned.h for the kernel under test.
 
-@@ 9.02 | Basic | Concept | tags=stack,layers,responsibility,block-layer
+@@ 9.02 | Basic | Concept | fig=zstack | tags=stack,layers,responsibility,block-layer
 Q: Which layers sit between an application and a ZNS SSD on Linux, and who keeps writes sequential at each?
 SHORT: The application or a zone-aware filesystem, then the block layer's zone write handling, then the NVMe driver, then the device. The application or filesystem must produce sequential writes and do its own reclaim. The block layer orders writes per zone and tracks the write pointer, the driver translates geometry and commands, and the device enforces the rules with zone status codes. The device is the last line of defense, not the first.
 DEEP:

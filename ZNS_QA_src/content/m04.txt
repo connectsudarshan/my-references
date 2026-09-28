@@ -1,6 +1,6 @@
 # Module 4: Zone Management Commands
 
-@@ 4.01 | Basic | Concept | tags=zone-mgmt-send,zsa,opcode,select-all
+@@ 4.01 | Basic | Concept | fig=zmgmt | tags=zone-mgmt-send,zsa,opcode,select-all
 Q: What does Zone Management Send do, and which actions does it carry?
 SHORT: Zone Management Send (opcode 79h) changes the state of a zone. CDW10-11 carry the SLBA, which must be the first LBA of the target zone. CDW13 carries the Zone Send Action (ZSA) in bits 7:0 and the Select All bit in bit 8. The actions are Close 01h, Finish 02h, Open 03h, Reset 04h, Offline 05h and Set Zone Descriptor Extension 10h. Only Set Zone Descriptor Extension moves data.
 DEEP:
@@ -153,7 +153,7 @@ FOLLOW:
 PITFALL: Testing illegal transitions through blkzone. The block layer may reject or cache-fix the request before it ever reaches the SSD.
 VERIFY: Exact subcommand names and option letters on your nvme-cli version (nvme zns help, nvme zns report-zones --help), and io-passthru flag names.
 
-@@ 4.08 | Intermediate | Concept | tags=zone-descriptor,report-zones,zrasf,write-pointer,attributes
+@@ 4.08 | Intermediate | Concept | fig=zdesc | tags=zone-descriptor,report-zones,zrasf,write-pointer,attributes
 Q: How do you decode a zone descriptor from Report Zones, and what do the filter values mean?
 SHORT: A descriptor is 64 bytes. Byte 0 holds the zone type (2h = Sequential Write Required), byte 1 bits 7:4 the zone state, byte 2 the zone attributes. Bytes 8 to 15 are Zone Capacity, 16 to 23 the Zone Start LBA and 24 to 31 the Write Pointer, all in LBAs and little-endian. The ZRAS filter selects zones by state: 00h all, 01h Empty, 02h Implicitly Open, 03h Explicitly Open, 04h Closed, 05h Full, 06h Read Only, 07h Offline.
 DEEP:

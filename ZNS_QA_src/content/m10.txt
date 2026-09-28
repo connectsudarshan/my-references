@@ -1,6 +1,6 @@
 # Module 10: ZNS Validation & Test Design
 
-@@ 10.01 | Basic | Concept | tags=test-plan,phases,dependencies,oracle,gating
+@@ 10.01 | Basic | Concept | fig=zplan | tags=test-plan,phases,dependencies,oracle,gating
 Q: What does a ZNS validation plan cover, and in what order do you build and run it?
 SHORT: Order it by dependency. Discover the drive's zoned profile first, then check static geometry, Identify data and Report Zones, then the state machine and management commands, I/O rules and boundaries, resource limits, Append, persistence across resets and power loss, data integrity and soak, media faults, performance and host-stack tests. Early phases gate later ones, because a broken Reset or Report Zones corrupts the meaning of every later result.
 DEEP:

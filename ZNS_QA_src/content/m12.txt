@@ -1,6 +1,6 @@
 # Module 12: ZNS Scenarios & System Design
 
-@@ 12.01 | Basic | Concept | tags=log-structured,design,ftl,host-gc,components
+@@ 12.01 | Basic | Concept | fig=zstore | tags=log-structured,design,ftl,host-gc,components
 Q: What must a host-managed log-structured store on ZNS implement that a conventional SSD's FTL did for it?
 SHORT: The host takes over every placement job: choosing the zone for each write, remembering where objects landed, reclaiming space with its own GC, rebuilding state after a crash, and staying within the active and open zone limits. The device keeps media management: ECC, bad blocks, wear inside a zone, and the write pointer. Design the components together, because the record format and index decide whether GC and recovery are possible.
 DEEP:

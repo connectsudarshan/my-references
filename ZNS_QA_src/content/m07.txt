@@ -26,7 +26,7 @@ FOLLOW:
 PITFALL: Memorising B8h to BFh as a flat list. In an interview or a triage, the useful skill is mapping code to cause: state problem, address problem, length problem, resource problem or media problem.
 Confirmed against ZNS 1.4, Figure 11 for the status names and the per-command status figures in section 3.3-3.4. B6h and B7h (ZRWA) were introduced by TP4153, which this Revision 1.4 explicitly incorporates (see the spec's front matter), so all eight codes are native to ZNS 1.4; older hosts written against ZNS 1.0-1.3 may only recognize B8h-BFh.
 
-@@ 7.02 | Basic | Concept | tags=write,status,zone-state,invalid-write,boundary
+@@ 7.02 | Basic | Concept | fig=zwrite | tags=write,status,zone-state,invalid-write,boundary
 Q: What does a Write return for each zone state and for each kind of bad address or length?
 SHORT: A Write that starts exactly at the write pointer and fits succeeds in Empty, Open and Closed zones. Full returns Zone Is Full, Read Only returns Zone Is Read Only and Offline returns Zone Is Offline. In a writable zone, an SLBA that is not the write pointer returns Zone Invalid Write, and a length that runs past the space left returns Zone Boundary Error. A rejected write should leave the state and write pointer unchanged.
 DEEP:
