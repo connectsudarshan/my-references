@@ -199,10 +199,10 @@ level:`Easy`,
 question:`What is the scope resolution operator (\`::\`)?`,
 answer:`It qualifies a name with its namespace or class, e.g., \`std::cout\`, or accesses a global variable shadowed by a local one (\`::x\`).`,
 code:`namespace math { int square(int x) { return x*x; } }
-int x = math::square(4);   // qualify with ::
+int sq = math::square(4);   // qualify a namespace member with ::
 
-int x = 10;
-void f() { int x = 20; std::cout << ::x; } // access global x via ::`,
+int x = 10;                 // global x
+void f() { int x = 20; std::cout << ::x; }   // ::x reaches the global (prints 10), not the local`,
 },
 {
 num:6, section:1, sectionTitle:`C++ Basics & Syntax`,
@@ -216,11 +216,17 @@ class Vector { double x, y; public: double len(); }; // private by default`,
 num:7, section:1, sectionTitle:`C++ Basics & Syntax`,
 level:`Easy`,
 question:`What are the storage classes in C++?`,
-answer:`\`auto\`, \`register\`, \`static\`, \`extern\`, \`mutable\`.`,
-code:`static int counter = 0;      // internal linkage / persists across calls
-extern int sharedFlag;       // declared elsewhere
-register int fast_i;         // hint (ignored by modern compilers)
-mutable int cacheHits;       // modifiable even in a const object`,
+answer:`Modern C++ has \`static\`, \`extern\`, \`thread_local\` (C++11) and \`mutable\` (class members only). They control **storage duration** (automatic, static, thread) and **linkage** (internal, external). History: \`auto\` was a storage class before C++11 and now means type deduction; \`register\` was deprecated in C++11 and removed in C++17.`,
+code:`static int counter = 0;        // static storage duration; internal linkage at namespace scope
+extern int sharedFlag;         // declaration only: defined in another translation unit
+thread_local int perThread;    // C++11: one instance per thread
+
+struct Stats {
+    mutable int cacheHits = 0; // mutable: class members only; writable even in const objects
+    int get() const { ++cacheHits; return 42; }
+};
+// register int fast_i;        // removed in C++17 (was only an optimization hint)
+// auto int y = 1;             // pre-C++11 meaning of auto; now auto means type deduction`,
 },
 {
 num:8, section:1, sectionTitle:`C++ Basics & Syntax`,
@@ -632,8 +638,11 @@ num:49, section:2, sectionTitle:`Object-Oriented Programming Concepts`,
 level:`Moderate`,
 question:`Explain the concept of "has-a" vs "is-a" relationships with examples.`,
 answer:`"is-a" (inheritance): a \`Car\` is-a \`Vehicle\`. "has-a" (composition): a \`Car\` has-a \`Engine\` as a member object.`,
-code:`class Engine {};
-class Car : public Vehicle { Engine e; };  // is-a Vehicle, has-a Engine`,
+code:`class Vehicle {};
+class Engine {};
+class Car : public Vehicle {   // is-a: a Car IS a Vehicle (inheritance)
+    Engine e;                  // has-a: a Car HAS an Engine (composition)
+};`,
 },
 {
 num:50, section:2, sectionTitle:`Object-Oriented Programming Concepts`,
@@ -849,11 +858,17 @@ answer:`A constructor that initializes a new object as a copy of an existing obj
 code:`class Buffer {
     int* data_;
 public:
-    Buffer(const Buffer& other) { data_ = new int(*other.data_); } // copy ctor
+    Buffer() : data_(new int(0)) {}                                  // declaring a copy ctor removes the implicit default ctor
+    Buffer(const Buffer& other) : data_(new int(*other.data_)) {}    // copy ctor: deep copy
+    ~Buffer() { delete data_; }
 };
-Buffer a; Buffer b = a;      // invoked here (copy-initialization)
 void f(Buffer b) {}
-f(a);                        // and here (pass-by-value)`,
+
+int main() {
+    Buffer a;
+    Buffer b = a;      // invoked here (copy-initialization)
+    f(a);              // and here (pass-by-value)
+}`,
 },
 {
 num:72, section:3, sectionTitle:`Constructors & Destructors`,
@@ -1361,9 +1376,11 @@ answer:`Giving user-defined types custom behavior for built-in operators (\`+\`,
 code:`class Vec2 {
     double x_, y_;
 public:
-    Vec2 operator+(const Vec2& o) const { return {x_+o.x_, y_+o.y_}; }
+    Vec2(double x, double y) : x_(x), y_(y) {}
+    Vec2 operator+(const Vec2& o) const { return {x_ + o.x_, y_ + o.y_}; }   // uses the constructor
 };
-Vec2 c = a + b;   // calls operator+`,
+Vec2 a{1, 2}, b{3, 4};
+Vec2 c = a + b;   // calls a.operator+(b)`,
 },
 {
 num:122, section:5, sectionTitle:`Operator Overloading`,
@@ -1403,11 +1420,12 @@ answer:`As a non-member (often friend) function: \`friend std::ostream& operator
 code:`class Point {
     int x_, y_;
 public:
+    Point(int x, int y) : x_(x), y_(y) {}
     friend std::ostream& operator<<(std::ostream& os, const Point& p) {
         return os << "(" << p.x_ << "," << p.y_ << ")";
     }
 };
-std::cout << Point{1,2};   // "(1,2)"`,
+int main() { std::cout << Point{1, 2}; }   // prints (1,2)`,
 },
 {
 num:126, section:5, sectionTitle:`Operator Overloading`,
@@ -2073,12 +2091,18 @@ level:`Difficult`,
 question:`How does \`std::allocator\` relate to STL containers, and why would you write a custom allocator?`,
 answer:`STL containers are templated on an allocator type (default \`std::allocator<T>\`) that abstracts memory allocation/deallocation; custom allocators let you plug in memory pools, arena allocation, or tracking/instrumentation without changing container logic.`,
 code:`template<typename T>
-class PoolAllocator {
-public:
-    T* allocate(size_t n) { /* pull from pre-reserved pool */ }
-    void deallocate(T* p, size_t n) { /* return to pool */ }
+struct PoolAllocator {
+    using value_type = T;                                    // required by the Allocator requirements
+    PoolAllocator() = default;
+    template<typename U> PoolAllocator(const PoolAllocator<U>&) noexcept {}   // rebind support
+    T* allocate(std::size_t n) {                             // real pools hand out pre-reserved blocks
+        return static_cast<T*>(::operator new(n * sizeof(T)));
+    }
+    void deallocate(T* p, std::size_t) noexcept { ::operator delete(p); }
 };
-std::vector<int, PoolAllocator<int>> v;   // plug custom allocator into a container`,
+template<class T, class U> bool operator==(const PoolAllocator<T>&, const PoolAllocator<U>&) { return true; }
+
+std::vector<int, PoolAllocator<int>> v{1, 2, 3};   // container uses the custom allocator`,
 },
 {
 num:197, section:7, sectionTitle:`Memory Management`,
@@ -2907,7 +2931,8 @@ answer:`Move operations should ideally be \`noexcept\` so operations like \`vect
 code:`class Buffer {
 public:
     Buffer(Buffer&&) noexcept;              // noexcept -> vector will MOVE on reallocation
-    Buffer& operator=(Buffer&&) noexcept;   // without noexcept, vector falls back to COPY`,
+    Buffer& operator=(Buffer&&) noexcept;   // without noexcept, vector falls back to COPY
+};                                          // (std::move_if_noexcept decides which one)`,
 },
 {
 num:293, section:10, sectionTitle:`Exception Handling`,
