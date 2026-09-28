@@ -29,30 +29,30 @@ DEEP:
 4. **Root Port receives:** it sets ERR_COR Received or ERR_FATAL/NONFATAL Received in Root Error Status (with a "multiple" bit for repeats) and records the Requester ID in Error Source Identification.
 5. **Notify software:** Root Error Command enables an AER interrupt (MSI or MSI-X) per class, and Root Control enables "System Error on Correctable, Non-Fatal or Fatal Error", which escalates to a platform SERR-style event (NMI, SMI or machine check).
 
-- **Two layers of enable:** Device Control gates the message from the device. AER Mask registers gate whether an individual error is logged and signaled. The Command register SERR# Enable also gates non-fatal and fatal messages.
+- **Two layers of enable:** Device Control gates the message from the device. AER Mask registers gate whether an individual error is logged and signaled. The Command register's SERR# Enable is an alternative, legacy-compatible enable: an ERR_NONFATAL or ERR_FATAL message is sent if either it or the matching Device Control enable is set.
+- **Detected bits ignore the enables:** the Correctable, Non-Fatal, Fatal and Unsupported Request Detected bits in Device Status are set whenever the error is detected, even when reporting is disabled, which makes them a useful cross-check.
 - **Mask does not clear the status bit:** a masked error usually still sets its status bit but is not signaled. Many systems show Advisory Non-Fatal set and masked in `lspci`.
 - **Design consequence:** silence in the OS log can mean no error, a disabled reporting path, a masked error or firmware-first ownership. Check the enables before concluding.
 FOLLOW:
 - Why is there a separate Unsupported Request enable? => URs are routine during probing and legacy accesses, so they can be silenced without hiding real errors.
 - Who reads Error Source Identification? => The OS AER driver at the Root Port, to find which function to interrogate without scanning the whole tree.
 PITFALL: Assuming "no ERR_ message" means "no error". Read the device's own status bits and mask registers.
-VERIFY: Whether the Detected bits in Device Status set regardless of the enables, the exact role of Command SERR# Enable, and mask versus status-bit behaviour, in the Base Specification.
 
 @@ 12.03 | Basic | Concept | tags=aer,registers,capability,header-log,sticky
 Q: What does each register in the AER capability do?
 SHORT: The AER extended capability holds the Uncorrectable Error Status, Mask and Severity registers, the Correctable Error Status and Mask registers, Advanced Error Capabilities and Control, the Header Log, and on Root Ports the Root Error Command, Root Error Status and Error Source Identification. Status registers say what happened, Mask says what to suppress, Severity says fatal or non-fatal, and the Header Log keeps the TLP header of the first error.
 DEEP:
-| Register | Purpose |
+| Register (offset from AER base) | Purpose |
 |---|---|
-| Uncorrectable Error Status | One bit per error type. Write 1 to clear. Sticky |
-| Uncorrectable Error Mask | Suppress logging and signaling of selected errors |
-| Uncorrectable Error Severity | Per error, fatal (1) or non-fatal (0) |
-| Correctable Error Status and Mask | Same for Receiver Error, Bad TLP, Bad DLLP, Replay Number Rollover, Replay Timer Timeout, Advisory Non-Fatal, Corrected Internal Error, Header Log Overflow |
-| Advanced Error Capabilities and Control | First Error Pointer (which uncorrectable bit came first), ECRC generation and check capable and enable, multiple header recording |
-| Header Log | Four DWORDs: header of the TLP tied to the first uncorrectable error |
-| Root Error Command and Status | Interrupt enables and received-error flags at Root Ports and event collectors |
-| Error Source Identification | Requester IDs of the last ERR_COR and last ERR_FATAL or ERR_NONFATAL |
-| TLP Prefix Log | Prefix DWORDs if the offending TLP had prefixes |
+| Uncorrectable Error Status (04h) | One bit per error type. Write 1 to clear. Sticky |
+| Uncorrectable Error Mask (08h) | Suppress logging and signaling of selected errors |
+| Uncorrectable Error Severity (0Ch) | Per error, fatal (1) or non-fatal (0) |
+| Correctable Error Status and Mask (10h, 14h) | Same for Receiver Error, Bad TLP, Bad DLLP, Replay Number Rollover, Replay Timer Timeout, Advisory Non-Fatal, Corrected Internal Error, Header Log Overflow |
+| Advanced Error Capabilities and Control (18h) | First Error Pointer (which uncorrectable bit came first), ECRC generation and check capable and enable, multiple header recording |
+| Header Log (1Ch to 2Bh) | Four DWORDs: header of the TLP tied to the first uncorrectable error |
+| Root Error Command and Status (2Ch, 30h) | Interrupt enables and received-error flags at Root Ports and event collectors |
+| Error Source Identification (34h) | Requester IDs of the last ERR_COR and last ERR_FATAL or ERR_NONFATAL |
+| TLP Prefix Log (38h) | Prefix DWORDs if the offending TLP had prefixes |
 
 - **Sticky:** these bits survive a hot reset and reflect the state before it, which is very useful for post-mortems. Software can clear them by writing 1, and a Fundamental Reset clears them unless auxiliary power keeps them alive.
 - **First Error Pointer:** later errors set status bits but only the first fills the Header Log (unless multiple header recording is on).
@@ -61,7 +61,6 @@ FOLLOW:
 - Which registers are on every function, and which only on Root Ports? => The status, mask, severity, capabilities and header log are per function. Root Error Command, Root Error Status and Error Source Identification exist only on Root Ports and Root Complex Event Collectors.
 - What clears the Header Log? => Clearing the First Error status bit re-arms it. The log is not cleared by reading.
 PITFALL: Reading the Header Log without checking the First Error Pointer. The log belongs to the first error only, not to the bit you are looking at.
-VERIFY: Register offsets from the AER capability base and all bit positions (for example, Uncorrectable Error Status bit 20 for Unsupported Request), and the header log re-arm behaviour.
 
 @@ 12.04 | Intermediate | Concept | tags=errors,poisoned,ecrc,ur,ca,cto,malformed,causes
 Q: For each Transaction Layer error, what causes it in a real SSD system and what does it tell you?
@@ -80,13 +79,13 @@ DEEP:
 | Flow Control Protocol Error | Fatal | Bad InitFC or UpdateFC values | Data Link or credit logic fault |
 | Receiver Overflow | Fatal | Sender exceeded advertised credits | Credit accounting bug |
 
+- **Bit positions in Uncorrectable Error Status:** 4 Data Link Protocol, 5 Surprise Down, 12 Poisoned TLP, 13 Flow Control Protocol, 14 Completion Timeout, 15 Completer Abort, 16 Unexpected Completion, 17 Receiver Overflow, 18 Malformed TLP, 19 ECRC, 20 Unsupported Request, 21 ACS Violation, 22 Uncorrectable Internal Error (fatal by default).
 - **Use the table backwards:** given an AER bit, the third column lists the first hypotheses.
 - **Layer view:** which layer detects each error is in the Layered Architecture module. Fatal Data Link errors (Surprise Down, Data Link Protocol Error) were covered in the Data Link Layer module.
 FOLLOW:
 - Which of these do you expect during normal operation? => Unsupported Request during probing, and occasionally Advisory Non-Fatal. Anything else in steady state is a bug or a marginal system.
 - Which are strongly related to each other? => A Completion Timeout followed by an Unexpected Completion when the late reply arrives.
 PITFALL: Memorizing the list without the causes. Interviewers ask for the next step, and the cause column gives it.
-VERIFY: Default severities and bit positions for each error, including ACS Violation and Uncorrectable Internal Error.
 
 @@ 12.05 | Intermediate | Trap | tags=trap,ur,ca,completion-status,advisory-non-fatal
 Q: Unsupported Request and Completer Abort both make a request fail. Are they the same?
@@ -110,7 +109,7 @@ FOLLOW:
 - Which one do you get for a config read of a non-existent function? => UR, and the Root Complex reports all ones to the CPU. That is how enumeration finds empty slots.
 - Should you mask UR globally to reduce log noise? => Prefer rate limiting the log. Masking UR globally hides real bugs, for example a firmware update that removed a register.
 PITFALL: Treating both as "the device said no". The first word is a hint to the cause: UR is about the request, CA is about the completer.
-VERIFY: Completion status encodings, mapping to the PCI Status bits, the exact set of errors eligible for Advisory Non-Fatal reporting, and how the specification treats UR for posted requests.
+VERIFY: The exact set of errors eligible for Advisory Non-Fatal reporting in your spec revision.
 
 @@ 12.06 | Intermediate | Concept | tags=poisoned,ecrc,ep-bit,td-bit,data-integrity
 Q: How do Poisoned TLPs and ECRC work, and where do they matter for an SSD?
@@ -130,14 +129,14 @@ FOLLOW:
 - Why is ECRC not enough by itself? => It is optional, and it does not protect data inside the device after the TLP has been received.
 - Can LCRC catch what ECRC catches? => No. LCRC is regenerated at every hop, so corruption inside a switch buffer carries a fresh, valid LCRC.
 PITFALL: Assuming that a Poisoned TLP was rejected. It was delivered, and it is the receiver's job not to consume the data.
-VERIFY: Master Data Parity Error behaviour, ECRC masking of variant fields, the Poisoned TLP Egress Blocking register, and how your NVMe device handles a poisoned host write.
+VERIFY: ECRC masking of variant fields and the Poisoned TLP Egress Blocking controls in the DPC capability, and how your NVMe device handles a poisoned host write.
 
 @@ 12.07 | Intermediate | Concept | tags=completion-timeout,devctl2,unexpected-completion,nvme
 Q: How does the Completion Timeout mechanism work, and what happens when it fires?
 SHORT: The requester starts a timer for each non-posted request. If the completion has not arrived when it expires, the requester logs Completion Timeout (uncorrectable non-fatal by default), releases the tag, and completes the operation in an error way (a CPU read returns all ones). The range is selectable through Device Control 2, with a default range of 50 microseconds to 50 milliseconds. A late completion then shows up as an Unexpected Completion.
 DEEP:
 - **Capabilities:** Device Capabilities 2 lists the supported ranges (A to D, short to long) and whether the timeout can be disabled. Device Control 2 selects a value and has the disable bit.
-- **Ranges (verify):** default 50 microseconds to 50 milliseconds. Others include 50 to 100 microseconds, 1 to 10 ms, 16 to 55 ms, 65 to 210 ms, 260 to 900 ms, 1 to 3.5 s, 4 to 13 s and 17 to 64 s.
+- **Ranges:** default 50 microseconds to 50 milliseconds (with a recommendation not to expire in under 10 ms). Others include 50 to 100 microseconds, 1 to 10 ms, 16 to 55 ms, 65 to 210 ms, 260 to 900 ms, 1 to 3.5 s, 4 to 13 s and 17 to 64 s.
 - **Range, not a value:** each setting is a range because the timer only has to expire somewhere inside it. The minimum is what the request is guaranteed to survive.
 - **Who is the requester:** a Root Port for CPU MMIO reads, an SSD for its DMA reads from host memory. Each has its own timer and its own log.
 - **CPU reads:** a CPU core waiting on an MMIO read to a hung device stalls until the timeout, which is one reason drivers avoid unnecessary reads. On expiry the read returns all ones and some platforms raise a machine check.
@@ -148,7 +147,7 @@ FOLLOW:
 - Can you disable the timeout? => If the device reports the capability, yes, but then a lost request hangs forever. Only for special test cases.
 - Where do you look next after a Completion Timeout? => The request-disappearance walk in the Layered Architecture module: routing, credits, link state, completer state.
 PITFALL: Sizing against the top of the range. The guarantee is the bottom of the range, and slow but healthy devices need that margin.
-VERIFY: The full range and encoding table in Device Control 2 and Device Capabilities 2, the default range guarantees (including any recommendation about the minimum), and platform behaviour on a core-initiated timeout.
+VERIFY: Platform behavior on a core-initiated completion timeout (all ones, machine check or firmware-first record).
 
 @@ 12.08 | Intermediate | Concept | tags=malformed,flow-control-error,receiver-overflow,mps,fatal
 Q: Why are Malformed TLP, Flow Control Protocol Error and Receiver Overflow fatal, and how do they show up during SSD bring-up?
@@ -180,7 +179,7 @@ Assumptions (illustrative): Root Port, switch 1, switch 2, SSD gives three links
 5. **One retrain:** replay timeouts plus a Recovery entry, assumed 1,000 us in total.
 6. **Sum:** 1.2 + 1,000 + 192 + 33 + 1,000 = about 2,226 us = 2.2 ms.
 
-| Setting (verify) | Guaranteed minimum | Verdict for 2.2 ms |
+| Setting | Guaranteed minimum | Verdict for 2.2 ms |
 |---|---|---|
 | 50 to 100 us | 50 us | Times out on a healthy path |
 | 1 to 10 ms | 1 ms | Can time out falsely |
@@ -193,7 +192,7 @@ FOLLOW:
 - What changes if the SSD is the requester reading host memory? => The completer is the Root Complex: IOMMU walks, memory controller queues and deep package idle exit (often tens of microseconds and more), so LTR values matter here too (see the Power Management module).
 - What if a time-out fires falsely? => The completion arrives later and is logged as Unexpected Completion, and the operation has already failed, so you get both an error and a stale response.
 PITFALL: Comparing the average latency to the timeout. The timeout is about the tail, including retrains and low-power exits.
-VERIFY: The range table and the minimum guaranteed by the default range, and L1 exit encodings, in the Base Specification. The 1 ms firmware and retrain terms are assumptions to replace with measured values.
+VERIFY: The 1 ms firmware and retrain terms are assumptions; replace them with measured values for your SSD and platform.
 
 @@ 12.10 | Advanced | Debug | tags=header-log,decode,ur,aer,lspci
 Q: An SSD logs an Unsupported Request with the AER header log 00000001 0000050f f7f03f00 00000000. Decode it and say what it tells you.
@@ -226,16 +225,17 @@ FOLLOW:
 - Why is the requester ID 0000 here? => CPU-originated requests carry an ID that the Root Complex chooses, and many platforms use 00:00.0. It does not identify a bug by itself.
 - What if the same log shows a 64-bit MWr (60h)? => A posted write that hit a bad address. Nothing returned to the CPU, so the AER log is the only evidence.
 PITFALL: Reading DW1 as the address. The address is in the last header DWORD or DWORDs (DW2 for 3-DW, DW2 and DW3 for 4-DW headers).
-VERIFY: The Header Log byte ordering as printed by your tool (lspci and Linux print DW0 first with Fmt/Type in the top byte on common hosts), and that the register map assumption fits your SSD.
+VERIFY: That the register map assumption (nothing at BAR0 + 3F00h) fits your SSD's firmware.
 
 @@ 12.11 | Advanced | Concept | tags=dpc,containment,trigger,recovery,edpc
 Q: What is Downstream Port Containment, what triggers it, and what does it do?
 SHORT: DPC is a capability of Downstream Ports (Root Ports and switch downstream ports). When triggered, the port takes its link down, completes non-posted requests to the subtree with UR or CA and drops the rest. Triggers are an unmasked uncorrectable error at the port, ERR_FATAL (optionally ERR_NONFATAL) received from below, a Root Port PIO error, or a software trigger. Software recovers by clearing the trigger status so the link retrains.
 DEEP:
+- **Where it lives:** the DPC extended capability (ID 001Dh) on Downstream Ports. DPC Control holds DPC Trigger Enable (bits 1:0: 00b off, 01b on ERR_FATAL, 10b on ERR_NONFATAL or ERR_FATAL), DPC Completion Control (bit 2: 0 returns CA, 1 returns UR) and the interrupt enable. DPC Status holds Trigger Status (bit 0), Trigger Reason (bits 2:1), RP Busy (bit 4) and the Trigger Reason Extension (bits 6:5, which distinguishes an RP PIO error from the software trigger); DPC Source ID is at offset 0Ah.
 - **Triggers (DPC Control, Trigger Enable):** off, on for fatal, or on for non-fatal and fatal. Sources: unmasked uncorrectable error detected at the port, ERR_FATAL or ERR_NONFATAL message received from below, Root Port PIO error (enhanced DPC), and the DPC software trigger.
 - **What containment does:**
   - Sets the trigger status and reason, and records the source ID.
-  - Takes the link down and holds it down.
+  - Takes the link down and holds the LTSSM in Disabled until software clears Trigger Status.
   - Non-posted requests heading downstream complete with UR or CA (DPC Completion Control). Posted writes are dropped. TLPs arriving from below are discarded.
   - Optionally raises an interrupt and an ERR_COR message.
 - **Why it matters:** the fatal error is confined to one subtree. Other drives and the rest of the system keep running, instead of a platform-wide fatal event.
@@ -251,7 +251,7 @@ FOLLOW:
 - What does the SSD see during DPC? => Its link goes down. A link-down alone does not necessarily reset the NVMe controller, so the driver's reset is what returns it to a known state.
 - Why is DPC not enabled everywhere by default? => The platform must support it, firmware may own it, and a link reset costs the outstanding I/O on that device. It suits storage backplanes well because the blast radius is one drive.
 PITFALL: Assuming that DPC clears the error. It contains the damage. The device is still in an unknown state and must be reset and re-initialized.
-VERIFY: DPC Control and Status field names and encodings (Trigger Enable, Trigger Reason, Completion Control), the exact link state entered on trigger, RP PIO register names, and the extended capability ID.
+VERIFY: RP PIO register names and the extended DPC fields in your spec revision.
 
 @@ 12.12 | Advanced | Concept | tags=linux,pci-error-handlers,aer-driver,windows,whea,recovery
 Q: How does the OS recover from a PCIe error? Describe the Linux flow and the Windows overview.
@@ -300,7 +300,7 @@ FOLLOW:
 - Why would a vendor choose firmware-first? => To collect uniform hardware error logs, to correct or retire memory and I/O errors without OS involvement, and to hide platform-specific quirks.
 - How do you detect that errors are being hidden? => Compare an injected error with what the OS saw. Read the AER registers directly with `setpci`/`lspci`: status bits stuck at zero after known stress suggest firmware cleared them.
 PITFALL: Concluding that an SSD is error free because the OS log is empty. Confirm who owns AER first.
-VERIFY: `_OSC` bit names for AER and DPC, HEST source types for PCIe, the `pcie_ports` option values on your kernel, and how EDR is negotiated on your platform.
+VERIFY: HEST error source types for PCIe on your platform and how EDR is negotiated there.
 
 @@ 12.14 | Advanced | Cross-layer | tags=nvme,csts-cfs,reset,timeout,namespace-offline
 Q: How does an NVMe driver react to PCIe errors, and when does a namespace go offline?
@@ -349,7 +349,7 @@ FOLLOW:
 - Why is `aer_inject` not enough? => It never touches the device or the link, so it cannot find a firmware bug in how the SSD survives a real error.
 - How do you make injection repeatable? => Trigger from a fixed event (for example the N-th TLP or a fixed LBA), and log the trigger time and state alongside the SSD, host and analyzer logs.
 PITFALL: Counting a run as a pass because the log line appeared. The pass needs recovery and data integrity, not just detection.
-VERIFY: `aer_inject` availability on current kernels and its input format, EINJ error type codes and BIOS support, the DPC software trigger register bit, and which fault-injection features your SSD or PCIe IP offers.
+VERIFY: `aer_inject` availability on your kernel, EINJ support in your BIOS, and which fault-injection features your SSD or PCIe IP offers.
 
 @@ 12.16 | Principal | Scenario | tags=dpc,fio,u2,timeline,blast-radius,recovery
 Q: During a 4 KB random write test on four U.2 SSDs, one SSD causes a fatal error on a DPC-enabled slot. What happens, in what order, and what do you check?
@@ -374,7 +374,7 @@ DEEP:
   - The link returns but at a lower speed or width.
   - The SSD firmware hangs after the link reset and never sets RDY.
   - Hot-plug logic removes the device because it treats the link drop as a surprise removal.
-- **Pass criteria:** recovery inside the target time, no data mismatch, siblings unaffected, logs complete, no hang, and the SSD's unsafe shutdown counter unchanged (the link event is not a power loss).
+- **Pass criteria:** recovery inside the target time, no data mismatch, siblings unaffected, logs complete, no hang, and the SSD's Unexpected Power Losses counter (formerly Unsafe Shutdowns) unchanged (the link event is not a power loss).
 FOLLOW:
 - How do you inject step 1 in the lab? => With the DPC software trigger or an exerciser for the mechanics, and a device-side hook or `aer_inject` for the log and recovery path. Use several methods.
 - What if the SSDs sit behind a shared switch? => Containment is at the switch downstream port, so still one SSD, but an upstream port trigger would take all of them down. Test both ports.

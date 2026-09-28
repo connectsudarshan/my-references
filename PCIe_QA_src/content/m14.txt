@@ -33,7 +33,7 @@ FOLLOW:
 - Is FBER measured after equalization? => It is the error rate at the receiver's decision point before FEC, after the receiver's equalization has done its work.
 - Why still need a CRC after FEC? => The lightweight FEC corrects a limited number of byte errors per group. Larger or unlucky bursts get past it, and the CRC detects them so the flit is replayed.
 PITFALL: Comparing Gen6's FBER of about 1e-6 with Gen5's 1e-12 as if they were the same metric. Gen6's is a raw rate that FEC and CRC then clean up, while Gen5's is the rate the link has to live with.
-VERIFY: The FBER target and how it is defined, the Gray mapping, and the precoder details in the Base Specification.
+VERIFY: The exact FBER definition and the precoder details in the Physical Layer chapter of PCIe Base 6.x.
 
 @@ 14.03 | Intermediate | Concept | fig=flit | tags=flit,256-byte,fec,crc,dlp
 Q: What does a 256-byte FLIT contain, and how does it compare with non-FLIT framing?
@@ -55,17 +55,17 @@ FOLLOW:
 - Can a TLP span two flits? => Yes. TLP bytes fill the 236-byte area back to back, so a TLP can start in one flit and finish in the next.
 - Does the CRC cover the FEC bytes? => No. The CRC covers the TLP area and the DLP, and the FEC covers those plus the CRC.
 PITFALL: Treating the 256 bytes as payload. Only 236 bytes hold TLPs, and headers come out of that budget.
-VERIFY: The exact byte positions, the FEC group layout and interleave, which DLP bytes carry what, and whether TLPs may straddle flit boundaries, all in the Base Specification. The 236 + 6 + 8 + 6 split matches published PCI-SIG material, but confirm before quoting.
+VERIFY: The FEC group interleave and which DLP bytes carry which fields, in PCIe Base 6.x.
 
 @@ 14.04 | Advanced | Concept | tags=flit,framing,lcrc,sequence-number,dllp,encoding
 Q: Why does FLIT mode replace the 128b/130b framing and the per-TLP LCRC and sequence numbers?
-SHORT: With FEC, errors are handled in fixed-size blocks, so the natural unit for detection and retry is the flit and not the TLP. FLIT mode therefore drops the per-TLP framing tokens (at 64 GT/s there is also no 128b/130b sync header), and replaces the per-TLP sequence number and LCRC with a flit sequence number and one CRC per flit. That saves about 10 bytes per TLP and makes the pipeline deterministic, at the price of a fixed 20 bytes of overhead per flit.
+SHORT: With FEC, errors are handled in fixed-size blocks, so the natural unit for detection and retry is the flit and not the TLP. FLIT mode therefore drops the per-TLP framing tokens (at 64 GT/s there is also no 128b/130b sync header), and replaces the per-TLP sequence number and LCRC with a flit sequence number and one CRC per flit. That saves 8 bytes per TLP (the 4-byte STP token and the 4-byte LCRC) and makes the pipeline deterministic, at the price of a fixed 20 bytes of overhead per flit.
 DEEP:
 | Function | Non-FLIT (Gen3 to Gen5) | FLIT mode |
 |---|---|---|
 | Framing | 128b/130b sync header plus STP/SDP/EDS tokens (END belongs to 8b/10b) | Implied by the flit position |
 | Per-TLP integrity | 32-bit LCRC each TLP | 8-byte CRC per flit |
-| Ordering and replay | 12-bit sequence number per TLP | Flit sequence number, about 10 bits |
+| Ordering and replay | 12-bit sequence number per TLP | 10-bit flit sequence number |
 | Acknowledgement | Ack and Nak DLLPs, cumulative | Ack and Nak carried in the DLP of each flit |
 | Link-management packets | 6-byte DLLPs with CRC-16 | Carried in DLP bytes and flit types |
 | Error correction | None | 6 bytes of FEC |
@@ -73,13 +73,13 @@ DEEP:
 - **Why a fixed block:** FEC needs a fixed codeword. Making the CRC and the retry unit the same block makes the decode pipeline simple and its latency constant.
 - **Why per-TLP overhead hurts at 64 GT/s:** a x16 link moves about 500 million flits per second, and TLPs of a few tens of bytes would need per-TLP framing, sequence numbers and CRC checks at that rate. One flit-level check is cheaper.
 - **What stays:** the Transaction Layer's TLPs, flow control (carried differently), and the enumeration and config model. NVMe over a flit-mode link needs no software change.
-- **Other consequences:** L0s is not supported in flit mode per current understanding (L0p covers its purpose; confirm in the spec), and the Bad TLP style counters change meaning because there is no per-TLP LCRC. A validator needs to learn the new logging capabilities.
+- **Other consequences:** L0s is not supported in flit mode (L0p covers its purpose), and the Bad TLP style counters change meaning because there is no per-TLP LCRC. AER gains flit-aware logging, for example an Advanced Error Capabilities bit that says the logged TLP header was captured in flit mode. A validator needs to learn the new logging capabilities.
 - **Debug consequence:** analyzers that decode TLPs from 128b/130b framing cannot decode flit-mode traffic. A flit-aware analyzer is needed.
 FOLLOW:
 - Do lower speeds use flits too? => Once flit mode is negotiated, the link stays in it, including at lower speeds, according to the negotiation rules. Confirm how the encoding at each rate works in the spec.
 - Where did the LCRC's job go? => Detection is the flit CRC, and correction or retry is FEC plus flit replay.
 PITFALL: Looking for Bad TLP and LCRC counters on a flit-mode link. They may not exist in the same form.
-VERIFY: The flit sequence number width, L0s support in flit mode, the flow control mechanism in flit mode, and the error logging capabilities added for flit mode.
+VERIFY: The flow control mechanism in flit mode and the full set of flit-mode error logging capabilities.
 
 @@ 14.05 | Advanced | Concept | tags=flit,ack-nak,replay,selective-nak,retry-buffer
 Q: How do ACK, NAK and replay work at the flit level?
@@ -99,37 +99,37 @@ FOLLOW:
 - Why is replay probability so much lower than the raw flit error probability? => FEC repairs most flits before the CRC check, so only uncorrectable patterns cause a Nak.
 - What does a validator watch? => Retry and Nak counts, FEC corrected counts when exposed, and replay timer events, converted to rates per flit.
 PITFALL: Assuming selective Nak means no go-back-N at all. Both exist, and behavior depends on what each side implements.
-VERIFY: Sequence number width and where it sits in the DLP, the replay command encodings, selective Nak support requirements, the retry probability figure, and the timers.
+VERIFY: Where the flit sequence number sits in the DLP, the replay command encodings, selective Nak support requirements and the replay timers.
 
 @@ 14.06 | Advanced | Numeric | tags=bandwidth,gen5,gen6,flit,efficiency,x4
 Q: Compare the effective payload bandwidth of a Gen5 x4 and a Gen6 x4 link with 256-byte payload TLPs.
-SHORT: Gen5 x4 gives 15.75 GB/s after 128b/130b, and with 256 B payloads and 26 B of per-TLP overhead about 14.3 GB/s of payload. Gen6 x4 gives 32 GB/s raw, 29.5 GB/s of TLP area after flit overhead (236/256), and about 27.8 GB/s of payload. The ratio is about 1.94, not 2, and it moves with TLP size, being larger for small payloads.
+SHORT: Gen5 x4 gives 15.75 GB/s after 128b/130b, and with 256 B payloads and 24 B of per-TLP overhead about 14.4 GB/s of payload. Gen6 x4 gives 32 GB/s raw, 29.5 GB/s of TLP area after flit overhead (236/256), and about 27.8 GB/s of payload. The ratio is about 1.93, not 2, and it moves with TLP size, being larger for small payloads.
 DEEP:
 Assumptions: x4, one direction, 256-byte payload, 16-byte TLP headers, no ECRC, no flow control or ack traffic counted, and flit-mode TLP headers the same size as non-FLIT ones.
 
 1. **Gen5 raw:** 32 GT/s x 4 lanes x 128/130 / 8 = 15.75 GB/s.
-2. **Gen5 per-TLP overhead:** 4 B framing token + 2 B sequence number + 16 B header + 4 B LCRC = 26 B. Efficiency = 256 / 282 = 90.8 percent.
-3. **Gen5 payload:** 15.75 x 0.908 = about 14.3 GB/s.
+2. **Gen5 per-TLP overhead:** 4 B STP token (which carries the sequence number) + 16 B header + 4 B LCRC = 24 B. Efficiency = 256 / 280 = 91.4 percent.
+3. **Gen5 payload:** 15.75 x 0.914 = about 14.4 GB/s.
 4. **Gen6 raw:** 64 GT/s x 4 / 8 = 32 GB/s (no line-code overhead at the PHY).
 5. **Flit efficiency:** 236 / 256 = 92.2 percent, so 29.5 GB/s of TLP bytes.
 6. **Gen6 per-TLP overhead:** the 16 B header only, since framing, sequence number and LCRC are gone. Efficiency = 256 / 272 = 94.1 percent.
-7. **Gen6 payload:** 29.5 x 0.941 = about 27.8 GB/s. Ratio = 27.8 / 14.3 = 1.94.
+7. **Gen6 payload:** 29.5 x 0.941 = about 27.8 GB/s. Ratio = 27.8 / 14.4 = 1.93.
 
 | Payload | Gen5 x4 GB/s | Gen6 x4 GB/s | Ratio |
 |---|---|---|---|
-| 64 B | 11.2 | 23.6 | 2.11 |
-| 128 B | 13.1 | 26.2 | 2.00 |
-| 256 B | 14.3 | 27.8 | 1.94 |
-| 512 B | 15.0 | 28.6 | 1.91 |
+| 64 B | 11.5 | 23.6 | 2.06 |
+| 128 B | 13.3 | 26.2 | 1.98 |
+| 256 B | 14.4 | 27.8 | 1.93 |
+| 512 B | 15.1 | 28.6 | 1.90 |
 
-- **Why the ratio moves:** flit overhead is a fixed 7.8 percent, while non-FLIT overhead is a per-TLP cost of 10 bytes that hurts small TLPs most. Gen6 wins more than 2x for small payloads and less than 2x for large ones.
+- **Why the ratio moves:** flit overhead is a fixed 7.8 percent, while non-FLIT overhead is a per-TLP cost of 8 bytes that hurts small TLPs most. Gen6 wins more than 2x for small payloads and less than 2x for large ones.
 - **Replay cost:** about 0.06 percent at the target retry rate (see the previous question), negligible.
 - **Real SSDs:** a Gen5 x4 drive around 14 GB/s is at the link limit, so a Gen6 x4 drive can aim for roughly 27 to 28 GB/s, before NAND, controller and host limits.
 FOLLOW:
 - How does a read-heavy workload change this? => The data flows as completions from the SSD to the host, plus a stream of small read request TLPs the other way. Each direction has its own budget, so compute the data direction and check that the request direction has headroom.
 - What if the flit-mode header is bigger than assumed? => Use the real header size in step 6. With 20 B the Gen6 payload efficiency drops to 92.8 percent, and the payload figure to about 27.4 GB/s.
 PITFALL: Doubling the Gen5 payload number and calling it Gen6. Flit overhead costs 7.8 percent, and the per-TLP savings only partly offset it.
-VERIFY: Flit-mode TLP header sizes and any optional header extensions, and the exact overhead in the current Base Specification.
+VERIFY: Flit-mode TLP header sizes (and optional header extensions) in PCIe Base 6.x.
 
 @@ 14.07 | Advanced | Concept | tags=flit,latency,fec,accumulation,replay,cxl
 Q: What latency does FLIT mode add, and when does replay hurt?
@@ -155,7 +155,7 @@ SHORT: Flit mode support is advertised in the training sequences, and the mode i
 DEEP:
 - **Decision point:** made during the first training, not at each speed change. A link that trained in flit mode at 32 GT/s stays in flit mode if it later moves to 64 GT/s or drops to a lower rate.
 - **Reset of the decision:** anything that takes the LTSSM back through Detect (link down, PERST#, a fresh training) allows a new decision.
-- **What software sees:** newer pciutils and the kernel report a flit-mode indication in the Link Status 2 area. Read it alongside speed and width.
+- **What software sees:** Flit Mode Supported is bit 15 of the PCI Express Capabilities register, and Flit Mode Status is bit 10 of Link Status 2 (set when the link is operating in flit mode). Newer pciutils print both. Read them alongside speed and width.
 - **Fallback:** a non-FLIT partner produces a non-FLIT link at any speed up to 32 GT/s. There is no non-FLIT 64 GT/s.
 - **Mixed hierarchies:** a switch may run flit mode on one link and non-FLIT on another. The Transaction Layer bridges them, since TLPs are still TLPs.
 - **Validation matrix:** every combination of {flit, non-flit} x {each speed} x {each partner type}, plus speed changes in both directions after flit mode is entered, plus retimers in the path (they must not disturb the negotiation).
@@ -164,7 +164,7 @@ FOLLOW:
 - Can software force a link to non-FLIT? => Not through a standard OS control. Some platform firmware offers a setting, and the Base Specification is the reference for what is allowed.
 - Is 64 GT/s possible without flit mode? => No. Flit mode is required at 64 GT/s.
 PITFALL: Assuming the mode is re-evaluated after every speed change. It is negotiated once and sticks until the link goes down.
-VERIFY: The training sequence fields and the training state where flit mode is negotiated, the Link Capabilities 2 and Link Status 2 bit names, the behavior at speeds below 64 GT/s, and which resets return the LTSSM through Detect.
+VERIFY: The training-sequence fields and LTSSM state where flit mode is negotiated, and the behavior at speeds below 64 GT/s.
 
 @@ 14.09 | Intermediate | Concept | tags=l0p,power,partial-width,flit,aspm
 Q: What is L0p, and how does it differ from L0s and L1?
@@ -220,7 +220,7 @@ DEEP:
   - Type 1: caching devices without host-visible memory, for example some SmartNICs.
   - Type 2: accelerators with their own memory, such as GPUs.
   - Type 3: memory expanders and memory modules. The host uses CXL.mem to reach their memory.
-- **Enumeration:** every CXL device is also a PCIe function. It has a class code identifying it (a CXL memory device for Type 3) and Designated Vendor-Specific Extended Capabilities (DVSEC) that describe CXL features. Linux binds cxl drivers to it, and `lspci` labels these devices CXL.
+- **Enumeration:** every CXL device is also a PCIe function. It has a class code identifying it (050210h, memory controller / CXL / CXL Memory Device, for Type 3) and Designated Vendor-Specific Extended Capabilities (DVSEC, with the CXL Consortium's vendor ID 1E98h) that describe CXL features. Linux binds cxl drivers to it, and `lspci` labels these devices CXL.
 - **Memory mapping:** device memory is mapped into the host physical address space through host-managed device memory (HDM) decoders, appears as a NUMA node, and is accessed by ordinary loads and stores with CPU caching. That is different from a BAR, which is normally uncached MMIO.
 - **Versions and rates:** CXL 1.1 and 2.0 run at 32 GT/s (Gen5), 3.x at 64 GT/s (Gen6) and CXL 4.0 at 128 GT/s (Gen7). CXL 2.0 added switching and pooling, and 3.x added fabrics and sharing.
 - **Reuse of your PCIe knowledge:** CXL.io is the PCIe transaction layer, so config space, AER, DPC, FLR and hot-plug all apply.
@@ -228,7 +228,7 @@ FOLLOW:
 - Is CXL.mem carried in TLPs? => No. CXL.cache and CXL.mem use their own link-layer messages multiplexed with CXL.io flits and packets, while CXL.io uses PCIe TLPs.
 - Does a Type 3 device look like an NVMe SSD to software? => No. It is a memory device with an HDM region and mailbox commands, not a block device.
 PITFALL: Thinking of a CXL memory device as a PCIe device with a big BAR. Its memory is cacheable system memory managed by the host with coherence rules.
-VERIFY: Class codes and how your lspci version labels CXL devices, the CXL DVSEC vendor ID and IDs, the exact alternate-protocol negotiation steps, and which CXL version needs which PCIe rate.
+VERIFY: The exact alternate-protocol negotiation steps and which CXL version needs which PCIe rate, in the current CXL specification.
 
 @@ 14.12 | Principal | Cross-layer | tags=cxl,ssd,memory-semantic,cmm,type3,validation
 Q: Why does an SSD firmware or validation engineer meet CXL, and how would you plan validation of a CXL memory or memory-semantic storage device?
@@ -259,7 +259,7 @@ SHORT: IDE protects TLPs in transit with AES-GCM: integrity through a message au
 DEEP:
 - **Threat model:** someone with an interposer, a compromised cable or retimer, or a malicious component on the path. IDE stops them reading or modifying TLPs undetected.
 - **Scope:** Link IDE protects each hop and needs every hop to be secure. Selective IDE protects a stream end to end while switches only forward it.
-- **Crypto:** AES-256-GCM, with the authentication tag aggregated over several TLPs to reduce overhead. Two operating styles trade latency and strictness: containment mode holds data until the tag checks, and skid mode releases data earlier and detects afterwards.
+- **Crypto:** AES-256-GCM with a 96-bit MAC, which can be aggregated over several TLPs to reduce overhead. The IDE extended capability is ID 0030h. Two operating styles trade latency and strictness: containment mode holds data until the tag checks, and skid mode releases data earlier and detects afterwards.
 - **Cost:** the tag and framing add link overhead, and encryption and authentication hardware must run at line rate. On a Gen5 x4 SSD that is over 14 GB/s in each direction, which is real silicon area and power.
 - **Not the same as data at rest:** IDE protects the wire. NVMe encryption at rest (self-encrypting drives, TCG Opal, media encryption) protects the media. A compromised host still sees plaintext.
 - **Validation:**
@@ -272,13 +272,13 @@ FOLLOW:
 - Where do the keys come from? => From an SPDM secure session between host or platform security firmware and the device. The IDE key management messages ride on it.
 - Does IDE work in flit mode? => IDE is defined for both formats, with different encapsulation. Check the specification for the exact form.
 PITFALL: Calling IDE "PCIe disk encryption". It protects data moving across the link, not stored data.
-VERIFY: Tag sizes, the exact names of the operating modes, the stream and prefix encoding in each flit mode, and the IDE extended capability contents.
+VERIFY: The stream and prefix encoding in each flit mode and the IDE extended capability contents.
 
 @@ 14.14 | Advanced | Concept | tags=doe,spdm,cma,tdisp,tee-io,attestation
 Q: What are DOE, SPDM, CMA and TDISP, and how do they fit together?
 SHORT: DOE (Data Object Exchange) is a config-space mailbox: software writes a data object, sets Go, and reads the response. It is a transport. SPDM is the DMTF protocol that runs over it, and CMA (Component Measurement and Authentication) uses SPDM to authenticate a device with certificates and read signed firmware measurements. TDISP uses that secure channel with IDE to let a trusted VM lock, attest and run a device interface (a PF or VF).
 DEEP:
-- **DOE:** an extended capability with control and status registers and two mailboxes (write and read). Objects carry a vendor ID, an object type and a length. A discovery object tells software which protocols an instance supports. Responses may take a while, so software polls the Busy and Data Object Ready state or uses an interrupt, with a timeout.
+- **DOE:** an extended capability (ID 002Eh) with control and status registers and two mailboxes (write and read). Objects carry a vendor ID, an object type and a length; for the PCI-SIG vendor ID, type 0 is DOE Discovery, 1 is CMA/SPDM and 2 is Secured CMA/SPDM. A discovery object tells software which protocols an instance supports. Responses may take a while, so software polls the Busy and Data Object Ready state or uses an interrupt, with a timeout.
 - **SPDM:** version and capability negotiation, certificate chain retrieval, challenge and response authentication, measurements, and key exchange that produces a secure session.
 - **CMA:** answers "is this the genuine device, with signed firmware at the expected version?". A platform can refuse a device that fails authentication or a measurement policy.
 - **IDE key management:** runs inside the secure SPDM session to program IDE keys.
@@ -289,7 +289,7 @@ FOLLOW:
 - Who initiates DOE exchanges? => Host software or platform firmware, using config accesses. The device only answers.
 - Is DOE only for security? => No. It is a general mailbox. CXL also uses it to read CDAT tables.
 PITFALL: Mixing up the transport (DOE), the protocol (SPDM), the data protection (IDE) and the policy (TDISP).
-VERIFY: DOE register names and timeouts, object type numbers for SPDM and secured SPDM, TDISP state and message names, NVMe SPDM support via Security Send and Receive, and which TEE-IO products are shipping.
+VERIFY: DOE register names and timeouts, TDISP state and message names, NVMe SPDM support via Security Send and Receive, and which TEE-IO products are shipping.
 
 @@ 14.15 | Principal | Debug | tags=downtrain,gen5,triage,lnksta2,equalization,checklist
 Q: A Gen5-capable SSD trains at Gen4 or Gen3. Give a systematic checklist that ties link capability, training and equalization together.
@@ -308,7 +308,7 @@ FOLLOW:
 - It is Gen5 on the bench slot and Gen4 in the server. What differs? => Channel loss, the retimer, connectors, a BIOS cap or thermals. Measure margin on the bench first to see how much you have.
 - Cold boot gives Gen4 and warm reset gives Gen5. What does that suggest? => Sequencing or timing (device or retimer not ready when the root port trains), or temperature. See the boot-yield automation in the equalization module.
 PITFALL: Trusting LnkSta alone. It says where the link ended up, not why.
-VERIFY: Bit names for LnkSta2 and the 16 and 32 GT/s equalization status registers, how flit mode maps onto 128b/130b blocks below 64 GT/s, how your BIOS caps speeds, and whether your platform lowers speed after errors.
+VERIFY: How your BIOS caps speeds, and whether your platform lowers speed after errors.
 
 @@ 14.16 | Principal | Scenario | tags=validation,strategy,gen4,gen5,gen6,tooling,flit,fec
 Q: How does an SSD validation strategy change from Gen4 to Gen5 to Gen6: new tests, new failure modes and new tooling?
@@ -337,9 +337,9 @@ VERIFY: Which FEC, CRC and retry counters the specification defines and your har
 
 @@ 14.17 | Advanced | Trap | tags=gen6,doubling,tags,credits,latency,flit
 Q: A colleague says a Gen6 SSD will simply double Gen5 numbers. What is wrong with that?
-SHORT: The raw rate doubles, the delivered performance does not. Flit overhead takes 7.8 percent, so a x4 link delivers 29.5 GB/s of TLP bytes against Gen5's 15.75, a ratio of 1.87, and about 1.94 for payload at 256 B once per-TLP savings are counted. Beyond the link, the bandwidth-delay product doubles, so tags, credits and buffers must double too. Random IOPS, latency and NAND behavior do not follow link speed at all.
+SHORT: The raw rate doubles, the delivered performance does not. Flit overhead takes 7.8 percent, so a x4 link delivers 29.5 GB/s of TLP bytes against Gen5's 15.75, a ratio of 1.87, and about 1.93 for payload at 256 B once per-TLP savings are counted. Beyond the link, the bandwidth-delay product doubles, so tags, credits and buffers must double too. Random IOPS, latency and NAND behavior do not follow link speed at all.
 DEEP:
-- **Link arithmetic:** the numeric question in this module gives 14.3 versus 27.8 GB/s of payload at MPS 256. That is 1.94x, and it varies with TLP size.
+- **Link arithmetic:** the numeric question in this module gives 14.4 versus 27.8 GB/s of payload at MPS 256. That is 1.93x, and it varies with TLP size.
 - **Bandwidth-delay product:** at a 1 microsecond round trip, a Gen5 x4 link needs 15.75 KB of data in flight, and a Gen6 x4 link needs 32 KB. Read requests need twice the outstanding tags or larger read sizes, receivers need twice the buffer, and flow control credits must cover twice the bytes. If the root complex or drive was sized for Gen5, throughput stops well short of double.
 - **Replay buffer:** it must also double, as in the Data Link module, and retimers add more.
 - **IOPS and latency:** 4 KiB random reads at low queue depth are limited by NAND read latency and firmware, not by the link. Adding link bandwidth does nothing there. The link adds a few nanoseconds of flit accumulation and FEC.
@@ -351,4 +351,4 @@ FOLLOW:
 - Which resource usually saturates first when you move an SSD to a faster link? => Outstanding read tags, host-side queue depth, or the controller and NAND. The link is often not the first limit.
 - What number would you check to catch a tag shortage? => Achieved bandwidth against outstanding requests times size divided by round-trip time, from the Flow Control and outstanding-reads discussions in earlier modules.
 PITFALL: Quoting the marketing rate (64 GT/s) as a throughput. Convert with the flit and TLP overhead first, and then find the next bottleneck.
-VERIFY: The flit-mode header sizes and exact overhead used in the arithmetic, and the tag and credit limits of your platform.
+VERIFY: The tag and credit limits of your platform.
