@@ -194,7 +194,7 @@ def main():
     html = html.replace('/*__DIAGRAMS__*/', diagrams).replace('/*__DATA__*/', 'var DATA=' + blob + ';')
     os.makedirs(os.path.join(ROOT, 'out'), exist_ok=True)
     out = os.path.join(ROOT, 'out', topic['out_file'])
-    with open(out, 'w', encoding='utf-8') as f:
+    with open(out, 'w', encoding='utf-8', newline='\n') as f:
         f.write(html)
 
     print(f'\nBuilt {out}  ({os.path.getsize(out) / 1024:.0f} KB)')
